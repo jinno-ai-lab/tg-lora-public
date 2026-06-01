@@ -1,0 +1,269 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class CycleState:
+    """Tracks aggregate state across TG-LoRA training cycles.
+
+    Extracted from train_tg_lora.py so the reduction-rate calculation,
+    early-stopping guard, and best-model tracking can be tested without
+    a GPU or model.
+    """
+
+    cycle: int = 0
+    optimizer_steps: int = 0
+    full_backward_passes: int = 0
+    extrapolation_steps: int = 0
+    speculative_equivalent_backward_passes: int = 0
+    best_loss: float = float("inf")
+    best_step: int = 0
+    stale_cycles: int = 0
+    last_train_loss: float = 0.0
+    last_valid_loss: float = float("inf")
+    accepted_count: int = 0
+    rejected_count: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            self.speculative_equivalent_backward_passes == 0
+            and self.extrapolation_steps > 0
+        ):
+            self.speculative_equivalent_backward_passes = self.extrapolation_steps
+        if self.cycle < 0:
+            raise ValueError(f"cycle must be non-negative, got {self.cycle}")
+        if self.optimizer_steps < 0:
+            raise ValueError(
+                f"optimizer_steps must be non-negative, got {self.optimizer_steps}"
+            )
+        if self.full_backward_passes < 0:
+            raise ValueError(
+                f"full_backward_passes must be non-negative, got {self.full_backward_passes}"
+            )
+        if self.extrapolation_steps < 0:
+            raise ValueError(
+                f"extrapolation_steps must be non-negative, got {self.extrapolation_steps}"
+            )
+        if self.speculative_equivalent_backward_passes < 0:
+            raise ValueError(
+                "speculative_equivalent_backward_passes must be non-negative, "
+                f"got {self.speculative_equivalent_backward_passes}"
+            )
+        if self.best_step < 0:
+            raise ValueError(f"best_step must be non-negative, got {self.best_step}")
+        if self.stale_cycles < 0:
+            raise ValueError(f"stale_cycles must be non-negative, got {self.stale_cycles}")
+        if self.accepted_count < 0:
+            raise ValueError(
+                f"accepted_count must be non-negative, got {self.accepted_count}"
+            )
+        if self.rejected_count < 0:
+            raise ValueError(
+                f"rejected_count must be non-negative, got {self.rejected_count}"
+            )
+
+    def record_cycle(
+        self,
+        *,
+        train_loss: float,
+        valid_loss: float | None = None,
+        accepted: bool | None = True,
+        actual_backward_passes: int | None = None,
+        speculative_optimizer_steps: int | None = None,
+        optimizer_steps: int | None = None,
+        speculative_equivalent_backward_passes: int | None = None,
+        K: int | None = None,
+        N: int | None = None,
+        grad_accum: int | None = None,
+    ) -> None:
+        (
+            resolved_actual_backward_passes,
+            resolved_speculative_optimizer_steps,
+            resolved_optimizer_steps,
+            resolved_speculative_equivalent_backward_passes,
+        ) = self._resolve_cycle_counts(
+            actual_backward_passes=actual_backward_passes,
+            speculative_optimizer_steps=speculative_optimizer_steps,
+            optimizer_steps=optimizer_steps,
+            speculative_equivalent_backward_passes=speculative_equivalent_backward_passes,
+            K=K,
+            N=N,
+            grad_accum=grad_accum,
+        )
+
+        self.cycle += 1
+        self.optimizer_steps += resolved_optimizer_steps
+        self.full_backward_passes += resolved_actual_backward_passes
+        self.extrapolation_steps += resolved_speculative_optimizer_steps
+        self.speculative_equivalent_backward_passes += (
+            resolved_speculative_equivalent_backward_passes
+        )
+        self.last_train_loss = train_loss
+
+        if valid_loss is not None:
+            self.last_valid_loss = valid_loss
+
+        if accepted is True:
+            self.accepted_count += 1
+        elif accepted is False:
+            self.rejected_count += 1
+
+        if valid_loss is not None:
+            if valid_loss < self.best_loss:
+                self.best_loss = valid_loss
+                self.best_step = self.full_backward_passes
+                self.stale_cycles = 0
+            else:
+                self.stale_cycles += 1
+
+    @staticmethod
+    def _resolve_cycle_counts(
+        *,
+        actual_backward_passes: int | None,
+        speculative_optimizer_steps: int | None,
+        optimizer_steps: int | None,
+        speculative_equivalent_backward_passes: int | None,
+        K: int | None,
+        N: int | None,
+        grad_accum: int | None,
+    ) -> tuple[int, int, int, int]:
+        if actual_backward_passes is None:
+            if K is None or grad_accum is None:
+                raise TypeError(
+                    "record_cycle requires either explicit cycle counts or legacy "
+                    "K/grad_accum inputs"
+                )
+            actual_backward_passes = K * grad_accum
+            if speculative_optimizer_steps is None:
+                if N is None:
+                    raise TypeError(
+                        "record_cycle requires speculative_optimizer_steps or legacy N"
+                    )
+                speculative_optimizer_steps = N
+            if optimizer_steps is None:
+                optimizer_steps = K
+            if speculative_equivalent_backward_passes is None:
+                # Preserve historical behavior for legacy callers that still
+                # interpret extrapolation steps in optimizer-step units.
+                speculative_equivalent_backward_passes = speculative_optimizer_steps
+        else:
+            if speculative_optimizer_steps is None:
+                raise TypeError(
+                    "record_cycle requires speculative_optimizer_steps when "
+                    "actual_backward_passes is provided"
+                )
+            if optimizer_steps is None:
+                optimizer_steps = 0
+            if speculative_equivalent_backward_passes is None:
+                speculative_equivalent_backward_passes = speculative_optimizer_steps
+
+        values = {
+            "actual_backward_passes": actual_backward_passes,
+            "speculative_optimizer_steps": speculative_optimizer_steps,
+            "optimizer_steps": optimizer_steps,
+            "speculative_equivalent_backward_passes": speculative_equivalent_backward_passes,
+        }
+        for name, value in values.items():
+            if value is None:
+                raise TypeError(f"record_cycle could not resolve {name}")
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+
+        return (
+            actual_backward_passes,
+            speculative_optimizer_steps,
+            optimizer_steps,
+            speculative_equivalent_backward_passes,
+        )
+
+    @property
+    def reduction_rate(self) -> float:
+        total = (
+            self.full_backward_passes + self.speculative_equivalent_backward_passes
+        )
+        if total == 0:
+            return 0.0
+        return 1.0 - self.full_backward_passes / total
+
+    @property
+    def acceptance_rate(self) -> float:
+        total = self.accepted_count + self.rejected_count
+        if total == 0:
+            return 0.0
+        return self.accepted_count / total
+
+    @property
+    def total_cycles(self) -> int:
+        return self.accepted_count + self.rejected_count
+
+    def should_stop(
+        self,
+        patience: int | None = None,
+        min_cycles: int = 10,
+    ) -> bool:
+        if patience is None:
+            return False
+        return self.stale_cycles >= patience and self.cycle >= min_cycles
+
+    def record_full_eval(self, full_loss: float) -> None:
+        """Update best_loss / stale_cycles from a full-validation-set eval.
+
+        Separate from ``record_cycle`` so the training loop can use quick-eval
+        for per-cycle monitoring and full-eval for early-stopping decisions
+        without double-counting stale cycles.
+        """
+        if full_loss < self.best_loss:
+            self.best_loss = full_loss
+            self.best_step = self.full_backward_passes
+            self.stale_cycles = 0
+        else:
+            self.stale_cycles += 1
+
+    def summary(self) -> dict:
+        return {
+            "cycles": self.cycle,
+            "optimizer_steps": self.optimizer_steps,
+            "full_backward_passes": self.full_backward_passes,
+            "micro_backward_passes": self.full_backward_passes,
+            "extrapolation_steps": self.extrapolation_steps,
+            "speculative_optimizer_steps": self.extrapolation_steps,
+            "speculative_equivalent_backward_passes": self.speculative_equivalent_backward_passes,
+            "reduction_rate": self.reduction_rate,
+            "best_valid_loss": self.best_loss,
+            "best_valid_step": self.best_step,
+            "stale_cycles": self.stale_cycles,
+            "acceptance_rate": self.acceptance_rate,
+            "accepted_count": self.accepted_count,
+            "rejected_count": self.rejected_count,
+            "final_train_loss": self.last_train_loss,
+            "last_valid_loss": self.last_valid_loss,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CycleState:
+        """Reconstruct a CycleState from a dict produced by ``summary()``.
+
+        Accepts both ``summary()`` keys (``cycles``, ``best_valid_loss``, ...)
+        and checkpoint-format keys (``cycle``, ``best_loss``, ...) for
+        backward compatibility with saved training states.
+        """
+        return cls(
+            cycle=data.get("cycles", data.get("cycle", 0)),
+            optimizer_steps=data.get("optimizer_steps", 0),
+            full_backward_passes=data.get("full_backward_passes", 0),
+            extrapolation_steps=data.get("extrapolation_steps", 0),
+            speculative_equivalent_backward_passes=data.get(
+                "speculative_equivalent_backward_passes",
+                data.get("extrapolation_steps", 0),
+            ),
+            best_loss=data.get("best_valid_loss", data.get("best_loss", float("inf"))),
+            best_step=data.get("best_valid_step", data.get("best_step", 0)),
+            stale_cycles=data.get("stale_cycles", 0),
+            last_train_loss=data.get(
+                "final_train_loss", data.get("last_train_loss", 0.0)
+            ),
+            last_valid_loss=data.get("last_valid_loss", float("inf")),
+            accepted_count=data.get("accepted_count", 0),
+            rejected_count=data.get("rejected_count", 0),
+        )
