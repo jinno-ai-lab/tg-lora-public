@@ -1,10 +1,12 @@
 # Default settings for evaluation and training
 MODEL_PATH ?= .cache/mlx_models/Qwen--Qwen3.5-9B
+HF_MODEL_PATH ?= Qwen/Qwen2.5-9B-Instruct
 ADAPTER_PATH ?= 
 MAX_EXAMPLES ?= 
 CONFIG ?= configs/9b_baseline.yaml
+OUTPUT_DIR ?= reports/downstream_eval_mlx
 
-.PHONY: train eval-latest run-all eval-llm-jp-eval-mlx eval-downstream-mlx help
+.PHONY: train eval-latest run-all eval-llm-jp-eval-mlx eval-downstream-mlx eval-downstream-pytorch smoke-test smoke-test-eval smoke-test-eval-pytorch help
 
 help: ## Show this help message
 	@echo "Available commands:"
@@ -35,14 +37,65 @@ run-all: ## Run training and then automatically evaluate the resulting adapter. 
 	@$(MAKE) train CONFIG=$(CONFIG)
 	@$(MAKE) eval-latest
 
-eval-llm-jp-eval-mlx: ## Evaluate model & optional adapter on JGLUE benchmarks (llm-jp-eval). Usage: make eval-llm-jp-eval-mlx [MODEL_PATH=...] [ADAPTER_PATH=...] [MAX_EXAMPLES=50]
+eval-llm-jp-eval-mlx: ## Evaluate model & optional adapter on JGLUE benchmarks (llm-jp-eval). Usage: make eval-llm-jp-eval-mlx [MODEL_PATH=...] [ADAPTER_PATH=...] [MAX_EXAMPLES=50] [OUTPUT_DIR=...]
 	python scripts/eval_llm_jp_eval_mlx.py \
 		--model-path "$(MODEL_PATH)" \
 		$(if $(ADAPTER_PATH),--adapter-path "$(ADAPTER_PATH)") \
-		$(if $(MAX_EXAMPLES),--max-examples $(MAX_EXAMPLES))
+		$(if $(MAX_EXAMPLES),--max-examples $(MAX_EXAMPLES)) \
+		--output-dir "$(OUTPUT_DIR)"
 
-eval-downstream-mlx: ## Evaluate model & optional adapter on downstream tasks (Japanese Capability & JSON compliance). Usage: make eval-downstream-mlx [MODEL_PATH=...] [ADAPTER_PATH=...] [MAX_EXAMPLES=50]
+eval-downstream-mlx: ## Evaluate model & optional adapter on downstream tasks (Japanese Capability & JSON compliance). Usage: make eval-downstream-mlx [MODEL_PATH=...] [ADAPTER_PATH=...] [MAX_EXAMPLES=50] [OUTPUT_DIR=...]
 	python scripts/eval_downstream_mlx.py \
 		--model-path "$(MODEL_PATH)" \
 		$(if $(ADAPTER_PATH),--adapter-path "$(ADAPTER_PATH)") \
-		$(if $(MAX_EXAMPLES),--max-examples $(MAX_EXAMPLES))
+		$(if $(MAX_EXAMPLES),--max-examples $(MAX_EXAMPLES)) \
+		--output-dir "$(OUTPUT_DIR)"
+
+eval-downstream-pytorch: ## Evaluate PyTorch model & optional PEFT adapter on downstream tasks. Usage: make eval-downstream-pytorch [HF_MODEL_PATH=Qwen/Qwen2.5-9B-Instruct] [ADAPTER_PATH=...] [MAX_EXAMPLES=50] [OUTPUT_DIR=reports/downstream_eval_pytorch] [DEVICE=cpu/mps/cuda]
+	python scripts/eval_downstream.py \
+		--model-path "$(HF_MODEL_PATH)" \
+		$(if $(ADAPTER_PATH),--adapter-path "$(ADAPTER_PATH)") \
+		$(if $(MAX_EXAMPLES),--max-examples $(MAX_EXAMPLES)) \
+		$(if $(DEVICE),--device $(DEVICE)) \
+		--output-dir "$(or $(OUTPUT_DIR),reports/downstream_eval_pytorch)"
+
+smoke-test: ## Run a quick full-workflow smoke test (train 2 steps + eval 1 example) using a tiny 0.5B model
+	@echo "=== Preparing Smoke Test Directory ==="
+	@mkdir -p data/smoke configs
+	@head -n 2 data/downstream/jp_capability.jsonl > data/smoke/train.jsonl
+	@head -n 2 data/downstream/jp_capability.jsonl > data/smoke/valid.jsonl
+	@echo "model: mlx-community/Qwen2.5-0.5B-Instruct-4bit" > configs/smoke_config.yaml
+	@echo "data: data/smoke" >> configs/smoke_config.yaml
+	@echo "train: true" >> configs/smoke_config.yaml
+	@echo "iters: 2" >> configs/smoke_config.yaml
+	@echo "batch_size: 1" >> configs/smoke_config.yaml
+	@echo "grad_accumulation_steps: 1" >> configs/smoke_config.yaml
+	@echo "max_seq_length: 256" >> configs/smoke_config.yaml
+	@echo "learning_rate: 1.0e-5" >> configs/smoke_config.yaml
+	@echo "steps_per_report: 1" >> configs/smoke_config.yaml
+	@echo "steps_per_eval: 2" >> configs/smoke_config.yaml
+	@echo "save_every: 2" >> configs/smoke_config.yaml
+	@echo "adapter_path: runs/mlx_smoke_test" >> configs/smoke_config.yaml
+	@echo "=== Running Training Smoke Test (2 steps) ==="
+	python -m mlx_lm.lora --config configs/smoke_config.yaml
+	@echo "=== Running Evaluation Smoke Test ==="
+	$(MAKE) eval-llm-jp-eval-mlx MODEL_PATH="mlx-community/Qwen2.5-0.5B-Instruct-4bit" ADAPTER_PATH="runs/mlx_smoke_test" MAX_EXAMPLES=1 OUTPUT_DIR="reports/smoke_test"
+	$(MAKE) eval-downstream-mlx MODEL_PATH="mlx-community/Qwen2.5-0.5B-Instruct-4bit" ADAPTER_PATH="runs/mlx_smoke_test" MAX_EXAMPLES=1 OUTPUT_DIR="reports/smoke_test"
+	@echo "=== Cleaning Up Smoke Test Temporary Files ==="
+	@rm -rf data/smoke configs/smoke_config.yaml runs/mlx_smoke_test
+	@echo "=== Smoke Test Passed Successfully! ==="
+
+smoke-test-eval: ## Run a quick evaluation smoke test (no training) using a tiny 0.5B model
+	@echo "=== Running Evaluation Smoke Test (No Training) ==="
+	$(MAKE) eval-llm-jp-eval-mlx MODEL_PATH="mlx-community/Qwen2.5-0.5B-Instruct-4bit" MAX_EXAMPLES=1 OUTPUT_DIR="reports/smoke_test"
+	$(MAKE) eval-downstream-mlx MODEL_PATH="mlx-community/Qwen2.5-0.5B-Instruct-4bit" MAX_EXAMPLES=1 OUTPUT_DIR="reports/smoke_test"
+	@echo "=== Cleaning Up Smoke Test Temporary Files ==="
+	@rm -rf reports/smoke_test
+	@echo "=== Evaluation Smoke Test Passed Successfully! ==="
+
+smoke-test-eval-pytorch: ## Run a quick evaluation smoke test (no training) using PyTorch with a tiny 0.5B model
+	@echo "=== Running PyTorch Evaluation Smoke Test (No Training) ==="
+	$(MAKE) eval-downstream-pytorch HF_MODEL_PATH="Qwen/Qwen2.5-0.5B-Instruct" MAX_EXAMPLES=1 OUTPUT_DIR="reports/smoke_test_pytorch"
+	@echo "=== Cleaning Up Smoke Test Temporary Files ==="
+	@rm -rf reports/smoke_test_pytorch
+	@echo "=== PyTorch Evaluation Smoke Test Passed Successfully! ==="
