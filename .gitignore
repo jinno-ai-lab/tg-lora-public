@@ -10,3 +10,11 @@ build/
 .coverage
 htmlcov/
 .venv/
+
+# Weights, cache, and evaluation reports (not to be committed to the public repo)
+runs/
+.cache/
+reports/
+
+# Tool-specific configs
+.antigravitycli/
