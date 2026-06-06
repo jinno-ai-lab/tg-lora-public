@@ -4,13 +4,16 @@ HF_MODEL_PATH ?= Qwen/Qwen2.5-9B-Instruct
 ADAPTER_PATH ?= 
 MAX_EXAMPLES ?= 
 CONFIG ?= configs/9b_baseline.yaml
-OUTPUT_DIR ?= reports/downstream_eval_mlx
+OUTPUT_DIR_MLX ?= reports/downstream_eval_mlx
+OUTPUT_DIR_PYTORCH ?= reports/downstream_eval_pytorch
 
-.PHONY: train eval-latest run-all eval-llm-jp-eval-mlx eval-downstream-mlx eval-downstream-pytorch smoke-test smoke-test-eval smoke-test-eval-pytorch help
+.PHONY: train eval-latest run-all eval-llm-jp-eval-mlx eval-downstream-mlx eval-llm-jp-eval-pytorch eval-downstream-pytorch smoke-test-mlx smoke-test-eval-mlx smoke-test-eval-pytorch help
 
 help: ## Show this help message
 	@echo "Available commands:"
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-25s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-26s\033[0m %s\n", $$1, $$2}'
+
+# ── Training & Workflow ───────────────────────────────────────────────────────
 
 train: ## Run training. Usage: make train [CONFIG=configs/...]
 	@if [ ! -f "scripts/train.py" ] && [ ! -f "scripts/train_mlx_lora.py" ]; then \
@@ -33,33 +36,47 @@ eval-latest: ## Detect the latest run in runs/ and run downstream evaluations
 	$(MAKE) eval-llm-jp-eval-mlx ADAPTER_PATH="$$LATEST_RUN"; \
 	$(MAKE) eval-downstream-mlx ADAPTER_PATH="$$LATEST_RUN"
 
-run-all: ## Run training and then automatically evaluate the resulting adapter. Usage: make run-all [CONFIG=configs/...]
+run-all: ## Run training and then automatically evaluate the resulting adapter. Usage: make run-all [CONFIG=...]
 	@$(MAKE) train CONFIG=$(CONFIG)
 	@$(MAKE) eval-latest
 
-eval-llm-jp-eval-mlx: ## Evaluate model & optional adapter on JGLUE benchmarks (llm-jp-eval). Usage: make eval-llm-jp-eval-mlx [MODEL_PATH=...] [ADAPTER_PATH=...] [MAX_EXAMPLES=50] [OUTPUT_DIR=...]
+# ── MLX Evaluation (Apple Silicon Only) ──────────────────────────────────────
+
+eval-llm-jp-eval-mlx: ## Evaluate MLX model/adapter on JGLUE benchmarks (llm-jp-eval). Usage: make eval-llm-jp-eval-mlx [MODEL_PATH=...] [ADAPTER_PATH=...] [MAX_EXAMPLES=50] [OUTPUT_DIR=...]
 	python scripts/eval_llm_jp_eval_mlx.py \
 		--model-path "$(MODEL_PATH)" \
 		$(if $(ADAPTER_PATH),--adapter-path "$(ADAPTER_PATH)") \
 		$(if $(MAX_EXAMPLES),--max-examples $(MAX_EXAMPLES)) \
-		--output-dir "$(OUTPUT_DIR)"
+		--output-dir "$(or $(OUTPUT_DIR),reports/llm_jp_eval_mlx)"
 
-eval-downstream-mlx: ## Evaluate model & optional adapter on downstream tasks (Japanese Capability & JSON compliance). Usage: make eval-downstream-mlx [MODEL_PATH=...] [ADAPTER_PATH=...] [MAX_EXAMPLES=50] [OUTPUT_DIR=...]
+eval-downstream-mlx: ## Evaluate MLX model/adapter on downstream tasks. Usage: make eval-downstream-mlx [MODEL_PATH=...] [ADAPTER_PATH=...] [MAX_EXAMPLES=50] [OUTPUT_DIR=...]
 	python scripts/eval_downstream_mlx.py \
 		--model-path "$(MODEL_PATH)" \
 		$(if $(ADAPTER_PATH),--adapter-path "$(ADAPTER_PATH)") \
 		$(if $(MAX_EXAMPLES),--max-examples $(MAX_EXAMPLES)) \
-		--output-dir "$(OUTPUT_DIR)"
+		--output-dir "$(or $(OUTPUT_DIR),$(OUTPUT_DIR_MLX))"
 
-eval-downstream-pytorch: ## Evaluate PyTorch model & optional PEFT adapter on downstream tasks. Usage: make eval-downstream-pytorch [HF_MODEL_PATH=Qwen/Qwen2.5-9B-Instruct] [ADAPTER_PATH=...] [MAX_EXAMPLES=50] [OUTPUT_DIR=reports/downstream_eval_pytorch] [DEVICE=cpu/mps/cuda]
+# ── PyTorch Evaluation (Cross-Platform) ──────────────────────────────────────
+
+eval-llm-jp-eval-pytorch: ## Evaluate PyTorch model/adapter on JGLUE benchmarks (llm-jp-eval). Usage: make eval-llm-jp-eval-pytorch [HF_MODEL_PATH=...] [ADAPTER_PATH=...] [MAX_EXAMPLES=50] [OUTPUT_DIR=...] [DEVICE=...]
+	python scripts/eval_llm_jp_eval.py \
+		--model-path "$(HF_MODEL_PATH)" \
+		$(if $(ADAPTER_PATH),--adapter-path "$(ADAPTER_PATH)") \
+		$(if $(MAX_EXAMPLES),--max-examples $(MAX_EXAMPLES)) \
+		$(if $(DEVICE),--device $(DEVICE)) \
+		--output-dir "$(or $(OUTPUT_DIR),reports/llm_jp_eval_pytorch)"
+
+eval-downstream-pytorch: ## Evaluate PyTorch model/adapter on downstream tasks. Usage: make eval-downstream-pytorch [HF_MODEL_PATH=...] [ADAPTER_PATH=...] [MAX_EXAMPLES=50] [OUTPUT_DIR=...] [DEVICE=...]
 	python scripts/eval_downstream.py \
 		--model-path "$(HF_MODEL_PATH)" \
 		$(if $(ADAPTER_PATH),--adapter-path "$(ADAPTER_PATH)") \
 		$(if $(MAX_EXAMPLES),--max-examples $(MAX_EXAMPLES)) \
 		$(if $(DEVICE),--device $(DEVICE)) \
-		--output-dir "$(or $(OUTPUT_DIR),reports/downstream_eval_pytorch)"
+		--output-dir "$(or $(OUTPUT_DIR),$(OUTPUT_DIR_PYTORCH))"
 
-smoke-test: ## Run a quick full-workflow smoke test (train 2 steps + eval 1 example) using a tiny 0.5B model
+# ── Smoke Tests (Verification) ───────────────────────────────────────────────
+
+smoke-test-mlx: ## Run full training (2 steps) + MLX evaluation smoke test on Apple Silicon
 	@echo "=== Preparing Smoke Test Directory ==="
 	@mkdir -p data/smoke configs
 	@head -n 2 data/downstream/jp_capability.jsonl > data/smoke/train.jsonl
@@ -85,16 +102,17 @@ smoke-test: ## Run a quick full-workflow smoke test (train 2 steps + eval 1 exam
 	@rm -rf data/smoke configs/smoke_config.yaml runs/mlx_smoke_test
 	@echo "=== Smoke Test Passed Successfully! ==="
 
-smoke-test-eval: ## Run a quick evaluation smoke test (no training) using a tiny 0.5B model
-	@echo "=== Running Evaluation Smoke Test (No Training) ==="
+smoke-test-eval-mlx: ## Run MLX evaluation smoke test (no training)
+	@echo "=== Running MLX Evaluation Smoke Test (No Training) ==="
 	$(MAKE) eval-llm-jp-eval-mlx MODEL_PATH="mlx-community/Qwen2.5-0.5B-Instruct-4bit" MAX_EXAMPLES=1 OUTPUT_DIR="reports/smoke_test"
 	$(MAKE) eval-downstream-mlx MODEL_PATH="mlx-community/Qwen2.5-0.5B-Instruct-4bit" MAX_EXAMPLES=1 OUTPUT_DIR="reports/smoke_test"
 	@echo "=== Cleaning Up Smoke Test Temporary Files ==="
 	@rm -rf reports/smoke_test
-	@echo "=== Evaluation Smoke Test Passed Successfully! ==="
+	@echo "=== MLX Evaluation Smoke Test Passed Successfully! ==="
 
-smoke-test-eval-pytorch: ## Run a quick evaluation smoke test (no training) using PyTorch with a tiny 0.5B model
+smoke-test-eval-pytorch: ## Run PyTorch evaluation smoke test (no training) on any device
 	@echo "=== Running PyTorch Evaluation Smoke Test (No Training) ==="
+	$(MAKE) eval-llm-jp-eval-pytorch HF_MODEL_PATH="Qwen/Qwen2.5-0.5B-Instruct" MAX_EXAMPLES=1 OUTPUT_DIR="reports/smoke_test_pytorch"
 	$(MAKE) eval-downstream-pytorch HF_MODEL_PATH="Qwen/Qwen2.5-0.5B-Instruct" MAX_EXAMPLES=1 OUTPUT_DIR="reports/smoke_test_pytorch"
 	@echo "=== Cleaning Up Smoke Test Temporary Files ==="
 	@rm -rf reports/smoke_test_pytorch

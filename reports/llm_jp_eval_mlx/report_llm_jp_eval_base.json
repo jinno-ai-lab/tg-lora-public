@@ -1,0 +1,19 @@
+{
+  "timestamp": "2026-06-06 08:07:48",
+  "model_path": "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+  "adapter_path": null,
+  "results": {
+    "jcommonsenseqa": {
+      "accuracy": 0.2,
+      "mean_char_f1": 0.005714285714285714
+    },
+    "jnli": {
+      "accuracy": 0.4,
+      "mean_char_f1": 0.01882223445239406
+    },
+    "jsquad": {
+      "accuracy": 0.0,
+      "mean_char_f1": 0.1353631862952795
+    }
+  }
+}
