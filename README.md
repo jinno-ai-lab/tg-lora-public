@@ -152,6 +152,33 @@ pip install -e ".[dev]"
 pytest
 ```
 
+## Evaluation
+
+We provide built-in downstream evaluation workflows for MLX models/adapters. The evaluation files (datasets and scripts) are pre-packaged under `data/downstream` and `scripts/`.
+
+You can run evaluations (with automatic loading/downloading from Hugging Face Hub) with a single command:
+
+```bash
+# Evaluate on JGLUE benchmarks (llm-jp-eval subset: JCommonsenseQA, JNLI, JSQuAD)
+make eval-llm-jp-eval-mlx ADAPTER_PATH=username/your-lora-adapter
+
+# Evaluate on Japanese Capability & JSON format compliance tasks
+make eval-downstream-mlx ADAPTER_PATH=username/your-lora-adapter
+```
+
+*Note: If `ADAPTER_PATH` is specified as a Hugging Face Hub repository ID (e.g. `username/my-adapter`), it will be automatically downloaded and cached locally.*
+
+## Supported Models
+
+This library officially recommends and supports the following models for evaluation:
+*   **Qwen3.5-9B**: A highly capable 9B dense model (released under the Apache 2.0 license).
+*   **Qwen3.6-35B-A3B**: A sparse Mixture-of-Experts (MoE) model engineered for agentic coding and efficient local deployment (released under the Apache 2.0 license).
+
 ## License
 
-MIT
+This repository is licensed under the [MIT License](LICENSE).
+
+### Model Licenses
+The models used or referenced in this project are subject to their respective creators' licenses:
+*   The **Qwen** model family (developed by Alibaba Cloud) is licensed under the **Apache 2.0** license.
+
