@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import deque
 from dataclasses import dataclass
 
 import torch
@@ -73,7 +74,7 @@ class DeltaTracker:
         if max_history <= 0:
             raise ValueError(f"max_history must be positive, got {max_history}")
         self._history: list[dict[str, torch.Tensor]] = []
-        self._norm_history: list[float] = []
+        self._norm_history: deque[float] = deque(maxlen=max_history)
         self._max_history = max_history
         self._last_stats: DeltaStats | None = None
 
@@ -111,8 +112,6 @@ class DeltaTracker:
         norm = self._last_stats.total_norm
         if math.isfinite(norm):
             self._norm_history.append(norm)
-        if len(self._norm_history) > self._max_history:
-            self._norm_history.pop(0)
         return delta
 
     def is_anomalous(self, threshold_sigma: float = 3.0) -> bool:

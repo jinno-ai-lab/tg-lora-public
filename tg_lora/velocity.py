@@ -1,5 +1,6 @@
 import logging
 import math
+from collections import deque
 
 import torch
 
@@ -11,7 +12,7 @@ class Velocity:
         if max_history <= 0:
             raise ValueError(f"max_history must be positive, got {max_history}")
         self._state: dict[str, torch.Tensor] | None = None
-        self._magnitude_history: list[float] = []
+        self._magnitude_history: deque[float] = deque(maxlen=max_history)
         self._max_history = max_history
 
     @property
@@ -50,8 +51,6 @@ class Velocity:
         if not math.isfinite(mag):
             return
         self._magnitude_history.append(mag)
-        if len(self._magnitude_history) > self._max_history:
-            self._magnitude_history.pop(0)
 
     def reset(self) -> None:
         self._state = None
