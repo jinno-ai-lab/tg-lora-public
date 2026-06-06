@@ -160,13 +160,13 @@ You can run evaluations (with automatic loading/downloading from Hugging Face Hu
 
 ```bash
 # Evaluate on JGLUE benchmarks (llm-jp-eval subset: JCommonsenseQA, JNLI, JSQuAD)
-make eval-llm-jp-eval-mlx ADAPTER_PATH=username/your-lora-adapter
+make eval-llm-jp-eval-mlx ADAPTER_PATH=jinno-ai-lab/your-lora-adapter
 
 # Evaluate on Japanese Capability & JSON format compliance tasks
-make eval-downstream-mlx ADAPTER_PATH=username/your-lora-adapter
+make eval-downstream-mlx ADAPTER_PATH=jinno-ai-lab/your-lora-adapter
 ```
 
-*Note: If `ADAPTER_PATH` is specified as a Hugging Face Hub repository ID (e.g. `username/my-adapter`), it will be automatically downloaded and cached locally.*
+*Note: If \`ADAPTER_PATH\` is specified as a Hugging Face Hub repository ID (e.g. \`jinno-ai-lab/my-adapter\`), it will be automatically downloaded and cached locally.*
 
 ## Supported Models
 
