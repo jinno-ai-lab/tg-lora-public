@@ -1,7 +1,9 @@
-# TG-LoRA 自動分析記録
+# TG-LoRA 設計自動分析記録
 
 **作成日**: 2026-06-10
 **分析実施**: step4 既存情報ベースの差分分析と自動統合
+**関連アーキテクチャ**: [architecture.md](architecture.md)
+**関連データフロー**: [dataflow.md](dataflow.md)
 
 ## 分析目的
 
@@ -120,4 +122,6 @@ TG-LoRA リポジトリの README・ソースコード（11ファイル）・テ
 
 ## 関連文書
 
+- **アーキテクチャ設計**: [architecture.md](architecture.md)
+- **データフロー**: [dataflow.md](dataflow.md)
 - **要件定義書**: [requirements.md](requirements.md)
