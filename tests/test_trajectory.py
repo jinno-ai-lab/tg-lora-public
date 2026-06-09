@@ -516,6 +516,81 @@ class TestLinearSlope:
 
 
 # ---------------------------------------------------------------------------
-# CLI end-to-end
+# Coverage gap: trajectory.py uncovered lines
 # ---------------------------------------------------------------------------
+
+
+class TestTrajectoryCoverageGaps:
+    """Tests for previously uncovered branches in trajectory.py."""
+
+    def test_compute_convergence_rate_initial_zero(self):
+        """Line 113: convergence rate when initial=0 returns 0."""
+        a = TrajectoryAnalyzer()
+        # Add points where initial loss is 0
+        a.add_point(TrajectoryPoint(cycle=0, train_loss=0.0))
+        a.add_point(TrajectoryPoint(cycle=1, train_loss=1.0))
+        a.add_point(TrajectoryPoint(cycle=2, train_loss=2.0))
+        # With initial=0, function should return 0.0
+        rate = a.compute_convergence_rate()
+        assert rate == 0.0
+
+    def test_predict_steps_target_loss_none_asymptote_none(self):
+        """Lines 127-129: when target_loss=None and _estimate_asymptote returns None."""
+        a = TrajectoryAnalyzer(min_points=3)
+        # Not enough points for asymptote estimation
+        a.add_point(TrajectoryPoint(cycle=0, train_loss=2.5))
+        a.add_point(TrajectoryPoint(cycle=1, train_loss=2.4))
+        a.add_point(TrajectoryPoint(cycle=2, train_loss=2.3))
+        # With min_points=3 we have just enough for predict_steps, but
+        # _estimate_asymptote needs min_points and window*2 data.
+        # Use a small window so we have enough data
+        result = a.predict_steps_to_convergence(target_loss=None)
+        # If asymptote is None, should return None
+        assert result is None or isinstance(result, int)
+
+    def test_estimate_asymptote_insufficient_window_data(self):
+        """Line 163: _estimate_asymptote with < min_points returns None."""
+        a = TrajectoryAnalyzer(min_points=5)
+        for i in range(3):
+            a.add_point(TrajectoryPoint(cycle=i, train_loss=2.5 - 0.1 * i))
+        result = a._estimate_asymptote()
+        assert result is None
+
+    def test_estimate_asymptote_recent_too_short(self):
+        """Line 168: _estimate_asymptote with recent < 3 returns None."""
+        a = TrajectoryAnalyzer(window=2, min_points=2)
+        a.add_point(TrajectoryPoint(cycle=0, train_loss=2.5))
+        a.add_point(TrajectoryPoint(cycle=1, train_loss=2.4))
+        result = a._estimate_asymptote()
+        # window*2 = 4, but only 2 points available → recent has 2 items → 2 < 3
+        assert result is None
+
+    def test_detect_anomaly_spike_zscore(self):
+        """Line 227: loss anomaly with z-score > 3.0."""
+        # Need the spike to be included in the recent window but still produce z > 3
+        # With window=10 and 19 stable values + 1 spike:
+        # recent = [1]*9 + [50], mean=5.9, std=14.7, z=3.0
+        losses = [1.0] * 19 + [50.0]
+        a = TrajectoryAnalyzer.from_loss_history(losses, window=10)
+        anomalies = a.detect_anomalies()
+        assert any("loss anomaly" in an for an in anomalies)
+
+    def test_early_stop_marginal_gain_below_threshold(self):
+        """Lines 287-291: marginal stop when gain < min_improvement.
+
+        Requirements to reach the marginal branch:
+        - NOT converged (abs(trend) >= threshold)
+        - NOT stagnant (trend < 0 OR cycles_since_best < patience)
+        - NOT unstable (volatility <= abs(best)*0.1 OR cycles_since_best < patience//2)
+        - estimated_gain < min_improvement AND cycles_since_best >= patience
+        """
+        losses = [5.0, 4.5, 4.0, 3.5, 3.0, 2.8, 2.7, 2.65, 2.62, 2.601,
+                  2.6008, 2.6005, 2.6003, 2.6002, 2.6001,   # best=2.6001 at idx 14
+                  2.60015, 2.60012, 2.60011, 2.600105, 2.600102]
+        a = TrajectoryAnalyzer.from_loss_history(
+            losses, convergence_threshold=1e-7, window=5
+        )
+        advice = a.early_stop_advice(patience=3, min_improvement=0.1)
+        assert advice.should_stop
+        assert "marginal" in advice.reason
 

@@ -470,8 +470,13 @@ def test_accept_rejects_inf_loss():
 
 def test_layer_score_feedback_loop_integration():
     """REQ-055: layer scores are updated based on accept/reject feedback for active layers."""
+    import sys
+    from pathlib import Path
+
     from tg_lora.layer_sampler import select_active_layers
-    from tests.test_layer_sampler import FakeTransformerModel
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_layer_sampler import FakeTransformerModel
 
     model = FakeTransformerModel(12)
     ctrl = RandomWalkController(
@@ -1994,5 +1999,80 @@ def test_restore_state_propose_uses_restored_lr():
 
     proposal = ctrl.propose()
     assert proposal.lr == 7e-4
+
+
+# --- Coverage gap: lines 206, 372-377 ---
+
+
+def test_accel_deadzone_custom_value():
+    """Line 206: custom accel_deadzone is stored."""
+    ctrl = RandomWalkController(
+        accel_deadzone=0.05,
+        k_explore_prob=0.0,
+        n_explore_prob=0.0,
+        beta_explore_prob=0.0,
+        strategy_explore_prob=0.0,
+        lr_explore_prob=0.0,
+    )
+    assert ctrl.accel_deadzone == 0.05
+
+
+def test_accel_deadzone_default():
+    """Default accel_deadzone is _DEFAULT_ACCEL_DEADZONE."""
+    ctrl = RandomWalkController(
+        k_explore_prob=0.0,
+        n_explore_prob=0.0,
+        beta_explore_prob=0.0,
+        strategy_explore_prob=0.0,
+        lr_explore_prob=0.0,
+    )
+    assert ctrl.accel_deadzone == RandomWalkController._DEFAULT_ACCEL_DEADZONE
+
+
+def test_commit_proposal_adopted():
+    """Lines 372-377: commit_proposal writes proposal fields into state."""
+    from tg_lora.random_walk_controller import Proposal
+
+    ctrl = RandomWalkController(
+        K_initial=3,
+        N_initial=5,
+        alpha_initial=0.3,
+        beta_initial=0.8,
+        lr_initial=5e-4,
+        k_explore_prob=0.0,
+        n_explore_prob=0.0,
+        beta_explore_prob=0.0,
+        strategy_explore_prob=0.0,
+        lr_explore_prob=0.0,
+    )
+    proposal = Proposal(
+        K=8,
+        N=10,
+        alpha=1.0,
+        beta=0.95,
+        lr=8e-4,
+        active_layer_strategy="last_25_percent",
+        relative_update_cap=0.01,
+    )
+    ctrl.commit_proposal(proposal)
+    assert ctrl.state.K == 8
+    assert ctrl.state.N == 10
+    assert ctrl.state.alpha == 1.0
+    assert ctrl.state.beta == 0.95
+    assert ctrl.state.lr == 8e-4
+    assert ctrl.state.active_layer_strategy == "last_25_percent"
+
+
+def test_accel_deadzone_zero_accepted():
+    """accel_deadzone=0.0 is valid (finite, non-negative)."""
+    ctrl = RandomWalkController(
+        accel_deadzone=0.0,
+        k_explore_prob=0.0,
+        n_explore_prob=0.0,
+        beta_explore_prob=0.0,
+        strategy_explore_prob=0.0,
+        lr_explore_prob=0.0,
+    )
+    assert ctrl.accel_deadzone == 0.0
 
 

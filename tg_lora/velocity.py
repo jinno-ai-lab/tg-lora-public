@@ -59,11 +59,12 @@ class Velocity:
     def is_magnitude_anomalous(self, threshold_sigma: float = 3.0) -> bool:
         if len(self._magnitude_history) < 3:
             return False
-        norms = self._magnitude_history[:-1]
-        mean = sum(norms) / len(norms)
-        var = sum((n - mean) ** 2 for n in norms) / len(norms)
+        norms = list(self._magnitude_history)
+        latest = norms[-1]
+        hist = norms[:-1]
+        mean = sum(hist) / len(hist)
+        var = sum((n - mean) ** 2 for n in hist) / len(hist)
         std = var**0.5
-        latest = self._magnitude_history[-1]
         if std < 1e-12:
             return latest > mean * 2.0
         return latest > mean + threshold_sigma * std
@@ -72,7 +73,7 @@ class Velocity:
         n = min(window, len(self._magnitude_history))
         if n < 2:
             return 0.0
-        recent = self._magnitude_history[-n:]
+        recent = list(self._magnitude_history)[-n:]
         mean_x = (n - 1) / 2.0
         mean_y = sum(recent) / n
         cov = sum((i - mean_x) * (y - mean_y) for i, y in enumerate(recent))
@@ -89,7 +90,7 @@ class Velocity:
         n = min(window, len(self._magnitude_history))
         if n < 3:
             return 0.0
-        recent = self._magnitude_history[-n:]
+        recent = list(self._magnitude_history)[-n:]
         slopes: list[float] = []
         for i in range(1, len(recent)):
             slopes.append(recent[i] - recent[i - 1])

@@ -146,3 +146,18 @@ def test_max_history_fifo_eviction():
     assert torch.allclose(
         model.linear.lora_A.data, torch.tensor(2.0).expand_as(model.linear.lora_A.data)
     )
+
+
+# --- Coverage gap: line 15 (max_history validation) ---
+
+
+def test_max_history_zero_raises():
+    """max_history=0 must raise ValueError."""
+    with pytest.raises(ValueError, match="max_history must be positive"):
+        RollbackManager(max_history=0)
+
+
+def test_max_history_negative_raises():
+    """Negative max_history must raise ValueError."""
+    with pytest.raises(ValueError, match="max_history must be positive"):
+        RollbackManager(max_history=-5)

@@ -7,7 +7,7 @@ CONFIG ?= configs/9b_baseline.yaml
 OUTPUT_DIR_MLX ?= reports/downstream_eval_mlx
 OUTPUT_DIR_PYTORCH ?= reports/downstream_eval_pytorch
 
-.PHONY: train eval-latest run-all eval-llm-jp-eval-mlx eval-downstream-mlx eval-llm-jp-eval-pytorch eval-downstream-pytorch smoke-test-mlx smoke-test-eval-mlx smoke-test-eval-pytorch help
+.PHONY: train eval-latest run-all eval-llm-jp-eval-mlx eval-downstream-mlx eval-llm-jp-eval-pytorch eval-downstream-pytorch smoke-test-mlx smoke-test-eval-mlx smoke-test-eval-pytorch test lint format coverage help
 
 help: ## Show this help message
 	@echo "Available commands:"
@@ -117,3 +117,17 @@ smoke-test-eval-pytorch: ## Run PyTorch evaluation smoke test (no training) on a
 	@echo "=== Cleaning Up Smoke Test Temporary Files ==="
 	@rm -rf reports/smoke_test_pytorch
 	@echo "=== PyTorch Evaluation Smoke Test Passed Successfully! ==="
+
+# ── Development Quality Checks ────────────────────────────────────────────────
+
+lint: ## Run ruff linter
+	ruff check .
+
+format: ## Check formatting with ruff (dry-run)
+	ruff format --check .
+
+test: ## Run tests with coverage
+	CI=1 pytest --cov=tg_lora --cov-report=term-missing
+
+coverage: ## Run tests and generate XML coverage report
+	CI=1 pytest --cov=tg_lora --cov-report=xml --cov-report=term-missing

@@ -123,9 +123,10 @@ class DeltaTracker:
         """
         if len(self._norm_history) < 3 or self._last_stats is None:
             return False
-        norms = self._norm_history[:-1]
-        mean = sum(norms) / len(norms)
-        var = sum((n - mean) ** 2 for n in norms) / len(norms)
+        norms = list(self._norm_history)
+        hist = norms[:-1]
+        mean = sum(hist) / len(hist)
+        var = sum((n - mean) ** 2 for n in hist) / len(hist)
         std = var**0.5
         if std < 1e-12:
             return self._last_stats.total_norm > mean * 2.0
@@ -140,7 +141,7 @@ class DeltaTracker:
         n = min(window, len(self._norm_history))
         if n < 2:
             return 0.0
-        recent = self._norm_history[-n:]
+        recent = list(self._norm_history)[-n:]
         mean_x = (n - 1) / 2.0
         mean_y = sum(recent) / n
         cov = sum((i - mean_x) * (y - mean_y) for i, y in enumerate(recent))
