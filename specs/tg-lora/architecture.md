@@ -164,8 +164,17 @@ sequenceDiagram
 │   ├── trajectory.py           # 学習軌跡分析
 │   ├── layer_sampler.py        # 層選択戦略
 │   └── lora_utils.py           # LoRA パラメータユーティリティ
-├── tests/                      # テスト (12ファイル、350+ テストケース)
-├── scripts/                    # 評価スクリプト (4ファイル)
+├── tests/                      # テスト (21ファイル、678 テストケース)
+├── scripts/                    # スクリプト (9ファイル)
+│   ├── train_tg_lora.py        # 参照学習スクリプト
+│   ├── benchmark.py            # パフォーマンスベンチマーク
+│   ├── eval_downstream.py      # downstream 評価 (PyTorch)
+│   ├── eval_downstream_mlx.py  # downstream 評価 (MLX)
+│   ├── eval_llm_jp_eval.py     # llm-jp-eval 評価 (PyTorch)
+│   ├── eval_llm_jp_eval_mlx.py # llm-jp-eval 評価 (MLX)
+│   ├── eval_utils.py           # 評価ユーティリティ (char_f1, JSON検証, JSONL読み込み)
+│   ├── jp_eval_formats.py      # JGLUE タスクフォーマッタ
+│   └── simple_model.py         # SimpleLoRAModel (テスト・デモ用)
 ├── specs/                      # 仕様・設計文書
 │   └── tg-lora/                # feature_id ディレクトリ
 ├── reports/                    # 評価レポート出力先
@@ -232,7 +241,7 @@ sequenceDiagram
 
 **信頼性**: 🔵 *tests/ 実装・pyproject.toml より*
 
-- **テスト**: 12 テストファイル、350+ テストケースで全モジュールをカバー
+- **テスト**: 21 テストファイル、678 テストケースで全モジュールをカバー
 - **Lint**: ruff (py311, line-length=120, E/F/W/I ルール)
 - **CI**: `pytest` + `pytest-cov` でカバレッジ測定
 
@@ -261,6 +270,15 @@ sequenceDiagram
 - LoRA パラメータ名は `lora_A` / `lora_B` を含むものと仮定（PEFT 標準）
 - 層マッピングは `layers.N.` パターンに依存（decoder-only Transformer 構造）
 - Python 3.11 以上（`X | Y` 型構文を使用）
+
+## Acceptance criteria
+
+- [x] 共有評価ユーティリティ (`eval_utils.py`) が抽出され、`compute_char_f1`, `check_json_validity`, `load_jsonl` を提供
+- [x] JGLUE タスクフォーマッタ (`jp_eval_formats.py`) が PyTorch/MLX 評価スクリプト間で共有
+- [x] SimpleLoRAModel (`simple_model.py`) が学習・ベンチマークスクリプト間で共有
+- [x] 全評価スクリプトが共有モジュールからインポートし、コード重複を解消
+- [x] 共有モジュールにテストを追加 (`test_eval_utils.py`, `test_jp_eval_formats.py`, `test_simple_model.py`)
+- [x] 全テストスイート (678 テスト) がグリーン
 
 ## 関連文書
 

@@ -16,8 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 
+from scripts.simple_model import SimpleLoRAModel
 from tg_lora import (
     CycleState,
     DeltaTracker,
@@ -30,33 +30,12 @@ from tg_lora import (
 )
 
 
-class SimpleLoRAModel(nn.Module):
-    def __init__(self, num_layers: int = 4, dim: int = 4) -> None:
-        super().__init__()
-        self.layers = nn.ModuleList()
-        for _ in range(num_layers):
-            layer = nn.Module()
-            layer.self_attn = nn.Module()
-            layer.self_attn.q_proj = nn.Module()
-            layer.self_attn.q_proj.lora_A = nn.Parameter(torch.randn(dim, dim) * 0.01)
-            layer.self_attn.q_proj.lora_B = nn.Parameter(torch.zeros(dim, dim))
-            layer.self_attn.q_proj.lora_A.requires_grad_(True)
-            layer.self_attn.q_proj.lora_B.requires_grad_(True)
-            self.layers.append(layer)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for layer in self.layers:
-            w = layer.self_attn.q_proj.lora_A @ layer.self_attn.q_proj.lora_B
-            x = x @ w.T
-        return x
-
-
-def _compute_loss(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+def _compute_loss(model: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
     return model(x).sum()
 
 
 @torch.no_grad()
-def _evaluate(model: nn.Module, x: torch.Tensor) -> float:
+def _evaluate(model: torch.nn.Module, x: torch.Tensor) -> float:
     return _compute_loss(model, x).item()
 
 
