@@ -4,9 +4,9 @@ import torch
 import torch.nn as nn
 
 from tg_lora.layer_sampler import (
-    select_active_layers,
-    get_num_layers,
     get_layer_indices,
+    get_num_layers,
+    select_active_layers,
 )
 
 

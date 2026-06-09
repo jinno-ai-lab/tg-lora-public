@@ -13,7 +13,6 @@ This test simulates one complete cycle of the TG-LoRA training loop:
 """
 import math
 
-import pytest
 import torch
 import torch.nn as nn
 
@@ -24,7 +23,6 @@ from tg_lora import (
     RollbackManager,
     Velocity,
     apply_extrapolation,
-    diff_lora,
     select_active_layers,
     snapshot_lora,
 )
@@ -92,7 +90,6 @@ class TestTGLoRAWorkflow:
         dW = delta_tracker.compute_and_record(WK, W0, K=proposal.K)
         assert len(dW) > 0
 
-        cos_sim = velocity.cosine_similarity(dW)
         velocity.update(dW, beta=proposal.beta)
         assert velocity.state is not None
 
@@ -216,7 +213,6 @@ class TestTGLoRAWorkflow:
 
     def test_rollback_on_degradation(self):
         model = SimpleLoRAModel()
-        x = torch.randn(2, 4)
         velocity = Velocity()
         rollback = RollbackManager()
 
@@ -240,7 +236,7 @@ class TestTGLoRAWorkflow:
         )
 
         W_after = snapshot_lora(model)
-        params_changed = not all(
+        assert not all(
             torch.equal(W0[k], W_after[k]) for k in W0
         )
 

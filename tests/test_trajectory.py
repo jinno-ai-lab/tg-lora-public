@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import pytest
 
-from tg_lora.trajectory import (ConvergenceEstimate, EarlyStopAdvice,
-                                    TrajectoryAnalyzer, TrajectoryPoint,
-                                    TrajectoryReport, _linear_slope)
+from tg_lora.trajectory import (
+    ConvergenceEstimate,
+    EarlyStopAdvice,
+    TrajectoryAnalyzer,
+    TrajectoryPoint,
+    TrajectoryReport,
+    _linear_slope,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers

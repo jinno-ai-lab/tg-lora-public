@@ -1,10 +1,9 @@
 import pytest
 import torch
-
-from tg_lora.lora_utils import iter_lora_params
-from tg_lora.extrapolator import apply_extrapolation, cap_update
-
 from conftest import FakeLoRAModel
+
+from tg_lora.extrapolator import apply_extrapolation, cap_update
+from tg_lora.lora_utils import iter_lora_params
 
 
 def test_apply_extrapolation():

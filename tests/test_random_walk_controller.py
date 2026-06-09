@@ -471,7 +471,6 @@ def test_accept_rejects_inf_loss():
 def test_layer_score_feedback_loop_integration():
     """REQ-055: layer scores are updated based on accept/reject feedback for active layers."""
     import sys
-    from pathlib import Path
 
     from tg_lora.layer_sampler import select_active_layers
 

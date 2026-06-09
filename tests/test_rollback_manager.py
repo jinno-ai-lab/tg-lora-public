@@ -1,10 +1,9 @@
-import torch
 import pytest
+import torch
+from conftest import FakeLoRAModel
 
 from tg_lora.lora_utils import iter_lora_params
 from tg_lora.rollback_manager import RollbackManager
-
-from conftest import FakeLoRAModel
 
 
 def test_rollback_basic():

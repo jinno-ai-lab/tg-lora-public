@@ -3,7 +3,6 @@ import os
 import pytest
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset
 
 
 def pytest_configure(config):

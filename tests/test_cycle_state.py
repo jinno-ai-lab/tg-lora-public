@@ -346,7 +346,10 @@ class TestValidation:
 
     @pytest.mark.parametrize(
         "field",
-        ["cycle", "full_backward_passes", "extrapolation_steps", "best_step", "stale_cycles", "accepted_count", "rejected_count"],
+        [
+            "cycle", "full_backward_passes", "extrapolation_steps",
+            "best_step", "stale_cycles", "accepted_count", "rejected_count",
+        ],
     )
     def test_accepts_zero(self, field):
         CycleState(**{field: 0})
