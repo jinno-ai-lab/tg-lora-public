@@ -18,3 +18,7 @@ reports/
 
 # Tool-specific configs
 .antigravitycli/
+
+.extract_skill_meta/
+
+.spine_briefs/
