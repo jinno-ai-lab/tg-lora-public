@@ -22,3 +22,14 @@ reports/
 .extract_skill_meta/
 
 .spine_briefs/
+
+# AI execution artifacts
+.task-prompt*.md
+.cleanup-prompt.md
+.audit/
+data/workspace_state/
+data/alternating_loop/
+data/dynamic_loop/
+runs_eval/
+observations/
+worktrees/
