@@ -275,3 +275,21 @@ sequenceDiagram
 - 🔴 赤信号: 0 件 (0%)
 
 **品質評価**: 高品質 — 全設計項目が既存実装・要件定義に基づいている
+
+
+<!-- spine:children:begin -->
+## Spine: child documents
+
+- [TG-LoRA データフロー図](dataflow.md)
+- [TG-LoRA 設計自動分析記録](interview-record.md)
+- [TG-LoRA 要件定義書（軽量版）](requirements.md)
+- [TASK-0001: CI/CD パイプライン構築（GitHub Actions）](tasks/TASK-0001.md)
+- [TASK-0002: テストカバレッジギャップの特定と補完](tasks/TASK-0002.md)
+- [TASK-0003: 学習設定管理モジュール（TGLoraConfig）](tasks/TASK-0003.md)
+- [TASK-0004: 参照学習スクリプト実装（train_tg_lora.py）](tasks/TASK-0004.md)
+- [TASK-0005: チェックポイント保存・復元機能](tasks/TASK-0005.md)
+- [TASK-0006: メトリクス出力とログ強化](tasks/TASK-0006.md)
+- [TASK-0007: パフォーマンスベンチマーク測定](tasks/TASK-0007.md)
+- [TG-LoRA タスク概要](tasks/overview.md)
+
+<!-- spine:children:end -->
