@@ -1,0 +1,75 @@
+# Version control
+.git
+.gitignore
+
+# Python bytecode
+__pycache__
+*.py[cod]
+*.so
+*.egg-info
+dist
+build
+.eggs
+
+# Virtual environments
+.venv
+venv
+env
+
+# Large data files (mounted via volume)
+data/raw
+data/generated
+data/filtered
+
+# Experiment outputs (mounted via volume)
+runs
+reports/*.json
+reports/*.html
+
+# Model checkpoints
+*.gguf
+*.safetensors
+*.bin
+checkpoints
+
+# MLflow
+mlruns
+
+# IDE
+.idea
+.vscode
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Type checking / test cache
+.mypy_cache
+.pytest_cache
+.coverage
+htmlcov
+
+# Offload / wandb
+offload
+wandb
+
+# LLM-generated wiki
+docs/llm-wiki
+
+# AI execution artifacts
+.task-prompt*.md
+.cleanup-prompt.md
+.spine_briefs
+.extract_skill_meta
+.audit
+observations
+worktrees
+runs_eval
+data/workspace_state
+data/alternating_loop
+data/dynamic_loop
+
+# Misc
+*.log
+.env

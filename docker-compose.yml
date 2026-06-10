@@ -1,0 +1,34 @@
+services:
+  tg-lora:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tg-lora:latest
+    container_name: tg-lora-dev
+
+    # GPU access (requires nvidia-container-toolkit)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    # Mount data, experiment outputs, and model cache
+    volumes:
+      - ./data:/workspace/data
+      - ./runs:/workspace/runs
+      - ./reports:/workspace/reports
+      - huggingface-cache:/root/.cache/huggingface
+
+    # Prevent container from exiting immediately in interactive use
+    stdin_open: true
+    tty: true
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - CUDA_VISIBLE_DEVICES=0
+
+volumes:
+  huggingface-cache:
