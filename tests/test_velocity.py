@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from tg_lora.velocity import Velocity
+from src.tg_lora.velocity import Velocity, beta_from_window
 
 
 def test_velocity_first_update():
@@ -25,6 +25,107 @@ def test_velocity_ema():
     # 0.8 * [1,0,0] + 0.2 * [0,1,0] = [0.8, 0.2, 0]
     expected = torch.tensor([0.8, 0.2, 0.0])
     assert torch.allclose(result["w"], expected)
+
+
+def test_velocity_update_normalizes_by_lr_and_k():
+    v = Velocity()
+    d1 = {"w": torch.tensor([0.6, 0.0])}
+    result = v.update(d1, beta=0.8, lr=0.1, K=3)
+    assert torch.allclose(result["w"], torch.tensor([2.0, 0.0]))
+
+    d2 = {"w": torch.tensor([0.0, 0.3])}
+    result = v.update(d2, beta=0.8, lr=0.1, K=3)
+    expected = torch.tensor([1.6, 0.2])
+    assert torch.allclose(result["w"], expected)
+
+
+def test_build_direction_normalizes_lr_k_and_global_norm():
+    v = Velocity()
+    direction = v.build_direction(
+        {"a": torch.tensor([0.6, 0.0]), "b": torch.tensor([0.0, 0.8])},
+        lr=0.1,
+        K=2,
+        cycle=7,
+    )
+
+    assert v.fixed_since_cycle == 7
+    flat = torch.cat([direction["a"].flatten(), direction["b"].flatten()])
+    assert flat.norm().item() == pytest.approx(1.0)
+    assert torch.allclose(direction["a"], torch.tensor([0.6, 0.0]))
+    assert torch.allclose(direction["b"], torch.tensor([0.0, 0.8]))
+
+
+def test_current_direction_returns_detached_clone():
+    v = Velocity()
+    direction = v.build_direction({"w": torch.tensor([1.0, 0.0])}, lr=1.0, K=1)
+    direction["w"].fill_(0.0)
+
+    restored = v.current_direction()
+    assert restored is not None
+    assert torch.allclose(restored["w"], torch.tensor([1.0, 0.0]))
+
+
+def test_beta_from_window():
+    assert beta_from_window(1) == 0.0
+    assert beta_from_window(3) == pytest.approx(2 / 3)
+    assert beta_from_window(10) == pytest.approx(0.9)
+    with pytest.raises(ValueError):
+        beta_from_window(0)
+
+
+def test_predicted_consistency_uses_short_long_ema():
+    v = Velocity(beta_short=0.0, beta_long=0.5)
+    v.update({"w": torch.tensor([1.0, 0.0])}, beta=0.8)
+    assert v.predicted_consistency() == 0.0
+
+    v.update({"w": torch.tensor([1.0, 0.0])}, beta=0.8)
+    assert v.predicted_consistency() == pytest.approx(1.0)
+    assert v.short_long_norm_ratio() > 0
+
+
+def test_choose_N_from_consistency_thresholds():
+    v = Velocity(beta_short=0.0, beta_long=0.5)
+    v.update({"w": torch.tensor([1.0, 0.0])}, beta=0.8)
+    assert v.choose_N([1, 5, 10], {1: 0.0, 5: 0.5, 10: 0.9}) == 1
+
+    v.update({"w": torch.tensor([1.0, 0.0])}, beta=0.8)
+    assert v.choose_N([1, 5, 10], {1: 0.0, 5: 0.5, 10: 0.9}) == 10
+
+
+def test_build_orthonormal_basis_uses_global_gram_schmidt_dim2():
+    v = Velocity()
+    v._short_state = {
+        "a": torch.tensor([1.0, 0.0]),
+        "b": torch.tensor([0.0]),
+    }
+    v._long_state = {
+        "a": torch.tensor([1.0, 1.0]),
+        "b": torch.tensor([0.0]),
+    }
+    v._update_count = 2
+
+    basis = v.build_orthonormal_basis(active_names={"a", "b"}, tau_dim=0.15)
+
+    assert basis.dim == 2
+    assert basis.residual_norm == pytest.approx(1.0 / math.sqrt(2.0))
+    e1, e2 = basis.vectors
+    dot = torch.dot(e1["a"].flatten(), e2["a"].flatten()).item()
+    assert dot == pytest.approx(0.0, abs=1e-6)
+    assert torch.cat([e1["a"].flatten(), e1["b"].flatten()]).norm().item() == pytest.approx(1.0)
+    assert torch.cat([e2["a"].flatten(), e2["b"].flatten()]).norm().item() == pytest.approx(1.0)
+
+
+def test_build_orthonormal_basis_collapses_parallel_velocity_to_dim1():
+    v = Velocity()
+    v._short_state = {"a": torch.tensor([2.0, 0.0])}
+    v._long_state = {"a": torch.tensor([3.0, 0.0])}
+    v._update_count = 2
+
+    basis = v.build_orthonormal_basis(active_names={"a"}, tau_dim=0.15)
+
+    assert basis.dim == 1
+    assert basis.residual_norm == pytest.approx(0.0)
+    assert basis.vectors[0]["a"].norm().item() == pytest.approx(1.0)
 
 
 def test_cosine_similarity():
@@ -57,6 +158,9 @@ def test_velocity_reset():
 
     v.reset()
     assert v.state is None
+    assert v.short_state is None
+    assert v.long_state is None
+    assert v.update_count == 0
 
 
 def test_cosine_similarity_mismatched_keys():
@@ -330,7 +434,10 @@ class TestCosineSimilarityNonFinite:
         d1 = {"good": torch.tensor([1.0, 0.0]), "bad": torch.tensor([1.0, 0.0])}
         v.update(d1, beta=0.8)
 
-        d2 = {"good": torch.tensor([1.0, 0.0]), "bad": torch.tensor([float("nan"), 1.0])}
+        d2 = {
+            "good": torch.tensor([1.0, 0.0]),
+            "bad": torch.tensor([float("nan"), 1.0]),
+        }
         sim = v.cosine_similarity(d2)
         assert math.isfinite(sim)
         assert abs(sim - 1.0) < 1e-6

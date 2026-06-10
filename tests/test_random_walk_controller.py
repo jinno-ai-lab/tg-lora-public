@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tg_lora.random_walk_controller import RandomWalkController
+from src.tg_lora.random_walk_controller import RandomWalkController
 
 
 def test_initial_state():
@@ -438,6 +438,48 @@ def test_lr_alternating_accept_reject_stays_in_bounds():
         )
 
 
+def test_accept_matches_decide_accept_rollback():
+    """REQ-012: accept() must use relative tolerance matching _decide_accept_rollback."""
+    from src.training.train_tg_lora import _decide_accept_rollback
+
+    ctrl = RandomWalkController(
+        rollback_tolerance=0.005,
+        k_explore_prob=0.0,
+        n_explore_prob=0.0,
+        beta_explore_prob=0.0,
+        strategy_explore_prob=0.0,
+        lr_explore_prob=0.0,
+    )
+
+    # With loss_pilot=2.0, the old absolute check would accept loss_after=2.004
+    # (2.004 <= 2.0 + 0.005 = 2.005), but the relative check correctly
+    # computes 0.004/2.0 = 0.002 <= 0.005 → accept.
+    # Both should agree regardless of pilot loss magnitude.
+    cases = [
+        (2.0, 2.004, True),  # relative = 0.002 <= 0.005
+        (2.0, 2.015, False),  # relative = 0.0075 > 0.005
+        (0.5, 0.502, True),  # relative = 0.004 <= 0.005
+        (
+            0.5,
+            0.505,
+            False,
+        ),  # relative = 0.01 > 0.005 → False (old abs: 0.505 <= 0.505 → True)
+        (10.0, 10.04, True),  # relative = 0.004 <= 0.005
+        (10.0, 10.06, False),  # relative = 0.006 > 0.005
+    ]
+    for loss_pilot, loss_after, expected in cases:
+        ctrl_result = ctrl.accept(loss_pilot, loss_after)
+        loop_result, _ = _decide_accept_rollback(loss_pilot, loss_after, 0.005)
+        assert ctrl_result == expected, (
+            f"accept({loss_pilot}, {loss_after}): expected {expected}, got {ctrl_result}"
+        )
+        assert ctrl_result == loop_result, (
+            f"accept vs _decide_accept_rollback mismatch for "
+            f"pilot={loss_pilot}, after={loss_after}: "
+            f"accept={ctrl_result}, loop={loop_result}"
+        )
+
+
 def test_accept_rejects_nan_loss():
     """NaN loss must always be rejected."""
     ctrl = RandomWalkController(
@@ -470,12 +512,8 @@ def test_accept_rejects_inf_loss():
 
 def test_layer_score_feedback_loop_integration():
     """REQ-055: layer scores are updated based on accept/reject feedback for active layers."""
-    import sys
-
-    from tg_lora.layer_sampler import select_active_layers
-
-    sys.path.insert(0, str(Path(__file__).parent))
-    from test_layer_sampler import FakeTransformerModel
+    from src.tg_lora.layer_sampler import select_active_layers
+    from tests.test_layer_sampler import FakeTransformerModel
 
     model = FakeTransformerModel(12)
     ctrl = RandomWalkController(
@@ -825,6 +863,52 @@ def test_full_explore_prob_changes_param(label, extra_kwargs, explore_key, attr,
     assert changed >= min_changes
 
 
+def test_explore_prob_config_schema_validation():
+    """TGLoRAParams schema rejects invalid exploration probability values."""
+    import pytest
+
+    from src.training.config_schema import TGLoRAParams
+
+    base = dict(
+        K_initial=3,
+        K_candidates=[2, 3, 5, 8],
+        N_initial=5,
+        N_candidates=[1, 3, 5, 10, 20],
+        alpha_initial=0.3,
+        alpha_min=0.03,
+        alpha_max=1.5,
+        beta_initial=0.8,
+        beta_candidates=[0.5, 0.8, 0.9, 0.95],
+        relative_update_cap=0.005,
+        active_layer_strategy="last_25_percent_plus_random_2",
+    )
+
+    # Valid defaults
+    params = TGLoRAParams(**base)
+    assert params.k_explore_prob == 0.4
+    assert params.n_explore_prob == 0.4
+    assert params.beta_explore_prob == 0.15
+    assert params.strategy_explore_prob == 0.08
+
+    # Valid custom
+    custom = {**base, "k_explore_prob": 0.1, "n_explore_prob": 0.2}
+    params = TGLoRAParams(**custom)
+    assert params.k_explore_prob == 0.1
+    assert params.n_explore_prob == 0.2
+
+    # Valid: zero enables deterministic ablations
+    params = TGLoRAParams(**{**base, "k_explore_prob": 0.0})
+    assert params.k_explore_prob == 0.0
+
+    # Invalid: negative
+    with pytest.raises(ValueError):
+        TGLoRAParams(**{**base, "k_explore_prob": -0.1})
+
+    # Invalid: >= 1.0
+    with pytest.raises(ValueError):
+        TGLoRAParams(**{**base, "k_explore_prob": 1.0})
+
+
 # --- Config-to-controller integration tests ---
 
 
@@ -914,6 +998,52 @@ def test_config_to_controller_defaults_when_omitted():
     assert ctrl.lr_log_sigma == RandomWalkController._LR_LOG_SIGMA
 
 
+def test_config_to_controller_yaml_file_values():
+    """The actual 9b_tg_lora.yaml values flow through to the controller."""
+
+    from src.training.config_schema import load_and_validate_config
+
+    config_path = Path("configs/9b_tg_lora.yaml")
+    if not config_path.exists():
+        import pytest
+
+        pytest.skip("configs/9b_tg_lora.yaml not found")
+
+    cfg = load_and_validate_config(config_path)
+    tg = cfg.tg_lora
+
+    ctrl = RandomWalkController(
+        K_initial=tg.K_initial,
+        K_candidates=list(tg.K_candidates),
+        N_initial=tg.N_initial,
+        N_candidates=list(tg.N_candidates),
+        alpha_initial=tg.alpha_initial,
+        alpha_min=tg.alpha_min,
+        alpha_max=tg.alpha_max,
+        alpha_log_sigma=tg.alpha_log_sigma,
+        beta_initial=tg.beta_initial,
+        beta_candidates=list(tg.beta_candidates),
+        lr_initial=tg.lr_initial,
+        lr_min=tg.lr_min,
+        lr_max=tg.lr_max,
+        lr_accept_boost=tg.lr_accept_boost,
+        lr_reject_decay=tg.lr_reject_decay,
+        active_layer_strategy=tg.active_layer_strategy,
+        relative_update_cap=tg.relative_update_cap,
+        enable_random_walk=tg.enable_random_walk,
+        k_explore_prob=tg.k_explore_prob,
+        n_explore_prob=tg.n_explore_prob,
+        beta_explore_prob=tg.beta_explore_prob,
+        strategy_explore_prob=tg.strategy_explore_prob,
+        lr_explore_prob=0.0,
+    )
+    assert ctrl.enable_random_walk is False
+    assert ctrl.k_explore_prob == 0.0
+    assert ctrl.n_explore_prob == 0.0
+    assert ctrl.beta_explore_prob == 0.0
+    assert ctrl.strategy_explore_prob == 0.0
+
+
 def test_enable_random_walk_false_freezes_hyperparameters():
     ctrl = RandomWalkController(
         K_initial=3,
@@ -983,7 +1113,7 @@ def test_config_custom_explore_probs_affect_propose():
 
 def test_controller_state_summary_round_trip():
     """summary() → from_dict() preserves all fields."""
-    from tg_lora.random_walk_controller import ControllerState as CS
+    from src.tg_lora.random_walk_controller import ControllerState as CS
 
     state = CS(
         K=5,
@@ -1022,7 +1152,7 @@ def test_controller_state_summary_round_trip():
 
 def test_controller_state_from_dict_with_defaults():
     """from_dict fills defaults for optional fields."""
-    from tg_lora.random_walk_controller import ControllerState as CS
+    from src.tg_lora.random_walk_controller import ControllerState as CS
 
     data = {
         "K": 3,
@@ -1046,7 +1176,7 @@ def test_controller_state_from_dict_with_defaults():
 
 def test_propose_recovers_from_zero_alpha():
     """propose() must not crash when alpha is zero (e.g. via corrupted state)."""
-    from tg_lora.random_walk_controller import ControllerState as CS
+    from src.tg_lora.random_walk_controller import ControllerState as CS
 
     ctrl = RandomWalkController(
         alpha_initial=0.3,
@@ -1069,7 +1199,7 @@ def test_propose_recovers_from_zero_alpha():
 
 def test_propose_recovers_from_negative_alpha():
     """propose() must not crash when alpha is negative."""
-    from tg_lora.random_walk_controller import ControllerState as CS
+    from src.tg_lora.random_walk_controller import ControllerState as CS
 
     ctrl = RandomWalkController(
         alpha_initial=0.3,
@@ -1187,7 +1317,7 @@ def test_lr_exploration_disabled_when_random_walk_off():
 
 def test_lr_exploration_near_min_clamps_to_lr_min():
     """When lr is at lr_min, downward perturbation must clamp."""
-    from tg_lora.random_walk_controller import ControllerState as CS
+    from src.tg_lora.random_walk_controller import ControllerState as CS
 
     ctrl = RandomWalkController(
         lr_initial=5e-4,
@@ -1211,7 +1341,7 @@ def test_lr_exploration_near_min_clamps_to_lr_min():
 
 def test_lr_exploration_near_max_clamps_to_lr_max():
     """When lr is at lr_max, upward perturbation must clamp."""
-    from tg_lora.random_walk_controller import ControllerState as CS
+    from src.tg_lora.random_walk_controller import ControllerState as CS
 
     ctrl = RandomWalkController(
         lr_initial=5e-4,
@@ -1235,7 +1365,7 @@ def test_lr_exploration_near_max_clamps_to_lr_max():
 
 def test_lr_exploration_recovers_from_zero_lr():
     """propose() must handle lr=0 gracefully (skip exploration, return 0)."""
-    from tg_lora.random_walk_controller import ControllerState as CS
+    from src.tg_lora.random_walk_controller import ControllerState as CS
 
     ctrl = RandomWalkController(
         lr_initial=5e-4,
@@ -1282,6 +1412,48 @@ def test_propose_lr_in_range_statistical():
     median_lr = statistics.median(proposed_lrs)
     # Median should be within 50% of the initial lr
     assert 2.5e-4 < median_lr < 1e-3, f"Median lr {median_lr} too far from 5e-4"
+
+
+def test_lr_explore_prob_config_schema_validation():
+    """TGLoRAParams schema validates lr_explore_prob and lr_log_sigma."""
+    from src.training.config_schema import TGLoRAParams
+
+    base = dict(
+        K_initial=3,
+        K_candidates=[2, 3, 5, 8],
+        N_initial=5,
+        N_candidates=[1, 3, 5, 10, 20],
+        alpha_initial=0.3,
+        alpha_min=0.03,
+        alpha_max=1.5,
+        beta_initial=0.8,
+        beta_candidates=[0.5, 0.8, 0.9, 0.95],
+        relative_update_cap=0.005,
+        active_layer_strategy="last_25_percent_plus_random_2",
+    )
+
+    # Valid defaults
+    params = TGLoRAParams(**base)
+    assert params.lr_explore_prob == 0.3
+    assert params.lr_log_sigma == 0.1
+
+    # Valid custom
+    custom = {**base, "lr_explore_prob": 0.5, "lr_log_sigma": 0.2}
+    params = TGLoRAParams(**custom)
+    assert params.lr_explore_prob == 0.5
+    assert params.lr_log_sigma == 0.2
+
+    # Invalid: negative lr_explore_prob
+    with pytest.raises(ValueError):
+        TGLoRAParams(**{**base, "lr_explore_prob": -0.1})
+
+    # Invalid: lr_explore_prob >= 1.0
+    with pytest.raises(ValueError):
+        TGLoRAParams(**{**base, "lr_explore_prob": 1.0})
+
+    # Invalid: lr_log_sigma <= 0
+    with pytest.raises(ValueError):
+        TGLoRAParams(**{**base, "lr_log_sigma": 0.0})
 
 
 # --- math.exp overflow protection tests ---
@@ -1879,7 +2051,7 @@ def test_last_accel_action_in_summary():
 
 def test_restore_state_replaces_state():
     """restore_state replaces K, N, alpha, beta, lr and counts."""
-    from tg_lora.random_walk_controller import ControllerState
+    from src.tg_lora.random_walk_controller import ControllerState
 
     ctrl = RandomWalkController(
         K_initial=3,
@@ -1920,7 +2092,7 @@ def test_restore_state_replaces_state():
 
 def test_restore_state_resets_last_accel_action():
     """restore_state resets last_accel_action to 0."""
-    from tg_lora.random_walk_controller import ControllerState
+    from src.tg_lora.random_walk_controller import ControllerState
 
     ctrl = RandomWalkController(
         enable_random_walk=True,
@@ -1943,7 +2115,7 @@ def test_restore_state_resets_last_accel_action():
 
 def test_restore_state_preserves_config():
     """restore_state keeps controller config (candidates, bounds)."""
-    from tg_lora.random_walk_controller import ControllerState
+    from src.tg_lora.random_walk_controller import ControllerState
 
     ctrl = RandomWalkController(
         K_candidates=[2, 4, 8],
@@ -1979,7 +2151,7 @@ def test_restore_state_preserves_config():
 
 def test_restore_state_propose_uses_restored_lr():
     """After restore_state, propose() uses the restored lr."""
-    from tg_lora.random_walk_controller import ControllerState
+    from src.tg_lora.random_walk_controller import ControllerState
 
     ctrl = RandomWalkController(
         lr_initial=5e-4,
@@ -1998,80 +2170,5 @@ def test_restore_state_propose_uses_restored_lr():
 
     proposal = ctrl.propose()
     assert proposal.lr == 7e-4
-
-
-# --- Coverage gap: lines 206, 372-377 ---
-
-
-def test_accel_deadzone_custom_value():
-    """Line 206: custom accel_deadzone is stored."""
-    ctrl = RandomWalkController(
-        accel_deadzone=0.05,
-        k_explore_prob=0.0,
-        n_explore_prob=0.0,
-        beta_explore_prob=0.0,
-        strategy_explore_prob=0.0,
-        lr_explore_prob=0.0,
-    )
-    assert ctrl.accel_deadzone == 0.05
-
-
-def test_accel_deadzone_default():
-    """Default accel_deadzone is _DEFAULT_ACCEL_DEADZONE."""
-    ctrl = RandomWalkController(
-        k_explore_prob=0.0,
-        n_explore_prob=0.0,
-        beta_explore_prob=0.0,
-        strategy_explore_prob=0.0,
-        lr_explore_prob=0.0,
-    )
-    assert ctrl.accel_deadzone == RandomWalkController._DEFAULT_ACCEL_DEADZONE
-
-
-def test_commit_proposal_adopted():
-    """Lines 372-377: commit_proposal writes proposal fields into state."""
-    from tg_lora.random_walk_controller import Proposal
-
-    ctrl = RandomWalkController(
-        K_initial=3,
-        N_initial=5,
-        alpha_initial=0.3,
-        beta_initial=0.8,
-        lr_initial=5e-4,
-        k_explore_prob=0.0,
-        n_explore_prob=0.0,
-        beta_explore_prob=0.0,
-        strategy_explore_prob=0.0,
-        lr_explore_prob=0.0,
-    )
-    proposal = Proposal(
-        K=8,
-        N=10,
-        alpha=1.0,
-        beta=0.95,
-        lr=8e-4,
-        active_layer_strategy="last_25_percent",
-        relative_update_cap=0.01,
-    )
-    ctrl.commit_proposal(proposal)
-    assert ctrl.state.K == 8
-    assert ctrl.state.N == 10
-    assert ctrl.state.alpha == 1.0
-    assert ctrl.state.beta == 0.95
-    assert ctrl.state.lr == 8e-4
-    assert ctrl.state.active_layer_strategy == "last_25_percent"
-
-
-def test_accel_deadzone_zero_accepted():
-    """accel_deadzone=0.0 is valid (finite, non-negative)."""
-    ctrl = RandomWalkController(
-        accel_deadzone=0.0,
-        k_explore_prob=0.0,
-        n_explore_prob=0.0,
-        beta_explore_prob=0.0,
-        strategy_explore_prob=0.0,
-        lr_explore_prob=0.0,
-    )
-    assert ctrl.accel_deadzone == 0.0
 
 

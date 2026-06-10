@@ -1,6 +1,6 @@
 import pytest
 
-from tg_lora.cycle_state import CycleState
+from src.tg_lora.cycle_state import CycleState
 
 # ---------------------------------------------------------------------------
 # Initial state
@@ -19,6 +19,11 @@ class TestCycleStateInit:
         assert cs.last_train_loss == 0.0
         assert cs.accepted_count == 0
         assert cs.rejected_count == 0
+        assert cs.current_alpha == 0.0
+        assert cs.v_fixed_since_cycle is None
+        assert cs.alpha_steps_in_cycle == 0
+        assert cs.base_term_cached is False
+        assert cs.n_base_recompute == 0
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +216,8 @@ class TestSummary:
         assert s["accepted_count"] == 1
         assert s["rejected_count"] == 0
         assert s["final_train_loss"] == 1.0
+        assert s["current_alpha"] == 0.0
+        assert s["base_term_cached"] is False
 
     def test_summary_after_multiple_cycles(self):
         cs = CycleState()
@@ -273,6 +280,22 @@ class TestFromDict:
         assert restored.rejected_count == 1
         assert restored.reduction_rate == pytest.approx(cs.reduction_rate)
         assert restored.acceptance_rate == pytest.approx(cs.acceptance_rate)
+
+    def test_round_trip_alpha_line_fields(self):
+        cs = CycleState(
+            current_alpha=0.25,
+            v_fixed_since_cycle=3,
+            alpha_steps_in_cycle=5,
+            base_term_cached=True,
+            n_base_recompute=2,
+        )
+        restored = CycleState.from_dict(cs.summary())
+
+        assert restored.current_alpha == pytest.approx(0.25)
+        assert restored.v_fixed_since_cycle == 3
+        assert restored.alpha_steps_in_cycle == 5
+        assert restored.base_term_cached is True
+        assert restored.n_base_recompute == 2
 
     def test_from_empty_dict(self):
         cs = CycleState.from_dict({})
@@ -338,6 +361,8 @@ class TestValidation:
             ("stale_cycles", -1),
             ("accepted_count", -1),
             ("rejected_count", -1),
+            ("alpha_steps_in_cycle", -1),
+            ("n_base_recompute", -1),
         ],
     )
     def test_rejects_negative_field(self, field, value):
@@ -346,10 +371,7 @@ class TestValidation:
 
     @pytest.mark.parametrize(
         "field",
-        [
-            "cycle", "full_backward_passes", "extrapolation_steps",
-            "best_step", "stale_cycles", "accepted_count", "rejected_count",
-        ],
+        ["cycle", "full_backward_passes", "extrapolation_steps", "best_step", "stale_cycles", "accepted_count", "rejected_count"],
     )
     def test_accepts_zero(self, field):
         CycleState(**{field: 0})

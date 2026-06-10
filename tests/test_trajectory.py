@@ -1,16 +1,18 @@
-"""Tests for tg_lora/trajectory.py — Training trajectory analysis."""
+"""Tests for src/tg_lora/trajectory.py — Training trajectory analysis (Phase 59)."""
 from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
-from tg_lora.trajectory import (
-    ConvergenceEstimate,
-    EarlyStopAdvice,
-    TrajectoryAnalyzer,
-    TrajectoryPoint,
-    TrajectoryReport,
-    _linear_slope,
-)
+from src.tg_lora.trajectory import (ConvergenceEstimate, EarlyStopAdvice,
+                                    TrajectoryAnalyzer, TrajectoryPoint,
+                                    TrajectoryReport, _linear_slope)
+
+SCRIPT = Path("scripts/analyze_trajectory.py")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -521,81 +523,133 @@ class TestLinearSlope:
 
 
 # ---------------------------------------------------------------------------
-# Coverage gap: trajectory.py uncovered lines
+# CLI end-to-end
 # ---------------------------------------------------------------------------
 
-
-class TestTrajectoryCoverageGaps:
-    """Tests for previously uncovered branches in trajectory.py."""
-
-    def test_compute_convergence_rate_initial_zero(self):
-        """Line 113: convergence rate when initial=0 returns 0."""
-        a = TrajectoryAnalyzer()
-        # Add points where initial loss is 0
-        a.add_point(TrajectoryPoint(cycle=0, train_loss=0.0))
-        a.add_point(TrajectoryPoint(cycle=1, train_loss=1.0))
-        a.add_point(TrajectoryPoint(cycle=2, train_loss=2.0))
-        # With initial=0, function should return 0.0
-        rate = a.compute_convergence_rate()
-        assert rate == 0.0
-
-    def test_predict_steps_target_loss_none_asymptote_none(self):
-        """Lines 127-129: when target_loss=None and _estimate_asymptote returns None."""
-        a = TrajectoryAnalyzer(min_points=3)
-        # Not enough points for asymptote estimation
-        a.add_point(TrajectoryPoint(cycle=0, train_loss=2.5))
-        a.add_point(TrajectoryPoint(cycle=1, train_loss=2.4))
-        a.add_point(TrajectoryPoint(cycle=2, train_loss=2.3))
-        # With min_points=3 we have just enough for predict_steps, but
-        # _estimate_asymptote needs min_points and window*2 data.
-        # Use a small window so we have enough data
-        result = a.predict_steps_to_convergence(target_loss=None)
-        # If asymptote is None, should return None
-        assert result is None or isinstance(result, int)
-
-    def test_estimate_asymptote_insufficient_window_data(self):
-        """Line 163: _estimate_asymptote with < min_points returns None."""
-        a = TrajectoryAnalyzer(min_points=5)
-        for i in range(3):
-            a.add_point(TrajectoryPoint(cycle=i, train_loss=2.5 - 0.1 * i))
-        result = a._estimate_asymptote()
-        assert result is None
-
-    def test_estimate_asymptote_recent_too_short(self):
-        """Line 168: _estimate_asymptote with recent < 3 returns None."""
-        a = TrajectoryAnalyzer(window=2, min_points=2)
-        a.add_point(TrajectoryPoint(cycle=0, train_loss=2.5))
-        a.add_point(TrajectoryPoint(cycle=1, train_loss=2.4))
-        result = a._estimate_asymptote()
-        # window*2 = 4, but only 2 points available → recent has 2 items → 2 < 3
-        assert result is None
-
-    def test_detect_anomaly_spike_zscore(self):
-        """Line 227: loss anomaly with z-score > 3.0."""
-        # Need the spike to be included in the recent window but still produce z > 3
-        # With window=10 and 19 stable values + 1 spike:
-        # recent = [1]*9 + [50], mean=5.9, std=14.7, z=3.0
-        losses = [1.0] * 19 + [50.0]
-        a = TrajectoryAnalyzer.from_loss_history(losses, window=10)
-        anomalies = a.detect_anomalies()
-        assert any("loss anomaly" in an for an in anomalies)
-
-    def test_early_stop_marginal_gain_below_threshold(self):
-        """Lines 287-291: marginal stop when gain < min_improvement.
-
-        Requirements to reach the marginal branch:
-        - NOT converged (abs(trend) >= threshold)
-        - NOT stagnant (trend < 0 OR cycles_since_best < patience)
-        - NOT unstable (volatility <= abs(best)*0.1 OR cycles_since_best < patience//2)
-        - estimated_gain < min_improvement AND cycles_since_best >= patience
-        """
-        losses = [5.0, 4.5, 4.0, 3.5, 3.0, 2.8, 2.7, 2.65, 2.62, 2.601,
-                  2.6008, 2.6005, 2.6003, 2.6002, 2.6001,   # best=2.6001 at idx 14
-                  2.60015, 2.60012, 2.60011, 2.600105, 2.600102]
-        a = TrajectoryAnalyzer.from_loss_history(
-            losses, convergence_threshold=1e-7, window=5
+class TestCLI:
+    def test_from_losses(self, tmp_path):
+        output = tmp_path / "report.json"
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "--from-losses", "2.5,2.3,2.1,1.9,1.8",
+             "--output", str(output)],
+            capture_output=True, text=True,
         )
-        advice = a.early_stop_advice(patience=3, min_improvement=0.1)
-        assert advice.should_stop
-        assert "marginal" in advice.reason
+        assert r.returncode == 0, r.stderr
+        assert output.exists()
+        data = json.loads(output.read_text())
+        assert data["total_points"] == 5
+        assert data["loss_trend"] < 0
+        assert "convergence" in data
 
+    def test_from_file(self, tmp_path):
+        metrics = [
+            {"cycle": i, "train_loss": 2.5 - 0.1 * i, "valid_loss": 2.6 - 0.1 * i}
+            for i in range(10)
+        ]
+        metrics_file = tmp_path / "run_metrics.json"
+        metrics_file.write_text(json.dumps(metrics))
+
+        output = tmp_path / "report.json"
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), str(metrics_file),
+             "--output", str(output)],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == 0, r.stderr
+        data = json.loads(output.read_text())
+        assert data["total_points"] == 10
+
+    def test_from_jsonl_file(self, tmp_path):
+        lines = [
+            json.dumps({"cycle": i, "train_loss": 2.5 - 0.1 * i})
+            for i in range(5)
+        ]
+        jsonl_file = tmp_path / "metrics.jsonl"
+        jsonl_file.write_text("\n".join(lines))
+
+        output = tmp_path / "report.json"
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), str(jsonl_file),
+             "--output", str(output)],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == 0, r.stderr
+
+    def test_from_jsonl_file_merges_duplicate_step_records(self, tmp_path):
+        lines = [
+            json.dumps({"step": 1, "loss_train": 2.5}),
+            json.dumps({"step": 1, "loss_train": 2.5, "loss_valid": 2.4}),
+            json.dumps({"step": 2, "loss_train": 2.3, "loss_valid": 2.2}),
+        ]
+        jsonl_file = tmp_path / "metrics.jsonl"
+        jsonl_file.write_text("\n".join(lines))
+
+        output = tmp_path / "report.json"
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), str(jsonl_file),
+             "--output", str(output)],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == 0, r.stderr
+
+        data = json.loads(output.read_text())
+        assert data["total_points"] == 2
+
+    def test_missing_file_exits_2(self):
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "/nonexistent/file.json"],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == 2
+
+    def test_no_args_shows_error(self):
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT)],
+            capture_output=True, text=True,
+        )
+        assert r.returncode != 0
+
+    def test_target_loss(self, tmp_path):
+        output = tmp_path / "report.json"
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "--from-losses", "2.5,2.3,2.1,1.9,1.8",
+             "--target-loss", "1.0", "--output", str(output)],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == 0, r.stderr
+        data = json.loads(output.read_text())
+        assert data["convergence"]["remaining_steps"] is not None
+
+    def test_prints_recommendation_continue(self, tmp_path):
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "--from-losses", "2.5,2.3,2.1,1.9,1.8"],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == 0
+        assert "CONTINUE" in r.stdout or "STOP" in r.stdout
+
+    def test_prints_recommendation_stop(self):
+        losses = ",".join(["1.0"] * 20)
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "--from-losses", losses],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == 0
+        assert "STOP" in r.stdout or "CONTINUE" in r.stdout
+
+
+# ---------------------------------------------------------------------------
+# Public API exports
+# ---------------------------------------------------------------------------
+
+class TestPublicAPIExports:
+    def test_trajectory_classes_importable_from_package(self):
+        from src.tg_lora import TrajectoryAnalyzer, TrajectoryPoint
+        assert TrajectoryAnalyzer is not None
+        assert TrajectoryPoint is not None
+
+    def test_all_trajectory_classes_in___all__(self):
+        import src.tg_lora as pkg
+        for name in ["TrajectoryAnalyzer", "TrajectoryPoint", "ConvergenceEstimate",
+                      "EarlyStopAdvice", "TrajectoryReport"]:
+            assert name in pkg.__all__

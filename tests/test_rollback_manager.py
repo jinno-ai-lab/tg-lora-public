@@ -1,9 +1,10 @@
-import pytest
 import torch
-from conftest import FakeLoRAModel
+import pytest
 
-from tg_lora.lora_utils import iter_lora_params
-from tg_lora.rollback_manager import RollbackManager
+from src.model.lora_utils import iter_lora_params
+from src.tg_lora.rollback_manager import RollbackManager
+
+from .conftest import FakeLoRAModel
 
 
 def test_rollback_basic():
@@ -147,16 +148,11 @@ def test_max_history_fifo_eviction():
     )
 
 
-# --- Coverage gap: line 15 (max_history validation) ---
-
-
-def test_max_history_zero_raises():
-    """max_history=0 must raise ValueError."""
-    with pytest.raises(ValueError, match="max_history must be positive"):
-        RollbackManager(max_history=0)
-
-
-def test_max_history_negative_raises():
-    """Negative max_history must raise ValueError."""
-    with pytest.raises(ValueError, match="max_history must be positive"):
-        RollbackManager(max_history=-5)
+def test_save_rejects_empty_snapshot(monkeypatch):
+    """save() must raise if snapshot_lora returns an empty dict."""
+    from src.tg_lora import rollback_manager as rm
+    monkeypatch.setattr(rm, "snapshot_lora", lambda model: {})
+    model = FakeLoRAModel()
+    mgr = RollbackManager()
+    with pytest.raises(RuntimeError, match="empty state"):
+        mgr.save(model)

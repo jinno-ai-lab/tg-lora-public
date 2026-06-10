@@ -1,15 +1,16 @@
 import pytest
 import torch
-from conftest import FakeLoRAModel
 
-from tg_lora.lora_state import (
-    apply_delta_snapshot,
-    diff_lora,
-    load_lora_snapshot,
+from src.model.lora_utils import iter_lora_params
+from src.tg_lora.lora_state import (
     snapshot_lora,
     snapshot_lora_delta,
+    apply_delta_snapshot,
+    load_lora_snapshot,
+    diff_lora,
 )
-from tg_lora.lora_utils import iter_lora_params
+
+from .conftest import FakeLoRAModel
 
 
 class TestLoRAState:

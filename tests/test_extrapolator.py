@@ -1,9 +1,37 @@
+import math
+
 import pytest
 import torch
-from conftest import FakeLoRAModel
 
-from tg_lora.extrapolator import apply_extrapolation, cap_update
-from tg_lora.lora_utils import iter_lora_params
+from src.model.lora_utils import iter_lora_params
+from src.tg_lora.extrapolator import (
+    AlphaLineStepStats,
+    ExtrapolationStats,
+    ZerothOrderStepStats,
+    alpha_line_reconstruct_output,
+    alpha_line_step,
+    apply_extrapolation,
+    cap_update,
+    subspace_zeroth_order_step,
+)
+from src.tg_lora.velocity import OrthonormalBasis
+
+from .conftest import FakeLoRAModel
+
+
+class AlphaLineLoRALinear(torch.nn.Module):
+    def __init__(self, in_features: int = 5, out_features: int = 3, rank: int = 2):
+        super().__init__()
+        self.base = torch.nn.Linear(in_features, out_features, bias=False)
+        self.lora_A = torch.nn.Parameter(torch.randn(rank, in_features) * 0.1)
+        self.lora_B = torch.nn.Parameter(torch.randn(out_features, rank) * 0.1)
+        self.scaling = 0.75
+
+    def forward(self, x):
+        lora_hidden = torch.nn.functional.linear(x, self.lora_A)
+        return self.base(x) + self.scaling * torch.nn.functional.linear(
+            lora_hidden, self.lora_B
+        )
 
 
 def test_apply_extrapolation():
@@ -16,15 +44,18 @@ def test_apply_extrapolation():
         velocity[name] = torch.ones_like(p) * 0.1
         active_names.add(name)
 
-    apply_extrapolation(
+    stats = apply_extrapolation(
         model=model,
         velocity=velocity,
         active_names=active_names,
-        alpha_by_name={},
-        default_alpha=0.3,
         n_steps=5,
+        lr=0.3,
         relative_update_cap=100.0,  # high cap so no capping
     )
+    assert isinstance(stats, ExtrapolationStats)
+    assert stats.num_tensors == len(active_names)
+    assert stats.capped_tensors > 0
+    assert 0.0 < stats.global_cap_ratio < 1.0
 
     for name, p in iter_lora_params(model):
         # cap_update uses p.detach() as ref; for lora_B (zeros), ref_norm is
@@ -34,7 +65,7 @@ def test_apply_extrapolation():
         diff = p - before[name]
         if before[name].norm() > 1e-6:
             # Non-zero param: raw update should mostly go through
-            expected_delta = torch.ones_like(p) * (5 * 0.3 * 0.1)  # n_steps * alpha * v
+            expected_delta = torch.ones_like(p) * (5 * 0.3 * 0.1)
             assert torch.allclose(diff, expected_delta, atol=1e-3)
         else:
             # Zero param (lora_B): capped update is tiny but non-zero
@@ -57,9 +88,8 @@ def test_apply_extrapolation_partial_layers():
         model=model,
         velocity=velocity,
         active_names=active_names,
-        alpha_by_name={},
-        default_alpha=1.0,
         n_steps=1,
+        lr=1.0,
         relative_update_cap=1.0,
     )
 
@@ -100,9 +130,8 @@ def test_apply_extrapolation_skips_missing_velocity_keys():
         model=model,
         velocity=velocity,
         active_names=active_names,
-        alpha_by_name={},
-        default_alpha=1.0,
         n_steps=1,
+        lr=1.0,
         relative_update_cap=100.0,
     )
 
@@ -134,8 +163,8 @@ def test_cap_update_zero_update_returns_zero():
     assert torch.allclose(capped, torch.zeros(3))
 
 
-def test_apply_extrapolation_per_name_alpha_override():
-    """alpha_by_name should override default_alpha for specific params."""
+def test_apply_extrapolation_ignores_legacy_alpha_arguments():
+    """alpha arguments are accepted for compatibility but no longer scale updates."""
     model = FakeLoRAModel()
     all_names = [name for name, _ in iter_lora_params(model)]
     velocity = {
@@ -151,10 +180,11 @@ def test_apply_extrapolation_per_name_alpha_override():
         model=model_a,
         velocity=velocity,
         active_names=set(all_names),
+        n_steps=1,
+        lr=1.0,
+        relative_update_cap=100.0,
         alpha_by_name={},
         default_alpha=1.0,
-        n_steps=1,
-        relative_update_cap=100.0,
     )
     diff_a = {
         name: (
@@ -174,10 +204,11 @@ def test_apply_extrapolation_per_name_alpha_override():
         model=model_b,
         velocity=velocity,
         active_names=set(all_names),
+        n_steps=1,
+        lr=1.0,
+        relative_update_cap=100.0,
         alpha_by_name={all_names[0]: 2.0},
         default_alpha=1.0,
-        n_steps=1,
-        relative_update_cap=100.0,
     )
     diff_b = {
         name: (
@@ -189,10 +220,8 @@ def test_apply_extrapolation_per_name_alpha_override():
         for name in all_names
     }
 
-    # Param with override alpha should have ~2x the diff of the same param with default
-    assert diff_b[all_names[0]] > diff_a[all_names[0]] * 1.5
-    # Other params should be identical
-    assert abs(diff_b[all_names[1]] - diff_a[all_names[1]]) < 1e-6
+    for name in all_names:
+        assert abs(diff_b[name] - diff_a[name]) < 1e-6
 
 
 def test_apply_extrapolation_zero_steps_is_noop():
@@ -201,15 +230,15 @@ def test_apply_extrapolation_zero_steps_is_noop():
     before = {name: p.clone() for name, p in iter_lora_params(model)}
     velocity = {name: torch.ones_like(p) * 0.1 for name, p in iter_lora_params(model)}
 
-    apply_extrapolation(
+    stats = apply_extrapolation(
         model=model,
         velocity=velocity,
         active_names=set(velocity.keys()),
-        alpha_by_name={},
-        default_alpha=1.0,
         n_steps=0,
+        lr=1.0,
         relative_update_cap=100.0,
     )
+    assert stats.num_tensors == 0
 
     for name, p in iter_lora_params(model):
         assert torch.allclose(p, before[name])
@@ -221,18 +250,213 @@ def test_apply_extrapolation_negative_steps_is_noop():
     before = {name: p.clone() for name, p in iter_lora_params(model)}
     velocity = {name: torch.ones_like(p) * 0.1 for name, p in iter_lora_params(model)}
 
-    apply_extrapolation(
+    stats = apply_extrapolation(
         model=model,
         velocity=velocity,
         active_names=set(velocity.keys()),
-        alpha_by_name={},
-        default_alpha=1.0,
         n_steps=-5,
+        lr=1.0,
         relative_update_cap=100.0,
     )
+    assert stats.num_tensors == 0
 
     for name, p in iter_lora_params(model):
         assert torch.allclose(p, before[name])
+
+
+def test_alpha_line_reconstruction_matches_full_forward_with_factor_updates():
+    torch.manual_seed(0)
+    model = AlphaLineLoRALinear().double()
+    cached_h = torch.randn(4, 5, dtype=torch.float64)
+    alpha = 0.37
+    direction = {
+        "layer.lora_A": torch.randn_like(model.lora_A) * 0.03,
+        "layer.lora_B": torch.randn_like(model.lora_B) * 0.03,
+    }
+
+    base_out = model(cached_h).detach()
+    reconstructed = alpha_line_reconstruct_output(
+        model,
+        cached_h,
+        direction,
+        alpha,
+        base_out=base_out,
+    )
+
+    with torch.no_grad():
+        model.lora_A.add_(direction["layer.lora_A"], alpha=alpha)
+        model.lora_B.add_(direction["layer.lora_B"], alpha=alpha)
+        full_forward = model(cached_h)
+        model.lora_A.add_(direction["layer.lora_A"], alpha=-alpha)
+        model.lora_B.add_(direction["layer.lora_B"], alpha=-alpha)
+
+    assert torch.allclose(reconstructed, full_forward, atol=1e-12, rtol=1e-10)
+
+
+def test_alpha_line_step_updates_scalar_alpha_only():
+    torch.manual_seed(1)
+    model = AlphaLineLoRALinear().double()
+    cached_h = torch.randn(4, 5, dtype=torch.float64)
+    target = torch.randn(4, 3, dtype=torch.float64)
+    direction = {
+        "lora_A": torch.randn_like(model.lora_A) * 0.02,
+        "lora_B": torch.randn_like(model.lora_B) * 0.02,
+    }
+    before = {
+        name: param.detach().clone()
+        for name, param in model.named_parameters()
+        if "lora_" in name
+    }
+
+    alpha_after, stats = alpha_line_step(
+        model,
+        cached_h,
+        direction,
+        alpha=0.1,
+        alpha_lr=0.5,
+        loss_fn=lambda output: torch.nn.functional.mse_loss(output, target),
+    )
+
+    assert isinstance(stats, AlphaLineStepStats)
+    assert alpha_after == pytest.approx(stats.alpha_after)
+    assert stats.grad_alpha != 0.0
+    for name, param in model.named_parameters():
+        if name in before:
+            assert torch.allclose(param, before[name])
+
+
+def test_alpha_line_step_non_finite_gradient_returns_original_alpha():
+    """When loss produces NaN gradient, alpha must remain unchanged."""
+    model = AlphaLineLoRALinear().double()
+    cached_h = torch.randn(4, 5, dtype=torch.float64)
+    direction = {
+        "lora_A": torch.randn_like(model.lora_A) * 0.02,
+        "lora_B": torch.randn_like(model.lora_B) * 0.02,
+    }
+    original_alpha = 0.1
+
+    def nan_loss(output):
+        return output.mean() * float("nan")
+
+    alpha_after, stats = alpha_line_step(
+        model,
+        cached_h,
+        direction,
+        alpha=original_alpha,
+        alpha_lr=0.5,
+        loss_fn=nan_loss,
+    )
+
+    assert alpha_after == original_alpha
+    assert math.isnan(stats.grad_alpha) or math.isinf(stats.grad_alpha)
+
+
+def test_subspace_zeroth_order_step_accepts_quadratic_minimum():
+    model = FakeLoRAModel()
+    params = dict(iter_lora_params(model))
+    name = "linear.lora_A"
+    direction = torch.ones_like(params[name])
+    direction = direction / direction.norm()
+    target = params[name].detach().clone() + 0.25 * direction
+    basis = OrthonormalBasis(
+        vectors=[{name: direction}],
+        dim=1,
+        residual_norm=0.0,
+        short_norm=1.0,
+        long_norm=1.0,
+        tau_dim=0.15,
+    )
+
+    def loss_closure():
+        return ((params[name] - target) ** 2).sum().item()
+
+    stats = subspace_zeroth_order_step(
+        model,
+        basis,
+        {name},
+        loss_closure,
+        mu_ratio=0.01,
+        max_step_ratio=100.0,
+    )
+
+    assert isinstance(stats, ZerothOrderStepStats)
+    assert stats.accepted
+    assert stats.dim == 1
+    assert stats.forward_count == 4
+    assert loss_closure() < ((params[name].detach() - 0.25 * direction - target) ** 2).sum().item()
+
+
+def test_subspace_zeroth_order_step_rejects_and_rolls_back():
+    model = FakeLoRAModel()
+    params = dict(iter_lora_params(model))
+    name = "linear.lora_A"
+    before = params[name].detach().clone()
+    direction = torch.ones_like(params[name])
+    direction = direction / direction.norm()
+    basis = OrthonormalBasis(
+        vectors=[{name: direction}],
+        dim=1,
+        residual_norm=0.0,
+        short_norm=1.0,
+        long_norm=1.0,
+        tau_dim=0.15,
+    )
+    losses = iter([1.0, 0.5, 0.0, 2.0])
+
+    def loss_closure():
+        return next(losses)
+
+    stats = subspace_zeroth_order_step(
+        model,
+        basis,
+        {name},
+        loss_closure,
+        mu_ratio=0.01,
+        max_step_ratio=100.0,
+        tolerance=0.0,
+    )
+
+    assert not stats.accepted
+    assert stats.rollback_triggered
+    assert torch.allclose(params[name], before)
+
+
+def test_subspace_zeroth_order_step_stops_on_non_descent_primary_g():
+    model = FakeLoRAModel()
+    params = dict(iter_lora_params(model))
+    name = "linear.lora_A"
+    before = params[name].detach().clone()
+    direction = torch.ones_like(params[name])
+    direction = direction / direction.norm()
+    basis = OrthonormalBasis(
+        vectors=[{name: direction}],
+        dim=1,
+        residual_norm=0.0,
+        short_norm=1.0,
+        long_norm=1.0,
+        tau_dim=0.15,
+    )
+    losses = iter([1.0, 1.1, 1.2])
+
+    def loss_closure():
+        return next(losses)
+
+    stats = subspace_zeroth_order_step(
+        model,
+        basis,
+        {name},
+        loss_closure,
+        mu_ratio=0.01,
+        max_step_ratio=100.0,
+        stop_on_positive_primary_g=True,
+    )
+
+    assert not stats.accepted
+    assert not stats.rollback_triggered
+    assert stats.termination_reason == "primary_g_non_descent"
+    assert stats.forward_count == 3
+    assert stats.directions[0].g > 0
+    assert torch.allclose(params[name], before)
 
 
 def test_apply_extrapolation_empty_velocity_is_noop():
@@ -240,15 +464,15 @@ def test_apply_extrapolation_empty_velocity_is_noop():
     model = FakeLoRAModel()
     before = {name: p.clone() for name, p in iter_lora_params(model)}
 
-    apply_extrapolation(
+    stats = apply_extrapolation(
         model=model,
         velocity={},
         active_names=set(before.keys()),
-        alpha_by_name={},
-        default_alpha=1.0,
         n_steps=5,
+        lr=1.0,
         relative_update_cap=100.0,
     )
+    assert stats.num_tensors == 0
 
     for name, p in iter_lora_params(model):
         assert torch.allclose(p, before[name])
@@ -367,3 +591,97 @@ class TestCapUpdateNonFiniteLogging:
             cap_update(update, ref, max_ratio=0.5)
         assert "1 NaN" in caplog.text
         assert "1 Inf" in caplog.text
+
+
+def test_subspace_m9_fit_step():
+    from src.tg_lora.extrapolator import subspace_m9_fit_step
+    model = FakeLoRAModel()
+    active_names = {name for name, _ in iter_lora_params(model)}
+    
+    # Create mock trajectory history (3 cycles)
+    history = []
+    for _ in range(3):
+        h_dict = {}
+        for name, p in iter_lora_params(model):
+            h_dict[name] = torch.randn_like(p) * 0.01
+        history.append(h_dict)
+        
+    dummy_batch = {"input_ids": torch.tensor([[1, 2, 3]])}
+    
+    # Dummy loss function (MSE of parameter values to make fitting meaningful)
+    def dummy_loss(batch):
+        tot = 0.0
+        for name, p in iter_lora_params(model):
+            tot += p.abs().mean().item()
+        return tot
+
+    # Call fit step
+    m9_delta, stats = subspace_m9_fit_step(
+        model=model,
+        history=history,
+        active_names=active_names,
+        batch=dummy_batch,
+        loss_fn=dummy_loss,
+        selected_N=5,
+        fd_epsilon=1e-3,
+        fit_lr=0.1,
+        fit_steps=2,
+    )
+    
+    # Assertions
+    assert isinstance(m9_delta, dict)
+    assert set(m9_delta.keys()) == active_names
+    for name in active_names:
+        assert m9_delta[name].shape == dict(iter_lora_params(model))[name].shape
+        
+    assert "loss_initial" in stats
+    assert "loss_final" in stats
+    assert "alpha_fit" in stats
+    assert "beta1_fit" in stats
+    assert "beta2_fit" in stats
+    assert "w_traj" in stats
+    assert stats["w_traj"] > 0
+
+
+def test_subspace_m9_scaling():
+    import math
+    from src.tg_lora.extrapolator import subspace_m9_fit_step, flatten_tensor_dict
+    model = FakeLoRAModel()
+    active_names = {name for name, _ in iter_lora_params(model)}
+    
+    # Create mock trajectory history (3 cycles)
+    history = []
+    for _ in range(3):
+        h_dict = {}
+        for name, p in iter_lora_params(model):
+            # Use deterministic history
+            h_dict[name] = torch.ones_like(p) * 0.01
+        history.append(h_dict)
+        
+    dummy_batch = {"input_ids": torch.tensor([[1, 2, 3]])}
+    
+    # Dummy loss function
+    def dummy_loss(batch):
+        return 0.0
+
+    norms = {}
+    for N in [1, 5, 10, 20]:
+        m9_delta, stats = subspace_m9_fit_step(
+            model=model,
+            history=history,
+            active_names=active_names,
+            batch=dummy_batch,
+            loss_fn=dummy_loss,
+            selected_N=N,
+            fd_epsilon=1e-3,
+            fit_lr=0.1,
+            fit_steps=0,  # 0 steps to keep alpha=1.0 and beta1=beta2=0.0
+        )
+        flat_delta = flatten_tensor_dict(m9_delta)
+        norms[N] = flat_delta.norm().item()
+        
+    # Norm of speculative update should be exactly linear in N since beta1=beta2=0
+    assert math.isclose(norms[5], 5 * norms[1], rel_tol=1e-4)
+    assert math.isclose(norms[10], 10 * norms[1], rel_tol=1e-4)
+    assert math.isclose(norms[20], 20 * norms[1], rel_tol=1e-4)
+

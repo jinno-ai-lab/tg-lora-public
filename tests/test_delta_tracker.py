@@ -1,14 +1,14 @@
+import torch
 import math
 
-import torch
-
-from tg_lora.delta_tracker import (
+from src.tg_lora.delta_tracker import (
     DeltaTracker,
     _compute_stats,
     compute_mean_delta,
 )
 
-# --- compute_mean_delta (original function) ---
+
+# --- compute_mean_delta (historical name; now raw cycle delta) ---
 
 
 def test_compute_mean_delta():
@@ -18,7 +18,7 @@ def test_compute_mean_delta():
 
     delta = compute_mean_delta(after, before, K=K)
 
-    expected = torch.tensor([1.0, 1.0, 1.0])
+    expected = torch.tensor([5.0, 5.0, 5.0])
     assert torch.allclose(delta["w"], expected)
 
 

@@ -3,10 +3,10 @@ import re
 import torch
 import torch.nn as nn
 
-from tg_lora.layer_sampler import (
-    get_layer_indices,
-    get_num_layers,
+from src.tg_lora.layer_sampler import (
     select_active_layers,
+    get_num_layers,
+    get_layer_indices,
 )
 
 
@@ -179,6 +179,41 @@ def _make_tg_lora_config_dict(temperature: float = 1.0) -> dict:
             "layer_sample_temperature": temperature,
         },
     }
+
+
+class TestTemperatureParameterFlow:
+    """AC1: temperature flows config → TGLoRAParams → select_active_layers."""
+
+    def test_config_parses_temperature(self):
+        from src.training.config_schema import validate_config_data
+
+        cfg = validate_config_data(_make_tg_lora_config_dict(temperature=2.5))
+        assert cfg.tg_lora.layer_sample_temperature == 2.5
+
+    def test_temperature_reaches_select_active_layers(self):
+        """Verify the temperature value stored in TGLoRAParams is forwarded
+        to select_active_layers when using lisa_like_weighted strategy."""
+        from unittest.mock import patch
+
+        from src.training.config_schema import validate_config_data
+
+        cfg = validate_config_data(_make_tg_lora_config_dict(temperature=3.0))
+        model = FakeTransformerModel(12)
+        scores = {i: float(i) for i in range(12)}
+
+        with patch(
+            "src.tg_lora.layer_sampler._lisa_weighted", return_value=({""}, {0})
+        ) as mock_lw:
+            select_active_layers(
+                model,
+                strategy=cfg.tg_lora.active_layer_strategy,
+                layer_scores=scores,
+                temperature=cfg.tg_lora.layer_sample_temperature,
+            )
+            mock_lw.assert_called_once()
+            assert (
+                mock_lw.call_args[1].get("temperature", mock_lw.call_args[0][2]) == 3.0
+            )
 
 
 class TestTemperatureDistributionVariation:

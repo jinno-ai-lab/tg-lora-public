@@ -1,270 +1,193 @@
-from __future__ import annotations
+"""Tests for save_checkpoint, save/load_training_state, _sanitize_tensors."""
 
-import platform
+import logging
+from pathlib import Path
+from unittest.mock import MagicMock
 
-import pytest
 import torch
-import torch.nn as nn
 
-from tg_lora.checkpoint import load_checkpoint, save_checkpoint
-from tg_lora.config import TGLoraConfig
-from tg_lora.cycle_state import CycleState
-from tg_lora.delta_tracker import DeltaTracker
-from tg_lora.random_walk_controller import ControllerState, RandomWalkController
-from tg_lora.trajectory import TrajectoryAnalyzer, TrajectoryPoint
-from tg_lora.velocity import Velocity
-
-
-class _SimpleModel(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.linear = nn.Linear(4, 2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x)
+from src.tg_lora.cycle_state import CycleState
+from src.tg_lora.delta_tracker import DeltaTracker
+from src.tg_lora.random_walk_controller import ControllerState
+from src.tg_lora.velocity import Velocity
+from src.utils.checkpoint import (
+    TrainingState,
+    _sanitize_tensors,
+    load_training_state,
+    save_checkpoint,
+    save_training_state,
+)
 
 
-@pytest.fixture()
-def model():
-    return _SimpleModel()
+def _mock_model_and_tokenizer(tmp_path, file_count=3, save_pretrained_side_effect=None):
+    """Create mock model/tokenizer that write files into *save_dir*."""
+    model = MagicMock()
+
+    def _fake_save_pretrained(save_dir):
+        if save_pretrained_side_effect is not None:
+            save_pretrained_side_effect(save_dir)
+            return
+        d = Path(save_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        for i in range(file_count):
+            (d / f"weight_{i}.bin").write_bytes(b"\x00")
+
+    model.save_pretrained = _fake_save_pretrained
+
+    tokenizer = MagicMock()
+
+    def _fake_tok_save(save_dir):
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        (Path(save_dir) / "tokenizer.json").write_text("{}")
+
+    tokenizer.save_pretrained = _fake_tok_save
+    return model, tokenizer
 
 
-@pytest.fixture()
-def optimizer(model):
-    return torch.optim.Adam(model.parameters(), lr=1e-3)
+class TestSaveCheckpointNormal:
+    def test_creates_directory(self, tmp_path):
+        model, tokenizer = _mock_model_and_tokenizer(tmp_path, file_count=2)
+        save_dir = tmp_path / "output"
+        save_checkpoint(model, tokenizer, save_dir)
+        assert save_dir.is_dir()
+
+    def test_directory_contains_files(self, tmp_path):
+        model, tokenizer = _mock_model_and_tokenizer(tmp_path, file_count=3)
+        save_dir = tmp_path / "output"
+        save_checkpoint(model, tokenizer, save_dir)
+        files = list(save_dir.iterdir())
+        assert len(files) >= 1
+
+    def test_creates_parent_directories(self, tmp_path):
+        model, tokenizer = _mock_model_and_tokenizer(tmp_path, file_count=1)
+        save_dir = tmp_path / "deep" / "nested" / "dir"
+        save_checkpoint(model, tokenizer, save_dir)
+        assert save_dir.is_dir()
 
 
-@pytest.fixture()
-def config():
-    return TGLoraConfig(K_initial=2, N_initial=3, max_steps=10)
+class TestSaveCheckpointReadbackVerification:
+    def test_no_warning_on_successful_save(self, tmp_path, caplog):
+        model, tokenizer = _mock_model_and_tokenizer(tmp_path, file_count=3)
+        save_dir = tmp_path / "output"
+        with caplog.at_level(logging.WARNING, logger="src.utils.checkpoint"):
+            save_checkpoint(model, tokenizer, save_dir)
+        checkpoint_warnings = [
+            r for r in caplog.records if "checkpoint" in r.message.lower()
+        ]
+        assert checkpoint_warnings == []
+
+    def test_warning_when_directory_empty(self, tmp_path, caplog):
+        """save_pretrained leaves an empty directory → warning logged."""
+
+        def _save_empty(save_dir):
+            Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+        model = MagicMock()
+        model.save_pretrained = _save_empty
+        tokenizer = MagicMock()
+        tokenizer.save_pretrained = lambda d: None
+
+        save_dir = tmp_path / "empty_ckpt"
+        with caplog.at_level(logging.WARNING, logger="src.utils.checkpoint"):
+            save_checkpoint(model, tokenizer, save_dir)
+        assert any("checkpoint" in r.message.lower() for r in caplog.records)
+
+    def test_warning_when_directory_missing(self, tmp_path, caplog):
+        """save_pretrained does not create directory → warning logged."""
+        model = MagicMock()
+        model.save_pretrained = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.save_pretrained = MagicMock()
+
+        save_dir = tmp_path / "missing_ckpt"
+        with caplog.at_level(logging.WARNING, logger="src.utils.checkpoint"):
+            save_checkpoint(model, tokenizer, save_dir)
+        assert any("checkpoint" in r.message.lower() for r in caplog.records)
 
 
-@pytest.fixture()
-def tmp_ckpt_path(tmp_path):
-    return tmp_path / "test_checkpoint.pt"
+class TestSaveCheckpointExistingDir:
+    def test_works_with_preexisting_directory(self, tmp_path):
+        save_dir = tmp_path / "existing"
+        save_dir.mkdir()
+        model, tokenizer = _mock_model_and_tokenizer(tmp_path, file_count=1)
+        save_checkpoint(model, tokenizer, save_dir)
+        files = list(save_dir.iterdir())
+        assert len(files) >= 1
 
 
-class TestSaveLoadRoundTrip:
-    def test_model_state_dict_round_trip(self, model, optimizer, config, tmp_ckpt_path):
-        original_sd = {k: v.clone() for k, v in model.state_dict().items()}
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config)
-        loaded = load_checkpoint(tmp_ckpt_path)
-        assert set(loaded["model_state_dict"].keys()) == set(original_sd.keys())
-        for k in original_sd:
-            assert torch.equal(loaded["model_state_dict"][k].cpu(), original_sd[k].cpu())
+class TestTrainingStateRoundtrip:
+    """TC-209-01: save_training_state→load_training_state round-trip."""
 
-    def test_optimizer_state_dict_round_trip(self, model, optimizer, config, tmp_ckpt_path):
-        x = torch.randn(2, 4)
-        loss = model(x).sum()
-        loss.backward()
-        optimizer.step()
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config)
-        loaded = load_checkpoint(tmp_ckpt_path)
-        assert isinstance(loaded["optimizer_state_dict"], dict)
-        assert "state" in loaded["optimizer_state_dict"]
-        assert "param_groups" in loaded["optimizer_state_dict"]
-
-    def test_config_round_trip(self, model, optimizer, config, tmp_ckpt_path):
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config)
-        loaded = load_checkpoint(tmp_ckpt_path)
-        restored = TGLoraConfig(**loaded["config"])
-        assert restored.to_dict() == config.to_dict()
-
-    def test_full_round_trip_with_all_components(self, model, optimizer, config, tmp_ckpt_path):
-        controller = RandomWalkController(K_initial=2, N_initial=3)
-        cycle_state = CycleState(cycle=5, accepted_count=3, rejected_count=2)
-        delta_tracker = DeltaTracker()
-        velocity = Velocity()
-        trajectory = TrajectoryAnalyzer()
-        trajectory.add_point(TrajectoryPoint(cycle=0, train_loss=1.0, valid_loss=0.9))
-
-        before = {"layer.0.lora_A": torch.randn(4, 4), "layer.0.lora_B": torch.randn(4, 4)}
-        after = {"layer.0.lora_A": torch.randn(4, 4), "layer.0.lora_B": torch.randn(4, 4)}
-        delta = delta_tracker.compute_and_record(after, before, K=2)
-        velocity.update(delta, beta=0.9)
-
-        extra = {"custom_key": "custom_value", "step_count": 42}
-        save_checkpoint(
-            tmp_ckpt_path, model, optimizer, config,
-            controller=controller, cycle_state=cycle_state,
-            delta_tracker=delta_tracker, velocity=velocity,
-            trajectory=trajectory, extra=extra,
+    def _make_state(self) -> TrainingState:
+        cs = CycleState(cycle=5, full_backward_passes=30, best_loss=2.5)
+        ctrl = ControllerState(
+            K=3,
+            N=5,
+            alpha=0.3,
+            beta=0.8,
+            lr=5e-4,
+            active_layer_strategy="last_25_percent_plus_random_2",
+            relative_update_cap=0.005,
         )
-        loaded = load_checkpoint(tmp_ckpt_path)
-
-        assert loaded["controller_summary"] is not None
-        assert loaded["controller_summary"]["current_K"] == 2
-        assert loaded["controller_summary"]["current_N"] == 3
-
-        assert loaded["cycle_state_summary"] is not None
-        assert loaded["cycle_state_summary"]["cycles"] == 5
-        assert loaded["cycle_state_summary"]["accepted_count"] == 3
-
-        assert loaded["delta_tracker_state"] is not None
-        assert "norms" in loaded["delta_tracker_state"]
-        assert "last_stats" in loaded["delta_tracker_state"]
-
-        assert loaded["velocity_state"] is not None
-        assert "state" in loaded["velocity_state"]
-        assert "magnitudes" in loaded["velocity_state"]
-
-        assert loaded["trajectory_points"] is not None
-        assert len(loaded["trajectory_points"]) == 1
-        assert loaded["trajectory_points"][0]["cycle"] == 0
-        assert loaded["trajectory_points"][0]["train_loss"] == 1.0
-
-        assert loaded["extra"] == extra
-
-
-class TestAtomicWrite:
-    def test_atomic_write_creates_valid_file(self, model, optimizer, config, tmp_ckpt_path):
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config)
-        assert tmp_ckpt_path.exists()
-        loaded = load_checkpoint(tmp_ckpt_path)
-        assert loaded["version"] == "0.1.0"
-
-    def test_interrupted_write_does_not_corrupt_existing(self, model, optimizer, config, tmp_ckpt_path):
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config)
-        original = load_checkpoint(tmp_ckpt_path)
-        tmp_file = tmp_ckpt_path.parent / ".ckpt_tmp_partial.pt"
-        tmp_file.write_bytes(b"corrupted data that is not a valid checkpoint")
-        try:
-            tmp_file.rename(tmp_ckpt_path)
-        except OSError:
-            pass
-        try:
-            load_checkpoint(tmp_ckpt_path)
-        except Exception:
-            pass
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config)
-        restored = load_checkpoint(tmp_ckpt_path)
-        for k in original["model_state_dict"]:
-            assert torch.equal(
-                restored["model_state_dict"][k].cpu(),
-                original["model_state_dict"][k].cpu(),
-            )
-
-
-class TestMetadata:
-    def test_metadata_fields(self, model, optimizer, config, tmp_ckpt_path):
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config)
-        loaded = load_checkpoint(tmp_ckpt_path)
-        meta = loaded["metadata"]
-        assert meta["tg_lora_version"] == "0.1.0"
-        assert meta["python_version"] == platform.python_version()
-        assert len(meta["torch_version"]) > 0
-        assert meta["platform"] == platform.system().lower() or isinstance(meta["platform"], str)
-
-    def test_timestamp_is_iso_format(self, model, optimizer, config, tmp_ckpt_path):
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config)
-        loaded = load_checkpoint(tmp_ckpt_path)
-        ts = loaded["timestamp"]
-        assert isinstance(ts, str)
-        assert "T" in ts
-
-    def test_version_present(self, model, optimizer, config, tmp_ckpt_path):
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config)
-        loaded = load_checkpoint(tmp_ckpt_path)
-        assert loaded["version"] == "0.1.0"
-
-
-class TestComponentReconstruction:
-    def test_controller_state_reconstruction(self, model, optimizer, config, tmp_ckpt_path):
-        controller = RandomWalkController(K_initial=5, N_initial=10, alpha_initial=0.5)
-        controller.state.total_cycles = 20
-        controller.state.accepted_count = 15
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config, controller=controller)
-        loaded = load_checkpoint(tmp_ckpt_path)
-        summary = loaded["controller_summary"]
-        assert summary["current_K"] == 5
-        assert summary["current_N"] == 10
-        assert summary["current_alpha"] == 0.5
-        assert summary["total_cycles"] == 20
-        assert summary["accepted"] == 15
-        restored_state = ControllerState(
-            K=summary["current_K"],
-            N=summary["current_N"],
-            alpha=summary["current_alpha"],
-            beta=summary["current_beta"],
-            lr=summary["current_lr"],
-            active_layer_strategy=summary["strategy"],
-            relative_update_cap=controller.state.relative_update_cap,
-            total_cycles=summary["total_cycles"],
-            accepted_count=summary["accepted"],
-            rolled_back_count=summary["rolled_back"],
+        vel = Velocity(max_history=100)
+        vel.update({"lora_A": torch.tensor([1.0, 2.0])}, beta=0.8)
+        vel.update({"lora_A": torch.tensor([1.0, 2.0])}, beta=0.8)
+        dt = DeltaTracker(max_history=50)
+        dt._history = [{"w": torch.tensor([0.1, 0.2])}]
+        dt._norm_history = [0.224]
+        return TrainingState(
+            cycle_state=cs,
+            controller_state=ctrl,
+            velocity=vel,
+            delta_tracker=dt,
+            cycle_offset=3,
+            train_batch_position=17,
+            accepted_valid_history=[2.9, 2.5, 2.1],
         )
-        new_controller = RandomWalkController.__new__(RandomWalkController)
-        new_controller.restore_state(restored_state)
-        assert new_controller.state.K == 5
-        assert new_controller.state.N == 10
 
-    def test_cycle_state_reconstruction(self, model, optimizer, config, tmp_ckpt_path):
-        cs = CycleState(cycle=10, optimizer_steps=30, accepted_count=7, rejected_count=3, best_loss=0.5)
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config, cycle_state=cs)
-        loaded = load_checkpoint(tmp_ckpt_path)
-        restored = CycleState.from_dict(loaded["cycle_state_summary"])
-        assert restored.cycle == 10
-        assert restored.optimizer_steps == 30
-        assert restored.accepted_count == 7
-        assert restored.rejected_count == 3
+    def test_roundtrip_preserves_values(self, tmp_path):
+        state = self._make_state()
+        path = tmp_path / "state.pt"
+        save_training_state(state, path)
+        loaded = load_training_state(path)
 
-    def test_velocity_tensors_on_cpu(self, model, optimizer, config, tmp_ckpt_path):
-        velocity = Velocity()
-        delta = {"layer.0.weight": torch.randn(4, 4)}
-        velocity.update(delta, beta=0.9)
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config, velocity=velocity)
-        loaded = load_checkpoint(tmp_ckpt_path)
-        for k, v in loaded["velocity_state"]["state"].items():
-            assert v.device == torch.device("cpu")
-
-    def test_trajectory_reconstruction(self, model, optimizer, config, tmp_ckpt_path):
-        trajectory = TrajectoryAnalyzer()
-        trajectory.add_point(TrajectoryPoint(cycle=0, train_loss=2.0, valid_loss=1.8))
-        trajectory.add_point(TrajectoryPoint(cycle=1, train_loss=1.5, valid_loss=1.3, velocity_magnitude=0.1))
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config, trajectory=trajectory)
-        loaded = load_checkpoint(tmp_ckpt_path)
-        pts = loaded["trajectory_points"]
-        assert len(pts) == 2
-        assert pts[0]["cycle"] == 0
-        assert pts[0]["train_loss"] == 2.0
-        assert pts[0]["valid_loss"] == 1.8
-        assert pts[1]["velocity_magnitude"] == 0.1
+        assert loaded.cycle_offset == 3
+        assert loaded.train_batch_position == 17
+        assert loaded.accepted_valid_history == [2.9, 2.5, 2.1]
+        assert loaded.cycle_state.cycle == 5
+        assert loaded.cycle_state.best_loss == 2.5
+        assert loaded.controller_state.K == 3
+        assert loaded.controller_state.alpha == 0.3
+        assert loaded.velocity._state is not None
+        assert torch.allclose(
+            loaded.velocity._state["lora_A"], torch.tensor([1.0, 2.0])
+        )
+        assert loaded.velocity.short_state is not None
+        assert loaded.velocity.long_state is not None
+        assert loaded.velocity.update_count == state.velocity.update_count
+        assert (
+            loaded.velocity.predicted_consistency()
+            == state.velocity.predicted_consistency()
+        )
+        assert loaded.delta_tracker.norm_history == state.delta_tracker.norm_history
 
 
-class TestMissingOptionalComponents:
-    def test_no_optional_components(self, model, optimizer, config, tmp_ckpt_path):
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config)
-        loaded = load_checkpoint(tmp_ckpt_path)
-        assert loaded["controller_summary"] is None
-        assert loaded["cycle_state_summary"] is None
-        assert loaded["delta_tracker_state"] is None
-        assert loaded["velocity_state"] is None
-        assert loaded["trajectory_points"] is None
-        assert loaded["extra"] is None
+class TestSanitizeTensors:
+    """TC-209-02: _sanitize_tensors replaces NaN/Inf with zeros."""
 
-    def test_partial_components(self, model, optimizer, config, tmp_ckpt_path):
-        cs = CycleState(cycle=3)
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config, cycle_state=cs)
-        loaded = load_checkpoint(tmp_ckpt_path)
-        assert loaded["controller_summary"] is None
-        assert loaded["cycle_state_summary"] is not None
-        assert loaded["velocity_state"] is None
+    def test_sanitize_replaces_nan_and_inf(self):
+        d = {
+            "a": torch.tensor([1.0, float("nan"), 3.0]),
+            "b": torch.tensor([float("inf"), 2.0, float("-inf")]),
+            "c": torch.tensor([1.0, 2.0, 3.0]),
+        }
+        _sanitize_tensors(d, "test")
+        assert torch.isfinite(d["a"]).all()
+        assert torch.isfinite(d["b"]).all()
+        assert d["c"].equal(torch.tensor([1.0, 2.0, 3.0]))
 
-
-class TestFileNotFound:
-    def test_missing_file_raises(self):
-        with pytest.raises(FileNotFoundError, match="Checkpoint not found"):
-            load_checkpoint("/nonexistent/path/checkpoint.pt")
-
-    def test_missing_file_error_message_contains_path(self):
-        bad_path = "/tmp/this_does_not_exist_abc123.pt"
-        with pytest.raises(FileNotFoundError, match="this_does_not_exist_abc123"):
-            load_checkpoint(bad_path)
-
-
-class TestCpuPortability:
-    def test_model_state_dict_on_cpu(self, model, optimizer, config, tmp_ckpt_path):
-        save_checkpoint(tmp_ckpt_path, model, optimizer, config)
-        loaded = load_checkpoint(tmp_ckpt_path)
-        for v in loaded["model_state_dict"].values():
-            assert v.device == torch.device("cpu")
+    def test_sanitize_logs_warning(self, caplog):
+        d = {"x": torch.tensor([float("nan")])}
+        with caplog.at_level(logging.WARNING, logger="src.utils.checkpoint"):
+            _sanitize_tensors(d, "my_label")
+        assert any("my_label" in r.message for r in caplog.records)
