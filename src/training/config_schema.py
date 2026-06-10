@@ -323,6 +323,11 @@ class TGLoRAParams(BaseModel):
     activation_regime_transition_drop_z: float = Field(default=2.0, gt=0.0)
     activation_regime_min_history: int = Field(default=3, ge=1)
 
+    # Progressive Freezing (Phase 1 gate)
+    progressive_freeze_enabled: bool = False
+    progressive_freeze_start_cycle: int = Field(default=3, ge=1)
+    progressive_freeze_layer: str = "last_active"
+
     @model_validator(mode="after")
     def psa_m9_exclusive(self) -> "TGLoRAParams":
         if self.enable_psa and self.subspace_m9_enabled:

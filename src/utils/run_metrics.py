@@ -217,6 +217,15 @@ class RunMetrics:
                     "tg_lora_warmup_release_count": _cfg_value(
                         tg_lora, "warmup_release_count"
                     ),
+                    "progressive_freeze_enabled": _cfg_value(
+                        tg_lora, "progressive_freeze_enabled", False
+                    ),
+                    "progressive_freeze_start_cycle": _cfg_value(
+                        tg_lora, "progressive_freeze_start_cycle"
+                    ),
+                    "progressive_freeze_layer": _cfg_value(
+                        tg_lora, "progressive_freeze_layer", "last_active"
+                    ),
                 }
             )
         if alpha_line is not None:

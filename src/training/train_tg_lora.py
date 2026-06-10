@@ -1146,6 +1146,21 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     batch_iter = InfiniteBatchIterator(train_loader, input_device)
     activation_cache = ActivationCache()
     num_decoder_layers = get_num_layers(model)
+
+    # Progressive freeze controller (Phase 1 gate)
+    progressive_freeze: ProgressiveFreezeController | None = None
+    if tg_cfg.get("progressive_freeze_enabled", False):
+        progressive_freeze = ProgressiveFreezeController(
+            start_cycle=int(tg_cfg.get("progressive_freeze_start_cycle", 3)),
+            freeze_layer=tg_cfg.get("progressive_freeze_layer", "last_active"),
+            active_layer_indices=fixed_active_indices,
+        )
+        logger.info(
+            "Progressive freeze enabled: start_cycle=%d layer=%s active=%s",
+            progressive_freeze._start_cycle,
+            tg_cfg.get("progressive_freeze_layer", "last_active"),
+            sorted(fixed_active_indices),
+        )
     train_batch_position = 0
 
     cycle_state = CycleState()
@@ -1336,6 +1351,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     psa_regime_reset_enabled = True
     if bool(tg_cfg.get("enable_psa", False)):
         from src.tg_lora.psa import PSAPrior, amplify_gradients_psa, summarize_by_layer_type
+        from src.tg_lora.progressive_freeze import ProgressiveFreezeController
         from src.tg_lora.regime import RegimeDetector
         psa_regime_reset_enabled = bool(tg_cfg.get("psa_regime_reset_enabled", True))
         psa_prior = PSAPrior(
@@ -1544,10 +1560,33 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
             # 2. Pilot前snapshot
             W0 = snapshot_lora(model)
 
+            # --- Progressive Freeze Gate (Phase 1) ---
+            # After W0 snapshot (includes target layer) and before pilot steps.
+            # On trigger: capture xin, freeze layer. Subsequent cycles skip this block.
+            if progressive_freeze is not None and progressive_freeze.should_freeze(cycle):
+                model.train()
+                _, pf_xin_shape = progressive_freeze.cache_xin(
+                    model, valid_quick_loader, input_device,
+                )
+                pf_result = progressive_freeze.apply_freeze(model)
+                logger.info(
+                    "Progressive freeze: cycle=%d layer=%d params=%d xin_shape=%s",
+                    cycle,
+                    pf_result.frozen_layer_idx,
+                    pf_result.num_frozen_params,
+                    pf_xin_shape,
+                )
+
             # 2b. Measurement: noise SNR (multiple independent batch gradients at W0)
             _measurement_noise = cfg.training.get("measurement_noise_samples", 0)
             _measurement_results = {}
             _measurement_results_record = {}
+            if progressive_freeze is not None:
+                _measurement_results_record["pf_active"] = progressive_freeze.is_frozen
+                if progressive_freeze.frozen_layer_idx is not None:
+                    _measurement_results_record["pf_layer"] = (
+                        progressive_freeze.frozen_layer_idx
+                    )
             if _measurement_noise > 0:
                 _noise_grads = []
                 _noise_losses = []
@@ -3832,6 +3871,13 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
         summary["async_cache_swap_cycle_valid_quick"] = swap_cycle_vq
     if swap_cycle_vf is not None:
         summary["async_cache_swap_cycle_valid_full"] = swap_cycle_vf
+
+    if progressive_freeze is not None:
+        summary["progressive_freeze"] = {
+            "enabled": True,
+            "frozen_layer": progressive_freeze.frozen_layer_idx,
+            "start_cycle": progressive_freeze._start_cycle,
+        }
 
     if fault_reason is not None:
         summary["status"] = "failed"
