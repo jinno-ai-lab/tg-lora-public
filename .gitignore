@@ -1,35 +1,101 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
 *.egg-info/
 dist/
 build/
 .eggs/
-*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data (large files)
+data/
+
+# Experiment outputs
+runs/
+reports/
+!reports/model_inspection.json
+
+# MLflow
+mlruns/
+mlflow.db
+
+# Model checkpoints
+*.gguf
+*.safetensors
+*.bin
+checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Type checking
+.mypy_cache/
+
+# Pytest
 .pytest_cache/
-.ruff_cache/
 .coverage
 htmlcov/
-.venv/
 
-# Weights, cache, and evaluation reports (not to be committed to the public repo)
-runs/
-.cache/
-reports/
+# Offload
+offload/
 
-# Tool-specific configs
-.antigravitycli/
+# wandb
+wandb/
 
-.extract_skill_meta/
-
-.spine_briefs/
+# LLM-generated wiki (auto-generated, not deliverable); keep log.md tracked
+docs/llm-wiki/*
+!docs/llm-wiki/log.md
 
 # AI execution artifacts
 .task-prompt*.md
 .cleanup-prompt.md
+.spine_briefs/
+.extract_skill_meta/
+
+# Persistent caches (prefix feature cache blobs, etc.)
+.cache/
+
+# Runtime state (not deliverables)
 .audit/
+observations/
+worktrees/
+runs_eval/
 data/workspace_state/
 data/alternating_loop/
 data/dynamic_loop/
-runs_eval/
-observations/
-worktrees/
+data_mlx/
+
+# Misc
+*.log
+.env
+MagicMock/
+
+# Goal executor runtime artifacts
+.endress_execute_to_goal/
+
+# Antigravity CLI artifacts
+.antigravitycli/
+.claude/
+# === goaldev runtime artifacts ===
+.goal_driven_parallel_dev/
+docs/MEMO.txt
+
+# Paper experiment artifacts (258MB+; keep only summaries and README)
+paper_evidence/*
+!paper_evidence/README.md
+!paper_evidence/*/aggregate_summary.md
+!paper_evidence/*/aggregate_summary.json
+!paper_evidence/*/version_metadata.json
+!paper_evidence/*/config.yaml
