@@ -14,6 +14,7 @@
 8.  [06_experiment_protocol.md](file:///home/jinno/tg-lora/docs/design/06_experiment_protocol.md): 本番実験 (Seed 42,43,44) の公平性比較プロトコル
 9.  [07_design_decisions_log.md](file:///home/jinno/tg-lora/docs/design/07_design_decisions_log.md): アーキテクチャの発展史と過去の設計決定の履歴
 10. [08_claims_and_evidence_map.md](file:///home/jinno/tg-lora/docs/design/08_claims_and_evidence_map.md): 論文の主張とそれを支える証拠の対応マッピング
+11. [10_progressive_freezing.md](10_progressive_freezing.md): Progressive Freezing + Activation Matching の設計と原理説明
 
 ---
 
