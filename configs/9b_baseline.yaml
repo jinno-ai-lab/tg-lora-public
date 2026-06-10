@@ -1,0 +1,50 @@
+experiment:
+  name: qlora_9b_baseline
+  seed: 42
+
+model:
+  name_or_path: Qwen/Qwen3.5-9B
+  dtype: bfloat16
+  load_in_4bit: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_compute_dtype: bfloat16
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: all-linear
+
+data:
+  train_path: data/train.jsonl
+  valid_quick_path: data/valid_quick.jsonl
+  valid_full_path: data/valid_full.jsonl
+  gold_test_path: data/gold_test.jsonl
+  max_seq_len: 1024 # default for 12GB-class CUDA GPUs on this machine
+
+training:
+  batch_size: 1
+  grad_accumulation: 8
+  learning_rate: 2.0e-4
+  weight_decay: 0.0
+  max_steps: 1500
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  warmup_steps: 50
+  schedule_type: linear
+  save_every_steps: 250
+  early_stopping_patience: null
+  min_steps_before_stop: 100
+
+eval:
+  quick_eval_examples: 64
+  full_eval_every_steps: 250
+
+logging:
+  backend: mlflow
+  log_every_steps: 10
+  run_dir: runs/${experiment.name}
+  mlflow:
+    enabled: true
+    tracking_uri: ""
+    experiment_name: ""

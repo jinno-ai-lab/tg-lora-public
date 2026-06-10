@@ -1,0 +1,26 @@
+# Paper Experiment Plan
+# Define all experiment parameters, configurations, seeds, evaluation targets,
+# and down-stream manuscript builds to manage the paper pipeline end-to-end.
+
+experiment_plan:
+  experiment_id: "paper_memory_one_shot_suite"
+  type: "paper-memory"
+  seeds: [42, 43, 44]
+  baseline_config: "configs/9b_baseline_suffix_only_last25.yaml"
+  tg_config: "configs/9b_tg_lora_prefix_feature_cache_one_shot_poc.yaml"
+  cache_base: ".cache/prefix_feature_cache_paper_suite_one_shot"
+  
+  parameters:
+    target_bp: 240
+    max_seq_len: 1024
+    quick_eval_examples: 32
+    eval_points: 3
+    mlflow_enabled: false
+    
+  evaluation:
+    run_external_eval: true
+    tasks: ["arc_easy", "hellaswag", "truthfulqa_mc2"]
+    
+  scholar:
+    compile_pdf: true
+    project: "tg_lora_paper_001"

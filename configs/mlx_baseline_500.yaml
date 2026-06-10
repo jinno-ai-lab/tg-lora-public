@@ -1,0 +1,32 @@
+# MLX QLoRA baseline 500-step run (extended from stable config)
+model: .cache/mlx_models/Qwen--Qwen3.5-9B
+data: data_mlx
+train: true
+iters: 500
+num_layers: 32
+batch_size: 1
+grad_accumulation_steps: 8
+max_seq_length: 2048
+seed: 42
+grad_checkpoint: true
+optimizer: adamw
+learning_rate: 1.0e-4
+lr_schedule:
+  name: cosine_decay
+  arguments:
+    - 1.0e-4
+    - 500
+  warmup: 20
+  warmup_init: 0.0
+optimizer_config:
+  adamw:
+    weight_decay: 0.01
+max_grad_norm: 1.0
+clear_cache_threshold: 8589934592
+wired_limit_ratio: 0.8
+memory_limit_ratio: 0.8
+cache_limit_ratio: 0.15
+steps_per_report: 10
+steps_per_eval: 50
+save_every: 100
+adapter_path: runs/mlx_qlora_baseline_500

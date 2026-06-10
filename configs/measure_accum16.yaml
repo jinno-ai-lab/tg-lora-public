@@ -1,0 +1,91 @@
+experiment:
+  name: measure_accum16
+  seed: 42
+
+model:
+  name_or_path: Qwen/Qwen3.5-9B
+  dtype: bfloat16
+  load_in_4bit: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_compute_dtype: bfloat16
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules: all-linear
+
+data:
+  train_path: data/train.jsonl
+  valid_quick_path: data/valid_quick.jsonl
+  valid_full_path: data/valid_full.jsonl
+  gold_test_path: data/gold_test.jsonl
+  max_seq_len: 1024
+
+training:
+  batch_size: 1
+  grad_accumulation: 16
+  learning_rate: 2.0e-4
+  weight_decay: 0.0
+  max_cycles: 20
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  optimizer_lifecycle: recreate_per_cycle
+  schedule_type: linear
+  trainable_lora_scope: last_25_percent
+  measurement_noise_samples: 4
+  measurement_save_per_step_deltas: true
+  prefix_feature_cache_experimental: false
+  prefix_feature_cache_train: false
+  prefix_feature_cache_valid_quick: false
+  prefix_feature_cache_valid_full: false
+
+tg_lora:
+  K_initial: 3
+  K_candidates: [3]
+  N_initial: 1
+  N_candidates: [1]
+  alpha_initial: 0.3
+  alpha_min: 0.03
+  alpha_max: 1.5
+  alpha_log_sigma: 0.15
+  beta_initial: 0.8
+  beta_candidates: [0.8]
+  lr_initial: 0.0005
+  lr_min: 1.0e-5
+  lr_max: 0.001
+  lr_accept_boost: 1.05
+  lr_reject_decay: 0.5
+  relative_update_cap: 0.005
+  active_layer_strategy: last_25_percent
+  random_middle_layers: 2
+  layer_sample_temperature: 1.0
+  force_top_layers_only: true
+  enable_random_walk: false
+  enable_convergence_adaptation: false
+  confident_skip_cos: 0.0
+  confident_skip_min_cycles: 10
+  cosine_n_selection_enabled: false
+  subspace_zo_enabled: false
+  subspace_m9_enabled: false
+  warmup_release_cos: 0.0
+  warmup_release_count: 1
+  validation_skip_enabled: false
+  linearity_guard_enabled: false
+  shadow_extrapolation_enabled: false
+  accept_after_sgd_steps: 0
+
+eval:
+  quick_eval_examples: 32
+  full_eval_every_cycles: 100
+  rollback_tolerance: 0.005
+  moving_avg_window: 3
+  eval_batch_size: 1
+
+logging:
+  backend: mlflow
+  log_every_cycles: 1
+  save_every_cycles: 100
+  run_dir: runs/measure_accum16
+  mlflow:
+    enabled: false

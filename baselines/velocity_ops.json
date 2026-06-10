@@ -1,0 +1,21 @@
+{
+  "iterations": 50,
+  "velocity_ema": {
+    "velocity_ema_time_ms": 4.5,
+    "velocity_ema_per_iter_ms": 0.09,
+    "velocity_ema_mem_delta_kb": 3572.0,
+    "velocity_ema_iterations": 50
+  },
+  "cap_update": {
+    "cap_update_time_ms": 125.0,
+    "cap_update_per_iter_ms": 2.5,
+    "cap_update_mem_delta_kb": 11864.0,
+    "cap_update_nocap_time_ms": 120.0,
+    "cap_update_nocap_per_iter_ms": 2.35,
+    "cap_update_iterations": 50,
+    "cap_update_tensor_shape": [
+      1024,
+      1024
+    ]
+  }
+}
