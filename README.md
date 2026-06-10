@@ -1,184 +1,107 @@
-# TG-LoRA
+# TG-LoRA: Tangent-Gradient LoRA
 
-Velocity-based extrapolation for efficient LoRA fine-tuning.
-
-TG-LoRA reduces backward-pass cost by predicting future LoRA weight updates from a running velocity (exponential moving average of past deltas). After a short pilot phase of K real gradient steps, it extrapolates N additional "free" steps — then accepts or rolls back based on validation loss.
-
-## Install
-
-```bash
-pip install -e .
-```
-
-Requires Python 3.11+, PyTorch, and a CUDA GPU.
-
-## Algorithm
-
-Each **cycle** repeats:
-
-```
-1. Propose (K, N, alpha, beta, lr)     ← controller
-2. Snapshot W0
-3. Run K real optimizer steps → WK
-4. Compute delta dW = WK − W0
-5. Update velocity v ← EMA(v, dW, beta)
-6. Eval → loss_pilot
-7. Extrapolate: W ← WK + N × alpha × v   (active layers only)
-8. Eval → loss_after
-9. If loss_after ≤ loss_pilot + tol → accept, reward
-   Else → rollback to WK, penalize
-```
-
-The **reduction rate** measures how many backward passes were replaced by cheap extrapolation:
-
-```
-reduction_rate = 1 − (real_backward_passes / total_equivalent_passes)
-```
+勾配速度ベクトルの外挿によるLoRA学習効率化手法。
 
 ## Quick Start
 
-```python
-import torch
-from tg_lora import (
-    RandomWalkController,
-    Velocity,
-    RollbackManager,
-    DeltaTracker,
-    CycleState,
-    apply_extrapolation,
-    select_active_layers,
-    snapshot_lora,
-)
+```bash
+# 環境セットアップ
+make install
 
-# Set up controller, velocity tracker, rollback manager
-controller = RandomWalkController(K_initial=3, N_initial=5, alpha_initial=0.3, beta_initial=0.8)
-velocity = Velocity()
-rollback = RollbackManager()
-delta_tracker = DeltaTracker()
-cycle_state = CycleState()
+# 公開データセットのダウンロードと前処理
+make download-data
+make prepare-data
 
-for cycle in range(max_cycles):
-    proposal = controller.propose()   # (K, N, alpha, beta, lr)
+# この 12GB CUDA マシンの標準既定値は 1024 token
+# Apple Silicon の MLX 導線は 2048 token 既定
 
-    # 1. Snapshot before pilot
-    W0 = snapshot_lora(model)
+# ベースライン学習
+make train-baseline
 
-    # 2. K real optimizer steps
-    optimizer = torch.optim.AdamW(trainable_params, lr=proposal.lr)
-    for _ in range(proposal.K):
-        loss = forward_backward(model, batch)
-        optimizer.step()
+# TG-LoRA学習
+make train-tg-lora
 
-    # 3. Compute delta and update velocity
-    WK = snapshot_lora(model)
-    dW = delta_tracker.compute_and_record(WK, W0, K=proposal.K)
-    velocity.update(dW, beta=proposal.beta)
-
-    # 4. Eval pilot
-    loss_pilot = eval_loss(model, valid_loader)
-
-    # 5. Save rollback point, then extrapolate
-    rollback.save(model)
-    active_names, _ = select_active_layers(model, strategy="last_25_percent")
-    apply_extrapolation(model, velocity.state, active_names,
-                        default_alpha=proposal.alpha, n_steps=proposal.N)
-
-    # 6. Eval after extrapolation
-    loss_after = eval_loss(model, valid_loader)
-
-    # 7. Accept or rollback
-    if loss_after <= loss_pilot + tolerance:
-        controller.reward(loss_pilot, loss_after)
-    else:
-        rollback.rollback(model)
-        controller.penalize(loss_pilot, loss_after)
+# 評価
+make eval
 ```
 
-## Key Hyperparameters
+## アルゴリズム概要
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `K` | 3 | Real optimizer steps per cycle (pilot phase) |
-| `N` | 5 | Extrapolation steps after pilot |
-| `alpha` | 0.3 | Extrapolation step size |
-| `beta` | 0.8 | EMA momentum for velocity |
-| `relative_update_cap` | 0.005 | Max extrapolation magnitude relative to weight norm |
-| `rollback_tolerance` | 0.005 | Accept loss increase up to this relative threshold |
+TG-LoRAは標準LoRA学習に以下を追加する:
 
-The `RandomWalkController` adapts K, N, alpha, beta, and lr across cycles based on accept/reject history. Set `enable_random_walk=False` for fixed hyperparameters.
+1. **Velocity Tracking** — LoRA重み更新の速度ベクトルを追跡
+2. **Extrapolation** — 速度から次ステップの重みを外挿予測
+3. **Layer Sampling** — 重要度に応じてレイヤーをサンプリング
+4. **Rollback** — 学習不安定時に自動ロールバック
+5. **Adaptive Control (Optional)** — ランダムウォークや収束適応でK, N, alpha, beta, lrを探索的に動かせる
 
-## Layer Sampling Strategies
+## Experiment Surfaces
 
-| Strategy | Description |
-|----------|-------------|
-| `last_25_percent` | Extrapolate only the last 25% of decoder layers |
-| `last_25_percent_plus_random_2` | Last 25% + 2 random middle layers (default) |
-| `middle_random` | Random 1/3 of all layers |
-| `lisa_like_weighted` | Score-based weighted sampling |
+- `configs/9b_tg_lora.yaml`: current mainline。deterministic な paper-PoC 既定設定。
+- `configs/9b_tg_lora_paper_poc.yaml`: paper-PoC の固定名コピー。比較実験で moving target を避けたい時に使う。
+- `configs/9b_tg_lora_adaptive_k5.yaml`: historical adaptive branch。`enable_random_walk=true`、`K_initial=5`、ランダム層戦略あり。
+- `configs/9b_tg_lora_adaptive_k5_no_conv.yaml`: adaptive branch から `enable_convergence_adaptation` だけを切った ablation 用設定。
+- `configs/9b_tg_lora_optimizer_reuse_experimental.yaml`: optimizer を再生成せず、AdamW state を in-place zero reset して再利用する experimental surface。
+- `configs/9b_tg_lora_prefix_feature_cache_experimental.yaml`: suffix-only trainable mode。後半25%の LoRA だけを学習対象に固定し、前半 prefix hidden states を CPU RAM に事前展開して train/eval の forward を短絡する experimental surface。現設定は amortization を優先して `train` cache を切り、`valid_quick` / `valid_full` の cache を主対象にしている。cache blob は `training.prefix_feature_cache_dir` 配下へ永続化されるので、同一 dataset / 同一 split 条件の2回目以降は disk hit で再利用される。
+- `configs/9b_baseline_suffix_only_last25.yaml`: apples-to-apples 比較用の suffix-only baseline。LoRA trainable scope だけを最後の25%に合わせ、cache を使わない標準 QLoRA 対照。
+- `scripts/run_ablation_suite.sh`: baseline / paper-PoC / adaptive / adaptive-no-conv を同じ eval hygiene で起動する launcher。
+- `scripts/benchmark_optimizer_lifecycle.py`: recreate-per-cycle と reuse-state-reset の steady-state overhead を比較する benchmark。
+- `scripts/benchmark_prefix_cache.py`: prefix feature cache の cold/warm 比較を 2 連続で実行し、persistent cache reuse の build/load 差分を `summary.json` に集約する benchmark。
 
-## Package API
+current mainline と historical adaptive branch は別物として扱う。adaptive K の run は planned cycle budget ではなく、実測の `total_backward_passes` を使って解釈する。
 
-```python
-from tg_lora import (
-    # Core algorithm
-    Velocity,                   # EMA velocity tracker
-    apply_extrapolation,        # Apply velocity-based weight extrapolation
-    cap_update,                 # Cap update magnitude relative to reference
+optimizer lifecycle 実験は論文 mainline とは別扱いにする。狙いは optimizer state drift の解消ではなく、cycle ごとの AdamW state 再確保を避けることにある。
 
-    # Training loop support
-    CycleState,                 # Track cycle metrics (reduction rate, acceptance rate)
-    DeltaTracker,               # Track weight change statistics
-    RollbackManager,            # Save/restore LoRA weight snapshots
-    RandomWalkController,       # Adaptive hyperparameter exploration
+prefix feature cache 実験も論文 mainline とは別扱いにする。これは現行 mainline の一時 activation cache を拡張したものではなく、前半層を固定した suffix-only 学習へ問題設定そのものを切り替える experimental mode である。CPU RAM を forward cache の保管先に使う代わりに、`lora.dropout=0.0` と `training.trainable_lora_scope=last_25_percent` を前提にする。さらに wall-clock 評価を歪めないため、precompute 時間も run metrics に含める。現在は build 後の prefix feature cache を disk に保存するので、同じ config と dataset を再実行した2回目は build をスキップして load だけで進む。
 
-    # Layer selection
-    select_active_layers,       # Choose which layers to extrapolate
+cache の cold/warm 差分を測るときは `make compare-prefix-coldwarm CACHE_DIR=.cache/prefix_feature_cache_compare_smoke ...` を使う。1回目が cold、2回目が同じ persistent cache dir を warm reuse する。
 
-    # Snapshot utilities
-    snapshot_lora,              # Capture LoRA parameter state dict
-    load_lora_snapshot,         # Restore LoRA parameters from snapshot
-    diff_lora,                  # Compute difference between two snapshots
+同じ検証を summary.json 付きで自動化したいときは `make bench-prefix-cache BUDGET=32 MAX_SEQ_LEN=256 QUICK_EVAL_EXAMPLES=4 EVAL_POINTS=1 CACHE_DIR=.cache/prefix_feature_cache_benchmark_bp32_s256_e1` を使う。
 
-    # Trajectory analysis
-    TrajectoryAnalyzer,         # Predict convergence, early-stop advice
-    TrajectoryPoint,            # Single trajectory data point
-)
-```
+## プロジェクト構成
 
-## Development
+詳細は [AGENTS.md](AGENTS.md) を参照。
+
+## モデル
+
+**Qwen3.5-9B** — ハイブリッドアーキテクチャ（Gated DeltaNet + Gated Attention）。
+32層（24 DeltaNet + 8 Attention層）、4096 hidden、248K vocab。
+4bit QLoRAでRTX3060 12GBに収まる構成。
+
+## 初期検証データ
+
+| データ                | 用途             | 規模                              |
+| --------------------- | ---------------- | --------------------------------- |
+| Dolly 15k (subset)    | SFT学習・検証    | train 3k / valid 300              |
+| Capybara              | 拡張学習データ   | ~16k                              |
+| lm-evaluation-harness | ベンチマーク評価 | ARC, HellaSwag, GSM8K, TruthfulQA |
+
+## Docker
+
+Docker による再現可能な開発環境（要 [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)）。
 
 ```bash
-pip install -e ".[dev]"
-pytest
+# イメージビルド
+docker compose build
+
+# テスト実行
+docker compose run --rm tg-lora pytest tests/ -v
+
+# インタラクティブセッション
+docker compose run --rm tg-lora bash
+
+# 学習（GPU使用）
+docker compose run --rm tg-lora make train-tg-lora
 ```
 
-## Evaluation
+データ (`data/`)、実験出力 (`runs/`)、モデルキャッシュはボリュームマウントされるため、コンテナを再ビルドしても保持されます。
 
-We provide built-in downstream evaluation workflows for MLX models/adapters. The evaluation files (datasets and scripts) are pre-packaged under `data/downstream` and `scripts/`.
-
-You can run evaluations (with automatic loading/downloading from Hugging Face Hub) with a single command:
+## 評価
 
 ```bash
-# Evaluate on JGLUE benchmarks (llm-jp-eval subset: JCommonsenseQA, JNLI, JSQuAD)
-make eval-llm-jp-eval-mlx ADAPTER_PATH=jinno-ai-lab/your-lora-adapter
+# lm-evaluation-harness による標準ベンチマーク
+make eval
 
-# Evaluate on Japanese Capability & JSON format compliance tasks
-make eval-downstream-mlx ADAPTER_PATH=jinno-ai-lab/your-lora-adapter
+# 学習中のquick eval
+# configs/*.yaml の eval.quick_eval_examples で制御
 ```
-
-*Note: If \`ADAPTER_PATH\` is specified as a Hugging Face Hub repository ID (e.g. \`jinno-ai-lab/my-adapter\`), it will be automatically downloaded and cached locally.*
-
-## Supported Models
-
-This library officially recommends and supports the following models for evaluation:
-*   **Qwen3.5-9B**: A highly capable 9B dense model (released under the Apache 2.0 license).
-*   **Qwen3.6-35B-A3B**: A sparse Mixture-of-Experts (MoE) model engineered for agentic coding and efficient local deployment (released under the Apache 2.0 license).
-
-## License
-
-This repository is licensed under the [MIT License](LICENSE).
-
-### Model Licenses
-The models used or referenced in this project are subject to their respective creators' licenses:
-*   The **Qwen** model family (developed by Alibaba Cloud) is licensed under the **Apache 2.0** license.
-
