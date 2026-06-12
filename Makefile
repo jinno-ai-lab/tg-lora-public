@@ -8,7 +8,7 @@
 	bench-optimizer bench-prefix-cache bench-prefix-cache-one-shot analyze-prefix-break-even bench-velocity-ops bench-velocity-ops-ci bench-velocity-ops-save-baseline \
        test test-accel test-cov test-integration test-trajectory test-cli-help lint format clean clean-data clean-runs \
        diagnose recover ci check-status \
-       convert-mlx train-mlx train-mlx-continuous train-mlx-upstream train-mlx-smoke mlx-data compare-mlx \
+       convert-mlx train-mlx train-mlx-baseline train-mlx-continuous train-mlx-upstream train-mlx-smoke mlx-data compare-mlx \
        help
 
 PYTHON ?= python
@@ -689,6 +689,16 @@ train-mlx-smoke: ## Quick MLX smoke test (20 steps, ~30s)
 		--steps-per-eval 10 \
 		--adapter-path runs/mlx_smoke_$(NOW_STAMP) \
 		--seed 42
+
+MLX_BASELINE_CONFIG ?= configs/mlx_baseline_500.yaml
+
+train-mlx-baseline: ## Run MLX baseline training with auto-resume (uses config file). MLX_BASELINE_CONFIG to override config.
+	MLX_MAX_OPS_PER_BUFFER=$(MLX_MAX_OPS_PER_BUFFER) \
+	MLX_MAX_MB_PER_BUFFER=$(MLX_MAX_MB_PER_BUFFER) \
+	MLX_BFS_MAX_WIDTH=$(MLX_BFS_MAX_WIDTH) \
+	MLX_GATED_DELTA_CHUNK=$(MLX_GATED_DELTA_CHUNK) \
+	$(PYTHON_VENV) mlx/scripts/train_lora_fixed.py \
+		--config $(MLX_BASELINE_CONFIG)
 
 compare-mlx: ## Compare MPS baseline vs MLX baseline
 	@if [ -z "$(BASELINE_RUN)" ] || [ -z "$(MLX_RUN)" ]; then \

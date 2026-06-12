@@ -613,10 +613,9 @@ def _check_and_save_linearity_budget_checkpoint(
                 total_backward_passes=cycle_state.full_backward_passes,
                 is_step_aligned_full_eval=True,
                 aligned_target=target,
-            **_measurement_results_record,
             )
-            
-            # Save checkpoint matching the target step
+
+            checkpoint_dir = run_dir / f"checkpoint-{target}"
             checkpoint_dir = run_dir / f"checkpoint-{target}"
             save_checkpoint(model, tokenizer, checkpoint_dir)
             logger.info(f"[Linearity Budget] Saved target checkpoint to {checkpoint_dir}")

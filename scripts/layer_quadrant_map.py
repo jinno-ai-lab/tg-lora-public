@@ -452,11 +452,6 @@ def main():
     row_labels = []
     ml_class = {}  # (module, layer, phase) -> dominant class
 
-    for (module, layer), _ in sorted(
-        defaultdict(list).items()
-    ):
-        pass
-
     # For each (module, layer), aggregate across A and B tensors
     for ri, (module, layer) in enumerate(module_layers):
         row_labels.append(f"L{layer} {module[:20]}")
