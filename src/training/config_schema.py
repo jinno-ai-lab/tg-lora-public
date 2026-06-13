@@ -67,6 +67,7 @@ class DataConfig(BaseModel):
     valid_full_path: str
     gold_test_path: str = ""
     max_seq_len: int = Field(ge=32, default=2048)
+    train_fraction: float = Field(default=1.0, gt=0.0, le=1.0)
 
 
 class TrainingConfig(BaseModel):
@@ -360,6 +361,8 @@ class TGLoRAParams(BaseModel):
     progressive_freeze_enabled: bool = False
     progressive_freeze_start_cycle: int = Field(default=3, ge=1)
     progressive_freeze_layer: str = "last_active"
+    progressive_freeze_depth: int = Field(default=1, ge=1)
+    activation_matching_loss: str = Field(default="mse", pattern="^(mse|mse_cos|distribution)$")
 
     # Dynamic reversible freeze (M10 experiment)
     dynfreeze_enabled: bool = False
