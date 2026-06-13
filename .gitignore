@@ -13,8 +13,8 @@ build/
 venv/
 env/
 
-# Data (large files)
-data/
+# Data (large files) — root only, not src/data/ Python package
+/data/
 
 # Experiment outputs
 runs/
