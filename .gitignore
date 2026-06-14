@@ -99,3 +99,6 @@ paper_evidence/*
 !paper_evidence/*/aggregate_summary.json
 !paper_evidence/*/version_metadata.json
 !paper_evidence/*/config.yaml
+
+# MLX jsonex symlink dir (regenerated at runtime)
+data_mlx_jsonex/

@@ -34,7 +34,7 @@
 *   **なぜ直線探索から M9 Subspace Learning へ移行したのか**:
     *   手探りの直線探索は、学習の進行に伴って方向ベクトルが変化する局面に追従できず、スケール調整の誤差が蓄積して効率が頭打ちになっていた。部分空間を構成して直交化 PC を加えることで、進行方向の微修正（ステアリング）を許容しつつ、有限差分で一発で最適な係数をフィットできるため。
 *   **なぜ accept 判定用の validation サイズを 32 件としたのか**:
-    *   計算コストを抑制し高速化の目的を維持するため。また、M9の3次元部分空間（v0, u1, u2）への探索空間制限自体が強い正則化として作用するため、32サンプルという極小データでも過適合を強力に抑制し判定ロバスト性を十分に担保できるため（[04_acceptance_and_validation.md](file:///home/jinno/tg-lora/docs/design/04_acceptance_and_validation.md) の Rationale に詳述）。
+    *   計算コストを抑制し高速化の目的を維持するため。また、M9の3次元部分空間（v0, u1, u2）への探索空間制限自体が強い正則化として作用するため、32サンプルという極小データでも過適合を強力に抑制し判定ロバスト性を十分に担保できるため（[04_acceptance_and_validation.md](04_acceptance_and_validation.md) の Rationale に詳述）。
 
 ---
 
@@ -84,3 +84,37 @@
 *   前回 run で alpha ∈ [-31.66, +7.17], std=4.46 と極めて不安定。
 *   accept 3 件はいずれも alpha ≒ 0（v0 寄与ほぼゼロ）で、2/3 が loss 悪化。
 *   FD フィットのノイズが設計意図（$N$ 倍 v0 外挿）を完全に遮断している状態で、FD を改善する前に「v0 外挿自体が有効か」を確認する必要がある。
+
+---
+
+## 5. Guard実験 — r_A による選択的学習 (2026-06-13)
+
+### 5.1 意思決定の要約
+
+*   **採用**: M9 の 110 チェックポイント事後分析で発見した r_A (相対 LoRA 重み変化率) を制御信号として用い、収束した層を出力側から連続的に固定し、上流から可逆的に解放する Guard 実験。
+*   **却下した代替案**:
+    *   (A) 全層同時固定 (all-layer simultaneous): ある cycle で r_A < τ なら全部固定。全層固定 → trainable params 0 のクラッシュリスクと、微細な層間差を活用できないため却下。
+    *   (B) 入力側からの固定: backward の連続性を考慮すると、出力側連続のほうが FLOP 削減効果が直接的なため却下。
+
+### 5.2 判断の根拠
+
+*   M9 事後分析で r_A が唯一の識別軸 (cos, r_S は無関係) であることを確認。
+*   r_A の時系列パターンが descent → settling → plateau の3相に分かれ、plateau に入った層は固定しても損失改善に寄与しない可能性が高い。
+*   出力側連続ブロック固定は backward の計算グラフを連続的に打ち切れるため、FLOP/壁時計削減が理論的に保証される。
+*   Frobenius ノルムの trace trick (O(r³)) により r_A 計算のオーバーヘッドはミリ秒以下。
+
+### 5.3 実装上の主要決定
+
+1.  **`_frozen_block: list[int]` を L31→L24 の降順で管理**: 走査順序と一致させ、contiguity check を簡素化。
+2.  **初期 W サイクルは判定免除**: cycle < window の間は r_A 履歴が不十分なため固定判定を行わない（全層即時固定バグの回避）。
+3.  **全層固定時のスキップパス**: `dynfreeze_all_frozen` フラグで optimizer・pilot steps を完全バイパス。trainable params 0 でのクラッシュを防止。
+4.  **Optimizer lifecycle との協調**: `recreate_per_cycle` が `requires_grad` で自動フィルタするため、固定層は param group から除外される。
+5.  **M9 active_names フィルタリング**: 凍結パラメータ名を active_names から除外し、M9 の投機更新が固定層に影響しないことを保証。
+6.  **二段停止プロトコル**: baseline (A) 先行 → L*/G* 確定 → Guard (B) が gold test で G* 到達時に停止。質は到達条件、速度が競争軸。
+7.  **既存 M9 run を baseline (A) として再利用**: 追加 8 時間の GPU 時間を節約。
+
+### 5.4 関連ドキュメント
+
+*   [10_guard_experiment.md](10_guard_experiment.md): Guard実験の完全設計書（§1-§10）
+*   [dynamic_freeze.py](../../src/tg_lora/dynamic_freeze.py): DynamicFreezeController 実装
+*   [analyze_dynfreeze_experiment.py](../../scripts/analyze_dynfreeze_experiment.py): ポスト実験分析スクリプト

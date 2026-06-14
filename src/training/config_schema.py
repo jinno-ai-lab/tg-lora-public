@@ -178,6 +178,15 @@ class EvalConfig(BaseModel):
     soft_accept_temperature: float = Field(default=0.0, ge=0.0)
     eval_batch_size: int = Field(default=16, ge=1)
 
+    # JSON-extraction gold evaluation (Guard experiment §5.2).
+    # When enabled, the loop periodically generates on cfg.data.gold_test_path
+    # and records gold_* scores per cycle. The §5.2 stop decision (gold >= G*)
+    # is resolved post-hoc by the analysis script, not in the live loop.
+    gold_eval_enabled: bool = False
+    gold_eval_every_cycles: int = Field(default=5, ge=1)
+    gold_eval_max_examples: int = Field(default=50, ge=1)
+    gold_eval_max_new_tokens: int = Field(default=128, ge=1)
+
 
 class MLflowConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -315,6 +324,16 @@ class TGLoRAParams(BaseModel):
     lawa_window_size: int = Field(default=5, ge=2)
     lawa_start_cycle: int = Field(default=10, ge=0)
 
+    # JSON generation-quality eval (structured-output domain task)
+    # Runs batched greedy generation on a held-out JSON set at full-eval cycles,
+    # scores via src/eval/eval_json_extraction. Headline quality metric for the
+    # plain/LAWA/PSA efficiency comparison (per GOAL §3.3/§4.3).
+    json_eval_enabled: bool = False
+    json_eval_path: str = ""
+    json_eval_every_cycles: int = Field(default=10, ge=1)
+    json_eval_batch_size: int = Field(default=8, ge=1)
+    json_eval_max_new_tokens: int = Field(default=96, ge=1)
+
     # Activation-fingerprint regime inventory (GOAL §4 step 1)
     activation_regime_enabled: bool = False
     activation_regime_window: int = Field(default=10, ge=3)
@@ -327,6 +346,23 @@ class TGLoRAParams(BaseModel):
     progressive_freeze_enabled: bool = False
     progressive_freeze_start_cycle: int = Field(default=3, ge=1)
     progressive_freeze_layer: str = "last_active"
+
+    # Dynamic reversible freeze (M10 experiment)
+    dynfreeze_enabled: bool = False
+    dynfreeze_tau: float = Field(default=0.015, gt=0.0)
+    dynfreeze_window: int = Field(default=5, ge=2)
+    dynfreeze_stir_interval: int = Field(default=10, ge=1)
+    dynfreeze_upstream_activity_factor: float = Field(default=1.5, gt=1.0)
+    dynfreeze_epsilon_ratio: float = Field(default=0.01, gt=0.0)
+    dynfreeze_a_mask_ratio: float = Field(default=0.1, ge=0.0, lt=1.0)
+
+    @model_validator(mode="after")
+    def freeze_mutual_exclusion(self) -> "TGLoRAParams":
+        if self.progressive_freeze_enabled and self.dynfreeze_enabled:
+            raise ValueError(
+                "progressive_freeze_enabled and dynfreeze_enabled are mutually exclusive"
+            )
+        return self
 
     @model_validator(mode="after")
     def psa_m9_exclusive(self) -> "TGLoRAParams":

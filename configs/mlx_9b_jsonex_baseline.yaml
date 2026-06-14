@@ -1,0 +1,55 @@
+# MLX Guard experiment — Condition A (baseline, no freeze) on jsonex domain.
+# Plain LoRA, all targeted layers trainable. Same LoRA/hyperparams as the
+# guard config so A vs B differ ONLY in dynfreeze_enabled.
+model: .cache/mlx_models/Qwen--Qwen3.5-9B
+data: data_mlx_jsonex
+train: true
+test: false
+fine_tune_type: lora
+num_layers: 8                 # LoRA on last 8 decoder layers (L24..L31 of 32)
+lora_parameters:
+  rank: 16
+  dropout: 0.0
+  scale: 2.0                  # = alpha/r = 32/16, mirrors PyTorch guard config
+iters: 960                    # 120 cycles x cycle_steps=8
+batch_size: 1
+grad_accumulation_steps: 8
+max_seq_length: 512
+seed: 42
+grad_checkpoint: true
+optimizer: adamw
+learning_rate: 2.0e-4
+optimizer_config:
+  adamw:
+    weight_decay: 0.0
+max_grad_norm: 1.0
+clear_cache_threshold: 4294967296
+wired_limit_ratio: 0.55
+memory_limit_ratio: 0.6
+cache_limit_ratio: 0.1
+steps_per_report: 8
+steps_per_eval: 50
+save_every: 80
+adapter_path: runs/mlx_9b_jsonex_baseline
+
+# Guard experiment (M10): baseline = freeze OFF
+dynfreeze_enabled: false
+
+# Gold metric (§5.2): generate + score jsonex_test every 5 cycles (both A & B)
+cycle_steps: 8
+gold_eval_enabled: true
+gold_test_path: data/jsonex_test.jsonl
+gold_eval_every_cycles: 5
+gold_eval_max_examples: 20
+gold_eval_max_new_tokens: 128
+
+# Prefix/suffix split + activation cache (TG-LoRA core, required for the Guard
+# speed gate to be testable — see AGENTS.md and 10_guard_experiment.md §2.5).
+# Both A and B use the cache so the comparison is fair (same architecture,
+# only the freeze differs). The prefix (layers[:split]) is computed once per
+# cycle and reused for pilot + post eval. Measured cache speedup on
+# Qwen3.5-9B: ~67% per eval (see _bench_cache.py). val_batches is kept
+# small (2) to keep the per-cycle Metal command buffer short and avoid the
+# ImpactingInteractivity timeout on 9B MLX training.
+split_layer: 24
+val_batches: 2

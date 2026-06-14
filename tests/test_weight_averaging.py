@@ -3,10 +3,15 @@
 GOAL §3.3: PSA must beat LAWA to have value.
 """
 
+import pytest
 import torch
 import torch.nn as nn
 
-from src.tg_lora.weight_averaging import LAWAAverager, evaluate_with_lawa
+from src.tg_lora.weight_averaging import (
+    LAWAAverager,
+    averaged_weights_context,
+    evaluate_with_lawa,
+)
 
 
 def _make_lora_model():
@@ -282,3 +287,86 @@ class TestEvaluateWithLAWAPrecomputedLoss:
         assert current_loss == 0.5  # precomputed passed through
         # eval_fn should never have been called
         # (we can't directly verify but the precomputed value is returned)
+
+
+# ---------------------------------------------------------------------------
+# averaged_weights_context
+# ---------------------------------------------------------------------------
+
+
+class TestAveragedWeightsContext:
+    def test_noop_when_averager_is_none(self):
+        """plain/PSA conditions pass None — context must be a pure no-op."""
+        model = _make_lora_model()
+        pre = {n: p.detach().clone() for n, p in model.named_parameters()}
+        with averaged_weights_context(model, None) as active:
+            assert active is False
+        for n, p in model.named_parameters():
+            assert torch.allclose(p.detach().cpu(), pre[n].cpu())
+
+    def test_noop_when_averager_not_ready(self):
+        """Before start_cycle / <2 snapshots, fall back to current weights."""
+        model = _make_lora_model()
+        avg = LAWAAverager(window_size=3, start_cycle=5)
+        avg.record(model, cycle=0)  # 1 snapshot, cycle<start -> not ready
+        pre = {n: p.detach().clone() for n, p in model.named_parameters()}
+        with averaged_weights_context(model, avg) as active:
+            assert active is False
+        for n, p in model.named_parameters():
+            assert torch.allclose(p.detach().cpu(), pre[n].cpu())
+
+    def test_swaps_in_averaged_weights_under_no_grad(self):
+        """Regression: the LoRA params are requires_grad=True leaves, so the
+        in-place copy_ must run under torch.no_grad(). Without it this raises
+        'a leaf Variable that requires grad is being used in an in-place
+        operation'. The swap must also load the averaged values."""
+        model = _make_lora_model()
+        for p in model.parameters():
+            assert p.requires_grad  # precondition: leaf, requires grad
+        avg = LAWAAverager(window_size=3)
+        avg.record(model, cycle=0)
+        for p in model.parameters():
+            p.data += 1.0
+        avg.record(model, cycle=1)  # window = {base, base+1} -> avg = base+0.5
+        snapshot = avg.average_snapshot()
+
+        with averaged_weights_context(model, avg) as active:
+            assert active is True
+            for n, p in model.named_parameters():
+                if "lora_A" in n or "lora_B" in n:
+                    assert torch.allclose(p.detach().cpu(), snapshot[n])
+
+    def test_restores_weights_on_clean_exit(self):
+        model = _make_lora_model()
+        avg = LAWAAverager(window_size=3)
+        avg.record(model, cycle=0)
+        for p in model.parameters():
+            p.data += 1.0
+        avg.record(model, cycle=1)
+        pre = {n: p.detach().clone() for n, p in model.named_parameters()}
+
+        with averaged_weights_context(model, avg):
+            pass  # weights are averaged inside; must restore on exit
+
+        for n, p in model.named_parameters():
+            assert torch.allclose(p.detach().cpu(), pre[n].cpu()), (
+                f"{n} not restored after context exit"
+            )
+
+    def test_restores_weights_on_exception(self):
+        model = _make_lora_model()
+        avg = LAWAAverager(window_size=3)
+        avg.record(model, cycle=0)
+        for p in model.parameters():
+            p.data += 1.0
+        avg.record(model, cycle=1)
+        pre = {n: p.detach().clone() for n, p in model.named_parameters()}
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with averaged_weights_context(model, avg):
+                raise RuntimeError("boom")
+
+        for n, p in model.named_parameters():
+            assert torch.allclose(p.detach().cpu(), pre[n].cpu()), (
+                f"{n} not restored after exception in context"
+            )

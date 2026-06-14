@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 import time
@@ -14,6 +15,7 @@ from tqdm import tqdm
 
 from src.data.build_seed_dataset import load_dataset
 from src.eval.eval_loss import eval_loss, eval_loss_detailed
+from src.eval.jsonex_generation import evaluate_json_extraction_run
 from src.model.load_model import (
     apply_lora,
     get_input_device,
@@ -616,7 +618,6 @@ def _check_and_save_linearity_budget_checkpoint(
             )
 
             checkpoint_dir = run_dir / f"checkpoint-{target}"
-            checkpoint_dir = run_dir / f"checkpoint-{target}"
             save_checkpoint(model, tokenizer, checkpoint_dir)
             logger.info(f"[Linearity Budget] Saved target checkpoint to {checkpoint_dir}")
 
@@ -712,6 +713,7 @@ def _save_fault_checkpoint(
             adapter_checkpoint_dir=str(oom_dir),
             train_batch_position=train_batch_position,
             accepted_valid_history=list(accepted_valid_history),
+            dynfreeze_state=dynfreeze.state_dict() if dynfreeze is not None else None,
         )
         save_training_state(ts, run_dir / "training_state.pt")
     except Exception as exc:
@@ -764,6 +766,20 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
         cfg.data.max_seq_len,
         train_on_prompt=cfg.training.get("train_on_prompt", False),
     )
+
+    # JSON-extraction gold-eval records (Guard experiment §5.2). Held as raw
+    # dicts for generation-based scoring; the §5.2 stop is resolved post-hoc
+    # by the analysis script from the recorded gold_* trajectory.
+    gold_eval_records: list[dict] = []
+    if cfg.eval.get("gold_eval_enabled", False) and cfg.data.get("gold_test_path"):
+        with open(cfg.data.gold_test_path) as _gold_file:
+            gold_eval_records = [json.loads(line) for line in _gold_file if line.strip()]
+        logger.info(
+            "Gold eval enabled: %d records from %s (every %d cycles)",
+            len(gold_eval_records),
+            cfg.data.gold_test_path,
+            cfg.eval.get("gold_eval_every_cycles", 5),
+        )
 
     use_prefix_feature_cache = cfg.training.get(
         "prefix_feature_cache_experimental", False
@@ -1099,6 +1115,28 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     _maybe_apply_prefix_runtime_offload()
 
     tg_cfg = cfg.tg_lora
+
+    # JSON generation-quality eval set (structured-output domain task).
+    # Raw records (dicts with text/completion/prompt) for batched generation +
+    # scoring at full-eval cycles. Headline quality metric for the
+    # plain/LAWA/PSA efficiency comparison (GOAL §3.3/§4.3).
+    json_eval_records: list[dict] = []
+    if tg_cfg.get("json_eval_enabled", False):
+        json_eval_path = tg_cfg.get("json_eval_path", "")
+        if json_eval_path:
+            with open(json_eval_path) as _jf:
+                json_eval_records = [json.loads(line) for line in _jf if line.strip()]
+            logger.info(
+                "JSON eval enabled: %d records from %s (every %d cycles)",
+                len(json_eval_records),
+                json_eval_path,
+                tg_cfg.get("json_eval_every_cycles", 10),
+            )
+        else:
+            logger.warning(
+                "json_eval_enabled is true but json_eval_path is empty; skipping JSON eval."
+            )
+
     controller = RandomWalkController(
         K_initial=tg_cfg.K_initial,
         K_candidates=list(tg_cfg.K_candidates),
@@ -1160,6 +1198,25 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
             tg_cfg.get("progressive_freeze_layer", "last_active"),
             sorted(fixed_active_indices),
         )
+
+    # Dynamic reversible freeze controller (Guard experiment)
+    dynfreeze: DynamicFreezeController | None = None
+    if bool(tg_cfg.get("dynfreeze_enabled", False)):
+        from src.tg_lora.dynamic_freeze import DynamicFreezeController
+        dynfreeze = DynamicFreezeController(
+            tau=float(tg_cfg.get("dynfreeze_tau", 0.015)),
+            window=int(tg_cfg.get("dynfreeze_window", 5)),
+            stir_interval=int(tg_cfg.get("dynfreeze_stir_interval", 10)),
+            upstream_activity_factor=float(tg_cfg.get("dynfreeze_upstream_activity_factor", 1.5)),
+            epsilon_ratio=float(tg_cfg.get("dynfreeze_epsilon_ratio", 0.01)),
+            a_mask_ratio=float(tg_cfg.get("dynfreeze_a_mask_ratio", 0.1)),
+            all_layer_indices=sorted(fixed_active_indices),
+        )
+        logger.info(
+            "Guard enabled: tau=%.4f window=%d stir=%d upstream_factor=%.1f layers=%s",
+            dynfreeze._tau, dynfreeze._window, dynfreeze._stir_interval,
+            dynfreeze._upstream_activity_factor, dynfreeze._all_layers,
+        )
     train_batch_position = 0
 
     cycle_state = CycleState()
@@ -1206,6 +1263,14 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
             train_batch_position,
             cycle_state.acceptance_rate * 100,
         )
+        # Restore dynfreeze state if present
+        if dynfreeze is not None and ts.dynfreeze_state is not None:
+            dynfreeze.load_state_dict(ts.dynfreeze_state)
+            logger.info(
+                "DynFreeze state restored: frozen_layers=%s frozen_since=%d",
+                sorted(dynfreeze.frozen_layer_indices),
+                dynfreeze._frozen_since_cycle,
+            )
 
     mlflow_cfg = cfg.logging.get("mlflow", {})
     batch_plan_manifest_path = run_dir / "batch_plan_manifest.json"
@@ -1576,6 +1641,17 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                     pf_xin_shape,
                 )
 
+            # --- Dynamic Reversible Freeze (M10) ---
+            dynfreeze_all_frozen = False
+            if dynfreeze is not None:
+                dynfreeze_r_A = dynfreeze.compute_r_A(model, cycle)
+                to_unfreeze = dynfreeze.decide_unfreeze(cycle)
+                dynfreeze.apply_unfreeze(model, to_unfreeze)
+                to_freeze = dynfreeze.decide_freeze(cycle)
+                dynfreeze.apply_freeze(model, to_freeze, cycle)
+                # If all layers are frozen, skip the expensive training steps
+                dynfreeze_all_frozen = dynfreeze.block_size == len(dynfreeze._all_layers)
+
             # 2b. Measurement: noise SNR (multiple independent batch gradients at W0)
             _measurement_noise = cfg.training.get("measurement_noise_samples", 0)
             _measurement_results = {}
@@ -1650,9 +1726,14 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
             # 既定ではcycleごとにoptimizerを再作成する。
             # experimental policyではstate tensorをin-placeでzero resetし、
             # fresh optimizerに近い挙動を保ったまま再確保を避ける。
-            optimizer = optimizer_lifecycle.prepare_for_cycle(
-                lr=pilot_lr,
-            )
+            if dynfreeze_all_frozen:
+                # All layers frozen by dynfreeze — skip expensive training steps
+                logger.info("DynFreeze: cycle=%d all layers frozen, skipping pilot steps", cycle)
+                optimizer = None
+            else:
+                optimizer = optimizer_lifecycle.prepare_for_cycle(
+                    lr=pilot_lr,
+                )
 
             step_losses: list[float] = []
             intermediate_deltas: list[dict[str, torch.Tensor]] = []
@@ -1660,57 +1741,58 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
             cycle_batch_keys: list[str] = []
             cycle_sample_keys: list[str] = []
             pilot_grad_sum_cpu: dict[str, torch.Tensor] | None = None
-            for _ in range(pilot_K):
-                step_loss = 0.0
-                valid_micro_batches = 0
-                empty_supervision_skips = 0
-                while valid_micro_batches < grad_accum:
-                    batch = batch_iter.next()
-                    batch_position = train_batch_position
-                    train_batch_position += 1
-                    if not has_supervised_tokens(batch):
-                        empty_supervision_skips += 1
-                        if empty_supervision_skips > max_empty_supervision_skips:
-                            raise RuntimeError(
-                                "Exceeded empty-supervision skip budget while filling a training step"
+            if optimizer is not None:
+                for _ in range(pilot_K):
+                    step_loss = 0.0
+                    valid_micro_batches = 0
+                    empty_supervision_skips = 0
+                    while valid_micro_batches < grad_accum:
+                        batch = batch_iter.next()
+                        batch_position = train_batch_position
+                        train_batch_position += 1
+                        if not has_supervised_tokens(batch):
+                            empty_supervision_skips += 1
+                            if empty_supervision_skips > max_empty_supervision_skips:
+                                raise RuntimeError(
+                                    "Exceeded empty-supervision skip budget while filling a training step"
+                                )
+                            continue
+                        if deterministic_data_order:
+                            batch_locator = batch_plan_manifest.batch_locator_at_position(
+                                batch_position
                             )
-                        continue
-                    if deterministic_data_order:
-                        batch_locator = batch_plan_manifest.batch_locator_at_position(
-                            batch_position
+                            cycle_batch_keys.append(batch_locator.batch_key)
+                            cycle_sample_keys.extend(batch_locator.sample_keys)
+                        micro_loss = forward_backward(model, batch, grad_accum)
+                        step_loss += micro_loss
+                        valid_micro_batches += 1
+                    if alpha_line_future_work_metrics_enabled:
+                        pilot_grad_sum_cpu = _accumulate_lora_grads_cpu(
+                            model,
+                            pilot_grad_sum_cpu,
                         )
-                        cycle_batch_keys.append(batch_locator.batch_key)
-                        cycle_sample_keys.extend(batch_locator.sample_keys)
-                    micro_loss = forward_backward(model, batch, grad_accum)
-                    step_loss += micro_loss
-                    valid_micro_batches += 1
-                if alpha_line_future_work_metrics_enabled:
-                    pilot_grad_sum_cpu = _accumulate_lora_grads_cpu(
-                        model,
-                        pilot_grad_sum_cpu,
+                    if psa_prior is not None:
+                        _psa_stats = amplify_gradients_psa(
+                            model, psa_prior, psa_gain_map, enabled=True
+                        )
+                    optimizer_step(
+                        optimizer,
+                        scheduler=None,
+                        model=model,
+                        max_grad_norm=cfg.training.max_grad_norm,
                     )
-                if psa_prior is not None:
-                    _psa_stats = amplify_gradients_psa(
-                        model, psa_prior, psa_gain_map, enabled=True
-                    )
-                optimizer_step(
-                    optimizer,
-                    scheduler=None,
-                    model=model,
-                    max_grad_norm=cfg.training.max_grad_norm,
-                )
-                step_losses.append(step_loss / grad_accum)
-                new_snapshot = snapshot_lora_delta(model, W0)
-                intermediate_deltas.append(new_snapshot)
-                # Record incremental delta (step-to-step change) into PSA buffer
-                if psa_prior is not None and len(intermediate_deltas) >= 2:
-                    prev = intermediate_deltas[-2]
-                    incremental = {k: new_snapshot[k] - prev[k] for k in new_snapshot}
-                    psa_prior.record_delta(incremental)
+                    step_losses.append(step_loss / grad_accum)
+                    new_snapshot = snapshot_lora_delta(model, W0)
+                    intermediate_deltas.append(new_snapshot)
+                    # Record incremental delta (step-to-step change) into PSA buffer
+                    if psa_prior is not None and len(intermediate_deltas) >= 2:
+                        prev = intermediate_deltas[-2]
+                        incremental = {k: new_snapshot[k] - prev[k] for k in new_snapshot}
+                        psa_prior.record_delta(incremental)
 
-                # Activation-fingerprint regime step (after optimizer step + forward hook captured)
-                if act_regime_tracker is not None:
-                    act_regime_tracker.step()
+                    # Activation-fingerprint regime step (after optimizer step + forward hook captured)
+                    if act_regime_tracker is not None:
+                        act_regime_tracker.step()
 
             # PSA: regime detection + prior management (once per cycle)
             if regime_detector is not None and step_losses:
@@ -1793,605 +1875,25 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 _measurement_results_record["act_cosine_latest"] = _act_summary["cosine_latest"]
                 _measurement_results_record["act_cosine_mean"] = _act_summary["cosine_mean"]
 
-            pilot_loss_avg, _pilot_metrics = _compute_pilot_average(
-                step_losses, pilot_K
-            )
-
-            # 3. Pilot後snapshot — intermediate_deltas[-1]からWK復元（冗長コピー回避）
-            WK = {k: W0[k] + intermediate_deltas[-1][k] for k in W0}
-
-            # 3b. Quick eval (pilot) — キャッシュ付きeval
-            # 次の外挿で変更されるレイヤーを予測し、変更されないレイヤーの
-            # hidden statesをキャッシュする。外挿後evalではキャッシュから再開。
-            if use_prefix_feature_cache:
-                predicted_strategy = "prefix_feature_cache_suffix_only"
-                predicted_active_names = fixed_active_names
-                predicted_active_indices = fixed_active_indices
-                split_layer = (
-                    prefix_cache_split_layer
-                    if prefix_cache_split_layer is not None
-                    else 0
-                )
-                use_cache = False
-                torch.cuda.empty_cache()  # Free memory before eval to prevent OOM
-                loss_pilot = eval_loss(
-                    model,
-                    valid_quick_loader,
-                    input_device,
-                    max_examples=accept_eval_examples,
-                )
-                validation_forwards_this_cycle += 1
-                pilot_validation_forwards_this_cycle += 1
-            else:
-                predicted_strategy = (
-                    "last_25_percent"
-                    if tg_cfg.get("force_top_layers_only", False)
-                    else proposal.active_layer_strategy
-                )
-                predicted_active_names, predicted_active_indices = select_active_layers(
-                    model,
-                    strategy=predicted_strategy,
-                    random_middle=cfg.tg_lora.random_middle_layers,
-                    layer_scores=controller.state.layer_scores,
-                    temperature=cfg.tg_lora.layer_sample_temperature,
-                )
-                split_layer = determine_split_layer(
-                    predicted_active_indices, num_decoder_layers
-                )
-
-                # split_layerが十分大きい場合のみキャッシュ（2層未満のスキップは意味なし）
-                use_cache = split_layer >= 2
-                if use_cache:
-                    activation_cache_build_count += 1
-                    loss_pilot = activation_cache.eval_and_cache(
-                        model,
-                        valid_quick_loader,
-                        input_device,
-                        split_layer_idx=split_layer,
-                        max_examples=accept_eval_examples,
-                    )
-                    validation_forwards_this_cycle += 1
-                    pilot_validation_forwards_this_cycle += 1
-                else:
-                    activation_cache.clear()
-                    loss_pilot = eval_loss(
-                        model,
-                        valid_quick_loader,
-                        input_device,
-                        max_examples=accept_eval_examples,
-                    )
-                    validation_forwards_this_cycle += 1
-                    pilot_validation_forwards_this_cycle += 1
-
-            # 3c. 中間点ロールバック判定
-            # loss_pilotがW0より悪化していたら、最良の中間点を探して戻す
-            # W0のlossは前cycleのloss_pilotを使う（初回はskip）
-            pilot_rollback_n = None
-            dW = None
-            dW_steps = pilot_K
-            pilot_full_rollback = False
-            if loss_pilot > cycle_state.last_valid_loss + controller.rollback_tolerance:
-                # 中間点の中から最良を探す
-                best_intermediate_loss = loss_pilot
-                for i in range(len(intermediate_deltas) - 2, -1, -1):
-                    apply_delta_snapshot(model, W0, intermediate_deltas[i])
-                    inter_loss = eval_loss(
-                        model,
-                        valid_quick_loader,
-                        input_device,
-                        max_examples=accept_eval_examples,
-                    )
-                    validation_forwards_this_cycle += 1
-                    pilot_validation_forwards_this_cycle += 1
-                    if inter_loss < best_intermediate_loss:
-                        best_intermediate_loss = inter_loss
-                        pilot_rollback_n = i
-                    if inter_loss <= cycle_state.last_valid_loss:
-                        break
-
-                if pilot_rollback_n is not None:
-                    apply_delta_snapshot(
-                        model, W0, intermediate_deltas[pilot_rollback_n]
-                    )
-                    logger.info(
-                        f"Pilot rollback: K={pilot_K} → N={pilot_rollback_n + 1}, "
-                        f"loss {loss_pilot:.4f} → {best_intermediate_loss:.4f}"
-                    )
-                    loss_pilot = best_intermediate_loss
-                    # dWとvelocityはロールバック先の状態で再計算
-                    W_rollback = {
-                        k: W0[k] + intermediate_deltas[pilot_rollback_n][k] for k in W0
-                    }
-                    dW = delta_tracker.compute_and_record(
-                        W_rollback, W0, K=pilot_rollback_n + 1
-                    )
-                    dW_steps = pilot_rollback_n + 1
-                    pilot_loss_avg = best_intermediate_loss
-                else:
-                    # 全中間点よりW0の方が良い → W0に戻す
-                    load_lora_snapshot(model, W0)
-                    logger.info(f"Pilot full rollback to W0, loss {loss_pilot:.4f}")
-                    pilot_full_rollback = True
-                    controller.penalize(cycle_state.last_valid_loss, loss_pilot)
-                    # loss_pilotをW0の実際のlossに更新（last_valid_lossと同じ）
-                    loss_pilot = cycle_state.last_valid_loss
-            else:
-                # 全Kステップ有効
-                dW = delta_tracker.compute_and_record(WK, W0, K=pilot_K)
-                dW_steps = pilot_K
-
-            pilot_state_snapshot = (
-                snapshot_lora(model) if save_trajectory_delta_artifacts else None
-            )
-            pilot_backward_passes = (
-                cycle_state.full_backward_passes + pilot_backward_pass_count
-            )
-            if (
-                save_trajectory_delta_artifacts
-                and dW is not None
-                and cycle % trajectory_delta_artifact_interval == 0
-            ):
-                pilot_metadata = build_trajectory_delta_artifact_metadata(
-                    mode="tg_lora",
-                    anchor_kind="after_pilot",
-                    trajectory_key=trajectory_key,
-                    epoch_batch_plan_key=batch_plan_manifest.epoch_batch_plan_key,
-                    batch_plan_manifest=(
-                        str(batch_plan_manifest_path)
-                        if save_batch_plan_manifest
-                        else None
-                    ),
-                    dataset_key=batch_plan_manifest.dataset_key,
-                    delta_tensors=dW,
-                    cycle=cycle,
-                    total_backward_passes=pilot_backward_passes,
-                    batch_keys=cycle_batch_keys,
-                    sample_keys=cycle_sample_keys,
-                    extra_metadata={
-                        "K": pilot_K,
-                        "pilot_lr": pilot_lr,
-                        "pilot_loss_avg": pilot_loss_avg,
-                        "pilot_valid_loss": loss_pilot,
-                    },
-                )
-                save_trajectory_delta_artifact(
-                    path=trajectory_delta_artifact_dir
-                    / artifact_file_name(
-                        mode="tg_lora",
-                        anchor_kind="after_pilot",
-                        cycle=cycle,
-                    ),
-                    metadata=pilot_metadata,
-                    delta_tensors=dW,
-                )
-
-            # Pilot完全失敗: velocity/extrapolationをスキップして次cycleへ
-            if pilot_full_rollback:
-                accepted = False
+            # --- Dynfreeze skip path: all layers frozen, skip expensive training ---
+            if dynfreeze_all_frozen:
+                # No training happened — use previous cycle's loss
+                pilot_loss_avg = cycle_state.last_valid_loss if cycle_state.last_valid_loss < float("inf") else 0.0
+                final_valid_loss = pilot_loss_avg
+                accepted = True
                 cos_sim = 0.0
-                is_full_eval_cycle = should_run_full_eval(
-                    cycle, cfg.eval.get("full_eval_every_cycles", 10)
-                )
-                cycle_state.record_cycle(
-                    train_loss=pilot_loss_avg,
-                    valid_loss=None if is_full_eval_cycle else loss_pilot,
-                    accepted=None,
-                    actual_backward_passes=pilot_backward_pass_count,
-                    speculative_optimizer_steps=0,
-                    optimizer_steps=pilot_K,
-                    speculative_equivalent_backward_passes=0,
-                )
-                pilot_validation_forward_count += pilot_validation_forwards_this_cycle
-                post_validation_forward_count += post_validation_forwards_this_cycle
-                metrics.record_step(
-                    step=cycle_state.full_backward_passes,
-                    cycle=cycle,
-                    loss_train=pilot_loss_avg,
-                    loss_valid=loss_pilot,
-                    backward_passes=pilot_backward_pass_count,
-                    total_backward_passes=cycle_state.full_backward_passes,
-                    tg_lora_accepted=False,
-                    tg_lora_cosine_sim=0.0,
-                    tg_lora_raw_delta_cosine_sim=0.0,
-                    tg_lora_predicted_consistency=0.0,
-                    tg_lora_short_long_norm_ratio=1.0,
-                    tg_lora_reduction_rate=cycle_state.reduction_rate,
-                    tg_lora_K=pilot_K,
-                    tg_lora_N=0,
-                    tg_lora_proposed_N=proposal.N,
-                    tg_lora_alpha=None,
-                    tg_lora_beta=pilot_beta,
-                    tg_lora_lr=pilot_lr,
-                    tg_lora_cache_built=use_cache,
-                    tg_lora_cache_eligible=None,
-                    tg_lora_cache_hit=None,
-                    tg_lora_validation_forwards=validation_forwards_this_cycle,
-                    tg_lora_pilot_validation_forwards=pilot_validation_forwards_this_cycle,
-                    tg_lora_post_validation_forwards=post_validation_forwards_this_cycle,
-                    tg_lora_post_extrapolation_eval=False,
-                    tg_lora_post_extrapolation_eval_skipped=False,
-                    tg_lora_post_extrapolation_eval_skip_reason="pilot_full_rollback",
-                    tg_lora_rollback_triggered=False,
-                    **_measurement_results_record,
-                )
-                if mlf.enabled:
-                    mlf.log_metrics(
-                        {
-                            "loss_train": pilot_loss_avg,
-                            "loss_valid": loss_pilot,
-                            "accepted": 0,
-                        },
-                        step=cycle,
-                    )
-                pbar.set_postfix(
-                    loss=f"{loss_pilot:.4f}",
-                    acc="N",
-                    cos="0.000",
-                    red=f"{cycle_state.reduction_rate:.1%}",
-                )
-                logger.info(
-                    f"c={cycle} loss={loss_pilot:.4f} N (pilot full rollback) K={pilot_K}"
-                )
-                if is_full_eval_cycle:
-                    full_result = eval_loss_detailed(
-                        model, valid_full_loader, input_device
-                    )
-                    full_loss = full_result.avg_loss
-                    logger.info(
-                        f"Cycle {cycle} full eval: loss={full_loss:.4f} "
-                        f"ppl={full_result.perplexity:.2f}"
-                    )
-                    cycle_state.record_full_eval(full_loss)
-                    if full_loss < best_full_eval_loss:
-                        best_full_eval_loss = full_loss
-                        best_full_eval_perplexity = full_result.perplexity
-                        save_checkpoint(model, tokenizer, run_dir / "best_model")
-                accepted_valid_history.append(loss_pilot)
-                if len(accepted_valid_history) > max(3, moving_avg_window * 2):
-                    accepted_valid_history.pop(0)
-                last_quick_valid_loss = loss_pilot
-                continue
-
-            # 4b. 収束トレンドに基づく能動的lr-K調整
-            # [作業B] ウォームアップ期は lr 適応経路を全バイパスし lr を初期値で固定保持する。
-            # 本番期（warmup_released=True）からのみ adapt_to_convergence を有効化する。
-            if warmup_released:
-                controller.adapt_to_convergence(delta_tracker.convergence_trend())
-
-            # 5. Velocity更新
-            assert dW is not None
-            raw_delta_cos_sim = velocity.cosine_similarity(dW)
-            velocity.update(dW, beta=pilot_beta, lr=pilot_lr, K=dW_steps)
-            current_velocity = velocity.state
-            assert current_velocity is not None
-            predicted_consistency = velocity.predicted_consistency()
-            velocity_norm_ratio = velocity.short_long_norm_ratio()
-            cos_sim = predicted_consistency
-
-            # 5b. 加速度ベースの能動的lr-K調整
-            # [作業B] ウォームアップ期は adapt_to_acceleration もバイパスする。
-            acceleration = velocity.magnitude_acceleration()
-            if warmup_released:
-                controller.adapt_to_acceleration(acceleration)
-
-            proposal_N_before_cosine = int(proposal.N)
-            selected_N = proposal.N
-            if tg_cfg.get("cosine_n_selection_enabled", False):
-                selected_N = velocity.choose_N(
-                    list(controller.N_candidates),
-                    _cosine_n_threshold_map(
-                        tg_cfg.get("cosine_n_selection_thresholds", None)
-                    ),
-                )
-                if selected_N != proposal.N:
-                    logger.debug(
-                        "cosine N selection: cycle=%d consistency=%.4f "
-                        "norm_ratio=%.4f N=%d->%d raw_delta_cos=%.4f",
-                        cycle,
-                        predicted_consistency,
-                        velocity_norm_ratio,
-                        proposal.N,
-                        selected_N,
-                        raw_delta_cos_sim,
-                    )
-                proposal.N = selected_N
-
-            # [N=1 diagnostic] Force N=1 to test if EMA direction
-            # improves loss at minimal extrapolation distance.
-            if warmup_released and selected_N > 0:
-                selected_N = 1
-                proposal.N = 1
-
-            # Shadow mode: bypass warmup gate, force N=1
-            shadow_enabled = tg_cfg.get("shadow_extrapolation_enabled", False)
-            if shadow_enabled:
-                if not warmup_released:
-                    warmup_released = True
-                    production_start_full_backward_passes = cycle_state.full_backward_passes
-                    logger.info("Shadow mode: warmup bypassed at cycle %d", cycle)
-                selected_N = 1
-                proposal.N = 1
-
-            # --- Warmup gate (two-phase design) ---
-            if not warmup_released:
-                if predicted_consistency >= warmup_release_cos:
-                    warmup_cos_consecutive += 1
-                else:
-                    warmup_cos_consecutive = 0
-                if warmup_cos_consecutive >= warmup_release_count:
-                    warmup_released = True
-                    production_start_full_backward_passes = (
-                        cycle_state.full_backward_passes
-                    )
-                    logger.info(
-                        "Warmup released at cycle %d: cos=%.4f consecutive=%d",
-                        cycle,
-                        predicted_consistency,
-                        warmup_cos_consecutive,
-                    )
-
-            if not warmup_released:
-                # Warmup phase: pilot only, skip all extrapolation.
-                is_full_eval_cycle_warmup = should_run_full_eval(
-                    cycle, cfg.eval.get("full_eval_every_cycles", 10)
-                )
-                cycle_state.record_cycle(
-                    train_loss=pilot_loss_avg,
-                    valid_loss=(
-                        None if is_full_eval_cycle_warmup else loss_pilot
-                    ),
-                    accepted=None,
-                    actual_backward_passes=pilot_backward_pass_count,
-                    speculative_optimizer_steps=0,
-                    optimizer_steps=pilot_K,
-                    speculative_equivalent_backward_passes=0,
-                )
-                accepted_valid_history.append(loss_pilot)
-                if len(accepted_valid_history) > max(
-                    3, moving_avg_window * 2
-                ):
-                    accepted_valid_history.pop(0)
-                last_quick_valid_loss = loss_pilot
-                pbar.set_postfix(
-                    loss=f"{loss_pilot:.4f}",
-                    acc="W",
-                    cos=f"{cos_sim:.3f}",
-                    red=f"{cycle_state.reduction_rate:.1%}",
-                )
-                if cycle % cfg.logging.get("log_every_cycles", 1) == 0:
-                    logger.info(
-                        "c=%d loss=%.4f W cos=%.3f warmup_consec=%d",
-                        cycle,
-                        loss_pilot,
-                        cos_sim,
-                        warmup_cos_consecutive,
-                    )
-                if is_full_eval_cycle_warmup:
-                    full_result = eval_loss_detailed(
-                        model, valid_full_loader, input_device
-                    )
-                    full_loss = full_result.avg_loss
-                    logger.info(
-                        "Cycle %d full eval (warmup): loss=%.4f ppl=%.2f",
-                        cycle,
-                        full_loss,
-                        full_result.perplexity,
-                    )
-                    cycle_state.record_full_eval(full_loss)
-                    if full_loss < best_full_eval_loss:
-                        best_full_eval_loss = full_loss
-                        best_full_eval_perplexity = full_result.perplexity
-                        save_checkpoint(
-                            model, tokenizer, run_dir / "best_model"
-                        )
-                if mlf.enabled:
-                    mlf.log_metrics(
-                        {
-                            "loss_train": pilot_loss_avg,
-                            "loss_valid": loss_pilot,
-                            "warmup_released": 0,
-                            "warmup_cos_consecutive": warmup_cos_consecutive,
-                            "predicted_consistency": predicted_consistency,
-                        },
-                        step=cycle,
-                    )
-                # [作業A] ウォームアップ期にも run_metrics.jsonl へ step record を出力する。
-                # w_traj と lr は全サイクルで記録必須。M9 係数は外挿していないため None。
-                metrics.record_step(
-                    step=cycle_state.full_backward_passes,
-                    cycle=cycle,
-                    loss_train=pilot_loss_avg,
-                    loss_valid=loss_pilot,
-                    backward_passes=pilot_backward_pass_count,
-                    total_backward_passes=cycle_state.full_backward_passes,
-                    tg_lora_accepted=None,
-                    tg_lora_cosine_sim=cos_sim,
-                    tg_lora_raw_delta_cosine_sim=raw_delta_cos_sim,
-                    tg_lora_predicted_consistency=predicted_consistency,
-                    tg_lora_short_long_norm_ratio=velocity_norm_ratio,
-                    tg_lora_reduction_rate=cycle_state.reduction_rate,
-                    tg_lora_K=pilot_K,
-                    tg_lora_N=0,
-                    tg_lora_proposed_N=None,
-                    tg_lora_alpha=None,
-                    tg_lora_beta=pilot_beta,
-                    tg_lora_lr=pilot_lr,
-                    tg_lora_validation_forwards=validation_forwards_this_cycle,
-                    tg_lora_pilot_validation_forwards=pilot_validation_forwards_this_cycle,
-                    tg_lora_post_validation_forwards=post_validation_forwards_this_cycle,
-                    tg_lora_post_extrapolation_eval=False,
-                    tg_lora_post_extrapolation_eval_skipped=False,
-                    tg_lora_post_extrapolation_eval_skip_reason="warmup_phase",
-                    tg_lora_rollback_triggered=False,
-                    # M9 係数: ウォームアップ期は外挿なし → None
-                    tg_lora_m9_alpha_fit=None,
-                    tg_lora_m9_beta1_fit=None,
-                    tg_lora_m9_beta2_fit=None,
-                    tg_lora_w_traj=None,
-                **_measurement_results_record,
-                )
-                continue
-
-            baseline_like_fallback, baseline_like_reason = (
-                _should_fallback_to_baseline_like(
-                    proposal_N=proposal.N,
-                    total_cycles=cycle_state.total_cycles,
-                    acceptance_rate=cycle_state.acceptance_rate,
-                    pilot_loss=loss_pilot,
-                    previous_valid_loss=last_quick_valid_loss,
-                    acceleration=acceleration,
-                    velocity_anomalous=velocity.is_magnitude_anomalous(),
-                    enabled=tg_cfg.get("linearity_guard_enabled", False),
-                    warmup_cycles=tg_cfg.get("linearity_guard_warmup_cycles", 5),
-                    min_acceptance_rate=tg_cfg.get(
-                        "linearity_guard_min_acceptance_rate", 0.0
-                    ),
-                    pilot_margin=tg_cfg.get("linearity_guard_pilot_margin", 0.01),
-                    max_positive_acceleration=tg_cfg.get(
-                        "linearity_guard_max_positive_acceleration", 0.02
-                    ),
-                )
-            )
-
-            if baseline_like_fallback:
-                controller.penalize(last_quick_valid_loss, loss_pilot)
-                is_full_eval_cycle = should_run_full_eval(
-                    cycle, cfg.eval.get("full_eval_every_cycles", 10)
-                )
-                cycle_state.record_cycle(
-                    train_loss=pilot_loss_avg,
-                    valid_loss=None if is_full_eval_cycle else loss_pilot,
-                    accepted=None,
-                    actual_backward_passes=pilot_backward_pass_count,
-                    speculative_optimizer_steps=0,
-                    optimizer_steps=pilot_K,
-                    speculative_equivalent_backward_passes=0,
-                )
-                last_quick_valid_loss = loss_pilot
-                pilot_validation_forward_count += pilot_validation_forwards_this_cycle
-                post_validation_forward_count += post_validation_forwards_this_cycle
-                metrics.record_step(
-                    step=cycle_state.full_backward_passes,
-                    cycle=cycle,
-                    loss_train=pilot_loss_avg,
-                    loss_valid=loss_pilot,
-                    backward_passes=pilot_backward_pass_count,
-                    total_backward_passes=cycle_state.full_backward_passes,
-                    tg_lora_accepted=False,
-                    tg_lora_cosine_sim=cos_sim,
-                    tg_lora_raw_delta_cosine_sim=raw_delta_cos_sim,
-                    tg_lora_predicted_consistency=predicted_consistency,
-                    tg_lora_short_long_norm_ratio=velocity_norm_ratio,
-                    tg_lora_reduction_rate=cycle_state.reduction_rate,
-                    tg_lora_K=pilot_K,
-                    tg_lora_N=0,
-                    tg_lora_proposed_N=proposal_N_before_cosine,
-                    tg_lora_alpha=None,
-                    tg_lora_beta=pilot_beta,
-                    tg_lora_lr=pilot_lr,
-                    tg_lora_cache_built=use_cache,
-                    tg_lora_cache_eligible=None,
-                    tg_lora_cache_hit=None,
-                    tg_lora_validation_forwards=validation_forwards_this_cycle,
-                    tg_lora_pilot_validation_forwards=pilot_validation_forwards_this_cycle,
-                    tg_lora_post_validation_forwards=post_validation_forwards_this_cycle,
-                    tg_lora_post_extrapolation_eval=False,
-                    tg_lora_post_extrapolation_eval_skipped=False,
-                    tg_lora_post_extrapolation_eval_skip_reason="linearity_guard",
-                    tg_lora_rollback_triggered=False,
-                **_measurement_results_record,
-                )
-                if mlf.enabled:
-                    mlf.log_metrics(
-                        {
-                            "loss_train": pilot_loss_avg,
-                            "loss_valid": loss_pilot,
-                            "accepted": 0,
-                            "raw_delta_cosine_sim": raw_delta_cos_sim,
-                            "velocity_predicted_consistency": predicted_consistency,
-                            "velocity_short_long_norm_ratio": velocity_norm_ratio,
-                            "linearity_guard_triggered": 1,
-                            "magnitude_acceleration": acceleration,
-                            "acceptance_rate": cycle_state.acceptance_rate,
-                        },
-                        step=cycle,
-                    )
-                pbar.set_postfix(
-                    loss=f"{loss_pilot:.4f}",
-                    acc="B",
-                    cos=f"{cos_sim:.3f}",
-                    red=f"{cycle_state.reduction_rate:.1%}",
-                )
-                logger.info(
-                    "c=%d loss=%.4f B cos=%.3f red=%.1f%% K=%d N=0 (%s)",
-                    cycle,
-                    loss_pilot,
-                    cos_sim,
-                    cycle_state.reduction_rate * 100,
-                    pilot_K,
-                    baseline_like_reason,
-                )
-                if is_full_eval_cycle:
-                    full_result = eval_loss_detailed(
-                        model, valid_full_loader, input_device
-                    )
-                    full_loss = full_result.avg_loss
-                    logger.info(
-                        f"Cycle {cycle} full eval: loss={full_loss:.4f} "
-                        f"ppl={full_result.perplexity:.2f}"
-                    )
-                    cycle_state.record_full_eval(full_loss)
-                    if full_loss < best_full_eval_loss:
-                        best_full_eval_loss = full_loss
-                        best_full_eval_perplexity = full_result.perplexity
-                        save_checkpoint(model, tokenizer, run_dir / "best_model")
-                _check_and_save_linearity_budget_checkpoint(
-                    model,
-                    tokenizer,
-                    valid_full_loader,
-                    input_device,
-                    cycle_state,
-                    grad_accum,
-                    triggered_target_steps,
-                    run_dir,
-                    logger,
-                    metrics,
-                )
-                accepted_valid_history.append(loss_pilot)
-                if len(accepted_valid_history) > max(3, moving_avg_window * 2):
-                    accepted_valid_history.pop(0)
-                continue
-
-            # 6. Pilot後状態をrollback用に保存
-            rollback_mgr.save(model)
-            snapshot_taken = True
-
-            try:
-                # 7. Extrapolation — proposal already created at cycle top
-
-                # 8. Active layers選択 — strategyが予測時と同じなら再利用
-                # （二重ランダム選択を避け、キャッシュ有効性を保証）
-                if use_prefix_feature_cache:
-                    active_names = fixed_active_names
-                    active_indices = fixed_active_indices
-                else:
-                    actual_strategy = (
-                        "last_25_percent"
-                        if tg_cfg.get("force_top_layers_only", False)
-                        else proposal.active_layer_strategy
-                    )
-                    if actual_strategy == predicted_strategy:
-                        active_names = predicted_active_names
-                        active_indices = predicted_active_indices
-                    else:
-                        active_names, active_indices = select_active_layers(
-                            model,
-                            strategy=actual_strategy,
-                            random_middle=cfg.tg_lora.random_middle_layers,
-                            layer_scores=controller.state.layer_scores,
-                            temperature=cfg.tg_lora.layer_sample_temperature,
-                        )
-
+                raw_delta_cos_sim = 0.0
+                pilot_backward_pass_count = 0
+                loss_after = None
+                loss_pilot = pilot_loss_avg
+                post_extrapolation_eval = False
+                post_extrapolation_eval_skipped = True
+                post_extrapolation_eval_skip_reason = "dynfreeze_frozen"
+                WK = dict(W0)  # No change
+                extrap_stats = ExtrapolationStats()
+                proposal_N_before_cosine = 0
+                predicted_consistency = 0.0
+                velocity_norm_ratio = 0.0
                 zo_attempted_steps = 0
                 zo_accepted_steps = 0
                 zo_rejected_steps = 0
@@ -2403,134 +1905,943 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 alpha_line_alpha_before = None
                 alpha_line_alpha_after = None
                 alpha_line_step_count = 0
-                alpha_line_grad_values: list[float] = []
-                alpha_line_losses: list[float] = []
-                alpha_line_exact_losses: list[float] = []
-                alpha_line_approx_errors: list[float] = []
-                alpha_line_jvp_methods: list[str] = []
-                alpha_line_base_recompute = 0
-                alpha_line_base_term_cached = False
+                alpha_line_base_recompute = False
                 alpha_line_base_out_jvp_cached = False
-                alpha_line_stop_reason = "not_reached"
-                alpha_line_consecutive_rejects = 0
-                alpha_line_interval_loss_start = None
-                alpha_line_interval_probe_batch = None
-                alpha_line_interval_net_loss_delta = None
+                alpha_line_base_term_cached = False
+                alpha_line_stop_reason = None
                 alpha_line_v_update_wall_seconds = 0.0
                 alpha_line_alpha_wall_seconds = 0.0
-                future_work_projection_ratio = None
-                future_work_internal_pairs: list[dict[str, float]] = []
-                cache_eligible = False
-                cache_hit = False
-                can_confident_skip = False
-                # [作業A] M9 フィット係数: subspace_m9_fit_step が実行された場合のみ更新される。
-                # 未実行サイクルでは None のまま記録される。
-                m9_cycle_stats: dict = {}
+                alpha_line_grad_values = None
+                alpha_line_losses = None
+                alpha_line_exact_losses = None
+                alpha_line_approx_errors = None
+                alpha_line_jvp_methods = None
+                alpha_line_order = 0
+                alpha_line_finite_diff_eps = None
+                alpha_line_consecutive_rejects = 0
+                alpha_line_interval_net_loss_delta = None
+                _shadow_delta = None
+                _shadow_cos = None
+                _measurement_results_record = {}
+                future_work_record = None
+                pilot_validation_forwards_this_cycle = 0
+                post_validation_forwards_this_cycle = 0
+                # Skip directly to metrics recording
+            else:
+                pilot_loss_avg, _pilot_metrics = _compute_pilot_average(
+                    step_losses, pilot_K
+                )
 
+            # 3. Pilot後snapshot — intermediate_deltas[-1]からWK復元（冗長コピー回避）
+            if dynfreeze_all_frozen:
+                WK = dict(W0)
+            else:
+                # 凍結層はpilotで更新されずintermediate_deltasに含まれない → W0のまま
+                last_delta = intermediate_deltas[-1]
+                WK = {
+                    k: (W0[k] + last_delta[k]) if k in last_delta else W0[k]
+                    for k in W0
+                }
 
-                # 10. 外挿適用
-                accepted = True
-                loss_after = loss_pilot
-                if alpha_line_enabled:
-                    accepted = False
-                    loss_after = loss_pilot
-                    proposal.N = 0
-                    extrap_stats = ExtrapolationStats()
-
-                    should_refresh_direction = (
-                        velocity.current_direction() is None
-                        or cycle % max(1, alpha_line_v_update_every) == 0
+            if not dynfreeze_all_frozen:
+                # 3b. Quick eval (pilot) — キャッシュ付きeval
+                # 次の外挿で変更されるレイヤーを予測し、変更されないレイヤーの
+                # hidden statesをキャッシュする。外挿後evalではキャッシュから再開。
+                if use_prefix_feature_cache:
+                    predicted_strategy = "prefix_feature_cache_suffix_only"
+                    predicted_active_names = fixed_active_names
+                    predicted_active_indices = fixed_active_indices
+                    split_layer = (
+                        prefix_cache_split_layer
+                        if prefix_cache_split_layer is not None
+                        else 0
                     )
-                    v_update_started = time.perf_counter()
-                    if should_refresh_direction:
-                        direction = velocity.build_direction(
-                            dW,
-                            lr=pilot_lr,
-                            K=dW_steps,
-                            cycle=cycle,
-                            active_names=active_names,
-                        )
-                        alpha_line_v_updated = True
-                    else:
-                        direction = velocity.current_direction() or {}
-                    alpha_line_v_update_wall_seconds = (
-                        time.perf_counter() - v_update_started
+                    use_cache = False
+                    torch.cuda.empty_cache()  # Free memory before eval to prevent OOM
+                    loss_pilot = eval_loss(
+                        model,
+                        valid_quick_loader,
+                        input_device,
+                        max_examples=accept_eval_examples,
                     )
-                    cycle_state.v_fixed_since_cycle = velocity.fixed_since_cycle
+                    validation_forwards_this_cycle += 1
+                    pilot_validation_forwards_this_cycle += 1
+                else:
+                    predicted_strategy = (
+                        "last_25_percent"
+                        if tg_cfg.get("force_top_layers_only", False)
+                        else proposal.active_layer_strategy
+                    )
+                    predicted_active_names, predicted_active_indices = select_active_layers(
+                        model,
+                        strategy=predicted_strategy,
+                        random_middle=cfg.tg_lora.random_middle_layers,
+                        layer_scores=controller.state.layer_scores,
+                        temperature=cfg.tg_lora.layer_sample_temperature,
+                    )
+                    split_layer = determine_split_layer(
+                        predicted_active_indices, num_decoder_layers
+                    )
 
-                    if not direction:
-                        alpha_line_stop_reason = "no_direction"
-                    else:
-                        if alpha_line_future_work_metrics_enabled:
-                            future_work_projection_ratio = (
-                                _projection_ratio_to_direction(
-                                    pilot_grad_sum_cpu,
-                                    direction,
-                                    active_names=active_names,
-                                )
-                            )
-                        base_alpha_snapshot = snapshot_lora(model)
-
-                        alpha_current = alpha_line_alpha_init
-                        alpha_line_alpha_before = alpha_current
-                        _apply_alpha_direction_from_base(
+                    # split_layerが十分大きい場合のみキャッシュ（2層未満のスキップは意味なし）
+                    use_cache = split_layer >= 2
+                    if use_cache:
+                        activation_cache_build_count += 1
+                        loss_pilot = activation_cache.eval_and_cache(
                             model,
-                            base_alpha_snapshot,
-                            direction,
-                            alpha_current,
-                            active_names=active_names,
+                            valid_quick_loader,
+                            input_device,
+                            split_layer_idx=split_layer,
+                            max_examples=accept_eval_examples,
+                        )
+                        validation_forwards_this_cycle += 1
+                        pilot_validation_forwards_this_cycle += 1
+                    else:
+                        activation_cache.clear()
+                        loss_pilot = eval_loss(
+                            model,
+                            valid_quick_loader,
+                            input_device,
+                            max_examples=accept_eval_examples,
+                        )
+                        validation_forwards_this_cycle += 1
+                        pilot_validation_forwards_this_cycle += 1
+
+                # 3c. 中間点ロールバック判定
+                # loss_pilotがW0より悪化していたら、最良の中間点を探して戻す
+                # W0のlossは前cycleのloss_pilotを使う（初回はskip）
+                pilot_rollback_n = None
+                dW = None
+                dW_steps = pilot_K
+                pilot_full_rollback = False
+                if loss_pilot > cycle_state.last_valid_loss + controller.rollback_tolerance:
+                    # 中間点の中から最良を探す
+                    best_intermediate_loss = loss_pilot
+                    for i in range(len(intermediate_deltas) - 2, -1, -1):
+                        apply_delta_snapshot(model, W0, intermediate_deltas[i])
+                        inter_loss = eval_loss(
+                            model,
+                            valid_quick_loader,
+                            input_device,
+                            max_examples=accept_eval_examples,
+                        )
+                        validation_forwards_this_cycle += 1
+                        pilot_validation_forwards_this_cycle += 1
+                        if inter_loss < best_intermediate_loss:
+                            best_intermediate_loss = inter_loss
+                            pilot_rollback_n = i
+                        if inter_loss <= cycle_state.last_valid_loss:
+                            break
+
+                    if pilot_rollback_n is not None:
+                        apply_delta_snapshot(
+                            model, W0, intermediate_deltas[pilot_rollback_n]
+                        )
+                        logger.info(
+                            f"Pilot rollback: K={pilot_K} → N={pilot_rollback_n + 1}, "
+                            f"loss {loss_pilot:.4f} → {best_intermediate_loss:.4f}"
+                        )
+                        loss_pilot = best_intermediate_loss
+                        # dWとvelocityはロールバック先の状態で再計算
+                        rb_delta = intermediate_deltas[pilot_rollback_n]
+                        W_rollback = {
+                            k: (W0[k] + rb_delta[k]) if k in rb_delta else W0[k]
+                            for k in W0
+                        }
+                        dW = delta_tracker.compute_and_record(
+                            W_rollback, W0, K=pilot_rollback_n + 1
+                        )
+                        dW_steps = pilot_rollback_n + 1
+                        pilot_loss_avg = best_intermediate_loss
+                    else:
+                        # 全中間点よりW0の方が良い → W0に戻す
+                        load_lora_snapshot(model, W0)
+                        logger.info(f"Pilot full rollback to W0, loss {loss_pilot:.4f}")
+                        pilot_full_rollback = True
+                        controller.penalize(cycle_state.last_valid_loss, loss_pilot)
+                        # loss_pilotをW0の実際のlossに更新（last_valid_lossと同じ）
+                        loss_pilot = cycle_state.last_valid_loss
+                else:
+                    # 全Kステップ有効
+                    dW = delta_tracker.compute_and_record(WK, W0, K=pilot_K)
+                    dW_steps = pilot_K
+
+                pilot_state_snapshot = (
+                    snapshot_lora(model) if save_trajectory_delta_artifacts else None
+                )
+                pilot_backward_passes = (
+                    cycle_state.full_backward_passes + pilot_backward_pass_count
+                )
+                if (
+                    save_trajectory_delta_artifacts
+                    and dW is not None
+                    and cycle % trajectory_delta_artifact_interval == 0
+                ):
+                    pilot_metadata = build_trajectory_delta_artifact_metadata(
+                        mode="tg_lora",
+                        anchor_kind="after_pilot",
+                        trajectory_key=trajectory_key,
+                        epoch_batch_plan_key=batch_plan_manifest.epoch_batch_plan_key,
+                        batch_plan_manifest=(
+                            str(batch_plan_manifest_path)
+                            if save_batch_plan_manifest
+                            else None
+                        ),
+                        dataset_key=batch_plan_manifest.dataset_key,
+                        delta_tensors=dW,
+                        cycle=cycle,
+                        total_backward_passes=pilot_backward_passes,
+                        batch_keys=cycle_batch_keys,
+                        sample_keys=cycle_sample_keys,
+                        extra_metadata={
+                            "K": pilot_K,
+                            "pilot_lr": pilot_lr,
+                            "pilot_loss_avg": pilot_loss_avg,
+                            "pilot_valid_loss": loss_pilot,
+                        },
+                    )
+                    save_trajectory_delta_artifact(
+                        path=trajectory_delta_artifact_dir
+                        / artifact_file_name(
+                            mode="tg_lora",
+                            anchor_kind="after_pilot",
+                            cycle=cycle,
+                        ),
+                        metadata=pilot_metadata,
+                        delta_tensors=dW,
+                    )
+
+                # Pilot完全失敗: velocity/extrapolationをスキップして次cycleへ
+                if pilot_full_rollback:
+                    accepted = False
+                    cos_sim = 0.0
+                    is_full_eval_cycle = should_run_full_eval(
+                        cycle, cfg.eval.get("full_eval_every_cycles", 10)
+                    )
+                    cycle_state.record_cycle(
+                        train_loss=pilot_loss_avg,
+                        valid_loss=None if is_full_eval_cycle else loss_pilot,
+                        accepted=None,
+                        actual_backward_passes=pilot_backward_pass_count,
+                        speculative_optimizer_steps=0,
+                        optimizer_steps=pilot_K,
+                        speculative_equivalent_backward_passes=0,
+                    )
+                    pilot_validation_forward_count += pilot_validation_forwards_this_cycle
+                    post_validation_forward_count += post_validation_forwards_this_cycle
+                    metrics.record_step(
+                        step=cycle_state.full_backward_passes,
+                        cycle=cycle,
+                        loss_train=pilot_loss_avg,
+                        loss_valid=loss_pilot,
+                        backward_passes=pilot_backward_pass_count,
+                        total_backward_passes=cycle_state.full_backward_passes,
+                        tg_lora_accepted=False,
+                        tg_lora_cosine_sim=0.0,
+                        tg_lora_raw_delta_cosine_sim=0.0,
+                        tg_lora_predicted_consistency=0.0,
+                        tg_lora_short_long_norm_ratio=1.0,
+                        tg_lora_reduction_rate=cycle_state.reduction_rate,
+                        tg_lora_K=pilot_K,
+                        tg_lora_N=0,
+                        tg_lora_proposed_N=proposal.N,
+                        tg_lora_alpha=None,
+                        tg_lora_beta=pilot_beta,
+                        tg_lora_lr=pilot_lr,
+                        tg_lora_cache_built=use_cache,
+                        tg_lora_cache_eligible=None,
+                        tg_lora_cache_hit=None,
+                        tg_lora_validation_forwards=validation_forwards_this_cycle,
+                        tg_lora_pilot_validation_forwards=pilot_validation_forwards_this_cycle,
+                        tg_lora_post_validation_forwards=post_validation_forwards_this_cycle,
+                        tg_lora_post_extrapolation_eval=False,
+                        tg_lora_post_extrapolation_eval_skipped=False,
+                        tg_lora_post_extrapolation_eval_skip_reason="pilot_full_rollback",
+                        tg_lora_rollback_triggered=False,
+                        **_measurement_results_record,
+                    )
+                    if mlf.enabled:
+                        mlf.log_metrics(
+                            {
+                                "loss_train": pilot_loss_avg,
+                                "loss_valid": loss_pilot,
+                                "accepted": 0,
+                            },
+                            step=cycle,
+                        )
+                    pbar.set_postfix(
+                        loss=f"{loss_pilot:.4f}",
+                        acc="N",
+                        cos="0.000",
+                        red=f"{cycle_state.reduction_rate:.1%}",
+                    )
+                    logger.info(
+                        f"c={cycle} loss={loss_pilot:.4f} N (pilot full rollback) K={pilot_K}"
+                    )
+                    if is_full_eval_cycle:
+                        full_result = eval_loss_detailed(
+                            model, valid_full_loader, input_device
+                        )
+                        full_loss = full_result.avg_loss
+                        logger.info(
+                            f"Cycle {cycle} full eval: loss={full_loss:.4f} "
+                            f"ppl={full_result.perplexity:.2f}"
+                        )
+                        cycle_state.record_full_eval(full_loss)
+                        if full_loss < best_full_eval_loss:
+                            best_full_eval_loss = full_loss
+                            best_full_eval_perplexity = full_result.perplexity
+                            save_checkpoint(model, tokenizer, run_dir / "best_model")
+                    accepted_valid_history.append(loss_pilot)
+                    if len(accepted_valid_history) > max(3, moving_avg_window * 2):
+                        accepted_valid_history.pop(0)
+                    last_quick_valid_loss = loss_pilot
+                    continue
+
+                # 4b. 収束トレンドに基づく能動的lr-K調整
+                # [作業B] ウォームアップ期は lr 適応経路を全バイパスし lr を初期値で固定保持する。
+                # 本番期（warmup_released=True）からのみ adapt_to_convergence を有効化する。
+                if warmup_released:
+                    controller.adapt_to_convergence(delta_tracker.convergence_trend())
+
+                # 5. Velocity更新
+                assert dW is not None
+                raw_delta_cos_sim = velocity.cosine_similarity(dW)
+                velocity.update(dW, beta=pilot_beta, lr=pilot_lr, K=dW_steps)
+                current_velocity = velocity.state
+                assert current_velocity is not None
+                predicted_consistency = velocity.predicted_consistency()
+                velocity_norm_ratio = velocity.short_long_norm_ratio()
+                cos_sim = predicted_consistency
+
+                # 5b. 加速度ベースの能動的lr-K調整
+                # [作業B] ウォームアップ期は adapt_to_acceleration もバイパスする。
+                acceleration = velocity.magnitude_acceleration()
+                if warmup_released:
+                    controller.adapt_to_acceleration(acceleration)
+
+                proposal_N_before_cosine = int(proposal.N)
+                selected_N = proposal.N
+                if tg_cfg.get("cosine_n_selection_enabled", False):
+                    selected_N = velocity.choose_N(
+                        list(controller.N_candidates),
+                        _cosine_n_threshold_map(
+                            tg_cfg.get("cosine_n_selection_thresholds", None)
+                        ),
+                    )
+                    if selected_N != proposal.N:
+                        logger.debug(
+                            "cosine N selection: cycle=%d consistency=%.4f "
+                            "norm_ratio=%.4f N=%d->%d raw_delta_cos=%.4f",
+                            cycle,
+                            predicted_consistency,
+                            velocity_norm_ratio,
+                            proposal.N,
+                            selected_N,
+                            raw_delta_cos_sim,
+                        )
+                    proposal.N = selected_N
+
+                # [N=1 diagnostic] Force N=1 to test if EMA direction
+                # improves loss at minimal extrapolation distance.
+                if warmup_released and selected_N > 0:
+                    selected_N = 1
+                    proposal.N = 1
+
+                # Shadow mode: bypass warmup gate, force N=1
+                shadow_enabled = tg_cfg.get("shadow_extrapolation_enabled", False)
+                if shadow_enabled:
+                    if not warmup_released:
+                        warmup_released = True
+                        production_start_full_backward_passes = cycle_state.full_backward_passes
+                        logger.info("Shadow mode: warmup bypassed at cycle %d", cycle)
+                    selected_N = 1
+                    proposal.N = 1
+
+                # --- Warmup gate (two-phase design) ---
+                if not warmup_released:
+                    if predicted_consistency >= warmup_release_cos:
+                        warmup_cos_consecutive += 1
+                    else:
+                        warmup_cos_consecutive = 0
+                    if warmup_cos_consecutive >= warmup_release_count:
+                        warmup_released = True
+                        production_start_full_backward_passes = (
+                            cycle_state.full_backward_passes
+                        )
+                        logger.info(
+                            "Warmup released at cycle %d: cos=%.4f consecutive=%d",
+                            cycle,
+                            predicted_consistency,
+                            warmup_cos_consecutive,
                         )
 
-                        alpha_loop_started = time.perf_counter()
-                        for _alpha_index in range(alpha_line_m_steps):
-                            alpha_batch, train_batch_position = _next_supervised_batch(
-                                batch_iter=batch_iter,
-                                batch_plan_manifest=batch_plan_manifest,
-                                deterministic_data_order=deterministic_data_order,
-                                train_batch_position=train_batch_position,
-                                max_empty_supervision_skips=max_empty_supervision_skips,
-                                cycle_batch_keys=cycle_batch_keys,
-                                cycle_sample_keys=cycle_sample_keys,
+                if not warmup_released:
+                    # Warmup phase: pilot only, skip all extrapolation.
+                    is_full_eval_cycle_warmup = should_run_full_eval(
+                        cycle, cfg.eval.get("full_eval_every_cycles", 10)
+                    )
+                    cycle_state.record_cycle(
+                        train_loss=pilot_loss_avg,
+                        valid_loss=(
+                            None if is_full_eval_cycle_warmup else loss_pilot
+                        ),
+                        accepted=None,
+                        actual_backward_passes=pilot_backward_pass_count,
+                        speculative_optimizer_steps=0,
+                        optimizer_steps=pilot_K,
+                        speculative_equivalent_backward_passes=0,
+                    )
+                    accepted_valid_history.append(loss_pilot)
+                    if len(accepted_valid_history) > max(
+                        3, moving_avg_window * 2
+                    ):
+                        accepted_valid_history.pop(0)
+                    last_quick_valid_loss = loss_pilot
+                    pbar.set_postfix(
+                        loss=f"{loss_pilot:.4f}",
+                        acc="W",
+                        cos=f"{cos_sim:.3f}",
+                        red=f"{cycle_state.reduction_rate:.1%}",
+                    )
+                    if cycle % cfg.logging.get("log_every_cycles", 1) == 0:
+                        logger.info(
+                            "c=%d loss=%.4f W cos=%.3f warmup_consec=%d",
+                            cycle,
+                            loss_pilot,
+                            cos_sim,
+                            warmup_cos_consecutive,
+                        )
+                    if is_full_eval_cycle_warmup:
+                        full_result = eval_loss_detailed(
+                            model, valid_full_loader, input_device
+                        )
+                        full_loss = full_result.avg_loss
+                        logger.info(
+                            "Cycle %d full eval (warmup): loss=%.4f ppl=%.2f",
+                            cycle,
+                            full_loss,
+                            full_result.perplexity,
+                        )
+                        cycle_state.record_full_eval(full_loss)
+                        if full_loss < best_full_eval_loss:
+                            best_full_eval_loss = full_loss
+                            best_full_eval_perplexity = full_result.perplexity
+                            save_checkpoint(
+                                model, tokenizer, run_dir / "best_model"
                             )
-                            alpha_t = torch.tensor(
+                    if mlf.enabled:
+                        mlf.log_metrics(
+                            {
+                                "loss_train": pilot_loss_avg,
+                                "loss_valid": loss_pilot,
+                                "warmup_released": 0,
+                                "warmup_cos_consecutive": warmup_cos_consecutive,
+                                "predicted_consistency": predicted_consistency,
+                            },
+                            step=cycle,
+                        )
+                    # [作業A] ウォームアップ期にも run_metrics.jsonl へ step record を出力する。
+                    # w_traj と lr は全サイクルで記録必須。M9 係数は外挿していないため None。
+                    metrics.record_step(
+                        step=cycle_state.full_backward_passes,
+                        cycle=cycle,
+                        loss_train=pilot_loss_avg,
+                        loss_valid=loss_pilot,
+                        backward_passes=pilot_backward_pass_count,
+                        total_backward_passes=cycle_state.full_backward_passes,
+                        tg_lora_accepted=None,
+                        tg_lora_cosine_sim=cos_sim,
+                        tg_lora_raw_delta_cosine_sim=raw_delta_cos_sim,
+                        tg_lora_predicted_consistency=predicted_consistency,
+                        tg_lora_short_long_norm_ratio=velocity_norm_ratio,
+                        tg_lora_reduction_rate=cycle_state.reduction_rate,
+                        tg_lora_K=pilot_K,
+                        tg_lora_N=0,
+                        tg_lora_proposed_N=None,
+                        tg_lora_alpha=None,
+                        tg_lora_beta=pilot_beta,
+                        tg_lora_lr=pilot_lr,
+                        tg_lora_validation_forwards=validation_forwards_this_cycle,
+                        tg_lora_pilot_validation_forwards=pilot_validation_forwards_this_cycle,
+                        tg_lora_post_validation_forwards=post_validation_forwards_this_cycle,
+                        tg_lora_post_extrapolation_eval=False,
+                        tg_lora_post_extrapolation_eval_skipped=False,
+                        tg_lora_post_extrapolation_eval_skip_reason="warmup_phase",
+                        tg_lora_rollback_triggered=False,
+                        # M9 係数: ウォームアップ期は外挿なし → None
+                        tg_lora_m9_alpha_fit=None,
+                        tg_lora_m9_beta1_fit=None,
+                        tg_lora_m9_beta2_fit=None,
+                        tg_lora_w_traj=None,
+                    **_measurement_results_record,
+                    )
+                    continue
+
+                baseline_like_fallback, baseline_like_reason = (
+                    _should_fallback_to_baseline_like(
+                        proposal_N=proposal.N,
+                        total_cycles=cycle_state.total_cycles,
+                        acceptance_rate=cycle_state.acceptance_rate,
+                        pilot_loss=loss_pilot,
+                        previous_valid_loss=last_quick_valid_loss,
+                        acceleration=acceleration,
+                        velocity_anomalous=velocity.is_magnitude_anomalous(),
+                        enabled=tg_cfg.get("linearity_guard_enabled", False),
+                        warmup_cycles=tg_cfg.get("linearity_guard_warmup_cycles", 5),
+                        min_acceptance_rate=tg_cfg.get(
+                            "linearity_guard_min_acceptance_rate", 0.0
+                        ),
+                        pilot_margin=tg_cfg.get("linearity_guard_pilot_margin", 0.01),
+                        max_positive_acceleration=tg_cfg.get(
+                            "linearity_guard_max_positive_acceleration", 0.02
+                        ),
+                    )
+                )
+
+                if baseline_like_fallback:
+                    controller.penalize(last_quick_valid_loss, loss_pilot)
+                    is_full_eval_cycle = should_run_full_eval(
+                        cycle, cfg.eval.get("full_eval_every_cycles", 10)
+                    )
+                    cycle_state.record_cycle(
+                        train_loss=pilot_loss_avg,
+                        valid_loss=None if is_full_eval_cycle else loss_pilot,
+                        accepted=None,
+                        actual_backward_passes=pilot_backward_pass_count,
+                        speculative_optimizer_steps=0,
+                        optimizer_steps=pilot_K,
+                        speculative_equivalent_backward_passes=0,
+                    )
+                    last_quick_valid_loss = loss_pilot
+                    pilot_validation_forward_count += pilot_validation_forwards_this_cycle
+                    post_validation_forward_count += post_validation_forwards_this_cycle
+                    metrics.record_step(
+                        step=cycle_state.full_backward_passes,
+                        cycle=cycle,
+                        loss_train=pilot_loss_avg,
+                        loss_valid=loss_pilot,
+                        backward_passes=pilot_backward_pass_count,
+                        total_backward_passes=cycle_state.full_backward_passes,
+                        tg_lora_accepted=False,
+                        tg_lora_cosine_sim=cos_sim,
+                        tg_lora_raw_delta_cosine_sim=raw_delta_cos_sim,
+                        tg_lora_predicted_consistency=predicted_consistency,
+                        tg_lora_short_long_norm_ratio=velocity_norm_ratio,
+                        tg_lora_reduction_rate=cycle_state.reduction_rate,
+                        tg_lora_K=pilot_K,
+                        tg_lora_N=0,
+                        tg_lora_proposed_N=proposal_N_before_cosine,
+                        tg_lora_alpha=None,
+                        tg_lora_beta=pilot_beta,
+                        tg_lora_lr=pilot_lr,
+                        tg_lora_cache_built=use_cache,
+                        tg_lora_cache_eligible=None,
+                        tg_lora_cache_hit=None,
+                        tg_lora_validation_forwards=validation_forwards_this_cycle,
+                        tg_lora_pilot_validation_forwards=pilot_validation_forwards_this_cycle,
+                        tg_lora_post_validation_forwards=post_validation_forwards_this_cycle,
+                        tg_lora_post_extrapolation_eval=False,
+                        tg_lora_post_extrapolation_eval_skipped=False,
+                        tg_lora_post_extrapolation_eval_skip_reason="linearity_guard",
+                        tg_lora_rollback_triggered=False,
+                    **_measurement_results_record,
+                    )
+                    if mlf.enabled:
+                        mlf.log_metrics(
+                            {
+                                "loss_train": pilot_loss_avg,
+                                "loss_valid": loss_pilot,
+                                "accepted": 0,
+                                "raw_delta_cosine_sim": raw_delta_cos_sim,
+                                "velocity_predicted_consistency": predicted_consistency,
+                                "velocity_short_long_norm_ratio": velocity_norm_ratio,
+                                "linearity_guard_triggered": 1,
+                                "magnitude_acceleration": acceleration,
+                                "acceptance_rate": cycle_state.acceptance_rate,
+                            },
+                            step=cycle,
+                        )
+                    pbar.set_postfix(
+                        loss=f"{loss_pilot:.4f}",
+                        acc="B",
+                        cos=f"{cos_sim:.3f}",
+                        red=f"{cycle_state.reduction_rate:.1%}",
+                    )
+                    logger.info(
+                        "c=%d loss=%.4f B cos=%.3f red=%.1f%% K=%d N=0 (%s)",
+                        cycle,
+                        loss_pilot,
+                        cos_sim,
+                        cycle_state.reduction_rate * 100,
+                        pilot_K,
+                        baseline_like_reason,
+                    )
+                    if is_full_eval_cycle:
+                        full_result = eval_loss_detailed(
+                            model, valid_full_loader, input_device
+                        )
+                        full_loss = full_result.avg_loss
+                        logger.info(
+                            f"Cycle {cycle} full eval: loss={full_loss:.4f} "
+                            f"ppl={full_result.perplexity:.2f}"
+                        )
+                        cycle_state.record_full_eval(full_loss)
+                        if full_loss < best_full_eval_loss:
+                            best_full_eval_loss = full_loss
+                            best_full_eval_perplexity = full_result.perplexity
+                            save_checkpoint(model, tokenizer, run_dir / "best_model")
+                    _check_and_save_linearity_budget_checkpoint(
+                        model,
+                        tokenizer,
+                        valid_full_loader,
+                        input_device,
+                        cycle_state,
+                        grad_accum,
+                        triggered_target_steps,
+                        run_dir,
+                        logger,
+                        metrics,
+                    )
+                    accepted_valid_history.append(loss_pilot)
+                    if len(accepted_valid_history) > max(3, moving_avg_window * 2):
+                        accepted_valid_history.pop(0)
+                    continue
+
+                # 6. Pilot後状態をrollback用に保存
+                rollback_mgr.save(model)
+                snapshot_taken = True
+
+                try:
+                    # 7. Extrapolation — proposal already created at cycle top
+
+                    # 8. Active layers選択 — strategyが予測時と同じなら再利用
+                    # （二重ランダム選択を避け、キャッシュ有効性を保証）
+                    if use_prefix_feature_cache:
+                        active_names = fixed_active_names
+                        active_indices = fixed_active_indices
+                    else:
+                        actual_strategy = (
+                            "last_25_percent"
+                            if tg_cfg.get("force_top_layers_only", False)
+                            else proposal.active_layer_strategy
+                        )
+                        if actual_strategy == predicted_strategy:
+                            active_names = predicted_active_names
+                            active_indices = predicted_active_indices
+                        else:
+                            active_names, active_indices = select_active_layers(
+                                model,
+                                strategy=actual_strategy,
+                                random_middle=cfg.tg_lora.random_middle_layers,
+                                layer_scores=controller.state.layer_scores,
+                                temperature=cfg.tg_lora.layer_sample_temperature,
+                            )
+
+                    # Exclude frozen params from M9 speculative update targets
+                    if dynfreeze is not None:
+                        frozen_names = dynfreeze.get_frozen_param_names(model)
+                        if frozen_names:
+                            active_names = active_names - frozen_names
+
+                    zo_attempted_steps = 0
+                    zo_accepted_steps = 0
+                    zo_rejected_steps = 0
+                    zo_forward_count = 0
+                    zo_dim1_steps = 0
+                    zo_dim2_steps = 0
+                    zo_last_stats = ZerothOrderStepStats()
+                    alpha_line_v_updated = False
+                    alpha_line_alpha_before = None
+                    alpha_line_alpha_after = None
+                    alpha_line_step_count = 0
+                    alpha_line_grad_values: list[float] = []
+                    alpha_line_losses: list[float] = []
+                    alpha_line_exact_losses: list[float] = []
+                    alpha_line_approx_errors: list[float] = []
+                    alpha_line_jvp_methods: list[str] = []
+                    alpha_line_base_recompute = 0
+                    alpha_line_base_term_cached = False
+                    alpha_line_base_out_jvp_cached = False
+                    alpha_line_stop_reason = "not_reached"
+                    alpha_line_consecutive_rejects = 0
+                    alpha_line_interval_loss_start = None
+                    alpha_line_interval_probe_batch = None
+                    alpha_line_interval_net_loss_delta = None
+                    alpha_line_v_update_wall_seconds = 0.0
+                    alpha_line_alpha_wall_seconds = 0.0
+                    future_work_projection_ratio = None
+                    future_work_internal_pairs: list[dict[str, float]] = []
+                    cache_eligible = False
+                    cache_hit = False
+                    can_confident_skip = False
+                    # [作業A] M9 フィット係数: subspace_m9_fit_step が実行された場合のみ更新される。
+                    # 未実行サイクルでは None のまま記録される。
+                    m9_cycle_stats: dict = {}
+
+
+                    # 10. 外挿適用
+                    accepted = True
+                    loss_after = loss_pilot
+                    if alpha_line_enabled:
+                        accepted = False
+                        loss_after = loss_pilot
+                        proposal.N = 0
+                        extrap_stats = ExtrapolationStats()
+
+                        should_refresh_direction = (
+                            velocity.current_direction() is None
+                            or cycle % max(1, alpha_line_v_update_every) == 0
+                        )
+                        v_update_started = time.perf_counter()
+                        if should_refresh_direction:
+                            direction = velocity.build_direction(
+                                dW,
+                                lr=pilot_lr,
+                                K=dW_steps,
+                                cycle=cycle,
+                                active_names=active_names,
+                            )
+                            alpha_line_v_updated = True
+                        else:
+                            direction = velocity.current_direction() or {}
+                        alpha_line_v_update_wall_seconds = (
+                            time.perf_counter() - v_update_started
+                        )
+                        cycle_state.v_fixed_since_cycle = velocity.fixed_since_cycle
+
+                        if not direction:
+                            alpha_line_stop_reason = "no_direction"
+                        else:
+                            if alpha_line_future_work_metrics_enabled:
+                                future_work_projection_ratio = (
+                                    _projection_ratio_to_direction(
+                                        pilot_grad_sum_cpu,
+                                        direction,
+                                        active_names=active_names,
+                                    )
+                                )
+                            base_alpha_snapshot = snapshot_lora(model)
+
+                            alpha_current = alpha_line_alpha_init
+                            alpha_line_alpha_before = alpha_current
+                            _apply_alpha_direction_from_base(
+                                model,
+                                base_alpha_snapshot,
+                                direction,
                                 alpha_current,
-                                device=input_device,
-                                dtype=torch.float32,
-                                requires_grad=True,
+                                active_names=active_names,
                             )
-                            use_first_order = (
-                                alpha_line_order == 1
-                                and "hidden_states" in alpha_batch
-                            )
-                            first_order_cache = None
-                            if use_first_order:
-                                first_order_cache = compute_alpha_line_base_out_jvp(
-                                    model,
-                                    alpha_batch,
-                                    base_alpha_snapshot,
-                                    direction,
-                                    active_names=active_names,
-                                    finite_diff_eps=alpha_line_finite_diff_eps,
+
+                            alpha_loop_started = time.perf_counter()
+                            for _alpha_index in range(alpha_line_m_steps):
+                                alpha_batch, train_batch_position = _next_supervised_batch(
+                                    batch_iter=batch_iter,
+                                    batch_plan_manifest=batch_plan_manifest,
+                                    deterministic_data_order=deterministic_data_order,
+                                    train_batch_position=train_batch_position,
+                                    max_empty_supervision_skips=max_empty_supervision_skips,
+                                    cycle_batch_keys=cycle_batch_keys,
+                                    cycle_sample_keys=cycle_sample_keys,
                                 )
-                                alpha_line_base_recompute += 1
-                                alpha_line_base_term_cached = True
-                                alpha_line_base_out_jvp_cached = True
-                                alpha_line_jvp_methods.append(
-                                    first_order_cache.jvp_method
+                                alpha_t = torch.tensor(
+                                    alpha_current,
+                                    device=input_device,
+                                    dtype=torch.float32,
+                                    requires_grad=True,
                                 )
-                                cycle_state.base_term_cached = True
-                                cycle_state.base_out_jvp_cached = True
-                                cycle_state.n_base_recompute += 1
-                                loss_t = alpha_line_loss_cached_first_order(
-                                    model,
-                                    first_order_cache,
-                                    alpha_batch,
-                                    alpha_t,
+                                use_first_order = (
+                                    alpha_line_order == 1
+                                    and "hidden_states" in alpha_batch
                                 )
-                                with torch.no_grad():
-                                    exact_loss_t = alpha_line_loss_exact(
+                                first_order_cache = None
+                                if use_first_order:
+                                    first_order_cache = compute_alpha_line_base_out_jvp(
                                         model,
                                         alpha_batch,
+                                        base_alpha_snapshot,
+                                        direction,
+                                        active_names=active_names,
+                                        finite_diff_eps=alpha_line_finite_diff_eps,
+                                    )
+                                    alpha_line_base_recompute += 1
+                                    alpha_line_base_term_cached = True
+                                    alpha_line_base_out_jvp_cached = True
+                                    alpha_line_jvp_methods.append(
+                                        first_order_cache.jvp_method
+                                    )
+                                    cycle_state.base_term_cached = True
+                                    cycle_state.base_out_jvp_cached = True
+                                    cycle_state.n_base_recompute += 1
+                                    loss_t = alpha_line_loss_cached_first_order(
+                                        model,
+                                        first_order_cache,
+                                        alpha_batch,
+                                        alpha_t,
+                                    )
+                                    with torch.no_grad():
+                                        exact_loss_t = alpha_line_loss_exact(
+                                            model,
+                                            alpha_batch,
+                                            base_alpha_snapshot,
+                                            direction,
+                                            torch.tensor(
+                                                alpha_current,
+                                                device=input_device,
+                                                dtype=torch.float32,
+                                            ),
+                                            active_names=active_names,
+                                        )
+                                else:
+                                    loss_t = _alpha_line_functional_loss(
+                                        model,
+                                        alpha_batch,
+                                        base_alpha_snapshot,
+                                        direction,
+                                        alpha_t,
+                                        active_names=active_names,
+                                    )
+                                    exact_loss_t = loss_t.detach()
+                                grad_t = torch.autograd.grad(
+                                    loss_t,
+                                    alpha_t,
+                                    retain_graph=False,
+                                    create_graph=False,
+                                )[0]
+                                loss_before = float(loss_t.detach().item())
+                                exact_loss_before = float(exact_loss_t.detach().item())
+                                grad_alpha = float(grad_t.detach().item())
+                                alpha_line_losses.append(loss_before)
+                                alpha_line_exact_losses.append(exact_loss_before)
+                                alpha_line_approx_errors.append(
+                                    abs(loss_before - exact_loss_before)
+                                )
+                                alpha_line_grad_values.append(grad_alpha)
+                                if alpha_line_interval_loss_start is None:
+                                    alpha_line_interval_loss_start = exact_loss_before
+                                    alpha_line_interval_probe_batch = alpha_batch
+
+                                if not math.isfinite(loss_before) or not math.isfinite(
+                                    grad_alpha
+                                ):
+                                    alpha_line_stop_reason = "non_finite"
+                                    break
+                                if grad_alpha >= 0.0:
+                                    alpha_line_stop_reason = "g_non_descent"
+                                    alpha_line_consecutive_rejects += 1
+                                    cycle_state.consecutive_rejects = (
+                                        alpha_line_consecutive_rejects
+                                    )
+                                    if (
+                                        alpha_line_consecutive_rejects
+                                        >= alpha_line_max_consecutive_reject
+                                    ):
+                                        alpha_line_stop_reason = (
+                                            "max_consecutive_reject"
+                                        )
+                                        break
+                                    continue
+
+                                alpha_candidate = (
+                                    alpha_current - alpha_line_alpha_lr * grad_alpha
+                                )
+                                alpha_candidate_t = torch.tensor(
+                                    alpha_candidate,
+                                    device=input_device,
+                                    dtype=torch.float32,
+                                )
+                                with torch.no_grad():
+                                    if use_first_order and first_order_cache is not None:
+                                        loss_new_t = alpha_line_loss_cached_first_order(
+                                            model,
+                                            first_order_cache,
+                                            alpha_batch,
+                                            alpha_candidate_t,
+                                        )
+                                        exact_loss_new_t = alpha_line_loss_exact(
+                                            model,
+                                            alpha_batch,
+                                            base_alpha_snapshot,
+                                            direction,
+                                            alpha_candidate_t,
+                                            active_names=active_names,
+                                        )
+                                    else:
+                                        loss_new_t = _alpha_line_functional_loss(
+                                            model,
+                                            alpha_batch,
+                                            base_alpha_snapshot,
+                                            direction,
+                                            alpha_candidate_t,
+                                            active_names=active_names,
+                                        )
+                                        exact_loss_new_t = loss_new_t
+                                loss_new = float(loss_new_t.detach().item())
+                                exact_loss_new = float(exact_loss_new_t.detach().item())
+                                if alpha_line_future_work_internal_metrics_enabled:
+                                    future_work_internal_pairs.append(
+                                        {
+                                            "g_dot_v": grad_alpha,
+                                            "exact_loss_delta": (
+                                                exact_loss_new - exact_loss_before
+                                            ),
+                                        }
+                                    )
+                                alpha_line_losses.append(loss_new)
+                                alpha_line_exact_losses.append(exact_loss_new)
+                                alpha_line_approx_errors.append(
+                                    abs(loss_new - exact_loss_new)
+                                )
+                                if (
+                                    math.isfinite(loss_new)
+                                    and loss_new
+                                    <= loss_before + controller.rollback_tolerance
+                                ):
+                                    _apply_alpha_direction_from_base(
+                                        model,
+                                        base_alpha_snapshot,
+                                        direction,
+                                        alpha_candidate,
+                                        active_names=active_names,
+                                    )
+                                    alpha_current = alpha_candidate
+                                    alpha_line_step_count += 1
+                                    alpha_line_consecutive_rejects = 0
+                                    cycle_state.consecutive_rejects = 0
+                                    cycle_state.alpha_steps_in_cycle = (
+                                        alpha_line_step_count
+                                    )
+                                    cycle_state.current_alpha = alpha_current
+                                    loss_after = exact_loss_new
+                                    accepted = True
+                                    alpha_line_stop_reason = "max"
+                                    continue
+
+                                alpha_line_stop_reason = "reject"
+                                alpha_line_consecutive_rejects += 1
+                                cycle_state.consecutive_rejects = (
+                                    alpha_line_consecutive_rejects
+                                )
+                                if (
+                                    alpha_line_consecutive_rejects
+                                    >= alpha_line_max_consecutive_reject
+                                ):
+                                    alpha_line_stop_reason = "max_consecutive_reject"
+                                    break
+                                continue
+                            alpha_line_alpha_wall_seconds = (
+                                time.perf_counter() - alpha_loop_started
+                            )
+                            alpha_line_alpha_after = alpha_current
+                            if (
+                                alpha_line_interval_loss_start is not None
+                                and alpha_line_interval_probe_batch is not None
+                                and alpha_line_step_count > 0
+                            ):
+                                with torch.no_grad():
+                                    alpha_line_interval_loss_end_t = alpha_line_loss_exact(
+                                        model,
+                                        alpha_line_interval_probe_batch,
                                         base_alpha_snapshot,
                                         direction,
                                         torch.tensor(
@@ -2540,345 +2851,85 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                                         ),
                                         active_names=active_names,
                                     )
-                            else:
-                                loss_t = _alpha_line_functional_loss(
-                                    model,
-                                    alpha_batch,
-                                    base_alpha_snapshot,
-                                    direction,
-                                    alpha_t,
-                                    active_names=active_names,
+                                alpha_line_interval_loss_end = float(
+                                    alpha_line_interval_loss_end_t.detach().item()
                                 )
-                                exact_loss_t = loss_t.detach()
-                            grad_t = torch.autograd.grad(
-                                loss_t,
-                                alpha_t,
-                                retain_graph=False,
-                                create_graph=False,
-                            )[0]
-                            loss_before = float(loss_t.detach().item())
-                            exact_loss_before = float(exact_loss_t.detach().item())
-                            grad_alpha = float(grad_t.detach().item())
-                            alpha_line_losses.append(loss_before)
-                            alpha_line_exact_losses.append(exact_loss_before)
-                            alpha_line_approx_errors.append(
-                                abs(loss_before - exact_loss_before)
-                            )
-                            alpha_line_grad_values.append(grad_alpha)
-                            if alpha_line_interval_loss_start is None:
-                                alpha_line_interval_loss_start = exact_loss_before
-                                alpha_line_interval_probe_batch = alpha_batch
-
-                            if not math.isfinite(loss_before) or not math.isfinite(
-                                grad_alpha
-                            ):
-                                alpha_line_stop_reason = "non_finite"
-                                break
-                            if grad_alpha >= 0.0:
-                                alpha_line_stop_reason = "g_non_descent"
-                                alpha_line_consecutive_rejects += 1
-                                cycle_state.consecutive_rejects = (
-                                    alpha_line_consecutive_rejects
+                                alpha_line_interval_net_loss_delta = (
+                                    alpha_line_interval_loss_end
+                                    - alpha_line_interval_loss_start
                                 )
-                                if (
-                                    alpha_line_consecutive_rejects
-                                    >= alpha_line_max_consecutive_reject
-                                ):
-                                    alpha_line_stop_reason = (
-                                        "max_consecutive_reject"
-                                    )
-                                    break
-                                continue
-
-                            alpha_candidate = (
-                                alpha_current - alpha_line_alpha_lr * grad_alpha
-                            )
-                            alpha_candidate_t = torch.tensor(
-                                alpha_candidate,
-                                device=input_device,
-                                dtype=torch.float32,
-                            )
-                            with torch.no_grad():
-                                if use_first_order and first_order_cache is not None:
-                                    loss_new_t = alpha_line_loss_cached_first_order(
-                                        model,
-                                        first_order_cache,
-                                        alpha_batch,
-                                        alpha_candidate_t,
-                                    )
-                                    exact_loss_new_t = alpha_line_loss_exact(
-                                        model,
-                                        alpha_batch,
-                                        base_alpha_snapshot,
-                                        direction,
-                                        alpha_candidate_t,
-                                        active_names=active_names,
-                                    )
-                                else:
-                                    loss_new_t = _alpha_line_functional_loss(
-                                        model,
-                                        alpha_batch,
-                                        base_alpha_snapshot,
-                                        direction,
-                                        alpha_candidate_t,
-                                        active_names=active_names,
-                                    )
-                                    exact_loss_new_t = loss_new_t
-                            loss_new = float(loss_new_t.detach().item())
-                            exact_loss_new = float(exact_loss_new_t.detach().item())
-                            if alpha_line_future_work_internal_metrics_enabled:
-                                future_work_internal_pairs.append(
-                                    {
-                                        "g_dot_v": grad_alpha,
-                                        "exact_loss_delta": (
-                                            exact_loss_new - exact_loss_before
-                                        ),
-                                    }
+                                cycle_state.interval_net_loss_delta = (
+                                    alpha_line_interval_net_loss_delta
                                 )
-                            alpha_line_losses.append(loss_new)
-                            alpha_line_exact_losses.append(exact_loss_new)
-                            alpha_line_approx_errors.append(
-                                abs(loss_new - exact_loss_new)
-                            )
-                            if (
-                                math.isfinite(loss_new)
-                                and loss_new
-                                <= loss_before + controller.rollback_tolerance
-                            ):
+                            proposal.N = alpha_line_step_count
+                            if alpha_line_step_count <= 0:
                                 _apply_alpha_direction_from_base(
                                     model,
                                     base_alpha_snapshot,
                                     direction,
-                                    alpha_candidate,
+                                    alpha_line_alpha_init,
                                     active_names=active_names,
                                 )
-                                alpha_current = alpha_candidate
-                                alpha_line_step_count += 1
-                                alpha_line_consecutive_rejects = 0
-                                cycle_state.consecutive_rejects = 0
-                                cycle_state.alpha_steps_in_cycle = (
-                                    alpha_line_step_count
-                                )
-                                cycle_state.current_alpha = alpha_current
-                                loss_after = exact_loss_new
-                                accepted = True
-                                alpha_line_stop_reason = "max"
-                                continue
+                                loss_after = loss_pilot
+                                accepted = False
+                                if alpha_line_stop_reason == "max":
+                                    alpha_line_stop_reason = "no_accepted_steps"
 
-                            alpha_line_stop_reason = "reject"
-                            alpha_line_consecutive_rejects += 1
-                            cycle_state.consecutive_rejects = (
-                                alpha_line_consecutive_rejects
-                            )
-                            if (
-                                alpha_line_consecutive_rejects
-                                >= alpha_line_max_consecutive_reject
-                            ):
-                                alpha_line_stop_reason = "max_consecutive_reject"
-                                break
-                            continue
-                        alpha_line_alpha_wall_seconds = (
-                            time.perf_counter() - alpha_loop_started
-                        )
-                        alpha_line_alpha_after = alpha_current
-                        if (
-                            alpha_line_interval_loss_start is not None
-                            and alpha_line_interval_probe_batch is not None
-                            and alpha_line_step_count > 0
-                        ):
-                            with torch.no_grad():
-                                alpha_line_interval_loss_end_t = alpha_line_loss_exact(
-                                    model,
-                                    alpha_line_interval_probe_batch,
-                                    base_alpha_snapshot,
-                                    direction,
-                                    torch.tensor(
-                                        alpha_current,
-                                        device=input_device,
-                                        dtype=torch.float32,
-                                    ),
-                                    active_names=active_names,
-                                )
-                            alpha_line_interval_loss_end = float(
-                                alpha_line_interval_loss_end_t.detach().item()
-                            )
-                            alpha_line_interval_net_loss_delta = (
-                                alpha_line_interval_loss_end
-                                - alpha_line_interval_loss_start
-                            )
-                            cycle_state.interval_net_loss_delta = (
-                                alpha_line_interval_net_loss_delta
-                            )
-                        proposal.N = alpha_line_step_count
-                        if alpha_line_step_count <= 0:
-                            _apply_alpha_direction_from_base(
-                                model,
-                                base_alpha_snapshot,
-                                direction,
-                                alpha_line_alpha_init,
-                                active_names=active_names,
-                            )
-                            loss_after = loss_pilot
-                            accepted = False
-                            if alpha_line_stop_reason == "max":
-                                alpha_line_stop_reason = "no_accepted_steps"
-
-                    post_extrapolation_eval = False
-                    post_extrapolation_eval_skipped = True
-                    post_extrapolation_eval_skip_reason = (
-                        f"alpha_line_{alpha_line_stop_reason}"
-                    )
-                    if accepted:
-                        controller.commit_proposal(proposal)
-                        controller.reward(loss_pilot, loss_after)
-                        controller.update_layer_scores(list(active_indices), 1.0)
-                    else:
-                        controller.penalize(loss_pilot, loss_after)
-                        controller.update_layer_scores(list(active_indices), -1.0)
-                    logger.debug(
-                        "alpha-line stats: cycle=%d accepted_steps=%d alpha=%s->%s "
-                        "stop=%s grads=%s losses=%s v_wall=%.4f alpha_wall=%.4f",
-                        cycle,
-                        alpha_line_step_count,
-                        alpha_line_alpha_before,
-                        alpha_line_alpha_after,
-                        alpha_line_stop_reason,
-                        alpha_line_grad_values,
-                        alpha_line_losses,
-                        alpha_line_v_update_wall_seconds,
-                        alpha_line_alpha_wall_seconds,
-                    )
-                elif subspace_m9_enabled:
-                    accepted = False
-                    loss_after = loss_pilot
-                    proposal.N = 0
-                    history_deltas = delta_tracker._history
-                    
-                    if len(history_deltas) < 2:
-                        logger.warning(
-                            "subspace M9: history length (%d) < 2, skipping extrapolation",
-                            len(history_deltas)
-                        )
                         post_extrapolation_eval = False
                         post_extrapolation_eval_skipped = True
-                        post_extrapolation_eval_skip_reason = "subspace_m9_insufficient_history"
-                        extrap_stats = ExtrapolationStats()
-                    else:
-                        empty_supervision_skips = 0
-                        while True:
-                            m9_batch = batch_iter.next()
-                            batch_position = train_batch_position
-                            train_batch_position += 1
-                            if has_supervised_tokens(m9_batch):
-                                break
-                            empty_supervision_skips += 1
-                            if empty_supervision_skips > max_empty_supervision_skips:
-                                raise RuntimeError(
-                                    "Exceeded empty-supervision skip budget while "
-                                    "filling an M9 step"
-                                )
-                        
-                        if deterministic_data_order:
-                            batch_locator = (
-                                batch_plan_manifest.batch_locator_at_position(
-                                    batch_position
-                                )
-                            )
-                            cycle_batch_keys.append(batch_locator.batch_key)
-                            cycle_sample_keys.extend(batch_locator.sample_keys)
-
-                        def _m9_loss_fn(batch_data: dict[str, torch.Tensor]) -> float:
-                            return _forward_loss_no_grad(model, batch_data)
-
-                        m9_delta, m9_stats = subspace_m9_fit_step(
-                            model=model,
-                            history=history_deltas[-tg_cfg.get("N_initial", 10):],
-                            active_names=active_names,
-                            batch=m9_batch,
-                            loss_fn=_m9_loss_fn,
-                            selected_N=selected_N,
-                            fd_epsilon=subspace_m9_fd_eps,
-                            fit_lr=subspace_m9_lr,
-                            fit_steps=subspace_m9_steps,
-                            velocity_direction=velocity.long_state,
+                        post_extrapolation_eval_skip_reason = (
+                            f"alpha_line_{alpha_line_stop_reason}"
                         )
-
-                        params_active = {name: p for name, p in model.named_parameters() if name in active_names}
-                        
-                        for name, p in params_active.items():
-                            p.data.add_(m9_delta[name].to(p.device))
-
-                        proposal.N = selected_N
-                        post_extrapolation_eval = True
-                        post_extrapolation_eval_skipped = False
-                        post_extrapolation_eval_skip_reason = "subspace_m9_fitted"
-
-                        delta_norm = float(sum(d.norm().item()**2 for d in m9_delta.values())**0.5)
-                        extrap_stats = ExtrapolationStats(
-                            num_tensors=1,
-                            capped_tensors=0,
-                            raw_update_norm=delta_norm,
-                            applied_update_norm=delta_norm,
-                            min_cap_ratio=1.0,
-                            mean_cap_ratio=1.0,
-                        )
-                        
-                        logger.info(
-                            "subspace M9 stats: cycle=%d alpha_fit=%.4f beta1_fit=%.4f beta2_fit=%.4f loss_initial=%.4f loss_final=%.4f w_traj=%.6f v0=%s",
+                        if accepted:
+                            controller.commit_proposal(proposal)
+                            controller.reward(loss_pilot, loss_after)
+                            controller.update_layer_scores(list(active_indices), 1.0)
+                        else:
+                            controller.penalize(loss_pilot, loss_after)
+                            controller.update_layer_scores(list(active_indices), -1.0)
+                        logger.debug(
+                            "alpha-line stats: cycle=%d accepted_steps=%d alpha=%s->%s "
+                            "stop=%s grads=%s losses=%s v_wall=%.4f alpha_wall=%.4f",
                             cycle,
-                            m9_stats.get("alpha_fit", 1.0),
-                            m9_stats.get("beta1_fit", 0.0),
-                            m9_stats.get("beta2_fit", 0.0),
-                            m9_stats.get("loss_initial", 0.0),
-                            m9_stats.get("loss_final", 0.0),
-                            m9_stats.get("w_traj", 0.0),
-                            m9_stats.get("v0_source", "unknown"),
+                            alpha_line_step_count,
+                            alpha_line_alpha_before,
+                            alpha_line_alpha_after,
+                            alpha_line_stop_reason,
+                            alpha_line_grad_values,
+                            alpha_line_losses,
+                            alpha_line_v_update_wall_seconds,
+                            alpha_line_alpha_wall_seconds,
                         )
-                        # [作業A] m9_stats を cycle 単位で保存 → main metrics.record_step へ渡す
-                        m9_cycle_stats = m9_stats
-                elif subspace_zo_enabled:
-                    accepted = False
-                    loss_after = loss_pilot
-                    proposal.N = 0
-                    raw_step_norm_sq = 0.0
-                    applied_step_norm_sq = 0.0
-                    cap_ratio_sum = 0.0
-                    min_cap_ratio = 1.0
-                    capped_steps = 0
-                    max_zo_steps = max(0, subspace_zo_max_steps_per_cycle)
-                    if predicted_consistency < subspace_zo_tau_cos:
+                    elif subspace_m9_enabled:
                         accepted = False
                         loss_after = loss_pilot
                         proposal.N = 0
-                        post_extrapolation_eval = False
-                        post_extrapolation_eval_skipped = True
-                        post_extrapolation_eval_skip_reason = "subspace_zo_low_cos"
-                    else:
-                        for _zo_index in range(max_zo_steps):
-                            basis = velocity.build_orthonormal_basis(
-                                active_names=active_names,
-                                tau_dim=subspace_zo_tau_dim,
-                                force_dim=subspace_zo_force_dim,
+                        history_deltas = delta_tracker._history
+                    
+                        if len(history_deltas) < 2:
+                            logger.warning(
+                                "subspace M9: history length (%d) < 2, skipping extrapolation",
+                                len(history_deltas)
                             )
-                            if basis.dim <= 0:
-                                post_extrapolation_eval_skip_reason = (
-                                    "subspace_zo_no_basis"
-                                )
-                                break
-
+                            post_extrapolation_eval = False
+                            post_extrapolation_eval_skipped = True
+                            post_extrapolation_eval_skip_reason = "subspace_m9_insufficient_history"
+                            extrap_stats = ExtrapolationStats()
+                        else:
                             empty_supervision_skips = 0
                             while True:
-                                zo_batch = batch_iter.next()
+                                m9_batch = batch_iter.next()
                                 batch_position = train_batch_position
                                 train_batch_position += 1
-                                if has_supervised_tokens(zo_batch):
+                                if has_supervised_tokens(m9_batch):
                                     break
                                 empty_supervision_skips += 1
                                 if empty_supervision_skips > max_empty_supervision_skips:
                                     raise RuntimeError(
                                         "Exceeded empty-supervision skip budget while "
-                                        "filling a zeroth-order step"
+                                        "filling an M9 step"
                                     )
+                        
                             if deterministic_data_order:
                                 batch_locator = (
                                     batch_plan_manifest.batch_locator_at_position(
@@ -2888,357 +2939,425 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                                 cycle_batch_keys.append(batch_locator.batch_key)
                                 cycle_sample_keys.extend(batch_locator.sample_keys)
 
-                            def _zo_loss_closure(
-                                batch: dict[str, torch.Tensor] = zo_batch,
-                            ) -> float:
-                                return _forward_loss_no_grad(model, batch)
+                            def _m9_loss_fn(batch_data: dict[str, torch.Tensor]) -> float:
+                                return _forward_loss_no_grad(model, batch_data)
 
-                            zo_last_stats = subspace_zeroth_order_step(
+                            m9_delta, m9_stats = subspace_m9_fit_step(
                                 model=model,
-                                basis=basis,
+                                history=history_deltas[-tg_cfg.get("N_initial", 10):],
                                 active_names=active_names,
-                                loss_closure=_zo_loss_closure,
-                                mu_ratio=subspace_zo_mu_ratio,
-                                eps_curv=subspace_zo_eps_curv,
-                                eta_fallback_ratio=subspace_zo_eta_fallback_ratio,
-                                max_step_ratio=subspace_zo_max_step_ratio,
-                                tolerance=controller.rollback_tolerance,
-                                disable_curvature=subspace_zo_disable_curvature,
-                                stop_on_positive_primary_g=(
-                                    subspace_zo_stop_on_positive_g1
-                                ),
-                                primary_g_stop_epsilon=subspace_zo_g1_stop_epsilon,
+                                batch=m9_batch,
+                                loss_fn=_m9_loss_fn,
+                                selected_N=selected_N,
+                                fd_epsilon=subspace_m9_fd_eps,
+                                fit_lr=subspace_m9_lr,
+                                fit_steps=subspace_m9_steps,
+                                velocity_direction=velocity.long_state,
                             )
-                            zo_attempted_steps += 1
-                            zo_forward_count += zo_last_stats.forward_count
-                            if zo_last_stats.dim == 1:
-                                zo_dim1_steps += 1
-                            elif zo_last_stats.dim == 2:
-                                zo_dim2_steps += 1
-                            if zo_last_stats.capped:
-                                capped_steps += 1
-                            min_cap_ratio = min(min_cap_ratio, zo_last_stats.cap_ratio)
-                            if math.isfinite(zo_last_stats.raw_step_norm):
-                                raw_step_norm_sq += zo_last_stats.raw_step_norm**2
-                            if math.isfinite(zo_last_stats.applied_step_norm):
-                                applied_step_norm_sq += (
-                                    zo_last_stats.applied_step_norm**2
-                                )
-                            cap_ratio_sum += zo_last_stats.cap_ratio
-                            if zo_last_stats.accepted:
-                                zo_accepted_steps += 1
-                                loss_after = zo_last_stats.loss_new
-                            else:
-                                zo_rejected_steps += 1
-                                if zo_accepted_steps == 0:
-                                    loss_after = loss_pilot
-                                post_extrapolation_eval_skip_reason = (
-                                    "subspace_zo_"
-                                    f"{zo_last_stats.termination_reason or 'rejected'}"
-                                )
-                                break
 
-                        accepted = zo_accepted_steps > 0
-                        proposal.N = zo_accepted_steps
-                        post_extrapolation_eval = False
-                        post_extrapolation_eval_skipped = True
-                        if post_extrapolation_eval_skip_reason == "not_reached":
-                            post_extrapolation_eval_skip_reason = (
-                                "subspace_zo_train_probe"
+                            params_active = {name: p for name, p in model.named_parameters() if name in active_names}
+                        
+                            for name, p in params_active.items():
+                                p.data.add_(m9_delta[name].to(p.device))
+
+                            proposal.N = selected_N
+                            post_extrapolation_eval = True
+                            post_extrapolation_eval_skipped = False
+                            post_extrapolation_eval_skip_reason = "subspace_m9_fitted"
+
+                            delta_norm = float(sum(d.norm().item()**2 for d in m9_delta.values())**0.5)
+                            extrap_stats = ExtrapolationStats(
+                                num_tensors=1,
+                                capped_tensors=0,
+                                raw_update_norm=delta_norm,
+                                applied_update_norm=delta_norm,
+                                min_cap_ratio=1.0,
+                                mean_cap_ratio=1.0,
                             )
-                        if accepted:
+                        
+                            logger.info(
+                                "subspace M9 stats: cycle=%d alpha_fit=%.4f beta1_fit=%.4f beta2_fit=%.4f loss_initial=%.4f loss_final=%.4f w_traj=%.6f v0=%s",
+                                cycle,
+                                m9_stats.get("alpha_fit", 1.0),
+                                m9_stats.get("beta1_fit", 0.0),
+                                m9_stats.get("beta2_fit", 0.0),
+                                m9_stats.get("loss_initial", 0.0),
+                                m9_stats.get("loss_final", 0.0),
+                                m9_stats.get("w_traj", 0.0),
+                                m9_stats.get("v0_source", "unknown"),
+                            )
+                            # [作業A] m9_stats を cycle 単位で保存 → main metrics.record_step へ渡す
+                            m9_cycle_stats = m9_stats
+                    elif subspace_zo_enabled:
+                        accepted = False
+                        loss_after = loss_pilot
+                        proposal.N = 0
+                        raw_step_norm_sq = 0.0
+                        applied_step_norm_sq = 0.0
+                        cap_ratio_sum = 0.0
+                        min_cap_ratio = 1.0
+                        capped_steps = 0
+                        max_zo_steps = max(0, subspace_zo_max_steps_per_cycle)
+                        if predicted_consistency < subspace_zo_tau_cos:
+                            accepted = False
+                            loss_after = loss_pilot
+                            proposal.N = 0
+                            post_extrapolation_eval = False
+                            post_extrapolation_eval_skipped = True
+                            post_extrapolation_eval_skip_reason = "subspace_zo_low_cos"
+                        else:
+                            for _zo_index in range(max_zo_steps):
+                                basis = velocity.build_orthonormal_basis(
+                                    active_names=active_names,
+                                    tau_dim=subspace_zo_tau_dim,
+                                    force_dim=subspace_zo_force_dim,
+                                )
+                                if basis.dim <= 0:
+                                    post_extrapolation_eval_skip_reason = (
+                                        "subspace_zo_no_basis"
+                                    )
+                                    break
+
+                                empty_supervision_skips = 0
+                                while True:
+                                    zo_batch = batch_iter.next()
+                                    batch_position = train_batch_position
+                                    train_batch_position += 1
+                                    if has_supervised_tokens(zo_batch):
+                                        break
+                                    empty_supervision_skips += 1
+                                    if empty_supervision_skips > max_empty_supervision_skips:
+                                        raise RuntimeError(
+                                            "Exceeded empty-supervision skip budget while "
+                                            "filling a zeroth-order step"
+                                        )
+                                if deterministic_data_order:
+                                    batch_locator = (
+                                        batch_plan_manifest.batch_locator_at_position(
+                                            batch_position
+                                        )
+                                    )
+                                    cycle_batch_keys.append(batch_locator.batch_key)
+                                    cycle_sample_keys.extend(batch_locator.sample_keys)
+
+                                def _zo_loss_closure(
+                                    batch: dict[str, torch.Tensor] = zo_batch,
+                                ) -> float:
+                                    return _forward_loss_no_grad(model, batch)
+
+                                zo_last_stats = subspace_zeroth_order_step(
+                                    model=model,
+                                    basis=basis,
+                                    active_names=active_names,
+                                    loss_closure=_zo_loss_closure,
+                                    mu_ratio=subspace_zo_mu_ratio,
+                                    eps_curv=subspace_zo_eps_curv,
+                                    eta_fallback_ratio=subspace_zo_eta_fallback_ratio,
+                                    max_step_ratio=subspace_zo_max_step_ratio,
+                                    tolerance=controller.rollback_tolerance,
+                                    disable_curvature=subspace_zo_disable_curvature,
+                                    stop_on_positive_primary_g=(
+                                        subspace_zo_stop_on_positive_g1
+                                    ),
+                                    primary_g_stop_epsilon=subspace_zo_g1_stop_epsilon,
+                                )
+                                zo_attempted_steps += 1
+                                zo_forward_count += zo_last_stats.forward_count
+                                if zo_last_stats.dim == 1:
+                                    zo_dim1_steps += 1
+                                elif zo_last_stats.dim == 2:
+                                    zo_dim2_steps += 1
+                                if zo_last_stats.capped:
+                                    capped_steps += 1
+                                min_cap_ratio = min(min_cap_ratio, zo_last_stats.cap_ratio)
+                                if math.isfinite(zo_last_stats.raw_step_norm):
+                                    raw_step_norm_sq += zo_last_stats.raw_step_norm**2
+                                if math.isfinite(zo_last_stats.applied_step_norm):
+                                    applied_step_norm_sq += (
+                                        zo_last_stats.applied_step_norm**2
+                                    )
+                                cap_ratio_sum += zo_last_stats.cap_ratio
+                                if zo_last_stats.accepted:
+                                    zo_accepted_steps += 1
+                                    loss_after = zo_last_stats.loss_new
+                                else:
+                                    zo_rejected_steps += 1
+                                    if zo_accepted_steps == 0:
+                                        loss_after = loss_pilot
+                                    post_extrapolation_eval_skip_reason = (
+                                        "subspace_zo_"
+                                        f"{zo_last_stats.termination_reason or 'rejected'}"
+                                    )
+                                    break
+
+                            accepted = zo_accepted_steps > 0
+                            proposal.N = zo_accepted_steps
+                            post_extrapolation_eval = False
+                            post_extrapolation_eval_skipped = True
+                            if post_extrapolation_eval_skip_reason == "not_reached":
+                                post_extrapolation_eval_skip_reason = (
+                                    "subspace_zo_train_probe"
+                                )
+                            if accepted:
+                                controller.commit_proposal(proposal)
+                                controller.reward(loss_pilot, loss_after)
+                                controller.update_layer_scores(list(active_indices), 1.0)
+                            else:
+                                controller.penalize(loss_pilot, loss_after)
+                                controller.update_layer_scores(list(active_indices), -1.0)
+
+                        extrap_stats = ExtrapolationStats(
+                            num_tensors=zo_attempted_steps,
+                            capped_tensors=capped_steps,
+                            raw_update_norm=raw_step_norm_sq**0.5,
+                            applied_update_norm=applied_step_norm_sq**0.5,
+                            min_cap_ratio=min_cap_ratio if zo_attempted_steps else 1.0,
+                            mean_cap_ratio=(
+                                cap_ratio_sum / zo_attempted_steps
+                                if zo_attempted_steps
+                                else 1.0
+                            ),
+                        )
+                        logger.debug(
+                            "subspace ZO stats: cycle=%d accepted=%d/%d rejected=%d "
+                            "forwards=%d dim1=%d dim2=%d last_loss=%.4f->%.4f "
+                            "last_residual=%.3f cap_ratio=%.3f",
+                            cycle,
+                            zo_accepted_steps,
+                            zo_attempted_steps,
+                            zo_rejected_steps,
+                            zo_forward_count,
+                            zo_dim1_steps,
+                            zo_dim2_steps,
+                            zo_last_stats.loss_initial,
+                            zo_last_stats.loss_new,
+                            zo_last_stats.residual_norm,
+                            zo_last_stats.cap_ratio,
+                        )
+                    else:
+                        extrap_stats = apply_extrapolation(
+                            model=model,
+                            velocity=current_velocity,
+                            active_names=active_names,
+                            n_steps=proposal.N,
+                            lr=pilot_lr,
+                            relative_update_cap=proposal.relative_update_cap,
+                        )
+                        if extrap_stats is None:
+                            extrap_stats = ExtrapolationStats()
+                        logger.debug(
+                            "extrapolation cap stats: cycle=%d raw_norm=%.4e applied_norm=%.4e "
+                            "global_ratio=%.3f mean_ratio=%.3f min_ratio=%.3f capped=%d/%d",
+                            cycle,
+                            extrap_stats.raw_update_norm,
+                            extrap_stats.applied_update_norm,
+                            extrap_stats.global_cap_ratio,
+                            extrap_stats.mean_cap_ratio,
+                            extrap_stats.min_cap_ratio,
+                            extrap_stats.capped_tensors,
+                            extrap_stats.num_tensors,
+                        )
+
+                    if (
+                        save_trajectory_delta_artifacts
+                        and pilot_state_snapshot is not None
+                        and cycle % trajectory_delta_artifact_interval == 0
+                    ):
+                        spec_delta = snapshot_lora_delta(model, pilot_state_snapshot)
+                        spec_metadata = build_trajectory_delta_artifact_metadata(
+                            mode="tg_lora",
+                            anchor_kind="after_speculative_update",
+                            trajectory_key=trajectory_key,
+                            epoch_batch_plan_key=batch_plan_manifest.epoch_batch_plan_key,
+                            batch_plan_manifest=(
+                                str(batch_plan_manifest_path)
+                                if save_batch_plan_manifest
+                                else None
+                            ),
+                            dataset_key=batch_plan_manifest.dataset_key,
+                            delta_tensors=spec_delta,
+                            cycle=cycle,
+                            total_backward_passes=pilot_backward_passes,
+                            batch_keys=cycle_batch_keys,
+                            sample_keys=cycle_sample_keys,
+                            extra_metadata={
+                                "K": pilot_K,
+                                "N": proposal.N,
+                                "proposed_N_before_cosine": proposal_N_before_cosine,
+                                "pilot_lr": pilot_lr,
+                                "relative_update_cap": proposal.relative_update_cap,
+                                "raw_delta_cosine_sim": raw_delta_cos_sim,
+                                "velocity_predicted_consistency": predicted_consistency,
+                                "velocity_short_long_norm_ratio": velocity_norm_ratio,
+                                "raw_update_norm": extrap_stats.raw_update_norm,
+                                "applied_update_norm": extrap_stats.applied_update_norm,
+                                "global_cap_ratio": extrap_stats.global_cap_ratio,
+                                "mean_cap_ratio": extrap_stats.mean_cap_ratio,
+                                "min_cap_ratio": extrap_stats.min_cap_ratio,
+                                "capped_fraction": extrap_stats.capped_fraction,
+                                "subspace_zo_enabled": subspace_zo_enabled,
+                                "subspace_zo_attempted_steps": zo_attempted_steps,
+                                "subspace_zo_accepted_steps": zo_accepted_steps,
+                                "subspace_zo_rejected_steps": zo_rejected_steps,
+                                "subspace_zo_forward_count": zo_forward_count,
+                                "subspace_zo_last_residual_norm": (
+                                    zo_last_stats.residual_norm
+                                ),
+                            },
+                        )
+                        save_trajectory_delta_artifact(
+                            path=trajectory_delta_artifact_dir
+                            / artifact_file_name(
+                                mode="tg_lora",
+                                anchor_kind="after_speculative_update",
+                                cycle=cycle,
+                            ),
+                            metadata=spec_metadata,
+                            delta_tensors=spec_delta,
+                        )
+
+                    # 10b. 外挿後パラメータ有限性チェック
+                    params_finite, non_finite_detail = check_lora_params_finite(model)
+                    if not params_finite:
+                        logger.warning(
+                            f"Non-finite LoRA params after extrapolation: {non_finite_detail}. "
+                            f"Rolling back and penalizing."
+                        )
+                        try:
+                            rollback_mgr.rollback(model)
+                        except (RuntimeError, IndexError) as exc:
+                            logger.error(
+                                f"Rollback failed, model state may be corrupted: {exc}"
+                            )
+                        controller.penalize(loss_pilot, float("inf"))
+                        controller.update_layer_scores(list(active_indices), -1.0)
+                        accepted = False
+                        loss_after = float("inf")
+                        # Skip the normal accept/rollback flow below
+                        if snapshot_taken:
+                            rollback_mgr.pop()
+                            snapshot_taken = False
+                        cycle_state.record_cycle(
+                            train_loss=pilot_loss_avg,
+                            valid_loss=loss_pilot,
+                            accepted=accepted,
+                            actual_backward_passes=pilot_backward_pass_count,
+                            speculative_optimizer_steps=proposal.N if accepted else 0,
+                            optimizer_steps=pilot_K,
+                            speculative_equivalent_backward_passes=(proposal.N * grad_accum) if accepted else 0,
+                        )
+                        accepted_valid_history.append(loss_pilot)
+                        if len(accepted_valid_history) > max(3, moving_avg_window * 2):
+                            accepted_valid_history.pop(0)
+                        last_quick_valid_loss = loss_pilot
+                        continue
+
+                    # 10c. [accept-after-sgd] M9着地点から1回SGDしてから評価する。
+                    # 外挿はジグザグをショートカットするので着地点のlossは必ず上振れする。
+                    # しかし着地点が「良い場所」なら1回SGDでpilot到達点以下に回復するはず。
+                    # これをaccept判定に使うことで、外挿の真の価値を測る。
+                    accept_after_sgd_steps = tg_cfg.get("accept_after_sgd_steps", 0)
+                    if accept_after_sgd_steps > 0 and subspace_m9_enabled:
+                        sgd_step_lr = tg_cfg.get("accept_after_sgd_lr", None)
+                        if sgd_step_lr is None:
+                            sgd_step_lr = cfg.training.learning_rate
+                        for _sgd_i in range(accept_after_sgd_steps):
+                            sgd_batch = batch_iter.next()
+                            while not has_supervised_tokens(sgd_batch):
+                                sgd_batch = batch_iter.next()
+                            model.train()
+                            with torch.set_grad_enabled(True):
+                                sgd_loss = compute_loss(model, sgd_batch)
+                                sgd_loss.backward()
+                            with torch.no_grad():
+                                for _n, _p in model.named_parameters():
+                                    if _n in active_names and _p.grad is not None:
+                                        _p.data -= sgd_step_lr * _p.grad.detach()
+                                        _p.grad = None
+                            model.eval()
+                            logger.info(
+                                "accept-after-sgd: cycle=%d step=%d loss_at_landing=%.4f",
+                                cycle, _sgd_i, float(sgd_loss.detach().item()),
+                            )
+
+                    # 11. Accept-probe eval (外挿後) — cosine-gated skip or cache use.
+                    cache_eligible = False
+                    cache_hit = False
+                    velocity_anomalous = velocity.is_magnitude_anomalous()
+                    if validation_skip_enabled:
+                        should_eval_after, skip_policy_reason = (
+                            _decide_post_extrapolation_eval_policy(
+                                consistency=cos_sim,
+                                selected_N=int(proposal.N),
+                                total_cycles=cycle_state.total_cycles,
+                                acceptance_rate=cycle_state.acceptance_rate,
+                                velocity_anomalous=velocity_anomalous,
+                                enabled=True,
+                                high_cos=validation_skip_high_cos,
+                                mid_cos=validation_skip_mid_cos,
+                                mid_eval_every=validation_skip_mid_eval_every,
+                                min_cycles=validation_skip_min_cycles,
+                                min_acceptance_rate=validation_skip_min_acceptance_rate,
+                                force_eval_N=validation_skip_force_eval_N,
+                            )
+                        )
+                    else:
+                        confident_skip_threshold = cfg.tg_lora.get(
+                            "confident_skip_cos", 0.0
+                        )
+                        confident_skip_min_cycles = cfg.tg_lora.get(
+                            "confident_skip_min_cycles", 10
+                        )
+                        can_legacy_skip = (
+                            confident_skip_threshold > 0
+                            and cos_sim >= confident_skip_threshold
+                            and cycle_state.acceptance_rate >= 0.8
+                            and cycle_state.total_cycles >= confident_skip_min_cycles
+                            and not velocity_anomalous
+                        )
+                        should_eval_after = not can_legacy_skip
+                        skip_policy_reason = (
+                            "legacy_confident_skip" if can_legacy_skip else "legacy_eval"
+                        )
+
+                    can_confident_skip = not should_eval_after
+                    if subspace_zo_enabled:
+                        can_confident_skip = True
+                        if post_extrapolation_eval_skip_reason == "not_reached":
+                            post_extrapolation_eval_skip_reason = "subspace_zo_train_probe"
+                        skip_policy_reason = post_extrapolation_eval_skip_reason
+                    if alpha_line_enabled:
+                        # Only skip validation evaluation if the alpha-line search did not accept any steps (i.e. model rolled back to pilot state).
+                        # If steps were accepted, we MUST evaluate on the validation set to guard against training-batch overfitting.
+                        can_confident_skip = not accepted
+                        skip_policy_reason = post_extrapolation_eval_skip_reason
+
+                    if can_confident_skip:
+                        # Eval skip: velocity direction is trusted for this cycle.
+                        if not subspace_zo_enabled and not alpha_line_enabled:
+                            loss_after = loss_pilot  # assume no degradation
+                            accepted = True
+                        post_extrapolation_eval_skipped = True
+                        post_extrapolation_eval_skip_reason = skip_policy_reason
+                        if not subspace_zo_enabled and not alpha_line_enabled:
                             controller.commit_proposal(proposal)
                             controller.reward(loss_pilot, loss_after)
                             controller.update_layer_scores(list(active_indices), 1.0)
-                        else:
-                            controller.penalize(loss_pilot, loss_after)
-                            controller.update_layer_scores(list(active_indices), -1.0)
-
-                    extrap_stats = ExtrapolationStats(
-                        num_tensors=zo_attempted_steps,
-                        capped_tensors=capped_steps,
-                        raw_update_norm=raw_step_norm_sq**0.5,
-                        applied_update_norm=applied_step_norm_sq**0.5,
-                        min_cap_ratio=min_cap_ratio if zo_attempted_steps else 1.0,
-                        mean_cap_ratio=(
-                            cap_ratio_sum / zo_attempted_steps
-                            if zo_attempted_steps
-                            else 1.0
-                        ),
-                    )
-                    logger.debug(
-                        "subspace ZO stats: cycle=%d accepted=%d/%d rejected=%d "
-                        "forwards=%d dim1=%d dim2=%d last_loss=%.4f->%.4f "
-                        "last_residual=%.3f cap_ratio=%.3f",
-                        cycle,
-                        zo_accepted_steps,
-                        zo_attempted_steps,
-                        zo_rejected_steps,
-                        zo_forward_count,
-                        zo_dim1_steps,
-                        zo_dim2_steps,
-                        zo_last_stats.loss_initial,
-                        zo_last_stats.loss_new,
-                        zo_last_stats.residual_norm,
-                        zo_last_stats.cap_ratio,
-                    )
-                else:
-                    extrap_stats = apply_extrapolation(
-                        model=model,
-                        velocity=current_velocity,
-                        active_names=active_names,
-                        n_steps=proposal.N,
-                        lr=pilot_lr,
-                        relative_update_cap=proposal.relative_update_cap,
-                    )
-                    if extrap_stats is None:
-                        extrap_stats = ExtrapolationStats()
-                    logger.debug(
-                        "extrapolation cap stats: cycle=%d raw_norm=%.4e applied_norm=%.4e "
-                        "global_ratio=%.3f mean_ratio=%.3f min_ratio=%.3f capped=%d/%d",
-                        cycle,
-                        extrap_stats.raw_update_norm,
-                        extrap_stats.applied_update_norm,
-                        extrap_stats.global_cap_ratio,
-                        extrap_stats.mean_cap_ratio,
-                        extrap_stats.min_cap_ratio,
-                        extrap_stats.capped_tensors,
-                        extrap_stats.num_tensors,
-                    )
-
-                if (
-                    save_trajectory_delta_artifacts
-                    and pilot_state_snapshot is not None
-                    and cycle % trajectory_delta_artifact_interval == 0
-                ):
-                    spec_delta = snapshot_lora_delta(model, pilot_state_snapshot)
-                    spec_metadata = build_trajectory_delta_artifact_metadata(
-                        mode="tg_lora",
-                        anchor_kind="after_speculative_update",
-                        trajectory_key=trajectory_key,
-                        epoch_batch_plan_key=batch_plan_manifest.epoch_batch_plan_key,
-                        batch_plan_manifest=(
-                            str(batch_plan_manifest_path)
-                            if save_batch_plan_manifest
-                            else None
-                        ),
-                        dataset_key=batch_plan_manifest.dataset_key,
-                        delta_tensors=spec_delta,
-                        cycle=cycle,
-                        total_backward_passes=pilot_backward_passes,
-                        batch_keys=cycle_batch_keys,
-                        sample_keys=cycle_sample_keys,
-                        extra_metadata={
-                            "K": pilot_K,
-                            "N": proposal.N,
-                            "proposed_N_before_cosine": proposal_N_before_cosine,
-                            "pilot_lr": pilot_lr,
-                            "relative_update_cap": proposal.relative_update_cap,
-                            "raw_delta_cosine_sim": raw_delta_cos_sim,
-                            "velocity_predicted_consistency": predicted_consistency,
-                            "velocity_short_long_norm_ratio": velocity_norm_ratio,
-                            "raw_update_norm": extrap_stats.raw_update_norm,
-                            "applied_update_norm": extrap_stats.applied_update_norm,
-                            "global_cap_ratio": extrap_stats.global_cap_ratio,
-                            "mean_cap_ratio": extrap_stats.mean_cap_ratio,
-                            "min_cap_ratio": extrap_stats.min_cap_ratio,
-                            "capped_fraction": extrap_stats.capped_fraction,
-                            "subspace_zo_enabled": subspace_zo_enabled,
-                            "subspace_zo_attempted_steps": zo_attempted_steps,
-                            "subspace_zo_accepted_steps": zo_accepted_steps,
-                            "subspace_zo_rejected_steps": zo_rejected_steps,
-                            "subspace_zo_forward_count": zo_forward_count,
-                            "subspace_zo_last_residual_norm": (
-                                zo_last_stats.residual_norm
-                            ),
-                        },
-                    )
-                    save_trajectory_delta_artifact(
-                        path=trajectory_delta_artifact_dir
-                        / artifact_file_name(
-                            mode="tg_lora",
-                            anchor_kind="after_speculative_update",
-                            cycle=cycle,
-                        ),
-                        metadata=spec_metadata,
-                        delta_tensors=spec_delta,
-                    )
-
-                # 10b. 外挿後パラメータ有限性チェック
-                params_finite, non_finite_detail = check_lora_params_finite(model)
-                if not params_finite:
-                    logger.warning(
-                        f"Non-finite LoRA params after extrapolation: {non_finite_detail}. "
-                        f"Rolling back and penalizing."
-                    )
-                    try:
-                        rollback_mgr.rollback(model)
-                    except (RuntimeError, IndexError) as exc:
-                        logger.error(
-                            f"Rollback failed, model state may be corrupted: {exc}"
+                        logger.debug(
+                            "Post-extrapolation eval skipped: cycle=%d reason=%s "
+                            "cos=%.3f N=%d acc_rate=%.2f",
+                            cycle,
+                            skip_policy_reason,
+                            cos_sim,
+                            proposal.N,
+                            cycle_state.acceptance_rate,
                         )
-                    controller.penalize(loss_pilot, float("inf"))
-                    controller.update_layer_scores(list(active_indices), -1.0)
-                    accepted = False
-                    loss_after = float("inf")
-                    # Skip the normal accept/rollback flow below
-                    if snapshot_taken:
-                        rollback_mgr.pop()
-                        snapshot_taken = False
-                    cycle_state.record_cycle(
-                        train_loss=pilot_loss_avg,
-                        valid_loss=loss_pilot,
-                        accepted=accepted,
-                        actual_backward_passes=pilot_backward_pass_count,
-                        speculative_optimizer_steps=proposal.N if accepted else 0,
-                        optimizer_steps=pilot_K,
-                        speculative_equivalent_backward_passes=(proposal.N * grad_accum) if accepted else 0,
-                    )
-                    accepted_valid_history.append(loss_pilot)
-                    if len(accepted_valid_history) > max(3, moving_avg_window * 2):
-                        accepted_valid_history.pop(0)
-                    last_quick_valid_loss = loss_pilot
-                    continue
-
-                # 10c. [accept-after-sgd] M9着地点から1回SGDしてから評価する。
-                # 外挿はジグザグをショートカットするので着地点のlossは必ず上振れする。
-                # しかし着地点が「良い場所」なら1回SGDでpilot到達点以下に回復するはず。
-                # これをaccept判定に使うことで、外挿の真の価値を測る。
-                accept_after_sgd_steps = tg_cfg.get("accept_after_sgd_steps", 0)
-                if accept_after_sgd_steps > 0 and subspace_m9_enabled:
-                    sgd_step_lr = tg_cfg.get("accept_after_sgd_lr", None)
-                    if sgd_step_lr is None:
-                        sgd_step_lr = cfg.training.learning_rate
-                    for _sgd_i in range(accept_after_sgd_steps):
-                        sgd_batch = batch_iter.next()
-                        while not has_supervised_tokens(sgd_batch):
-                            sgd_batch = batch_iter.next()
-                        model.train()
-                        with torch.set_grad_enabled(True):
-                            sgd_loss = compute_loss(model, sgd_batch)
-                            sgd_loss.backward()
-                        with torch.no_grad():
-                            for _n, _p in model.named_parameters():
-                                if _n in active_names and _p.grad is not None:
-                                    _p.data -= sgd_step_lr * _p.grad.detach()
-                                    _p.grad = None
-                        model.eval()
-                        logger.info(
-                            "accept-after-sgd: cycle=%d step=%d loss_at_landing=%.4f",
-                            cycle, _sgd_i, float(sgd_loss.detach().item()),
-                        )
-
-                # 11. Accept-probe eval (外挿後) — cosine-gated skip or cache use.
-                cache_eligible = False
-                cache_hit = False
-                velocity_anomalous = velocity.is_magnitude_anomalous()
-                if validation_skip_enabled:
-                    should_eval_after, skip_policy_reason = (
-                        _decide_post_extrapolation_eval_policy(
-                            consistency=cos_sim,
-                            selected_N=int(proposal.N),
-                            total_cycles=cycle_state.total_cycles,
-                            acceptance_rate=cycle_state.acceptance_rate,
-                            velocity_anomalous=velocity_anomalous,
-                            enabled=True,
-                            high_cos=validation_skip_high_cos,
-                            mid_cos=validation_skip_mid_cos,
-                            mid_eval_every=validation_skip_mid_eval_every,
-                            min_cycles=validation_skip_min_cycles,
-                            min_acceptance_rate=validation_skip_min_acceptance_rate,
-                            force_eval_N=validation_skip_force_eval_N,
-                        )
-                    )
-                else:
-                    confident_skip_threshold = cfg.tg_lora.get(
-                        "confident_skip_cos", 0.0
-                    )
-                    confident_skip_min_cycles = cfg.tg_lora.get(
-                        "confident_skip_min_cycles", 10
-                    )
-                    can_legacy_skip = (
-                        confident_skip_threshold > 0
-                        and cos_sim >= confident_skip_threshold
-                        and cycle_state.acceptance_rate >= 0.8
-                        and cycle_state.total_cycles >= confident_skip_min_cycles
-                        and not velocity_anomalous
-                    )
-                    should_eval_after = not can_legacy_skip
-                    skip_policy_reason = (
-                        "legacy_confident_skip" if can_legacy_skip else "legacy_eval"
-                    )
-
-                can_confident_skip = not should_eval_after
-                if subspace_zo_enabled:
-                    can_confident_skip = True
-                    if post_extrapolation_eval_skip_reason == "not_reached":
-                        post_extrapolation_eval_skip_reason = "subspace_zo_train_probe"
-                    skip_policy_reason = post_extrapolation_eval_skip_reason
-                if alpha_line_enabled:
-                    # Only skip validation evaluation if the alpha-line search did not accept any steps (i.e. model rolled back to pilot state).
-                    # If steps were accepted, we MUST evaluate on the validation set to guard against training-batch overfitting.
-                    can_confident_skip = not accepted
-                    skip_policy_reason = post_extrapolation_eval_skip_reason
-
-                if can_confident_skip:
-                    # Eval skip: velocity direction is trusted for this cycle.
-                    if not subspace_zo_enabled and not alpha_line_enabled:
-                        loss_after = loss_pilot  # assume no degradation
-                        accepted = True
-                    post_extrapolation_eval_skipped = True
-                    post_extrapolation_eval_skip_reason = skip_policy_reason
-                    if not subspace_zo_enabled and not alpha_line_enabled:
-                        controller.commit_proposal(proposal)
-                        controller.reward(loss_pilot, loss_after)
-                        controller.update_layer_scores(list(active_indices), 1.0)
-                    logger.debug(
-                        "Post-extrapolation eval skipped: cycle=%d reason=%s "
-                        "cos=%.3f N=%d acc_rate=%.2f",
-                        cycle,
-                        skip_policy_reason,
-                        cos_sim,
-                        proposal.N,
-                        cycle_state.acceptance_rate,
-                    )
-                else:
-                    post_extrapolation_eval_skipped = False
-                    post_extrapolation_eval_skip_reason = skip_policy_reason
-                    post_extrapolation_eval = True
-                    # active_indicesが予測と一致し、キャッシュが有効なら高速eval
-                    if use_prefix_feature_cache:
-                        torch.cuda.empty_cache()  # Free memory before eval to prevent OOM
-                        loss_after = eval_loss(
-                            model,
-                            valid_quick_loader,
-                            input_device,
-                            max_examples=accept_eval_examples,
-                        )
-                        validation_forwards_this_cycle += 1
-                        post_validation_forwards_this_cycle += 1
                     else:
-                        actual_split = determine_split_layer(
-                            active_indices, num_decoder_layers
-                        )
-                        cache_eligible = use_cache
-                        cache_usable = (
-                            use_cache
-                            and activation_cache.is_valid
-                            and actual_split
-                            >= split_layer  # 実際の変更がキャッシュ境界以降
-                        )
-                        if cache_eligible:
-                            activation_cache_eligible_count += 1
-                        if cache_usable:
-                            cache_hit = True
-                            activation_cache_hit_count += 1
-                            loss_after = activation_cache.eval_from_cache(
-                                model, input_device
-                            )
-                            validation_forwards_this_cycle += 1
-                            post_validation_forwards_this_cycle += 1
-                        else:
-                            if cache_eligible:
-                                activation_cache_miss_count += 1
+                        post_extrapolation_eval_skipped = False
+                        post_extrapolation_eval_skip_reason = skip_policy_reason
+                        post_extrapolation_eval = True
+                        # active_indicesが予測と一致し、キャッシュが有効なら高速eval
+                        if use_prefix_feature_cache:
                             torch.cuda.empty_cache()  # Free memory before eval to prevent OOM
                             loss_after = eval_loss(
                                 model,
@@ -3248,161 +3367,212 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                             )
                             validation_forwards_this_cycle += 1
                             post_validation_forwards_this_cycle += 1
+                        else:
+                            actual_split = determine_split_layer(
+                                active_indices, num_decoder_layers
+                            )
+                            cache_eligible = use_cache
+                            cache_usable = (
+                                use_cache
+                                and activation_cache.is_valid
+                                and actual_split
+                                >= split_layer  # 実際の変更がキャッシュ境界以降
+                            )
+                            if cache_eligible:
+                                activation_cache_eligible_count += 1
+                            if cache_usable:
+                                cache_hit = True
+                                activation_cache_hit_count += 1
+                                loss_after = activation_cache.eval_from_cache(
+                                    model, input_device
+                                )
+                                validation_forwards_this_cycle += 1
+                                post_validation_forwards_this_cycle += 1
+                            else:
+                                if cache_eligible:
+                                    activation_cache_miss_count += 1
+                                torch.cuda.empty_cache()  # Free memory before eval to prevent OOM
+                                loss_after = eval_loss(
+                                    model,
+                                    valid_quick_loader,
+                                    input_device,
+                                    max_examples=accept_eval_examples,
+                                )
+                                validation_forwards_this_cycle += 1
+                                post_validation_forwards_this_cycle += 1
 
-                # 11b. Shadow extrapolation: measure without committing.
-                # If enabled, always rollback and record what WOULD have happened.
-                shadow_enabled = tg_cfg.get("shadow_extrapolation_enabled", False)
-                if shadow_enabled:
-                    # Force eval (never skip in shadow mode)
-                    if not post_extrapolation_eval:
-                        torch.cuda.empty_cache()
-                        loss_after = eval_loss(
-                            model,
-                            valid_quick_loader,
-                            input_device,
-                            max_examples=accept_eval_examples,
-                        )
-                        validation_forwards_this_cycle += 1
-                        post_validation_forwards_this_cycle += 1
-                        post_extrapolation_eval = True
+                    # 11b. Shadow extrapolation: measure without committing.
+                    # If enabled, always rollback and record what WOULD have happened.
+                    shadow_enabled = tg_cfg.get("shadow_extrapolation_enabled", False)
+                    if shadow_enabled:
+                        # Force eval (never skip in shadow mode)
+                        if not post_extrapolation_eval:
+                            torch.cuda.empty_cache()
+                            loss_after = eval_loss(
+                                model,
+                                valid_quick_loader,
+                                input_device,
+                                max_examples=accept_eval_examples,
+                            )
+                            validation_forwards_this_cycle += 1
+                            post_validation_forwards_this_cycle += 1
+                            post_extrapolation_eval = True
 
-                    shadow_delta = loss_after - loss_pilot
-                    logger.info(
-                        "SHADOW: cycle=%d cos=%.4f loss_pilot=%.4f loss_after=%.4f delta=%+.4f N=1",
-                        cycle, cos_sim, loss_pilot, loss_after, shadow_delta,
-                    )
-                    # Always rollback — learning is unaffected
-                    try:
-                        rollback_mgr.rollback(model)
-                    except (RuntimeError, IndexError):
-                        pass
-                    accepted = False
-                    _shadow_delta = shadow_delta
-                    _shadow_cos = cos_sim
-                    loss_after = loss_pilot  # for cycle recording
-
-                # 12. Accept / Rollback (normal mode)
-                # Guard: reject non-finite loss_after to prevent bad accept decisions
-                if not math.isfinite(loss_after):
-                    logger.warning(
-                        "Non-finite loss_after=%s detected, treating as rejection",
-                        loss_after,
-                    )
-                    loss_after = float("inf")
-                accepted, _reason = _decide_accept_rollback(
-                    loss_pilot,
-                    loss_after,
-                    controller.rollback_tolerance,
-                    loss_history=accepted_valid_history[-moving_avg_window:],
-                    temperature=soft_accept_temperature,
-                )
-                logger.info(
-                    "M9 accept eval: cycle=%d loss_pilot=%.4f loss_after=%.4f delta=%+.4f accepted=%s reason=%s",
-                    cycle, loss_pilot, loss_after, loss_after - loss_pilot, accepted, _reason,
-                )
-                if accepted:
-                    controller.commit_proposal(proposal)
-                    controller.reward(loss_pilot, loss_after)
-                    controller.update_layer_scores(list(active_indices), 1.0)
-                    # [作業B] Accept後の履歴全捨て + ウォームアップ再突入
-                    # 外挿で大きく飛んだ後は過去の方向が陳腐化するため、
-                    # 履歴を全クリアして再ウォームアップで方向を溜め直す。
-                    if subspace_m9_enabled:
-                        delta_tracker._history.clear()
-                        delta_tracker._norm_history.clear()
-                        warmup_released = False
-                        warmup_cos_consecutive = 0
+                        shadow_delta = loss_after - loss_pilot
                         logger.info(
-                            "M9 accept: history cleared, warmup reset at cycle %d",
-                            cycle,
+                            "SHADOW: cycle=%d cos=%.4f loss_pilot=%.4f loss_after=%.4f delta=%+.4f N=1",
+                            cycle, cos_sim, loss_pilot, loss_after, shadow_delta,
                         )
-                else:
-                    try:
-                        rollback_mgr.rollback(model)
-                    except (RuntimeError, IndexError) as exc:
-                        logger.error(
-                            f"Rollback failed, model state may be corrupted: {exc}"
+                        # Always rollback — learning is unaffected
+                        try:
+                            rollback_mgr.rollback(model)
+                        except (RuntimeError, IndexError):
+                            pass
+                        accepted = False
+                        _shadow_delta = shadow_delta
+                        _shadow_cos = cos_sim
+                        loss_after = loss_pilot  # for cycle recording
+
+                    # 12. Accept / Rollback (normal mode)
+                    # Guard: reject non-finite loss_after to prevent bad accept decisions
+                    if not math.isfinite(loss_after):
+                        logger.warning(
+                            "Non-finite loss_after=%s detected, treating as rejection",
+                            loss_after,
                         )
-                    controller.penalize(loss_pilot, loss_after)
-                    controller.update_layer_scores(list(active_indices), -1.0)
-            finally:
-                if snapshot_taken:
-                    rollback_mgr.pop()
-
-            # Record cycle state
-            # On full-eval cycles, skip quick-eval stale tracking to avoid
-            # double-counting; record_full_eval will handle it instead.
-            is_full_eval_cycle = should_run_full_eval(
-                cycle, cfg.eval.get("full_eval_every_cycles", 10)
-            )
-            final_valid_loss = loss_after if accepted else loss_pilot
-            cycle_state.record_cycle(
-                train_loss=pilot_loss_avg,
-                valid_loss=None if is_full_eval_cycle else final_valid_loss,
-                accepted=accepted,
-                actual_backward_passes=pilot_backward_pass_count,
-                speculative_optimizer_steps=proposal.N if accepted else 0,
-                optimizer_steps=pilot_K,
-                speculative_equivalent_backward_passes=(proposal.N * grad_accum) if accepted else 0,
-            )
-            accepted_valid_history.append(final_valid_loss)
-            # LAWA: record current LoRA weights after accept/reject settled
-            if lawa_averager is not None:
-                lawa_averager.record(model, cycle=cycle)
-            if len(accepted_valid_history) > max(3, moving_avg_window * 2):
-                accepted_valid_history.pop(0)
-            last_quick_valid_loss = final_valid_loss
-
-            pilot_validation_forward_count += pilot_validation_forwards_this_cycle
-            post_validation_forward_count += post_validation_forwards_this_cycle
-            if post_extrapolation_eval:
-                post_extrapolation_eval_count += 1
-            if post_extrapolation_eval_skipped:
-                post_extrapolation_eval_skipped_count += 1
-                post_extrapolation_eval_skip_reasons[
-                    post_extrapolation_eval_skip_reason
-                ] = (
-                    post_extrapolation_eval_skip_reasons.get(
-                        post_extrapolation_eval_skip_reason, 0
+                        loss_after = float("inf")
+                    accepted, _reason = _decide_accept_rollback(
+                        loss_pilot,
+                        loss_after,
+                        controller.rollback_tolerance,
+                        loss_history=accepted_valid_history[-moving_avg_window:],
+                        temperature=soft_accept_temperature,
                     )
-                    + 1
+                    logger.info(
+                        "M9 accept eval: cycle=%d loss_pilot=%.4f loss_after=%.4f delta=%+.4f accepted=%s reason=%s",
+                        cycle, loss_pilot, loss_after, loss_after - loss_pilot, accepted, _reason,
+                    )
+                    if accepted:
+                        controller.commit_proposal(proposal)
+                        controller.reward(loss_pilot, loss_after)
+                        controller.update_layer_scores(list(active_indices), 1.0)
+                        # [作業B] Accept後の履歴全捨て + ウォームアップ再突入
+                        # 外挿で大きく飛んだ後は過去の方向が陳腐化するため、
+                        # 履歴を全クリアして再ウォームアップで方向を溜め直す。
+                        if subspace_m9_enabled:
+                            delta_tracker._history.clear()
+                            delta_tracker._norm_history.clear()
+                            warmup_released = False
+                            warmup_cos_consecutive = 0
+                            logger.info(
+                                "M9 accept: history cleared, warmup reset at cycle %d",
+                                cycle,
+                            )
+                    else:
+                        try:
+                            rollback_mgr.rollback(model)
+                        except (RuntimeError, IndexError) as exc:
+                            logger.error(
+                                f"Rollback failed, model state may be corrupted: {exc}"
+                            )
+                        controller.penalize(loss_pilot, loss_after)
+                        controller.update_layer_scores(list(active_indices), -1.0)
+                finally:
+                    if snapshot_taken:
+                        rollback_mgr.pop()
+
+                # Record cycle state
+                # On full-eval cycles, skip quick-eval stale tracking to avoid
+                # double-counting; record_full_eval will handle it instead.
+                is_full_eval_cycle = should_run_full_eval(
+                    cycle, cfg.eval.get("full_eval_every_cycles", 10)
                 )
-            subspace_zo_attempted_steps_total += zo_attempted_steps
-            subspace_zo_accepted_steps_total += zo_accepted_steps
-            subspace_zo_rejected_steps_total += zo_rejected_steps
-            subspace_zo_forward_count_total += zo_forward_count
-            subspace_zo_dim1_steps_total += zo_dim1_steps
-            subspace_zo_dim2_steps_total += zo_dim2_steps
-            alpha_line_steps_total += alpha_line_step_count
-            alpha_line_base_recompute_total += alpha_line_base_recompute
-            alpha_line_v_update_wall_seconds_total += alpha_line_v_update_wall_seconds
-            alpha_line_alpha_wall_seconds_total += alpha_line_alpha_wall_seconds
-            future_work_record = None
-            if (
-                alpha_line_future_work_metrics_enabled
-                or alpha_line_future_work_internal_metrics_enabled
-            ):
-                future_work_record = {
-                    "namespace": "future_work",
-                    "paper_scope": "motivation_only",
-                }
-                if future_work_projection_ratio is not None:
-                    future_work_record["projection_ratio"] = {
-                        "value": future_work_projection_ratio,
-                        "kind": "abs_dot_pilot_grad_sum_fixed_v_over_norms",
-                    }
-                    future_work_projection_ratios.append(future_work_projection_ratio)
+                final_valid_loss = loss_after if accepted else loss_pilot
+                cycle_state.record_cycle(
+                    train_loss=pilot_loss_avg,
+                    valid_loss=None if is_full_eval_cycle else final_valid_loss,
+                    accepted=accepted,
+                    actual_backward_passes=pilot_backward_pass_count,
+                    speculative_optimizer_steps=proposal.N if accepted else 0,
+                    optimizer_steps=pilot_K,
+                    speculative_equivalent_backward_passes=(proposal.N * grad_accum) if accepted else 0,
+                )
+                accepted_valid_history.append(final_valid_loss)
+                # LAWA: record current LoRA weights after accept/reject settled
+                if lawa_averager is not None:
+                    lawa_averager.record(model, cycle=cycle)
+                if len(accepted_valid_history) > max(3, moving_avg_window * 2):
+                    accepted_valid_history.pop(0)
+                last_quick_valid_loss = final_valid_loss
+
+                pilot_validation_forward_count += pilot_validation_forwards_this_cycle
+                post_validation_forward_count += post_validation_forwards_this_cycle
+                if post_extrapolation_eval:
+                    post_extrapolation_eval_count += 1
+                if post_extrapolation_eval_skipped:
+                    post_extrapolation_eval_skipped_count += 1
+                    post_extrapolation_eval_skip_reasons[
+                        post_extrapolation_eval_skip_reason
+                    ] = (
+                        post_extrapolation_eval_skip_reasons.get(
+                            post_extrapolation_eval_skip_reason, 0
+                        )
+                        + 1
+                    )
+                subspace_zo_attempted_steps_total += zo_attempted_steps
+                subspace_zo_accepted_steps_total += zo_accepted_steps
+                subspace_zo_rejected_steps_total += zo_rejected_steps
+                subspace_zo_forward_count_total += zo_forward_count
+                subspace_zo_dim1_steps_total += zo_dim1_steps
+                subspace_zo_dim2_steps_total += zo_dim2_steps
+                alpha_line_steps_total += alpha_line_step_count
+                alpha_line_base_recompute_total += alpha_line_base_recompute
+                alpha_line_v_update_wall_seconds_total += alpha_line_v_update_wall_seconds
+                alpha_line_alpha_wall_seconds_total += alpha_line_alpha_wall_seconds
+                future_work_record = None
                 if (
-                    alpha_line_future_work_internal_metrics_enabled
-                    and future_work_internal_pairs
+                    alpha_line_future_work_metrics_enabled
+                    or alpha_line_future_work_internal_metrics_enabled
                 ):
-                    future_work_record["internal"] = {
-                        "paper_exclude": True,
-                        "g_dot_v_loss_delta_pairs": future_work_internal_pairs,
+                    future_work_record = {
+                        "namespace": "future_work",
+                        "paper_scope": "motivation_only",
                     }
-                    future_work_internal_pair_count += len(future_work_internal_pairs)
-                if len(future_work_record) == 2:
-                    future_work_record = None
+                    if future_work_projection_ratio is not None:
+                        future_work_record["projection_ratio"] = {
+                            "value": future_work_projection_ratio,
+                            "kind": "abs_dot_pilot_grad_sum_fixed_v_over_norms",
+                        }
+                        future_work_projection_ratios.append(future_work_projection_ratio)
+                    if (
+                        alpha_line_future_work_internal_metrics_enabled
+                        and future_work_internal_pairs
+                    ):
+                        future_work_record["internal"] = {
+                            "paper_exclude": True,
+                            "g_dot_v_loss_delta_pairs": future_work_internal_pairs,
+                        }
+                        future_work_internal_pair_count += len(future_work_internal_pairs)
+                    if len(future_work_record) == 2:
+                        future_work_record = None
+
+            # JSON-extraction gold eval (Guard §5.2): generate + score on the
+            # held-out gold set when due. Recorded per-cycle via extra_fields;
+            # the §5.2 stop (gold >= G*) is resolved post-hoc by the analyzer.
+            gold_scores: dict[str, float] = {}
+            if (
+                gold_eval_records
+                and cycle % cfg.eval.get("gold_eval_every_cycles", 5) == 0
+            ):
+                torch.cuda.empty_cache()  # Free memory before generation to prevent OOM
+                gold_scores = evaluate_json_extraction_run(
+                    model,
+                    tokenizer,
+                    gold_eval_records,
+                    max_examples=cfg.eval.get("gold_eval_max_examples", 50),
+                    max_new_tokens=cfg.eval.get("gold_eval_max_new_tokens", 128),
+                    device=input_device,
+                )
 
             metrics.record_step(
                 step=cycle_state.full_backward_passes,
@@ -3505,6 +3675,12 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 alpha_line_alpha_wall_seconds=alpha_line_alpha_wall_seconds,
                 future_work=future_work_record,
                 **_measurement_results_record,
+                **({f"guard_{k}": v for k, v in {
+                    "block_size": dynfreeze.block_size,
+                    "block_layers": ",".join(str(l) for l in dynfreeze.frozen_block),
+                    **{f"r_A_L{li}": h[-1] for li, h in dynfreeze._r_A_history.items() if h},
+                }.items()} if dynfreeze is not None else {}),
+                **({f"gold_{k}": v for k, v in gold_scores.items()} if gold_scores else {}),
             )
 
             if mlf.enabled:
@@ -3566,6 +3742,12 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 # Per-layer scores as individual metrics
                 for layer_idx, score in controller.state.layer_scores.items():
                     tg_metrics[f"layer_score_{layer_idx}"] = score
+                # Guard experiment metrics
+                if dynfreeze is not None:
+                    tg_metrics["guard_block_size"] = dynfreeze.block_size
+                    for layer_idx, hist in dynfreeze._r_A_history.items():
+                        if hist:
+                            tg_metrics[f"guard_r_A_L{layer_idx}"] = hist[-1]
                 mlf.log_metrics(tg_metrics, step=cycle)
 
             pbar.set_postfix(
@@ -3656,6 +3838,57 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                             "lawa_window_count": lawa_averager.count,
                         })
 
+                # JSON generation-quality eval (structured-output domain task).
+                # Batched greedy generation on a held-out set, scored by
+                # field-F1/validity. Headline metric for plain/LAWA/PSA.
+                if (
+                    json_eval_records
+                    and cycle % int(tg_cfg.get("json_eval_every_cycles", 10)) == 0
+                ):
+                    from src.eval.json_generation import generate_and_score_json
+                    from src.tg_lora.weight_averaging import averaged_weights_context
+
+                    # LAWA's headline quality is measured on the window-averaged
+                    # (shadow) weights once the averager is ready; plain/PSA
+                    # (averager None) eval on the current weights. The context
+                    # manager restores the live weights on exit.
+                    with averaged_weights_context(model, lawa_averager) as _lawa_active:
+                        json_scores = generate_and_score_json(
+                            model,
+                            tokenizer,
+                            json_eval_records,
+                            batch_size=int(tg_cfg.get("json_eval_batch_size", 8)),
+                            max_new_tokens=int(tg_cfg.get("json_eval_max_new_tokens", 96)),
+                            device=input_device,
+                        )
+                    json_scores.pop("_preview", None)
+                    json_row = {
+                        "cycle": cycle,
+                        "full_backward_passes": cycle_state.full_backward_passes,
+                        "speculative_backward_passes": cycle_state.speculative_equivalent_backward_passes,
+                        "reduction_rate": cycle_state.reduction_rate,
+                        "lawa_averaged": bool(_lawa_active),
+                        **{k: v for k, v in json_scores.items() if not k.startswith("_")},
+                    }
+                    with open(run_dir / "json_eval_log.jsonl", "a") as _jf:
+                        _jf.write(json.dumps(json_row) + "\n")
+                    if mlf.enabled:
+                        mlf.log_metrics(
+                            {f"json_{k}": v for k, v in json_scores.items()},
+                            step=cycle,
+                        )
+                    logger.info(
+                        "Cycle %d JSON eval: combined=%.3f field_f1=%.3f "
+                        "exact=%.3f computed_acc=%.3f strict=%.3f valid=%.3f",
+                        cycle,
+                        json_scores["combined"],
+                        json_scores["field_f1"],
+                        json_scores["exact_match"],
+                        json_scores["computed_accuracy"],
+                        json_scores["strict_valid"],
+                        json_scores["valid"],
+                    )
+
             # Periodic save
             if cycle > 0 and cycle % cfg.logging.get("save_every_cycles", 25) == 0:
                 checkpoint_dir = run_dir / f"checkpoint-cycle-{cycle}"
@@ -3669,6 +3902,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                     adapter_checkpoint_dir=str(checkpoint_dir),
                     train_batch_position=train_batch_position,
                     accepted_valid_history=list(accepted_valid_history),
+                    dynfreeze_state=dynfreeze.state_dict() if dynfreeze is not None else None,
                 )
                 save_training_state(ts, checkpoint_dir / "training_state.pt")
                 mlf.log_artifact(checkpoint_dir, "checkpoints")

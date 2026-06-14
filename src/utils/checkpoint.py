@@ -6,6 +6,7 @@ import torch
 
 from src.tg_lora.cycle_state import CycleState
 from src.tg_lora.delta_tracker import DeltaTracker
+from src.tg_lora.dynamic_freeze import DynFreezeState
 from src.tg_lora.random_walk_controller import ControllerState
 from src.tg_lora.velocity import Velocity
 from src.utils.tensor_artifact import load_tensor_artifact
@@ -58,6 +59,7 @@ class TrainingState:
     adapter_checkpoint_dir: str | None = None
     train_batch_position: int = 0
     accepted_valid_history: list[float] | None = None
+    dynfreeze_state: DynFreezeState | None = None
 
 
 @dataclass
@@ -159,6 +161,18 @@ def save_training_state(state: TrainingState, path: Path) -> None:
         "adapter_checkpoint_dir": state.adapter_checkpoint_dir,
         "train_batch_position": state.train_batch_position,
         "accepted_valid_history": state.accepted_valid_history,
+        "dynfreeze_state": (
+            {
+                "frozen_layer_indices": state.dynfreeze_state.frozen_layer_indices,
+                "r_A_history": state.dynfreeze_state.r_A_history,
+                "frozen_since_cycle": state.dynfreeze_state.frozen_since_cycle,
+                "prev_A_fro": state.dynfreeze_state.prev_A_fro,
+                "median_A": state.dynfreeze_state.median_A,
+                "epsilon": state.dynfreeze_state.epsilon,
+            }
+            if state.dynfreeze_state is not None
+            else None
+        ),
     }
     torch.save(blob, path)
     logger.info("Saved training state to %s (cycle %d)", path, state.cycle_state.cycle)
@@ -216,6 +230,19 @@ def load_training_state(path: Path) -> TrainingState:
 
         delta_tracker._last_stats = _compute_stats(delta_tracker._history[-1])
 
+    # Restore DynFreezeState
+    dynfreeze_raw = blob.get("dynfreeze_state")
+    dynfreeze_state = None
+    if dynfreeze_raw is not None:
+        dynfreeze_state = DynFreezeState(
+            frozen_layer_indices=dynfreeze_raw.get("frozen_layer_indices", []),
+            r_A_history=dynfreeze_raw.get("r_A_history", {}),
+            frozen_since_cycle=dynfreeze_raw.get("frozen_since_cycle", 0),
+            prev_A_fro=dynfreeze_raw.get("prev_A_fro", {}),
+            median_A=dynfreeze_raw.get("median_A", 0.0),
+            epsilon=dynfreeze_raw.get("epsilon", 1e-6),
+        )
+
     return TrainingState(
         cycle_state=cycle_state,
         controller_state=controller_state,
@@ -225,4 +252,5 @@ def load_training_state(path: Path) -> TrainingState:
         adapter_checkpoint_dir=blob.get("adapter_checkpoint_dir"),
         train_batch_position=blob.get("train_batch_position", 0),
         accepted_valid_history=blob.get("accepted_valid_history"),
+        dynfreeze_state=dynfreeze_state,
     )

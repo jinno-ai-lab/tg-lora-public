@@ -1,0 +1,58 @@
+# MLX Guard experiment — Condition B (dynamic freeze ON) on jsonex domain.
+# Identical to the baseline config except dynfreeze_enabled: true.
+model: .cache/mlx_models/Qwen--Qwen3.5-9B
+data: data_mlx_jsonex
+train: true
+test: false
+fine_tune_type: lora
+num_layers: 8                 # LoRA on last 8 decoder layers (L24..L31 of 32)
+lora_parameters:
+  rank: 16
+  dropout: 0.0
+  scale: 2.0                  # = alpha/r = 32/16, mirrors PyTorch guard config
+iters: 960                    # 120 cycles x cycle_steps=8
+batch_size: 1
+grad_accumulation_steps: 8
+max_seq_length: 512
+seed: 42
+grad_checkpoint: true
+optimizer: adamw
+learning_rate: 2.0e-4
+optimizer_config:
+  adamw:
+    weight_decay: 0.0
+max_grad_norm: 1.0
+clear_cache_threshold: 4294967296
+wired_limit_ratio: 0.55
+memory_limit_ratio: 0.6
+cache_limit_ratio: 0.1
+steps_per_report: 8
+steps_per_eval: 50
+save_every: 80
+adapter_path: runs/mlx_9b_jsonex_guard
+
+# Guard experiment (M10): freeze ON — adaptive settled criterion (scale-invariant)
+dynfreeze_enabled: true
+dynfreeze_settled_ratio: 0.15      # settled when r_A <= ratio * own peak
+dynfreeze_window: 5
+dynfreeze_stir_interval: 10
+dynfreeze_unfreeze_ratio: 0.5      # release when upstream r_A > ratio * its peak
+dynfreeze_min_trainable: 2         # never freeze all; keep >= 2 layers trainable
+dynfreeze_epsilon_ratio: 0.01
+dynfreeze_a_mask_ratio: 0.1
+
+# Gold metric (§5.2): generate + score jsonex_test every 5 cycles (both A & B)
+cycle_steps: 8
+gold_eval_enabled: true
+gold_test_path: data/jsonex_test.jsonl
+gold_eval_every_cycles: 5
+gold_eval_max_examples: 20
+gold_eval_max_new_tokens: 128
+
+# Prefix/suffix split + activation cache (TG-LoRA core — see AGENTS.md and
+# 10_guard_experiment.md §2.5). split_layer=24 → prefix=layers[0:24], suffix=
+# layers[24:32]+norm+lm_head. Cache reused across pilot + post eval per
+# cycle. Measured ~67% eval speedup on Qwen3.5-9B. val_batches kept small
+# (2) to keep the per-cycle Metal command buffer short.
+split_layer: 24
+val_batches: 2

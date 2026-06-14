@@ -10,6 +10,8 @@ generalization over the final checkpoint alone.
 
 import logging
 from collections import deque
+from contextlib import contextmanager
+from typing import Iterator
 
 import torch
 
@@ -139,3 +141,43 @@ def evaluate_with_lawa(
             p.copy_(current[name].to(device=p.device, dtype=p.dtype))
 
     return lawa_loss, current_loss
+
+
+@contextmanager
+def averaged_weights_context(
+    model: torch.nn.Module,
+    averager: LAWAAverager | None,
+) -> Iterator[bool]:
+    """Temporarily load the LAWA-averaged LoRA weights, restoring on exit.
+
+    Yields True if the averaged weights were swapped in, False otherwise (e.g.
+    ``averager`` is None or not yet ready). Used so the headline JSON-quality
+    eval measures the *averaged* model — LAWA's proposition that the
+    window-average generalizes better than the current checkpoint.
+
+    No-op for the plain/PSA conditions where ``averager`` is None.
+    """
+    if averager is None or not averager.is_ready:
+        yield False
+        return
+    avg = averager.average_snapshot()
+    if avg is None:
+        yield False
+        return
+    restore = {
+        name: p.detach().cpu().clone() for name, p in iter_lora_params(model)
+    }
+    # no_grad: the LoRA params are leaf tensors with requires_grad=True, so the
+    # in-place copy_ must run outside autograd (same reason evaluate_with_lawa
+    # is decorated @torch.no_grad()).
+    with torch.no_grad():
+        for name, p in iter_lora_params(model):
+            if name in avg:
+                p.copy_(avg[name].to(device=p.device, dtype=p.dtype))
+    try:
+        yield True
+    finally:
+        with torch.no_grad():
+            for name, p in iter_lora_params(model):
+                if name in restore:
+                    p.copy_(restore[name].to(device=p.device, dtype=p.dtype))

@@ -1,0 +1,121 @@
+# 10_guard_experiment.md — TG-LoRA Guard: 選択的学習による高速フィット検証
+
+## 1. 主張
+
+学習軌道を r_A で監視し、収束した層を出力側から連続して凍結し、上流から可逆に解放することで、全層学習(baseline)と同等の下流性能に、より短い壁時計(総GPU秒)で到達する。質は到達条件として固定し、競うのは速度。
+
+## 2. 制御信号 r_A
+
+各サイクル t、各 series s について:
+- A(s,t) = LoRA ΔW(=B·A) の Frobenius ノルム (trace trick: O(r³))
+- dA/dt = 直前サイクルとの一次差分
+- r_A(s,t) = |dA/dt| / (A + ε), ε = 全series A 中央値の 0.01 倍
+- A 立ち上がり前(初期 W サイクル)は判定対象外
+
+層 L の r_A = 当該層の全 series の領域平均。直近 W=5 サイクルの移動領域平均を r_A_window(L) とする。
+
+### 計算方法
+
+```
+||B·A||_F² = trace((B^T·B) @ (A·A^T))    # ともに (r×r)、O(r³)
+```
+
+r=16 なので、r³=4096 FLOP/series × 8層×16series ≈ 0.5M FLOP。1サイクルあたりミリ秒以下。
+
+## 2.5 必須前提：prefix/suffix 分割 + prefix cache（速度PASS成立条件 — 絶対に忘れないこと）
+
+凍結で「backward/forward 計算を削減」できるのは、**loss が prefix/suffix 境界（`split_layer_idx`）で計算され、凍結 prefix の forward 出力がキャッシュされて N 回の eval（外挿線探索）で再利用される**場合に限る。これは **TG-LoRA の基本ロジック（pilot loss at split boundary + prefix cache）** であり、Guard 実験はこれを前提とする。
+
+PyTorch 経路での三位一体:
+- `src/tg_lora/activation_cache.py` — `ActivationCache.eval_and_cache`（prefix forward のキャッシュと再利用）
+- `src/tg_lora/extrapolator.py` — `split_layer_idx` / `output_split_layer_idx`（pilot loss を境界で計算）
+- `src/tg_lora/prefix_runtime_offload.py` — `split_layer_idx` での prefix オフロード
+
+plain LoRA（loss がモデル最終出力）で `freeze` だけ移植しても、凍結層の `W×x` forward matmul は output `y` を作るために不可避、`∂L/∂x` の backward matmul は上流 LoRA への勾配伝播のために不可避。凍結で消えるのは `∂L/∂W`（重み勾配）の VJP だけで、削減は数%が上限（ノイズ内）。**速度 PASS は原理的に検証不可能**。
+
+**Guard 実験を他経路へ移植する際は `dynamic_freeze` だけでなく `activation_cache` + `split_layer` 機構も必ず移植すること。片方だけ移植した freeze 実験は構造的に無効。**（2026-06 MLX 移植で `dynamic_freeze` だけ移植して `activation_cache` を脱落させた教訓）
+
+## 3. 固定ロジック (出力側連続)
+
+§3: 各サイクル終了時、r_A_window(L) < τ(=0.015) を「静か」とする。
+
+- 出力側 L31 から入力側 L24 へ走査
+- 静かな層を連続して固定塊に入れる
+- 最初の騒がしい層で打ち切る (orphan は作らない)
+- 固定塊 = {L31, ..., L_k} の連続範囲
+- requires_grad=False → backward をこの塊の境界で打ち切る
+
+**出力側連続の理由**: backward 打ち切りが連続塊でのみ FLOP/壁時計削減になるため。
+
+## 4. 解放ロジック (上流側逐次・可逆)
+
+固定層は ΔW が更新されず r_A を計算できないため、解放トリガは固定層自身の r_A では引かない。
+
+上流端 (L_k 側) から 1 層ずつ解放:
+- **(a) 強制攪拌**: 固定塊が R=10 サイクル維持されたら上流端 1 層を解放
+- **(b) 上流活性**: 固定塊直上流の層の r_A_window が τ×1.5(=0.0225) を超えたら上流端 1 層を解放
+
+出力側 (L31 側) は最後まで固定を保ち連続塊を守る。
+
+## 5. 二段停止プロトコル
+
+### 5.1 条件 A (baseline先行)
+- 固定なし・全層学習
+- 保険の valid 早期停止 (§5.3) 込み
+- 終了後: L* = baseline 最良 valid_full loss, G* = L* 時点の gold_test 性能
+
+### 5.2 条件 B (Guard)
+- §3-4 の動的固定/解放を有効化
+- 一次トリガ: valid_full loss ≤ L*+0.02 で gold_test 発火
+- 最終判定: gold ≥ G* なら停止 (=baseline 同等の下流性能に到達)
+- 未達なら学習継続、次の gold 発火は 5 サイクルのクールダウン後
+
+### 5.3 保険の valid 早期停止 (両条件共通)
+- valid_full loss が 10 サイクル連続で改善幅 < 0.01 なら打ち切り
+
+## 6. 壁時計の正味削減実測
+
+各サイクルで forward / backward / optimizer / 制御の時間を分離計測:
+- 固定塊サイズと backward 時間の負相関を確認
+- gradient_checkpointing 併用時の固定層 forward 再計算スキップ確認
+- 制御オーバーヘッド (requires_grad 切替・param group 再構成・r_A 計算) のミリ秒計測
+
+## 7. 判定基準
+
+- **第一関門 (速度) PASS**: B の総GPU秒 ≤ A × 0.90 (10%以上短縮) + 正味削減確認
+- **第二関門 (質)**: gold ≥ G* (§5.2 停止規則に統合済み)
+- 両関門 PASS で主張成立
+
+## 8. パラメータ一覧 (確定値)
+
+| パラメータ | 値 | 備考 |
+|---|---|---|
+| τ | 0.015 | 固定閾値 |
+| W | 5 | 移動窓幅 |
+| R | 10 | 強制攪拌間隔 |
+| 上流活性倍率 | 1.5 | τ×1.5=0.0225 |
+| ε | A中央値×0.01 |適応 epsilon |
+| 一次トリガ余裕 | L*+0.02 | gold 発火閾値 |
+| gold クールダウン | 5 cycles | 再評価間隔 |
+| 保険 patience | 10 cycles (Δ<0.01) | 早期停止 |
+| 第一関門ライン | 総GPU秒 10% 短縮 | |
+
+## 9. 実装マッピング
+
+| 機能 | ファイル | クラス/関数 |
+|---|---|---|
+| コントローラ | `src/tg_lora/dynamic_freeze.py` | `DynamicFreezeController` |
+| 設定 | `src/training/config_schema.py` | `TGLoRAParams.dynfreeze_*` |
+| 統合 | `src/training/train_tg_lora.py` | 初期化・判定・スキップ・メトリクス |
+| チェックポイント | `src/utils/checkpoint.py` | `TrainingState.dynfreeze_state` |
+| 設定 (有効) | `configs/9b_tg_lora_m10_dynfreeze.yaml` | experiment: tg_lora_9b_m10_guard |
+| 設定 (baseline) | `configs/9b_tg_lora_m10_dynfreeze_baseline.yaml` | dynfreeze_enabled: false |
+| 分析 | `scripts/analyze_dynfreeze_experiment.py` | グラフ・判定出力 |
+
+## 10. 事前分析結果 (M9 110チェックポイント)
+
+- r_A は唯一の識別軸 (cos, r_S は無関係)
+- 全 8 層 (L24-L31) が同時動 (深度勾配なし)
+- r_A 平均の時系列が固定/攪拌フェーズを分離
+- p90/mean 比 = 1.6 (安定、平均だけで代表可能)
+- descent (cycles 1-15), settling (15-50), plateau (50+)
