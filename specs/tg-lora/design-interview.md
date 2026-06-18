@@ -1,5 +1,13 @@
 # TG-LoRA 設計自動分析記録
 
+
+<!-- spine:anchor:begin -->
+> **Spine anchor**: [Tangent-Gradient LoRA (TG-LoRA) — 全体設計・研究指針 (GOAL)](../../docs/GOAL.md)
+>
+> - parent: `docs/GOAL.md`
+> - status: `canonical_child`
+<!-- spine:anchor:end -->
+
 **作成日**: 2026-05-21
 **分析実施**: step4 既存情報ベースの差分分析と自動統合
 

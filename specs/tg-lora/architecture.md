@@ -1,5 +1,13 @@
 # TG-LoRA アーキテクチャ設計
 
+
+<!-- spine:anchor:begin -->
+> **Spine anchor**: [Tangent-Gradient LoRA (TG-LoRA) — 全体設計・研究指針 (GOAL)](../../docs/GOAL.md)
+>
+> - parent: `docs/GOAL.md`
+> - status: `canonical_child`
+<!-- spine:anchor:end -->
+
 **作成日**: 2026-05-21
 **関連要件定義**: [requirements.md](requirements.md)
 **分析記録**: [design-interview.md](design-interview.md)

@@ -1,5 +1,13 @@
 # TG-LoRA 要件定義書
 
+
+<!-- spine:anchor:begin -->
+> **Spine anchor**: [TG-LoRA アーキテクチャ設計](architecture.md)
+>
+> - parent: `tg-lora/architecture.md`
+> - status: `canonical_child`
+<!-- spine:anchor:end -->
+
 **最終更新**: 2026-06-10（Phase 62追加: PSA Prior-based Subspace Amplification・RegimeDetector・ActivationFingerprint・LAWA・LayerDeltaAnalysis要件）
 
 ## 概要

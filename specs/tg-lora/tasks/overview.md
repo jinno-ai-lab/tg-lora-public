@@ -1,5 +1,13 @@
 # TG-LoRA タスク概要
 
+
+<!-- spine:anchor:begin -->
+> **Spine anchor**: [TG-LoRA アーキテクチャ設計](../architecture.md)
+>
+> - parent: `tg-lora/architecture.md`
+> - status: `canonical_child`
+<!-- spine:anchor:end -->
+
 **作成日**: 2026-05-21
 **最終更新**: 2026-05-25（Phase 64 parse_warnings E2E検証）
 **プロジェクト期間**: 2026-05-21 - 2026-06-19（24日）

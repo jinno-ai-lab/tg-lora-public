@@ -1,5 +1,13 @@
 # TG-LoRA データフロー図
 
+
+<!-- spine:anchor:begin -->
+> **Spine anchor**: [TG-LoRA アーキテクチャ設計](architecture.md)
+>
+> - parent: `tg-lora/architecture.md`
+> - status: `canonical_child`
+<!-- spine:anchor:end -->
+
 **作成日**: 2026-05-21
 **関連アーキテクチャ**: [architecture.md](architecture.md)
 **関連要件定義**: [requirements.md](requirements.md)

@@ -1,5 +1,13 @@
 # TG-LoRA 自動分析記録
 
+
+<!-- spine:anchor:begin -->
+> **Spine anchor**: [TG-LoRA アーキテクチャ設計](architecture.md)
+>
+> - parent: `tg-lora/architecture.md`
+> - status: `canonical_child`
+<!-- spine:anchor:end -->
+
 **作成日**: 2026-05-21
 **分析実施**: step4 既存情報ベースの差分分析と自動統合
 

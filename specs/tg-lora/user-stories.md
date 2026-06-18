@@ -1,5 +1,13 @@
 # TG-LoRA ユーザストーリー
 
+
+<!-- spine:anchor:begin -->
+> **Spine anchor**: [TG-LoRA アーキテクチャ設計](architecture.md)
+>
+> - parent: `tg-lora/architecture.md`
+> - status: `canonical_child`
+<!-- spine:anchor:end -->
+
 **作成日**: 2026-05-21
 **関連要件定義**: [requirements.md](requirements.md)
 **分析記録**: [interview-record.md](interview-record.md)
