@@ -573,3 +573,171 @@ class TestSummarizeByLayerType:
         result = summarize_by_layer_type(stats)
         assert "deltanet" in result
         assert result["deltanet"]["count"] == 2.0
+
+
+# ---------------------------------------------------------------------------
+# TC-EDGE-202 / TC-EDGE-203: PSAPrior input validation
+# ---------------------------------------------------------------------------
+
+
+class TestPSAPriorInputValidation:
+    """PSAPrior must reject nonsensical configurations up front rather than
+    silently producing no-ops (empty ring buffer / sign-flipped amplification)."""
+
+    def test_history_length_zero_raises(self):  # TC-EDGE-202
+        with pytest.raises(ValueError, match="history_length"):
+            PSAPrior(history_length=0)
+
+    def test_negative_gain_raises(self):  # TC-EDGE-203
+        with pytest.raises(ValueError, match="gain"):
+            PSAPrior(gain=-0.1)
+
+    def test_gain_zero_is_allowed(self):
+        """gain=0.0 is the no-amplification ablation baseline (TC-281-01 sweep
+        uses gamma=0.0) — it must NOT raise, only negative gain is invalid."""
+        prior = PSAPrior(gain=0.0)
+        assert prior.gain == 0.0
+
+
+# ---------------------------------------------------------------------------
+# TC-266-01 / TC-266-02: PSA L2 regularization
+# ---------------------------------------------------------------------------
+
+
+def _make_layer_typed_model():
+    """Model with one LoRA param per LayerType for gain-map tests.
+
+    Names chosen so classify_layer_type maps each to a distinct type:
+    out_proj -> ATTENTION_OUT, v_proj -> ATTENTION_V, mlp -> MLP,
+    embed_tokens -> UNKNOWN (no recognized substring).
+    """
+    names = [
+        "layers.0.self_attn.out_proj.lora_A.default.weight",
+        "layers.0.self_attn.v_proj.lora_A.default.weight",
+        "layers.0.mlp.gate_proj.lora_A.default.weight",
+        "embed_tokens.lora_A.default.weight",
+    ]
+
+    class FakeModel(nn.Module):
+        pass
+
+    model = FakeModel()
+    for name in names:
+        parts = name.split(".")
+        obj = model
+        for p in parts[:-1]:
+            if not hasattr(obj, p):
+                setattr(obj, p, nn.Module())
+            obj = getattr(obj, p)
+        param = nn.Parameter(torch.randn(8))
+        setattr(obj, parts[-1], param)
+        param.requires_grad_(True)
+    return model, names
+
+
+class TestL2Regularization:
+    """l2_reg>0 blends each new prior toward the previous one (penalizing
+    deviation); l2_reg=0 disables blending so the prior tracks data only."""
+
+    @staticmethod
+    def _data_dominated_history(v_new, name, n=6):
+        """History rows dominated by v_new with tiny additive noise."""
+        history = []
+        for t in range(n):
+            row = v_new * (t + 1) * 1.0 + torch.randn_like(v_new) * 0.02
+            history.append({name: row})
+        return history
+
+    @staticmethod
+    def _orthonormal_pair(dim=8):
+        """Return (v_prev, v_new) with v_prev along e0 and v_new at 45° to it."""
+        v_prev = torch.zeros(dim)
+        v_prev[0] = 1.0
+        v_new = torch.zeros(dim)
+        v_new[0] = 1.0
+        v_new[1] = 1.0
+        v_new = v_new / v_new.norm()  # cos(v_new, v_prev) = 1/sqrt(2) ~= 0.707
+        return v_prev, v_new
+
+    def test_l2_reg_positive_penalizes_deviation(self):  # TC-266-01
+        torch.manual_seed(0)
+        v_prev, v_new = self._orthonormal_pair()
+        name = "layers.0.self_attn.lora_A.default.weight"
+        history = self._data_dominated_history(v_new, name)
+
+        # Same data + same previous prior, varying only l2_reg.
+        prior_reg = PSAPrior(history_length=6, gain=0.5, l2_reg=0.5)
+        prior_reg.priors[name] = v_prev.clone()
+        prior_reg.extract_priors(history)
+        r_reg = prior_reg.priors[name]
+
+        prior_zero = PSAPrior(history_length=6, gain=0.5, l2_reg=0.0)
+        prior_zero.priors[name] = v_prev.clone()
+        prior_zero.extract_priors(history)
+        r_zero = prior_zero.priors[name]
+
+        cos_prev_reg = abs(torch.dot(r_reg, v_prev).item())
+        cos_prev_zero = abs(torch.dot(r_zero, v_prev).item())
+        cos_data_reg = abs(torch.dot(r_reg, v_new).item())
+        cos_data_zero = abs(torch.dot(r_zero, v_new).item())
+
+        # l2_reg>0 pulls the prior toward the previous prior (penalizes deviation)
+        assert cos_prev_reg > cos_prev_zero
+        # ... and is therefore less purely aligned with the data direction
+        assert cos_data_zero > cos_data_reg
+
+    def test_l2_reg_zero_disables_regularization(self):  # TC-266-02
+        torch.manual_seed(1)
+        v_prev, v_new = self._orthonormal_pair()
+        name = "layers.0.self_attn.lora_A.default.weight"
+        history = self._data_dominated_history(v_new, name)
+
+        prior = PSAPrior(history_length=6, gain=0.5, l2_reg=0.0)
+        prior.priors[name] = v_prev.clone()  # previous prior points elsewhere
+        prior.extract_priors(history)
+        r = prior.priors[name]
+
+        # With blending disabled, the prior tracks the data, not v_prev.
+        assert abs(torch.dot(r, v_new).item()) > 0.95
+
+
+# ---------------------------------------------------------------------------
+# TC-267-01..04: layer-type-specific gain multipliers
+# ---------------------------------------------------------------------------
+
+
+class TestLayerTypeGain:
+    """compute_gain_map applies gain multipliers by module type
+    (out_proj x1.2, v_proj x1.1, MLP x0.7, unknown x1.0) under a stable regime."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_typed_gain_map(self):
+        self.model, self.names = _make_layer_typed_model()
+        self.prior = PSAPrior(gain=1.0)
+        for name in self.names:
+            v = torch.randn(8)
+            self.prior.priors[name] = v / v.norm()
+        self.gm = self.prior.compute_gain_map(self.model, regime="stable")
+
+    def test_out_proj_gets_1_2x(self):  # TC-267-01
+        name = next(n for n in self.names if "out_proj" in n)
+        assert self.gm[name] == pytest.approx(1.2)
+
+    def test_v_proj_gets_1_1x(self):  # TC-267-02
+        name = next(
+            n for n in self.names if "v_proj" in n and "out_proj" not in n
+        )
+        assert self.gm[name] == pytest.approx(1.1)
+
+    def test_mlp_gets_0_7x(self):  # TC-267-03
+        name = next(n for n in self.names if "mlp" in n)
+        assert self.gm[name] == pytest.approx(0.7)
+
+    def test_unknown_gets_default_1_0x(self):  # TC-267-04
+        typed = {
+            n
+            for n in self.names
+            if any(s in n for s in ("out_proj", "v_proj", "mlp"))
+        }
+        name = next(n for n in self.names if n not in typed)
+        assert self.gm[name] == pytest.approx(1.0)

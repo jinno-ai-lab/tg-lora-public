@@ -35,6 +35,17 @@ class PSAPrior:
         l2_reg: float = 0.01,
         regime_plateau_gain: float = 0.5,
     ):
+        # Reject nonsensical configurations up front so misconfigurations
+        # surface before training rather than producing silent no-ops.
+        # history_length backs the internal ring buffer (deque(maxlen=...));
+        # a length of 0 would discard every recorded delta. gain is allowed to
+        # be 0.0 (the no-amplification ablation baseline) but must not be
+        # negative (would amplify against the prior direction).
+        if history_length < 1:
+            raise ValueError("history_length must be >= 1")
+        if gain < 0:
+            raise ValueError("gain must be non-negative")
+
         self.history_length = history_length
         self.gain = gain
         self.update_interval = update_interval

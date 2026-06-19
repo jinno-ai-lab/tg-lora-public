@@ -81,6 +81,20 @@ class TestLAWARecord:
 
 
 # ---------------------------------------------------------------------------
+# LAWAAverager — input validation (TC-EDGE-206)
+# ---------------------------------------------------------------------------
+
+
+class TestLAWAAveragerValidation:
+    def test_window_size_zero_raises(self):
+        # A window_size of 0 backs a deque(maxlen=0) that discards every
+        # snapshot — a misconfiguration that must surface here, not as a
+        # silent never-ready averager.
+        with pytest.raises(ValueError, match="window_size"):
+            LAWAAverager(window_size=0)
+
+
+# ---------------------------------------------------------------------------
 # LAWAAverager — average_snapshot
 # ---------------------------------------------------------------------------
 

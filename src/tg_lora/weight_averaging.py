@@ -41,6 +41,12 @@ class LAWAAverager:
         window_size: int = 5,
         start_cycle: int = 0,
     ):
+        # A window_size of 0 backs a deque(maxlen=0) that discards every
+        # recorded snapshot — a misconfiguration that should surface here
+        # rather than silently never becoming ready.
+        if window_size < 1:
+            raise ValueError("window_size must be >= 1")
+
         self.window_size = window_size
         self.start_cycle = start_cycle
         self._buffer: deque[dict[str, torch.Tensor]] = deque(maxlen=window_size)

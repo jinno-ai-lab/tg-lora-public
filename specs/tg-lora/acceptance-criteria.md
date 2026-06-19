@@ -5270,16 +5270,16 @@
 
 #### 正常系
 
-- [ ] **TC-265-01**: record_delta()後にリングバッファにdeltaが記録される 🔵
-- [ ] **TC-265-02**: extract_priors()がPC1方向を返す 🔵
-- [ ] **TC-265-03**: amplify_gradients()が正しい増幅公式で勾配を変更する 🔵
-- [ ] **TC-265-04**: compute_gain_map()がlayer-type別gainを返す 🔵
+- [x] **TC-265-01**: record_delta()後にリングバッファにdeltaが記録される 🔵
+- [x] **TC-265-02**: extract_priors()がPC1方向を返す 🔵
+- [x] **TC-265-03**: amplify_gradients()が正しい増幅公式で勾配を変更する 🔵
+- [x] **TC-265-04**: compute_gain_map()がlayer-type別gainを返す 🔵
 
 #### 境界値
 
-- [ ] **TC-265-B01**: history_length未満のdelta記録ではextract_priors()が空priorを返す 🔵
-- [ ] **TC-265-B02**: warmup_steps未満ではshould_update()がFalseを返す 🔵
-- [ ] **TC-265-B03**: reset_priors()後にpriorと履歴がクリアされる 🔵
+- [x] **TC-265-B01**: history_length未満のdelta記録ではextract_priors()が空priorを返す 🔵
+- [x] **TC-265-B02**: warmup_steps未満ではshould_update()がFalseを返す 🔵
+- [x] **TC-265-B03**: reset_priors()後にpriorと履歴がクリアされる 🔵
 
 ---
 
@@ -5289,8 +5289,8 @@
 
 ### テストケース
 
-- [ ] **TC-266-01**: l2_reg > 0で前回priorからの乖離がペナルティされる 🔵
-- [ ] **TC-266-02**: l2_reg = 0でL2正則化が無効になる 🔵
+- [x] **TC-266-01**: l2_reg > 0で前回priorからの乖離がペナルティされる 🔵
+- [x] **TC-266-02**: l2_reg = 0でL2正則化が無効になる 🔵
 
 ---
 
@@ -5300,10 +5300,10 @@
 
 ### テストケース
 
-- [ ] **TC-267-01**: out_projテンソルにgain×1.2が適用される 🔵
-- [ ] **TC-267-02**: v_projテンソルにgain×1.1が適用される 🔵
-- [ ] **TC-267-03**: MLPテンソルにgain×0.7が適用される 🔵
-- [ ] **TC-267-04**: 未知テンソル名にデフォルトgain（1.0）が適用される 🔵
+- [x] **TC-267-01**: out_projテンソルにgain×1.2が適用される 🔵
+- [x] **TC-267-02**: v_projテンソルにgain×1.1が適用される 🔵
+- [x] **TC-267-03**: MLPテンソルにgain×0.7が適用される 🔵
+- [x] **TC-267-04**: 未知テンソル名にデフォルトgain（1.0）が適用される 🔵
 
 ---
 
@@ -5313,11 +5313,11 @@
 
 ### テストケース
 
-- [ ] **TC-272-01**: 減少loss系列でSTABLEが返る 🔵
-- [ ] **TC-272-02**: 横ばいloss系列でPLATEAUが返る 🔵
-- [ ] **TC-272-03**: 急激なloss変動でTRANSITIONが返る 🔵
-- [ ] **TC-272-04**: consume_reset_signal()がワンショットでTrueを返し、次回はFalseを返す 🔵
-- [ ] **TC-272-05**: min_history未満のデータでSTABLEが返る 🔵
+- [x] **TC-272-01**: 減少loss系列でSTABLEが返る 🔵
+- [x] **TC-272-02**: 横ばいloss系列でPLATEAUが返る 🔵
+- [x] **TC-272-03**: 急激なloss変動でTRANSITIONが返る 🔵
+- [x] **TC-272-04**: consume_reset_signal()がワンショットでTrueを返し、次回はFalseを返す 🔵
+- [x] **TC-272-05**: min_history未満のデータでSTABLEが返る 🔵
 
 ---
 
@@ -5327,10 +5327,10 @@
 
 ### テストケース
 
-- [ ] **TC-274-01**: 高cosine similarity（>0.95）でSTABLEが分類される 🔵
-- [ ] **TC-274-02**: 低cosine similarity（<0.5）でCHAOTICが分類される 🔵
-- [ ] **TC-274-03**: regime_inventoryが各レジームの割合を返す 🔵
-- [ ] **TC-274-04**: compute_regime_null_baseline()が時系列シャッフル結果を返す 🔵
+- [x] **TC-274-01**: 高cosine similarity（>0.95）でSTABLEが分類される 🔵
+- [x] **TC-274-02**: 低cosine similarity（<0.5）でCHAOTICが分類される 🔵
+- [x] **TC-274-03**: regime_inventoryが各レジームの割合を返す 🔵
+- [x] **TC-274-04**: compute_regime_null_baseline()が時系列シャッフル結果を返す 🔵
 
 ---
 
@@ -5340,11 +5340,11 @@
 
 ### テストケース
 
-- [ ] **TC-276-01**: record()後にスナップショットがバッファに追加される 🔵
-- [ ] **TC-276-02**: average_snapshot()がスライディングウィンドウの算術平均を返す 🔵
-- [ ] **TC-276-03**: window_size超過時に最古のエントリが破棄される 🔵
-- [ ] **TC-276-04**: evaluate_with_lawa()が評価後に元の重みを復元する 🔵
-- [ ] **TC-276-05**: start_cycle未満ではis_ready=Falseである 🔵
+- [x] **TC-276-01**: record()後にスナップショットがバッファに追加される 🔵
+- [x] **TC-276-02**: average_snapshot()がスライディングウィンドウの算術平均を返す 🔵
+- [x] **TC-276-03**: window_size超過時に最古のエントリが破棄される 🔵
+- [x] **TC-276-04**: evaluate_with_lawa()が評価後に元の重みを復元する 🔵
+- [x] **TC-276-05**: start_cycle未満ではis_ready=Falseである 🔵
 
 ---
 
@@ -5354,12 +5354,12 @@
 
 ### テストケース
 
-- [ ] **TC-278-01**: compute_rank1_dominance()が正しいPC1分散比率を返す 🔵
-- [ ] **TC-278-02**: compute_direction_stability()がPC1方向安定性を返す 🔵
-- [ ] **TC-278-03**: marchenko_pastur_expected_rank1()がランダムヌル期待値を返す 🔵
-- [ ] **TC-278-04**: classify_layer_type()が正しいレイヤータイプを返す 🔵
-- [ ] **TC-278-05**: group_by_layer_type()がタイプ別に集約する 🔵
-- [ ] **TC-278-06**: ゼロ行列のrank1_dominanceが0.0を返す 🔵
+- [x] **TC-278-01**: compute_rank1_dominance()が正しいPC1分散比率を返す 🔵
+- [x] **TC-278-02**: compute_direction_stability()がPC1方向安定性を返す 🔵
+- [x] **TC-278-03**: marchenko_pastur_expected_rank1()がランダムヌル期待値を返す 🔵
+- [x] **TC-278-04**: classify_layer_type()が正しいレイヤータイプを返す 🔵
+- [x] **TC-278-05**: group_by_layer_type()がタイプ別に集約する 🔵
+- [x] **TC-278-06**: ゼロ行列のrank1_dominanceが0.0を返す 🔵
 
 ---
 
@@ -5369,21 +5369,21 @@
 
 ### テストケース
 
-- [ ] **TC-280-01**: run_psa_ablation.shの3条件が順次実行される 🔵
-- [ ] **TC-281-01**: run_psa_gamma_sweep.shのγスイープが実行される 🔵
-- [ ] **TC-282-01**: summarize_psa_sweep.pyが結果を集約する 🔵
+- [x] **TC-280-01**: run_psa_ablation.shの3条件が順次実行される 🔵
+- [x] **TC-281-01**: run_psa_gamma_sweep.shのγスイープが実行される 🔵
+- [x] **TC-282-01**: summarize_psa_sweep.pyが結果を集約する 🔵
 
 ---
 
 ### Phase 62 境界値テスト
 
-- [ ] **TC-EDGE-202**: PSAPrior(history_length=0)がValueErrorを送出する 🔵
-- [ ] **TC-EDGE-203**: PSAPrior(gain=-0.1)がValueErrorを送出する 🔵
-- [ ] **TC-EDGE-204**: RegimeDetector min_history未満でSTABLEが返る 🔵
-- [ ] **TC-EDGE-205**: hook未登録でstep()がエラーなくスキップする 🔵
-- [ ] **TC-EDGE-206**: LAWAAverager(window_size=0)がValueErrorを送出する 🔵
-- [ ] **TC-EDGE-207**: 空バッファでaverage_snapshot()が空辞書を返す 🔵
-- [ ] **TC-EDGE-208**: ゼロ行列でrank1_dominanceが0.0を返す 🔵
-- [ ] **TC-EDGE-209**: 未知テンソル名でLayerType.UNKNOWNが返る 🔵
-- [ ] **TC-EDGE-210**: PSAConfig gain=0.0がPydantic ValidationErrorで拒否される 🔵
-- [ ] **TC-EDGE-211**: 9b_tg_lora_psa.yamlがPydantic検証を通過する 🔵
+- [x] **TC-EDGE-202**: PSAPrior(history_length=0)がValueErrorを送出する 🔵
+- [x] **TC-EDGE-203**: PSAPrior(gain=-0.1)がValueErrorを送出する 🔵
+- [x] **TC-EDGE-204**: RegimeDetector min_history未満でSTABLEが返る 🔵
+- [x] **TC-EDGE-205**: hook未登録でstep()がエラーなくスキップする 🔵
+- [x] **TC-EDGE-206**: LAWAAverager(window_size=0)がValueErrorを送出する 🔵
+- [x] **TC-EDGE-207**: 空バッファでaverage_snapshot()が None を返す 🔵
+- [x] **TC-EDGE-208**: ゼロ行列でrank1_dominanceが0.0を返す 🔵
+- [x] **TC-EDGE-209**: 未知テンソル名でLayerType.UNKNOWNが返る 🔵
+- [x] **TC-EDGE-210**: PSAConfig gain<0 がPydantic ValidationErrorで拒否される（gain=0.0はγスイープ基準として許可） 🔵
+- [x] **TC-EDGE-211**: 9b_tg_lora_psa.yamlがPydantic検証を通過する 🔵

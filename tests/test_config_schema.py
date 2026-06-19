@@ -678,6 +678,47 @@ logging:
         with pytest.raises(FileNotFoundError):
             load_and_validate_config("/nonexistent/path.yaml")
 
+    def test_actual_psa_config_file(self):  # TC-EDGE-211
+        config_path = Path("configs/9b_tg_lora_psa.yaml")
+        if not config_path.exists():
+            pytest.skip("configs/9b_tg_lora_psa.yaml not found")
+        cfg = load_and_validate_config(config_path)
+        assert isinstance(cfg, TGLoRAConfig)
+        assert cfg.tg_lora.enable_psa is True
+
+
+# ── PSA gain validation (TC-EDGE-210) ──────────────────────────────────────
+
+
+class TestPSAGainValidation:
+    """psa_gain uses Field(ge=0.0): negatives are rejected, but 0.0 is allowed
+    because the gamma sweep (TC-281-01) uses gamma=0.0 as the no-amplification
+    baseline. This matches PSAPrior's own gain < 0 guard (TC-EDGE-203)."""
+
+    @staticmethod
+    def _base_kwargs() -> dict:
+        return dict(
+            K_initial=3,
+            K_candidates=[2, 3, 5],
+            N_initial=5,
+            N_candidates=[1, 3, 5],
+            alpha_initial=0.3,
+            alpha_min=0.03,
+            alpha_max=1.5,
+            beta_initial=0.8,
+            beta_candidates=[0.5, 0.8, 0.9],
+            relative_update_cap=0.005,
+            active_layer_strategy="last_25_percent",
+        )
+
+    def test_negative_psa_gain_rejected(self):  # TC-EDGE-210 (negative half)
+        with pytest.raises(ValidationError):
+            TGLoRAParams(**self._base_kwargs(), psa_gain=-0.1)
+
+    def test_zero_psa_gain_accepted(self):  # TC-EDGE-210 (0.0 allowed)
+        params = TGLoRAParams(**self._base_kwargs(), psa_gain=0.0)
+        assert params.psa_gain == 0.0
+
 
 # ── validate_config_data ──────────────────────────────────────────────────
 
