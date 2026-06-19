@@ -5387,3 +5387,25 @@
 - [x] **TC-EDGE-209**: 未知テンソル名でLayerType.UNKNOWNが返る 🔵
 - [x] **TC-EDGE-210**: PSAConfig gain<0 がPydantic ValidationErrorで拒否される（gain=0.0はγスイープ基準として許可） 🔵
 - [x] **TC-EDGE-211**: 9b_tg_lora_psa.yamlがPydantic検証を通過する 🔵
+
+
+<!-- spine:references:begin -->
+## Spine: external references
+
+- [TASK-0007: 受け入れ基準の全テストケース検証](tasks/TASK-0007.md)
+- [TASK-0011: Phase 2 受け入れ基準・ドキュメント更新](tasks/TASK-0011.md)
+- [TASK-0015: Phase 3 受け入れ基準・ドキュメント更新](tasks/TASK-0015.md)
+- [TASK-0019: Phase 4 受け入れ基準・ドキュメント更新](tasks/TASK-0019.md)
+- [TASK-0068: OptimizerLifecycleManager E2E スモークテスト](tasks/TASK-0068.md)
+- [TASK-0070: Phase 30 ドキュメント更新](tasks/TASK-0070.md)
+- [TASK-0076: REQ-136~138 acceptance criteria追加](tasks/TASK-0076.md)
+- [TASK-0089: Phase 38 ドキュメント同期と受け入れ基準更新](tasks/TASK-0089.md)
+- [TASK-0090: --resume E2E統合テスト（save→interrupt→resume→verify loss）](tasks/TASK-0090.md)
+- [TASK-0102: NaN/Inf バリデーションとランタイムガード完全化](tasks/TASK-0102.md)
+- [TASK-0112: モデル検査・比較ダッシュボード・ワンショットキャッシュのacceptance criteria追加](tasks/TASK-0112.md)
+- [TASK-0113: コスト分析・データ細粒度・クリーンアップターゲットのテスト追加](tasks/TASK-0113.md)
+- [TASK-0119: 学習軌跡分析・収束予測・早期停止推奨](tasks/TASK-0119.md)
+- [TASK-0120: 軌跡連動適応制御モジュール・テスト](tasks/TASK-0120.md)
+- [TASK-0121: Training Advisor モジュール・CLI](tasks/TASK-0121.md)
+
+<!-- spine:references:end -->
