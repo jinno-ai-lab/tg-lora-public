@@ -11,13 +11,14 @@ See docs/design/10_progressive_freezing.md for the design rationale.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 
 from src.model.lora_utils import iter_all_lora_params_by_layer
 from src.tg_lora.activation_cache import _get_decoder_layers
+from src.tg_lora.activation_matching import ActivationMatchingLoss
 
 logger = logging.getLogger("tg-lora")
 
@@ -167,6 +168,107 @@ class ProgressiveFreezeController:
             xin_shape,
         )
         return result
+
+    def compute_local_loss(
+        self,
+        model: nn.Module,
+        batch: dict,
+        loss_fn: ActivationMatchingLoss,
+        *,
+        batch_idx: int = 0,
+        device: torch.device | str = "cpu",
+    ) -> torch.Tensor:
+        """Front-layer activation-matching loss against the cached ``xin``.
+
+        The Level 2 training signal (GOAL §1.6.1, design §8 items 3-4): once
+        layer ``X`` is frozen, run the model forward and capture ``X``'s input
+        — which is exactly the front layer ``X-1``'s current output. Pair it
+        with the cached ``xin`` (the *past* input ``X`` received at freeze time)
+        and return ``loss_fn(front_output, xin, mask)``. The scalar carries a
+        gradient into the front layer's parameters; the frozen layer's
+        parameters receive none (``requires_grad=False`` from
+        :meth:`apply_freeze`).
+
+        The gap is non-zero only because ``xin`` is a past observation that the
+        still-training front layer no longer emits (design §3.3) — so this is a
+        genuine learning signal, not "current output vs itself".
+
+        Parameters
+        ----------
+        model:
+            Model with the target layer already frozen (call
+            :meth:`apply_freeze` first).
+        batch:
+            Batch dict with ``input_ids`` and ``attention_mask``; padded
+            positions are masked out of the loss (leak-free, GOAL §3.3).
+        loss_fn:
+            :class:`ActivationMatchingLoss`. The Phase 1 gate uses the pure-MSE
+            default.
+        batch_idx:
+            Which cached ``xin`` batch to pair against (captured by
+            :meth:`cache_xin`). Phase 1 captures batch 0.
+        device:
+            Device for the forward pass and ``xin`` target alignment.
+
+        Raises
+        ------
+        RuntimeError
+            If the layer is not frozen, no ``xin`` is cached for ``batch_idx``,
+            or the forward did not reach the frozen layer.
+        """
+        if not self._is_frozen:
+            raise RuntimeError(
+                "compute_local_loss requires apply_freeze() first"
+            )
+        cached = self._xin_cache.get(batch_idx)
+        if not cached:
+            raise RuntimeError(
+                f"no cached xin for batch {batch_idx}; call cache_xin() first"
+            )
+
+        target_idx = self._frozen_layer_idx
+        decoder_layers = _get_decoder_layers(model)
+        target_layer = decoder_layers[target_idx]
+
+        captured: list[torch.Tensor] = []
+
+        def _hook_fn(module, args, kwargs):
+            del module
+            # Keep grad + device: unlike cache_xin this is a live capture that
+            # must stay on the autograd graph so the loss backprops into the
+            # front layer.
+            if args:
+                captured.append(args[0])
+            elif "hidden_states" in kwargs:
+                captured.append(kwargs["hidden_states"])
+
+        hook = target_layer.register_forward_pre_hook(_hook_fn, with_kwargs=True)
+        try:
+            batch_dev = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
+            model(
+                input_ids=batch_dev["input_ids"],
+                attention_mask=batch_dev["attention_mask"],
+                labels=batch_dev.get("labels"),
+            )
+        finally:
+            hook.remove()
+
+        if not captured:
+            raise RuntimeError(
+                "forward did not reach the frozen layer; no front-layer "
+                "activation captured"
+            )
+
+        predicted = captured[0]
+        target = cached[0].to(device)
+        mask = batch_dev.get("attention_mask")
+        if mask is not None:
+            mask = mask.to(device=device, dtype=predicted.dtype).unsqueeze(-1)
+
+        return loss_fn(predicted, target, mask=mask)
 
     def clear_xin_cache(self) -> None:
         self._xin_cache.clear()

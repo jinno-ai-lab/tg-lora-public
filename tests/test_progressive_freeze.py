@@ -11,6 +11,7 @@ from src.model.lora_utils import (
     set_trainable_lora_layers,
 )
 from src.tg_lora.activation_cache import _get_decoder_layers
+from src.tg_lora.activation_matching import ActivationMatchingLoss
 from src.tg_lora.progressive_freeze import ProgressiveFreezeController
 
 
@@ -298,3 +299,121 @@ class TestCacheXin:
         assert ctrl._xin_cache
         ctrl.clear_xin_cache()
         assert ctrl._xin_cache == {}
+
+
+# --- compute_local_loss (Level 2 front-layer training signal) coverage ---
+# This is the glue that consumes the cached xin: run the front layer forward,
+# pair its current output against the cached xin, and return the
+# activation-matching loss (GOAL §1.6.1, docs/design/10_progressive_freezing.md
+# §8 items 3-4). Verified in isolation before any freeze experiment trusts it.
+
+
+class TestComputeLocalLoss:
+    def _make_frozen(self, num_layers: int = 4, active: set[int] = {2, 3}):
+        """Model with layer 3 frozen and its xin cached for batch 0."""
+        model = _ForwardingModel(num_layers=num_layers)
+        set_trainable_lora_layers(model, active)
+        ctrl = ProgressiveFreezeController(
+            start_cycle=1,
+            freeze_layer="last_active",
+            active_layer_indices=active,
+        )
+        loader = _make_xin_loader()
+        ctrl.cache_xin(model, loader, "cpu")
+        ctrl.apply_freeze(model)
+        return model, ctrl, loader
+
+    def test_pairs_current_front_output_vs_cached_xin(self):
+        # Immediately after freezing (no weight change) the front layer still
+        # emits exactly the cached xin, so the local loss is zero. This proves
+        # the glue captures the same quantity cache_xin stored and pairs it
+        # correctly (design §3.3: the signal only appears once the front moves).
+        model, ctrl, loader = self._make_frozen()
+        loss = ctrl.compute_local_loss(model, loader[0], ActivationMatchingLoss())
+        assert loss.dim() == 0
+        assert torch.isfinite(loss)
+        assert loss.requires_grad
+        assert torch.allclose(loss, torch.tensor(0.0))
+
+    def test_local_loss_drives_front_toward_xin(self):
+        # design §3.3: the gap is a genuine learning signal. Gradient descent
+        # on the local loss must shrink the front-vs-xin distance — the whole
+        # reason Progressive Freezing keeps improving after the suffix is cut.
+        model, ctrl, loader = self._make_frozen()
+        with torch.no_grad():
+            model.layers[2].proj.weight.add_(0.25)  # push front off the xin
+        w = model.layers[2].proj.weight
+        first, last = None, None
+        for _ in range(5):
+            model.zero_grad()
+            loss = ctrl.compute_local_loss(model, loader[0], ActivationMatchingLoss())
+            if first is None:
+                first = loss.item()
+            last = loss.item()
+            loss.backward()
+            with torch.no_grad():
+                w -= 0.1 * w.grad
+        assert last < first
+
+    def test_gradient_flows_into_front_not_frozen(self):
+        model, ctrl, loader = self._make_frozen()
+        with torch.no_grad():
+            model.layers[2].proj.weight.add_(0.25)
+        loss = ctrl.compute_local_loss(model, loader[0], ActivationMatchingLoss())
+        loss.backward()
+        front = model.layers[2].proj.weight
+        assert front.grad is not None
+        assert front.grad.abs().sum().item() > 0
+        # The frozen layer's LoRA params (requires_grad=False) receive nothing.
+        frozen = model.layers[3].self_attn.q_proj.lora_A
+        assert frozen.grad is None
+
+    def test_attention_mask_passed_through(self):
+        # Padding mask must actually reach the loss: a partial mask differs from
+        # the all-ones mask once the front is off the cached xin.
+        model, ctrl, loader = self._make_frozen()
+        with torch.no_grad():
+            model.layers[2].proj.weight.add_(0.3)
+        full = ctrl.compute_local_loss(model, loader[0], ActivationMatchingLoss())
+        partial_batch = {
+            **loader[0],
+            "attention_mask": torch.tensor([[1, 1, 0, 0, 0], [1, 1, 0, 0, 0]]),
+        }
+        partial = ctrl.compute_local_loss(
+            model, partial_batch, ActivationMatchingLoss()
+        )
+        assert not torch.allclose(full, partial)
+
+    def test_hook_removed_after_call(self):
+        model, ctrl, loader = self._make_frozen()
+        target = _get_decoder_layers(model)[3]
+        assert len(target._forward_pre_hooks) == 0
+        ctrl.compute_local_loss(model, loader[0], ActivationMatchingLoss())
+        assert len(target._forward_pre_hooks) == 0
+
+    def test_requires_freeze_first(self):
+        model = _ForwardingModel()
+        set_trainable_lora_layers(model, {2, 3})
+        ctrl = ProgressiveFreezeController(start_cycle=1, active_layer_indices={2, 3})
+        ctrl.cache_xin(model, _make_xin_loader(), "cpu")
+        with pytest.raises(RuntimeError, match="apply_freeze"):
+            ctrl.compute_local_loss(
+                model, _make_xin_loader()[0], ActivationMatchingLoss()
+            )
+
+    def test_requires_cached_xin(self):
+        model = _ForwardingModel()
+        set_trainable_lora_layers(model, {2, 3})
+        ctrl = ProgressiveFreezeController(start_cycle=1, active_layer_indices={2, 3})
+        ctrl.apply_freeze(model)
+        with pytest.raises(RuntimeError, match="cache_xin"):
+            ctrl.compute_local_loss(
+                model, _make_xin_loader()[0], ActivationMatchingLoss()
+            )
+
+    def test_unknown_batch_idx_raises(self):
+        model, ctrl, loader = self._make_frozen()
+        with pytest.raises(RuntimeError, match="batch 7"):
+            ctrl.compute_local_loss(
+                model, loader[0], ActivationMatchingLoss(), batch_idx=7
+            )
