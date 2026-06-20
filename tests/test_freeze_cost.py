@@ -887,6 +887,44 @@ class TestCalibrateReductionBand:
         assert "max=0.5000" in out
         assert "stddev=0.2500" in out
 
+    def test_format_empirical_output_byte_identical(self):
+        # Regression guard: the default empirical_envelope band (the only path
+        # the analysis pipeline emits, and the byte-identical contract) is
+        # unchanged by the conditional non-physical-floor note — its lower is
+        # min(observations) >= 0, so the note never fires here.
+        band = calibrate_reduction_band(self._sample())
+        assert format_reduction_band(band) == (
+            "reduction_band: empirical_envelope (calibrated)\n"
+            "  n=3 lower=0.0000 upper=0.5000 center=0.2500 width=0.5000\n"
+            "  measured_spread: min=0.0000 max=0.5000 mean=0.2500 stddev=0.2500"
+        )
+
+    def test_format_flags_nonphysical_negative_lower_bound(self):
+        # A symmetric normal interval on a low-mean sample dips below zero
+        # (reference [-0.25, 0.75] at z=2). Reductions are non-negative, so the
+        # audit must flag the bound rather than print a bare negative reduction.
+        band = calibrate_reduction_band(
+            self._sample(), method=CALIBRATION_NORMAL, z=2.0
+        )
+        assert band.lower == pytest.approx(-0.25)
+        out = format_reduction_band(band)
+        assert "lower=-0.2500 dips below the non-negative reduction floor" in out
+        assert "read as >= 0" in out
+
+    def test_format_no_note_when_lower_nonnegative(self):
+        # The note is conditional on a strictly-negative lower bound, not a
+        # blanket addition: an empirical band (lower = min >= 0) and a normal
+        # band whose interval stays above zero both omit it.
+        empirical = format_reduction_band(calibrate_reduction_band(self._sample()))
+        assert "note:" not in empirical
+        # [0.4, 0.5, 0.6]: mean=0.5, stddev=0.1 -> lower = 0.5 - 1.96*0.1 > 0.
+        high_mean = calibrate_reduction_band(
+            ReductionSample.from_values([0.4, 0.5, 0.6]),
+            method=CALIBRATION_NORMAL,
+        )
+        assert high_mean.lower > 0.0
+        assert "note:" not in format_reduction_band(high_mean)
+
 
 class TestPerCycleRealizedReductions:
     """The per-cycle observed spread a confidence band is calibrated over (§6.3).

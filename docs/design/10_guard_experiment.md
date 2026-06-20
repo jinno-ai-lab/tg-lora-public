@@ -120,7 +120,7 @@ in-vivo 検証（`tests/test_progressive_freeze_invivo.py`、CPU-proxy h=24, L=8
 - **`ReductionSample`** — 観測された実現削減率（サイクル毎・ラン毎・測定条件毎）を生の値のまま保持し、`n` / `min` / `max` / `mean` / `stddev`（標本標準偏差, ddof=1）を算出する。点推定と違い**測定されたばらつき**を記録する。
 - **`calibrate_reduction_band(sample, *, method, z)`** — band 幅を標本の**測定分散**から較正する:
   - `method="empirical_envelope"`（既定）: band = `[min, max]`。観測された全範囲・ノンパラメトリック。幅は観測 spread そのもので、推測を含まない。
-  - `method="normal"`: band = `mean ± z·stddev`（`z=1.96` ≈ 95% 正規区間）。観測を一つの削減率の雑音付き測定とみなす。低平均・高分散の標本ではゼロを下回りうる（削減率は非負のため、その場合は empirical_envelope を推奨）。
+  - `method="normal"`: band = `mean ± z·stddev`（`z=1.96` ≈ 95% 正規区間）。観測を一つの削減率の雑音付き測定とみなす。低平均・高分散の標本ではゼロを下回りうる（削減率は非負のため、その場合は empirical_envelope を推奨）。`format_reduction_band()` は下限がゼロを下回ったとき、負の削減率が達成可能と読まれないよう監査行にその旨を明示する（既定の empirical_envelope は `lower=min(observations)≥0` でこの注記は発火せず、パイプライン出力は byte-identical）。
 - **`MIN_SAMPLE_FOR_CONFIDENCE_BAND = 3`** — 標本がこれ未満のとき band は `is_thin_evidence=True` になる。統計量は監査のため計算されるが、関門はこれを「較正済み confidence band」として提示してはならない（1-2 点の再現は band の名に値しない）。
 
 `ConfidenceBand` は `effective_reduction` 周りの**不確実性報告**であり、§7 の判定を反転させない（関門の honesty は既に §6.1 + §6.2 が担う）。実観測から band に供給する系列は `per_cycle_realized_reductions(accountant, level)` が生成する: サイクル `t` 毎に「`t` までに凍結した層だけ」でスケジュールを切り詰め、§6.2 の実現削減率を報告する。これは実現削減率がラン全体で**どう推移したか**を 1 本のヘッドライン数に潰さずに記録する。複数ランにわたる spread は、系列を結合してから標本を組めば同じ枠で扱える。

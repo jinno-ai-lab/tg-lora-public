@@ -1049,15 +1049,32 @@ def format_reduction_band(band: ConfidenceBand) -> str:
     states plainly that the band must not be read as a calibrated confidence
     band — the statistics are recorded for the audit, but two reproductions of
     a median do not earn the name.
+
+    When the calibrated ``lower`` dips below zero it is flagged: reductions are
+    non-negative (a freeze cannot increase backward work), so a symmetric
+    ``normal`` interval on a low-mean, high-variance sample must not be read as
+    attaining a negative reduction. The empirical envelope is ``[min, max]`` of
+    non-negative observations, so the note only ever arises for the normal
+    method and the default (empirical) output stays byte-identical.
     """
     label = "THIN_EVIDENCE" if band.is_thin_evidence else "calibrated"
-    return (
-        f"reduction_band: {band.method} ({label})\n"
+    lines = [
+        f"reduction_band: {band.method} ({label})",
         f"  n={band.n} lower={band.lower:.4f} upper={band.upper:.4f} "
-        f"center={band.center:.4f} width={band.width:.4f}\n"
+        f"center={band.center:.4f} width={band.width:.4f}",
         f"  measured_spread: min={band.min_obs:.4f} max={band.max_obs:.4f} "
-        f"mean={band.center:.4f} stddev={band.stddev:.4f}"
-    )
+        f"mean={band.center:.4f} stddev={band.stddev:.4f}",
+    ]
+    if band.lower < 0.0:
+        # The symmetric normal interval (mean ± z·stddev) can extend its lower
+        # bound below the non-negative reduction floor; flag it so the audit
+        # never reads a negative reduction as attainable (10_guard_experiment.md
+        # §6.3). Read the effective floor as 0, not the printed negative bound.
+        lines.append(
+            f"  note: lower={band.lower:.4f} dips below the non-negative "
+            f"reduction floor (symmetric normal interval); read as >= 0"
+        )
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
