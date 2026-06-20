@@ -510,6 +510,142 @@ def format_speed_gate_verdict(verdict: SpeedGateVerdict) -> str:
     )
 
 
+# Level-1-vs-Level-2 quantitative comparison (GOAL §5 / §1.6.3 / Phase 3). The
+# accountant computes a separate ``reduction_rate`` per freeze level; this
+# bundles the two into the comparison the constitution names — Level 1 (the
+# established progressive-freeze baseline: weight-grad stop, final loss still
+# propagates) versus Level 2 (the activation-matching suffix cut: the advanced
+# experiment that additionally stops the activation gradient). The marginal
+# reductions — the *extra* arithmetic / realized / effective savings the suffix
+# cut buys on top of Level 1 — are the quantity GOAL Phase 3 weighs against
+# Level 2's proxy-loss quality risk (§1.6.5). Because Level 2 skips a superset
+# of the work Level 1 skips, every marginal delta is non-negative by
+# construction.
+
+@dataclass(frozen=True)
+class LevelComparison:
+    """Level-1 vs Level-2 freeze-savings comparison (GOAL §5, §1.6.3, Phase 3).
+
+    Bundles the §7 verdict for each level over one schedule at one target width,
+    plus the marginal reductions Level 2's suffix cut adds on top of the
+    established Level 1 baseline. Level 1 (progressive freeze, weight-grad stop)
+    is the mature, certain baseline (GOAL §1.6.3: "実装が枯れていて確実");
+    Level 2 (the suffix cut / activation-matching trio) is the advanced
+    experiment that additionally stops the activation gradient, buying more
+    arithmetic savings but at proxy-loss consistency risk ("代理ロスの整合性
+    リスクあり"). The ``additional_*`` fields make the extra cut explicit rather
+    than two numbers a reader must subtract by hand.
+
+    Under the :data:`LEVEL1_REALIZED_REDUCTION_CEILING`, Level 1 realizes ~0
+    backward reduction in vivo at every width, so
+    :attr:`additional_realized_reduction` equals Level 2's full realized
+    reduction: the suffix cut is the only thing carrying realizable backward
+    reduction, which is exactly why GOAL §1.6.3 treats Level 2 as an experiment
+    rather than the production path.
+    """
+
+    target_width: int
+    level1: SpeedGateVerdict
+    level2: SpeedGateVerdict
+    additional_arithmetic_reduction: float
+    additional_realized_reduction: float
+    additional_effective_reduction: float
+
+    @property
+    def additional_passes(self) -> bool:
+        """Level 2 clears the §7 bar where the Level 1 baseline does not.
+
+        True only when Level 2 PASSes / PROVISIONAL_PASSes and Level 1 does not:
+        the case in which the suffix cut's extra realization is what actually
+        carries the gate. A Level 2 PASS here means the activation-matching cut
+        is the sole thing producing realizable backward reduction at this width
+        (Level 1 realizes ~0 under the §6.2 ceiling), so the experiment's extra
+        cost and proxy-loss risk are the price of that realized reduction.
+        """
+        return self.level2.passes and not self.level1.passes
+
+
+def compare_freeze_levels(
+    accountant: FreezeCostAccountant,
+    target_width: int,
+    *,
+    threshold: float = SPEED_GATE_THRESHOLD,
+    validated_max_width: int = PROXY_VALIDATED_MAX_WIDTH,
+    scale_measurement_floor: float = 0.5,
+) -> LevelComparison:
+    """Quantitative Level-1-vs-Level-2 comparison (GOAL §5 / Phase 3 deliverable).
+
+    Builds the §7 speed-gate verdict for each level over the same schedule and
+    target width (so both are judged under the identical §6.1 width bound and
+    §6.2 realizability correction), then derives the marginal reductions Level
+    2's suffix cut buys on top of Level 1 from the two verdicts' provenance
+    fields. Level 2 skips a superset of the work Level 1 skips (weight-grad +
+    activation-grad versus weight-grad alone), so every marginal delta is
+    non-negative by construction; the comparison surfaces the *extra* realization
+    the suffix cut delivers — the quantity the Phase-3 activation-matching
+    experiment exists to weigh against its proxy-loss quality risk.
+
+    Both verdicts share the same ``threshold`` / ``validated_max_width`` /
+    ``scale_measurement_floor`` so the marginal numbers are a clean
+    apples-to-apples delta, not a confound of differing gate settings.
+    """
+    level1 = speed_gate_verdict(
+        accountant,
+        level=1,
+        target_width=target_width,
+        threshold=threshold,
+        validated_max_width=validated_max_width,
+        scale_measurement_floor=scale_measurement_floor,
+    )
+    level2 = speed_gate_verdict(
+        accountant,
+        level=2,
+        target_width=target_width,
+        threshold=threshold,
+        validated_max_width=validated_max_width,
+        scale_measurement_floor=scale_measurement_floor,
+    )
+    return LevelComparison(
+        target_width=target_width,
+        level1=level1,
+        level2=level2,
+        additional_arithmetic_reduction=level2.proxy_reduction
+        - level1.proxy_reduction,
+        additional_realized_reduction=level2.realized_reduction
+        - level1.realized_reduction,
+        additional_effective_reduction=level2.effective_reduction
+        - level1.effective_reduction,
+    )
+
+
+def format_level_comparison(comparison: LevelComparison) -> str:
+    """Render the Level-1-vs-Level-2 comparison with the marginal cut explicit.
+
+    The GOAL §5 / Phase 3 deliverable as a compact, deterministic audit block:
+    both levels' verdicts and their arithmetic / realized / effective reductions,
+    plus the extra reduction Level 2's suffix cut buys over the established
+    Level 1 baseline. The ``additional`` line is the quantity the
+    activation-matching experiment is run to earn — and because the §6.2 ceiling
+    holds Level 1's in-vivo realization at ~0, the additional realized reduction
+    is exactly Level 2's full realized reduction: the suffix cut is the only
+    thing carrying realizable backward reduction in vivo.
+    """
+    l1, l2 = comparison.level1, comparison.level2
+    return (
+        f"level_comparison: target_width={comparison.target_width}\n"
+        f"  level1 (progressive freeze): {l1.verdict} "
+        f"arith={l1.proxy_reduction:.4f} realized={l1.realized_reduction:.4f} "
+        f"effective={l1.effective_reduction:.4f}\n"
+        f"  level2 (suffix cut):         {l2.verdict} "
+        f"arith={l2.proxy_reduction:.4f} realized={l2.realized_reduction:.4f} "
+        f"effective={l2.effective_reduction:.4f}\n"
+        f"  additional (level2 - level1): "
+        f"arith={comparison.additional_arithmetic_reduction:.4f} "
+        f"realized={comparison.additional_realized_reduction:.4f} "
+        f"effective={comparison.additional_effective_reduction:.4f}"
+    )
+
+
 # §6.3 variance-calibrated confidence band (10_guard_experiment.md §6.3). The §7
 # verdict's two bounds (width §6.1, realizability §6.2) graduate a *point*
 # reduction. This section records the *measured spread* of the realized

@@ -24,6 +24,7 @@ from src.tg_lora.freeze_cost import (
     FreezeCostSummary,
     GatedReduction,
     LayerBackwardCost,
+    LevelComparison,
     RealizedReduction,
     ReductionSample,
     SpeedGateVerdict,
@@ -32,7 +33,9 @@ from src.tg_lora.freeze_cost import (
     VERDICT_PROVISIONAL_PASS,
     VERDICT_REQUIRES_SCALE_MEASUREMENT,
     calibrate_reduction_band,
+    compare_freeze_levels,
     extrapolation_confidence,
+    format_level_comparison,
     format_reduction_band,
     format_speed_gate_verdict,
     frozen_at_epoch_from_freeze_log,
@@ -888,3 +891,158 @@ class TestPerCycleRealizedReductions:
         band = calibrate_reduction_band(ReductionSample.from_values(series))
         assert band.is_thin_evidence is True
         assert band.n == 2
+
+
+class TestCompareFreezeLevels:
+    """Level-1-vs-Level-2 quantitative comparison (GOAL §5 / §1.6.3 / Phase 3).
+
+    Reference accountant: ``_two_layers(frozen_at_epoch={1: 2})`` (see module
+    docstring). Layer 1 frozen at epoch 2 -> Level-1 arithmetic reduction 0.125
+    (realized ~0 under the §6.2 ceiling), Level-2 arithmetic reduction 0.25
+    (realized exactly). The comparison bundles both verdicts and the marginal
+    reduction Level 2's suffix cut buys on top of the Level 1 baseline — the
+    quantity GOAL Phase 3 weighs against Level 2's proxy-loss quality risk.
+    """
+
+    def _acc(self) -> FreezeCostAccountant:
+        return _two_layers(frozen_at_epoch={1: 2})
+
+    def test_marginal_deltas_match_verdict_difference(self):
+        # The additional_* fields are exactly level2 minus level1 across all
+        # three provenance quantities, derived from the bundled verdicts.
+        comp = compare_freeze_levels(self._acc(), target_width=2048)
+        assert comp.additional_arithmetic_reduction == pytest.approx(
+            comp.level2.proxy_reduction - comp.level1.proxy_reduction
+        )
+        assert comp.additional_realized_reduction == pytest.approx(
+            comp.level2.realized_reduction - comp.level1.realized_reduction
+        )
+        assert comp.additional_effective_reduction == pytest.approx(
+            comp.level2.effective_reduction - comp.level1.effective_reduction
+        )
+
+    def test_level1_realizes_zero_so_additional_realized_is_level2(self):
+        # §6.2: Level 1 realizes ~0 in vivo regardless of width, so the entire
+        # realizable backward reduction is carried by Level 2's suffix cut.
+        # The marginal realized reduction therefore equals Level 2's realized.
+        comp = compare_freeze_levels(self._acc(), target_width=2048)
+        assert comp.level1.realized_reduction == pytest.approx(0.0)
+        assert comp.additional_realized_reduction == pytest.approx(
+            comp.level2.realized_reduction
+        )
+        assert comp.additional_realized_reduction == pytest.approx(0.25)
+
+    def test_additional_arithmetic_positive_with_activation_grad_cost(self):
+        # Weight-grad AND act-grad both cost 10: skipping act-grad on top of
+        # weight-grad adds the 0.125 arithmetic reduction (0.25 - 0.125).
+        comp = compare_freeze_levels(self._acc(), target_width=2048)
+        assert comp.level1.proxy_reduction == pytest.approx(0.125)
+        assert comp.level2.proxy_reduction == pytest.approx(0.25)
+        assert comp.additional_arithmetic_reduction == pytest.approx(0.125)
+
+    def test_additional_arithmetic_zero_without_activation_grad_cost(self):
+        # No activation-gradient work to skip -> Level 1 and Level 2 agree
+        # arithmetically, so the extra cut buys zero additional FLOPs. The §6.2
+        # ceiling still holds Level 1's realization at 0, so the suffix cut is
+        # nonetheless the only level whose reduction realizes in vivo.
+        acc = FreezeCostAccountant(
+            layer_costs={0: _cost(act=0.0), 1: _cost(act=0.0)},
+            steps_per_epoch=1,
+            num_epochs=4,
+            frozen_at_epoch={1: 2},
+        )
+        comp = compare_freeze_levels(acc, target_width=2048)
+        assert comp.additional_arithmetic_reduction == pytest.approx(0.0)
+        assert comp.level1.realized_reduction == pytest.approx(0.0)
+        assert comp.additional_realized_reduction == pytest.approx(
+            comp.level2.realized_reduction
+        )
+
+    def test_additional_passes_at_validated_and_nine_b_widths(self):
+        # Level 1 always FAILs (realized ~0); Level 2 PASSes at the validated
+        # width and PROVISIONAL_PASSes at 9B (2x). In both cases the suffix cut
+        # is what carries the gate, so additional_passes is True.
+        assert (
+            compare_freeze_levels(self._acc(), target_width=2048).additional_passes
+            is True
+        )
+        nine_b = compare_freeze_levels(self._acc(), target_width=4096)
+        assert nine_b.level1.verdict == VERDICT_FAIL
+        assert nine_b.level2.verdict == VERDICT_PROVISIONAL_PASS
+        assert nine_b.additional_passes is True
+
+    def test_additional_passes_false_when_level2_requires_scale(self):
+        # At 4x width Level 2 refuses to PASS on the proxy alone, so even though
+        # it is the only level that could realize reduction, additional_passes
+        # is False — a CUDA/scale measurement is mandatory first.
+        extreme = compare_freeze_levels(self._acc(), target_width=8192)
+        assert extreme.level1.verdict == VERDICT_FAIL
+        assert extreme.level2.verdict == VERDICT_REQUIRES_SCALE_MEASUREMENT
+        assert extreme.additional_passes is False
+
+    def test_verdicts_share_target_width_threshold_and_confidence(self):
+        # Both levels are judged at the same width, so their width-confidence
+        # (§6.1) is identical — the marginal numbers are an apples-to-apples
+        # delta, not a confound of differing gate settings.
+        comp = compare_freeze_levels(self._acc(), target_width=4096)
+        assert comp.level1.target_width == comp.target_width
+        assert comp.level2.target_width == comp.target_width
+        assert comp.level1.threshold == comp.level2.threshold == SPEED_GATE_THRESHOLD
+        assert (
+            comp.level1.confidence.confidence
+            == comp.level2.confidence.confidence
+            == pytest.approx(0.5)
+        )
+
+    def test_agrees_with_independently_built_verdicts(self):
+        # The comparison's verdicts are identical to building each level's
+        # verdict by hand — the function is pure bundling, no extra arithmetic.
+        acc = self._acc()
+        comp = compare_freeze_levels(acc, target_width=2048)
+        assert isinstance(comp, LevelComparison)
+        assert comp.level1 == speed_gate_verdict(acc, level=1, target_width=2048)
+        assert comp.level2 == speed_gate_verdict(acc, level=2, target_width=2048)
+
+    def test_uniform_accountant_substrate_feeds_comparison(self):
+        # The §7 proxy substrate (freeze log -> accountant -> verdict) reaches
+        # the comparison too: a homogeneous-stack schedule produces a comparison
+        # whose marginal realized reduction is exactly Level 2's realized.
+        log = {2: {3}, 4: {2, 3}}
+        acc = uniform_layer_accountant(
+            4, 10, frozen_at_epoch_from_freeze_log(log)
+        )
+        comp = compare_freeze_levels(acc, target_width=2048)
+        assert comp.level1.realized_reduction == pytest.approx(0.0)
+        assert comp.additional_realized_reduction == pytest.approx(
+            comp.level2.realized_reduction
+        )
+        assert comp.additional_realized_reduction > 0.0
+
+    def test_marginal_deltas_are_non_negative(self):
+        # Level 2 skips a superset of Level 1's skipped work, so every marginal
+        # delta is non-negative across a range of schedules and widths.
+        schedules = [
+            {1: 2},
+            {0: 1, 1: 3},
+            {},
+        ]
+        for frozen in schedules:
+            acc = _two_layers(frozen_at_epoch=frozen)
+            for width in (2048, 4096, 8192):
+                comp = compare_freeze_levels(acc, target_width=width)
+                assert comp.additional_arithmetic_reduction >= 0.0
+                assert comp.additional_realized_reduction >= 0.0
+                assert comp.additional_effective_reduction >= -1e-12
+
+    def test_format_renders_both_verdicts_and_marginal_line(self):
+        comp = compare_freeze_levels(self._acc(), target_width=2048)
+        text = format_level_comparison(comp)
+        assert "level_comparison: target_width=2048" in text
+        assert "level1 (progressive freeze):" in text
+        assert "level2 (suffix cut):" in text
+        assert "additional (level2 - level1):" in text
+        # Both verdict categories and the hand-computed marginal realized (0.25)
+        # appear in the rendered audit block.
+        assert VERDICT_FAIL in text
+        assert VERDICT_PASS in text
+        assert "realized=0.2500" in text
