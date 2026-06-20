@@ -23,6 +23,8 @@ tables this engine implements.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 _VALID_LEVELS: tuple[int, int] = (1, 2)
@@ -505,6 +507,231 @@ def format_speed_gate_verdict(verdict: SpeedGateVerdict) -> str:
         f"  proxy_reduction={verdict.proxy_reduction:.4f} "
         f"realized_reduction={verdict.realized_reduction:.4f} "
         f"effective_reduction={verdict.effective_reduction:.4f}"
+    )
+
+
+# §6.3 variance-calibrated confidence band (10_guard_experiment.md §6.3). The §7
+# verdict's two bounds (width §6.1, realizability §6.2) graduate a *point*
+# reduction. This section records the *measured spread* of the realized
+# reduction across cycles/runs and calibrates a band whose width comes from that
+# variance — instead of presenting a single number or checking containment
+# against a static analytic envelope. The steering feedback named the failure
+# mode this retires: "two reproductions of a median is thin evidence to call it
+# a confidence band"; :data:`MIN_SAMPLE_FOR_CONFIDENCE_BAND` makes that an
+# enforced, auditable rule rather than prose.
+MIN_SAMPLE_FOR_CONFIDENCE_BAND: int = 3
+
+# How :func:`calibrate_reduction_band` derives its width from a sample.
+CALIBRATION_EMPIRICAL_ENVELOPE: str = "empirical_envelope"
+CALIBRATION_NORMAL: str = "normal"
+
+
+@dataclass(frozen=True)
+class ReductionSample:
+    """Observed realized-reduction values with their summary statistics.
+
+    Holds the raw observations (one per cycle, per run, or per measurement
+    condition) plus the min / max / mean / stddev / N a confidence band is
+    calibrated against. Unlike a single point reduction, this records the
+    *measured spread*, so a band derived from it has a width grounded in
+    observed variance rather than a static analytic envelope
+    (10_guard_experiment.md §6.3).
+
+    Reductions are non-negative fractions (a freeze cannot increase backward
+    work), so the sample rejects a negative observation.
+    """
+
+    observations: tuple[float, ...]
+
+    @classmethod
+    def from_values(cls, values: Iterable[float]) -> ReductionSample:
+        """Build a sample from any iterable of observed reductions."""
+        obs = tuple(float(v) for v in values)
+        if any(v < 0.0 for v in obs):
+            raise ValueError(f"reductions must be non-negative, got {obs}")
+        return cls(observations=obs)
+
+    @property
+    def n(self) -> int:
+        return len(self.observations)
+
+    @property
+    def is_empty(self) -> bool:
+        return self.n == 0
+
+    @property
+    def is_thin_evidence(self) -> bool:
+        """Too few observations to support a calibrated band at all.
+
+        True below :data:`MIN_SAMPLE_FOR_CONFIDENCE_BAND`: a band calibrated
+        from one or two reproductions is not a confidence band, so a gate must
+        not present it as one (it collapses to the lone observation(s)).
+        """
+        return self.n < MIN_SAMPLE_FOR_CONFIDENCE_BAND
+
+    @property
+    def min(self) -> float:
+        return min(self.observations) if self.observations else 0.0
+
+    @property
+    def max(self) -> float:
+        return max(self.observations) if self.observations else 0.0
+
+    @property
+    def mean(self) -> float:
+        if not self.observations:
+            return 0.0
+        return sum(self.observations) / self.n
+
+    @property
+    def stddev(self) -> float:
+        """Sample standard deviation (ddof=1); 0.0 below two observations."""
+        if self.n < 2:
+            return 0.0
+        mu = self.mean
+        variance = sum((v - mu) ** 2 for v in self.observations) / (self.n - 1)
+        return math.sqrt(variance)
+
+
+@dataclass(frozen=True)
+class ConfidenceBand:
+    """A band over observed reductions whose width is calibrated to their spread.
+
+    :attr:`lower` / :attr:`upper` come from the sample's measured variance
+    (the full observed range, or a mean ± z·stddev normal interval), so the
+    band width grows with what was actually observed — not a guess.
+    :attr:`is_thin_evidence` records when the sample was too small to support
+    the band, so a gate never calls two reproductions of a median a
+    "confidence band" (10_guard_experiment.md §6.3). This is an uncertainty
+    report around the realized reduction; it does not flip the §7 verdict,
+    whose honesty is already carried by the width (§6.1) and realizability
+    (§6.2) bounds.
+    """
+
+    lower: float
+    upper: float
+    center: float
+    half_width: float
+    n: int
+    is_thin_evidence: bool
+    method: str
+
+    @property
+    def width(self) -> float:
+        return self.upper - self.lower
+
+    def contains(self, value: float) -> bool:
+        """Whether ``value`` falls inside the calibrated band."""
+        return self.lower <= value <= self.upper
+
+
+def calibrate_reduction_band(
+    sample: ReductionSample,
+    *,
+    method: str = CALIBRATION_EMPIRICAL_ENVELOPE,
+    z: float = 1.96,
+) -> ConfidenceBand:
+    """Calibrate a confidence band against the sample's measured spread.
+
+    ``method="empirical_envelope"`` (default) — the band is ``[min, max]`` over
+    the observations: the full measured range, non-parametric and honest. Its
+    width is exactly the observed spread, never a guess.
+
+    ``method="normal"`` — ``mean ± z·stddev`` (``z=1.96`` ≈ a 95% normal
+    interval over the realized reduction). Treats the observations as noisy
+    measurements of one underlying reduction; needs ``n >= 2`` for a nonzero
+    width. Because it is a symmetric normal interval it may dip below zero for
+    a low-mean, high-variance sample — reductions are non-negative, so prefer
+    the empirical envelope when that matters.
+
+    Either way a sample smaller than :data:`MIN_SAMPLE_FOR_CONFIDENCE_BAND`
+    yields a thin-evidence band (``is_thin_evidence=True``): the statistics are
+    still computed for the record, but a gate must not present it as a
+    calibrated confidence band — it collapses to the lone observation(s)
+    (10_guard_experiment.md §6.3).
+    """
+    if method not in (CALIBRATION_EMPIRICAL_ENVELOPE, CALIBRATION_NORMAL):
+        raise ValueError(
+            f"method must be {CALIBRATION_EMPIRICAL_ENVELOPE!r} or "
+            f"{CALIBRATION_NORMAL!r}, got {method!r}"
+        )
+    if sample.is_empty:
+        raise ValueError("cannot calibrate a band from an empty sample")
+    if z <= 0:
+        raise ValueError(f"z must be positive, got {z}")
+    if method == CALIBRATION_EMPIRICAL_ENVELOPE:
+        lower, upper = sample.min, sample.max
+    else:  # CALIBRATION_NORMAL
+        half = z * sample.stddev
+        lower, upper = sample.mean - half, sample.mean + half
+    return ConfidenceBand(
+        lower=lower,
+        upper=upper,
+        center=sample.mean,
+        half_width=(upper - lower) / 2.0,
+        n=sample.n,
+        is_thin_evidence=sample.is_thin_evidence,
+        method=method,
+    )
+
+
+def per_cycle_realized_reductions(
+    accountant: FreezeCostAccountant,
+    level: int,
+    *,
+    num_cycles: int | None = None,
+) -> list[float]:
+    """Realized reduction as the freeze suffix grows, one value per cycle.
+
+    For each cycle ``t`` in ``[0, num_cycles)``, restricts the accountant's
+    schedule to the layers already frozen by cycle ``t`` (those with
+    ``frozen_at_epoch <= t``) and reports
+    ``realizable_reduction(...).realized_reduction`` — the in-vivo-realized
+    reduction the observed suffix delivers as of that cycle. The returned
+    series is the per-cycle observed spread a :class:`ConfidenceBand` is
+    calibrated over (10_guard_experiment.md §6.3): it records how the realized
+    reduction actually ramped across the run instead of collapsing it to one
+    headline number. Accumulate across runs by concatenating series before
+    building the sample.
+    """
+    # Validate level up front (matches FreezeCostAccountant._check_level) so an
+    # invalid level raises even when num_cycles == 0 yields an empty series.
+    if level not in _VALID_LEVELS:
+        raise ValueError(f"level must be one of {_VALID_LEVELS}, got {level}")
+    total = accountant.num_epochs if num_cycles is None else num_cycles
+    if total < 0:
+        raise ValueError(f"num_cycles must be non-negative, got {total}")
+    series: list[float] = []
+    for t in range(total):
+        truncated = {
+            idx: epoch
+            for idx, epoch in accountant.frozen_at_epoch.items()
+            if epoch <= t
+        }
+        acc_t = FreezeCostAccountant(
+            layer_costs=accountant.layer_costs,
+            steps_per_epoch=accountant.steps_per_epoch,
+            num_epochs=accountant.num_epochs,
+            frozen_at_epoch=truncated,
+        )
+        series.append(realizable_reduction(acc_t, level).realized_reduction)
+    return series
+
+
+def format_reduction_band(band: ConfidenceBand) -> str:
+    """Render a §6.3 variance-calibrated band with full provenance.
+
+    A compact, deterministic audit block: the calibration method, the sample
+    size, the calibrated bounds and width, and the thin-evidence verdict. When
+    ``is_thin_evidence`` the label states plainly that the band must not be
+    read as a calibrated confidence band — the statistics are recorded for the
+    audit, but two reproductions of a median do not earn the name.
+    """
+    label = "THIN_EVIDENCE" if band.is_thin_evidence else "calibrated"
+    return (
+        f"reduction_band: {band.method} ({label})\n"
+        f"  n={band.n} lower={band.lower:.4f} upper={band.upper:.4f} "
+        f"center={band.center:.4f} width={band.width:.4f}"
     )
 
 

@@ -12,24 +12,32 @@ A layer frozen at epoch f is active for epochs [0, f) and frozen for [f, 4).
 import pytest
 
 from src.tg_lora.freeze_cost import (
+    CALIBRATION_EMPIRICAL_ENVELOPE,
+    CALIBRATION_NORMAL,
     LEVEL1_REALIZED_REDUCTION_CEILING,
+    MIN_SAMPLE_FOR_CONFIDENCE_BAND,
     PROXY_VALIDATED_MAX_WIDTH,
     SPEED_GATE_THRESHOLD,
+    ConfidenceBand,
     ExtrapolationConfidence,
     FreezeCostAccountant,
     FreezeCostSummary,
     GatedReduction,
     LayerBackwardCost,
     RealizedReduction,
+    ReductionSample,
     SpeedGateVerdict,
     VERDICT_FAIL,
     VERDICT_PASS,
     VERDICT_PROVISIONAL_PASS,
     VERDICT_REQUIRES_SCALE_MEASUREMENT,
+    calibrate_reduction_band,
     extrapolation_confidence,
+    format_reduction_band,
     format_speed_gate_verdict,
     frozen_at_epoch_from_freeze_log,
     gate_reduction,
+    per_cycle_realized_reductions,
     realizable_reduction,
     speed_gate_verdict,
     uniform_layer_accountant,
@@ -670,3 +678,213 @@ class TestFormatSpeedGateVerdict:
             speed_gate_verdict(self._acc(), level=2, target_width=2048)
         )
         assert "threshold=0.10" in text
+
+
+class TestReductionSample:
+    """Observed-reduction statistics that record the measured spread (§6.3).
+
+    All expected values are hand-computed. Sample [0.0, 0.1, 0.2, 0.3, 0.4]:
+    n=5, min=0.0, max=0.4, mean=0.2, stddev=sqrt(0.025)=0.15811…, and n >= 3 so
+    it is not thin evidence (the boundary is MIN_SAMPLE_FOR_CONFIDENCE_BAND = 3).
+    """
+
+    def test_min_sample_for_confidence_band_is_three(self):
+        # The steering critique ("two reproductions of a median is thin
+        # evidence") is enforced as a named constant, not prose.
+        assert MIN_SAMPLE_FOR_CONFIDENCE_BAND == 3
+
+    def test_statistics_hand_computed(self):
+        s = ReductionSample.from_values([0.0, 0.1, 0.2, 0.3, 0.4])
+        assert s.n == 5
+        assert s.min == 0.0
+        assert s.max == 0.4
+        assert s.mean == pytest.approx(0.2)
+        assert s.stddev == pytest.approx(0.15811388, abs=1e-6)
+        assert s.is_empty is False
+        assert s.is_thin_evidence is False  # n=5 >= 3
+
+    def test_thin_evidence_below_three_observations(self):
+        # n=2 reproductions: too thin to call a confidence band.
+        s = ReductionSample.from_values([0.1, 0.2])
+        assert s.n == 2
+        assert s.is_thin_evidence is True
+
+    def test_boundary_three_is_not_thin(self):
+        # Exactly MIN_SAMPLE_FOR_CONFIDENCE_BAND observations clear the bar.
+        s = ReductionSample.from_values([0.0, 0.25, 0.5])
+        assert s.n == 3
+        assert s.is_thin_evidence is False
+
+    def test_single_observation_is_thin(self):
+        s = ReductionSample.from_values([0.3])
+        assert s.n == 1
+        assert s.is_thin_evidence is True
+        # stddev is undefined below two observations and reports 0.0.
+        assert s.stddev == 0.0
+        assert s.min == s.max == s.mean == 0.3
+
+    def test_empty_sample(self):
+        s = ReductionSample.from_values([])
+        assert s.is_empty is True
+        assert s.n == 0
+        assert s.min == 0.0 and s.max == 0.0 and s.mean == 0.0
+
+    def test_accepts_any_iterable(self):
+        # A generator (the shape per_cycle_realized_reductions returns) works.
+        s = ReductionSample.from_values(x / 4 for x in range(4))
+        assert s.n == 4
+        assert s.observations == (0.0, 0.25, 0.5, 0.75)
+
+    def test_rejects_negative_reduction(self):
+        # A freeze cannot increase backward work, so a reduction is non-negative.
+        with pytest.raises(ValueError, match="non-negative"):
+            ReductionSample.from_values([-0.1, 0.2])
+
+
+class TestCalibrateReductionBand:
+    """Band width calibrated against the sample's measured spread (§6.3).
+
+    Reference sample [0.0, 0.25, 0.5]: n=3, mean=0.25, stddev=0.25. The
+    empirical envelope is [min, max] = [0.0, 0.5]; the normal band is
+    mean ± z·stddev. This retires the containment-only band the steering
+    feedback named — the width now comes from what was measured, and thin
+    evidence is flagged rather than printed as a confidence band.
+    """
+
+    def _sample(self) -> ReductionSample:
+        return ReductionSample.from_values([0.0, 0.25, 0.5])
+
+    def test_empirical_envelope_uses_observed_range(self):
+        band = calibrate_reduction_band(self._sample())
+        assert isinstance(band, ConfidenceBand)
+        assert band.method == CALIBRATION_EMPIRICAL_ENVELOPE  # default
+        assert band.lower == 0.0
+        assert band.upper == 0.5
+        assert band.center == pytest.approx(0.25)
+        assert band.half_width == pytest.approx(0.25)
+        assert band.width == pytest.approx(0.5)
+        assert band.n == 3
+        assert band.is_thin_evidence is False
+
+    def test_normal_band_is_mean_plus_minus_z_stddev(self):
+        # stddev=0.25, z=2 -> half_width 0.5 -> [-0.25, 0.75].
+        band = calibrate_reduction_band(
+            self._sample(), method=CALIBRATION_NORMAL, z=2.0
+        )
+        assert band.method == CALIBRATION_NORMAL
+        assert band.lower == pytest.approx(-0.25)
+        assert band.upper == pytest.approx(0.75)
+        assert band.center == pytest.approx(0.25)
+        assert band.width == pytest.approx(1.0)
+        # Symmetric normal interval may dip below zero for a low-mean sample —
+        # reductions are non-negative, so prefer the empirical envelope then.
+        assert band.lower < 0.0
+
+    def test_contains_inclusive_bounds(self):
+        band = calibrate_reduction_band(self._sample())
+        assert band.contains(0.0) is True
+        assert band.contains(0.5) is True
+        assert band.contains(0.25) is True
+        assert band.contains(-0.001) is False
+        assert band.contains(0.501) is False
+
+    def test_thin_evidence_is_flagged_not_hidden(self):
+        # Two observations: the band is still computed for the record, but it is
+        # explicitly thin evidence — a gate must not present it as calibrated.
+        band = calibrate_reduction_band(ReductionSample.from_values([0.1, 0.2]))
+        assert band.is_thin_evidence is True
+        assert band.n == 2
+        assert band.lower == 0.1 and band.upper == 0.2
+
+    def test_single_observation_collapses_to_a_point(self):
+        band = calibrate_reduction_band(ReductionSample.from_values([0.3]))
+        assert band.is_thin_evidence is True
+        assert band.lower == band.upper == 0.3
+        assert band.width == 0.0
+
+    def test_empty_sample_raises(self):
+        with pytest.raises(ValueError, match="empty"):
+            calibrate_reduction_band(ReductionSample.from_values([]))
+
+    def test_unknown_method_raises(self):
+        with pytest.raises(ValueError, match="method"):
+            calibrate_reduction_band(self._sample(), method="quartile")
+
+    def test_non_positive_z_raises(self):
+        with pytest.raises(ValueError, match="z"):
+            calibrate_reduction_band(self._sample(), method=CALIBRATION_NORMAL, z=0.0)
+
+    def test_format_records_provenance_and_thin_flag(self):
+        calibrated = format_reduction_band(calibrate_reduction_band(self._sample()))
+        assert "empirical_envelope" in calibrated
+        assert "calibrated" in calibrated
+        assert "n=3" in calibrated
+        assert "width=0.5000" in calibrated
+        thin = format_reduction_band(
+            calibrate_reduction_band(ReductionSample.from_values([0.1, 0.2]))
+        )
+        assert "THIN_EVIDENCE" in thin
+        assert "n=2" in thin
+
+
+class TestPerCycleRealizedReductions:
+    """The per-cycle observed spread a confidence band is calibrated over (§6.3).
+
+    Reference accountant: layer 1 frozen at epoch 2 -> Level-2 reduction 0.25
+    (see TestSingleLayerMidFreeze). As the suffix freezes, the realized Level-2
+    reduction ramps cycle by cycle; Level-1 stays ~0 (the §6.2 ceiling).
+    """
+
+    def _acc(self) -> FreezeCostAccountant:
+        return _two_layers(frozen_at_epoch={1: 2})
+
+    def test_level2_ramps_as_suffix_freezes(self):
+        # Cycle t counts layers frozen by epoch <= t: nothing until t=2, then the
+        # full 0.25 reduction is realized and held to the end of the run.
+        series = per_cycle_realized_reductions(self._acc(), level=2, num_cycles=4)
+        assert series == [0.0, 0.0, pytest.approx(0.25), pytest.approx(0.25)]
+
+    def test_level1_stays_zero_every_cycle(self):
+        # Level-1 realizes ~0 in vivo regardless of cycle (the §6.2 ceiling).
+        series = per_cycle_realized_reductions(self._acc(), level=1, num_cycles=4)
+        assert series == [0.0, 0.0, 0.0, 0.0]
+
+    def test_default_num_cycles_is_num_epochs(self):
+        assert len(per_cycle_realized_reductions(self._acc(), level=2)) == 4
+
+    def test_multi_freeze_ramp(self):
+        # layer0 frozen@1, layer1 frozen@3: reduction steps 0 -> 0.375 -> 0.5.
+        # t=1: only layer0 frozen -> 1 - (20 + 80)/160 = 0.375.
+        # t=3: both frozen -> 1 - (20 + 60)/160 = 0.5.
+        acc = _two_layers(frozen_at_epoch={0: 1, 1: 3})
+        series = per_cycle_realized_reductions(acc, level=2, num_cycles=4)
+        assert series == [
+            0.0,
+            pytest.approx(0.375),
+            pytest.approx(0.375),
+            pytest.approx(0.5),
+        ]
+
+    @pytest.mark.parametrize("bad_level", [0, 3, -1])
+    def test_invalid_level_raises(self, bad_level):
+        with pytest.raises(ValueError, match="level"):
+            per_cycle_realized_reductions(self._acc(), level=bad_level)
+
+    def test_feeds_calibrated_band_containing_headline(self):
+        # The headline realized reduction (0.25) sits at the band's upper edge,
+        # and the band records the full per-cycle spread rather than one number.
+        series = per_cycle_realized_reductions(self._acc(), level=2, num_cycles=4)
+        band = calibrate_reduction_band(ReductionSample.from_values(series))
+        assert band.is_thin_evidence is False  # n=4
+        assert band.contains(
+            realizable_reduction(self._acc(), level=2).realized_reduction
+        )
+        assert band.upper == pytest.approx(0.25)
+        assert band.lower == 0.0
+
+    def test_few_cycles_is_thin_evidence(self):
+        # Two cycles before any freeze: the sample is too thin for a band.
+        series = per_cycle_realized_reductions(self._acc(), level=2, num_cycles=2)
+        band = calibrate_reduction_band(ReductionSample.from_values(series))
+        assert band.is_thin_evidence is True
+        assert band.n == 2

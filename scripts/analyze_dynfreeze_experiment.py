@@ -38,8 +38,12 @@ except ImportError:
     sys.exit(1)
 
 from src.tg_lora.freeze_cost import (
+    ReductionSample,
+    calibrate_reduction_band,
+    format_reduction_band,
     format_speed_gate_verdict,
     frozen_at_epoch_from_freeze_log,
+    per_cycle_realized_reductions,
     speed_gate_verdict,
     uniform_layer_accountant,
 )
@@ -290,17 +294,21 @@ def _proxy_speed_gate_section(
     target_width: int,
     freeze_level: int,
 ) -> list[str]:
-    """Emit the §7 proxy speed-gate verdict (CUDA-less path, design §6.1 + §6.2).
+    """Emit the §7 proxy speed-gate verdict (CUDA-less path, §6.1 + §6.2 + §6.3).
 
     Judges the 10% bar from the model-free accountant over the *observed* freeze
     schedule, so a proxy reduction is credited only as far as it is realized in
     vivo (§6.2) and validated at ``target_width`` (§6.1) — never the raw number.
-    Returns a labelled, indented block for ``gate_decision.txt``; returns a SKIP
-    line when no freeze schedule was observed. This is the concrete proxy path
-    that ``freeze_cost.speed_gate_verdict`` exists for, so the §7 bar does not
-    silently print N/A or trust a raw proxy figure when CUDA is unavailable.
+    When the gate credits a realizable reduction, its measured per-cycle spread is
+    also recorded as a variance-calibrated band (§6.3), so the headline number is
+    not presented without its uncertainty; a thin-evidence run is labelled, not
+    dressed up as a confidence band. Returns a labelled, indented block for
+    ``gate_decision.txt``; returns a SKIP line when no freeze schedule was
+    observed. This is the concrete proxy path that ``freeze_cost.speed_gate_verdict``
+    exists for, so the §7 bar does not silently print N/A or trust a raw proxy
+    figure when CUDA is unavailable.
     """
-    lines = ["", "--- Speed gate (proxy / CUDA-less, §6.1 + §6.2) ---"]
+    lines = ["", "--- Speed gate (proxy / CUDA-less, §6.1 + §6.2 + §6.3) ---"]
     # Per-cycle frozen-layer set parsed from the guard block log.
     block_log: dict[int, set[int]] = {}
     for cycle, info in schedule.items():
@@ -337,6 +345,16 @@ def _proxy_speed_gate_section(
     )
     for rendered in format_speed_gate_verdict(verdict).split("\n"):
         lines.append("    " + rendered)
+    # §6.3: when the gate credits a realizable reduction (Level-2), record its
+    # measured per-cycle spread as a calibrated band so the headline number is
+    # not presented without its uncertainty. A thin-evidence run (too few cycles)
+    # is labelled THIN_EVIDENCE, not dressed up as a confidence band. Level-1 /
+    # no-freeze credits nothing, so no band is emitted there.
+    if verdict.realized_reduction > 0.0:
+        series = per_cycle_realized_reductions(accountant, level=freeze_level)
+        band = calibrate_reduction_band(ReductionSample.from_values(series))
+        for rendered in format_reduction_band(band).split("\n"):
+            lines.append("    " + rendered)
     return lines
 
 

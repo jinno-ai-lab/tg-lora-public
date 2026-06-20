@@ -109,12 +109,31 @@ in-vivo 検証（`tests/test_progressive_freeze_invivo.py`、CPU-proxy h=24, L=8
 
 したがって §7 第一関門は Level-1 の削減率を**信用してはならない**。`gate_reduction(level=1)` は算術値を保持（`proxy_reduction`、透明性のため）しつつ、`realized_reduction` を `LEVEL1_REALIZED_REDUCTION_CEILING = 0.0` に据え、`effective_reduction` を 0 にする。結果として Level-1 はいかなる幅でも第一関門（10% 短縮）を通らない。これは CPU-proxy in-vivo 証拠に基づく境界であり、実 9B 計測ではない（§6.1 の幅境界と同じ honesty）。将来の in-vivo 計測で Level-1 に非零の実現削減が観測されれば（例: gradient checkpointing 併用下）、この ceiling を引き上げて回復させる。
 
+### 6.3 分散較正バンド（観測分散 → band 幅）— 薄い証拠で band を名乗らない第三の境界
+
+§6.1（幅: proxy → scale）と §6.2（実現性: 算術 → in-vivo）は関門が信用する**点推定** `effective_reduction` を段階的に補正する。本節は直交する第三の次元「**観測分散**」を扱う: 関門が提示する削減率を、その**測定されたばらつき**とともに記録し、band 幅を**測定分散**から較正する。 steering フィードバックが指摘した失敗モード — "中央値の2回再現は confidence band と呼ぶには薄い証拠" — を、判断ではなく**強制可能な監査可能ルール**として退場させる。
+
+`freeze_cost.py` の 3 つ組がこれを実装する:
+
+- **`ReductionSample`** — 観測された実現削減率（サイクル毎・ラン毎・測定条件毎）を生の値のまま保持し、`n` / `min` / `max` / `mean` / `stddev`（標本標準偏差, ddof=1）を算出する。点推定と違い**測定されたばらつき**を記録する。
+- **`calibrate_reduction_band(sample, *, method, z)`** — band 幅を標本の**測定分散**から較正する:
+  - `method="empirical_envelope"`（既定）: band = `[min, max]`。観測された全範囲・ノンパラメトリック。幅は観測 spread そのもので、推測を含まない。
+  - `method="normal"`: band = `mean ± z·stddev`（`z=1.96` ≈ 95% 正規区間）。観測を一つの削減率の雑音付き測定とみなす。低平均・高分散の標本ではゼロを下回りうる（削減率は非負のため、その場合は empirical_envelope を推奨）。
+- **`MIN_SAMPLE_FOR_CONFIDENCE_BAND = 3`** — 標本がこれ未満のとき band は `is_thin_evidence=True` になる。統計量は監査のため計算されるが、関門はこれを「較正済み confidence band」として提示してはならない（1-2 点の再現は band の名に値しない）。
+
+`ConfidenceBand` は `effective_reduction` 周りの**不確実性報告**であり、§7 の判定を反転させない（関門の honesty は既に §6.1 + §6.2 が担う）。実観測から band に供給する系列は `per_cycle_realized_reductions(accountant, level)` が生成する: サイクル `t` 毎に「`t` までに凍結した層だけ」でスケジュールを切り詰め、§6.2 の実現削減率を報告する。これは実現削減率がラン全体で**どう推移したか**を 1 本のヘッドライン数に潰さずに記録する。複数ランにわたる spread は、系列を結合してから標本を組めば同じ枠で扱える。
+
+**パイプライン統合**: `scripts/analyze_dynfreeze_experiment.py` の `_proxy_speed_gate_section` は、§7 proxy 判定（`speed_gate_verdict`）の直後に、実現削減率を信用する Level-2 のときだけこの band を出力する。観測サイクル数が少ないランは `THIN_EVIDENCE` と明記され、confidence band の体裁をとらない。Level-1 / 凍結なしが信用するものはゼロなので、そこでは band を出力しない。
+
+これは steering フィードバックの「実 CUDA/9B 計測を行う **or** 分散に対して band を較正する」の後者。CUDA が利用できない反復では、band が少なくとも**測定された spread に対して正直**になる。実 9B 計測が得られれば、その per-cycle / per-run 観測を同じ `ReductionSample` に蓄積するだけで band が真の測定分散に較正される。
+
 ## 7. 判定基準
 
 - **第一関門 (速度) PASS**: B の総GPU秒 ≤ A × 0.90 (10%以上短縮) + 正味削減確認
   - 削減量を proxy（h ≤ 2048）の会計から判定する場合、§6.1 の外挿信頼度で割り引いた `effective_reduction` で判定すること。検証範囲を外れる幅では proxy 数をそのまま信じない。
   - **実現性**: `effective_reduction` は §6.2 の実現性補正を経た値を使うこと。Level-1（freeze-only）の算術削減率は in-vivo で実現しないため、関門はこれを信用せず Level-2（trio）のみを信用する。
   - **判定の実装**: 上記2補正を経た proxy 判定は `freeze_cost.speed_gate_verdict()`（閾値 `SPEED_GATE_THRESHOLD = 0.10`）がそのまま出力する。生の `passes()` 真偽値では表現できない段階的判定 (`PASS` / `PROVISIONAL_PASS` / `REQUIRES_SCALE_MEASUREMENT` / `FAIL`) を返し、proxy 数が関門を黙り越しで通過することを構造的に防ぐ。Level-1 はいかなる幅でも `FAIL`、9B(h=4096) は条件付き `PROVISIONAL_PASS`、4×幅以上は実計測を要求する。
+  - **不確実性の報告**: 判定を反転させない第三の honesty 次元として、信用した実現削減率の**測定された per-cycle spread** を §6.3 の分散較正バンド（`freeze_cost.calibrate_reduction_band`）で併記する。観測が薄い（`MIN_SAMPLE_FOR_CONFIDENCE_BAND` 未満）場合は `THIN_EVIDENCE` と明記し、confidence band の体裁をとらない。これは PASS/FAIL を変えるものではなく、ヘッドライン数をその分散抜きで提示しないための報告である。
 - **第二関門 (質)**: gold ≥ G* (§5.2 停止規則に統合済み)
 - 両関門 PASS で主張成立
 
