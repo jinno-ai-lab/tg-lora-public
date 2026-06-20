@@ -642,6 +642,13 @@ class LevelComparison:
     actually credited (the validated 0.0 default, or a measured value resolved
     from a supplied :class:`Level1RealizationRecord`), so the audit shows when a
     real measurement recovered a Level-1 reduction rather than the baseline ~0.
+    :attr:`reproduction_bracket` carries the across-reproduction §6.3 bracket on
+    :attr:`additional_realized_reduction` when N A/B reproductions deposit their
+    measured headline reductions via a :class:`ReproductionRecord`. ``None`` (the
+    default) leaves the headline a point estimate, so the comparison is unchanged
+    unless real evidence is supplied — the same landing-point contract as the
+    §6.2 ceiling, distinct from it: the ceiling bounds *realizability* (§6.2),
+    the bracket bounds *measurement spread* (§6.3).
     """
 
     target_width: int
@@ -651,6 +658,7 @@ class LevelComparison:
     additional_realized_reduction: float
     additional_effective_reduction: float
     level1_ceiling: float = LEVEL1_REALIZED_REDUCTION_CEILING
+    reproduction_bracket: ConfidenceBand | None = None
 
     @property
     def additional_passes(self) -> bool:
@@ -674,6 +682,7 @@ def compare_freeze_levels(
     validated_max_width: int = PROXY_VALIDATED_MAX_WIDTH,
     scale_measurement_floor: float = 0.5,
     level1_record: Level1RealizationRecord | None = None,
+    reproduction_record: ReproductionRecord | None = None,
 ) -> LevelComparison:
     """Quantitative Level-1-vs-Level-2 comparison (GOAL §5 / Phase 3 deliverable).
 
@@ -698,6 +707,18 @@ def compare_freeze_levels(
     may flip its verdict from FAIL; a thin record is recorded on the comparison
     but does not raise the ceiling. ``None`` keeps the validated baseline, so
     the comparison is unchanged unless real evidence is supplied.
+
+    ``reproduction_record`` is the researcher-facing entry point for §6.3
+    evidence: N measured across-reproduction observations of the headline
+    :attr:`LevelComparison.additional_realized_reduction` (resolved by
+    :func:`calibrate_reproduction_bracket` into a :class:`ConfidenceBand`). The
+    bracket is an uncertainty report on the headline — it does not flip the §7
+    verdict (whose honesty the width §6.1, realizability §6.2, and the verdict
+    graduation already carry); it only stops the headline being presented as a
+    bare point once reproductions exist. A non-thin record calibrates a band;
+    a thin record (below :data:`MIN_SAMPLE_FOR_CONFIDENCE_BAND` reproductions) is
+    labelled ``THIN_EVIDENCE`` rather than presented as calibrated. ``None``
+    leaves the headline a point estimate with byte-identical output.
     """
     level1_ceiling = resolve_level1_ceiling(level1_record)
     level1 = speed_gate_verdict(
@@ -729,6 +750,7 @@ def compare_freeze_levels(
         additional_effective_reduction=level2.effective_reduction
         - level1.effective_reduction,
         level1_ceiling=level1_ceiling,
+        reproduction_bracket=calibrate_reproduction_bracket(reproduction_record),
     )
 
 
@@ -765,6 +787,19 @@ def format_level_comparison(comparison: LevelComparison) -> str:
         lines.append(
             f"  level1 ceiling: raised to {comparison.level1_ceiling:.4f} "
             f"by a measured in-vivo record"
+        )
+    if comparison.reproduction_bracket is not None:
+        # §6.3: across-reproduction bracket on the headline additional realized
+        # reduction. A thin record (too few reproductions) is labelled
+        # THIN_EVIDENCE and shows its count, not dressed as a calibrated bracket
+        # — the same honesty rule as the per-level band. Omitted entirely when no
+        # record is supplied, so the default output is byte-identical.
+        band = comparison.reproduction_bracket
+        label = "THIN_EVIDENCE" if band.is_thin_evidence else "calibrated"
+        lines.append(
+            f"  reproduction_bracket: {band.method} ({label}, n={band.n}) "
+            f"lower={band.lower:.4f} upper={band.upper:.4f} "
+            f"width={band.width:.4f}"
         )
     return "\n".join(lines)
 
@@ -1023,6 +1058,93 @@ def format_reduction_band(band: ConfidenceBand) -> str:
         f"  measured_spread: min={band.min_obs:.4f} max={band.max_obs:.4f} "
         f"mean={band.center:.4f} stddev={band.stddev:.4f}"
     )
+
+
+@dataclass(frozen=True)
+class ReproductionRecord:
+    """Across-reproduction observations of the A/B headline reduction (§6.3 bracket).
+
+    One observed value per A/B reproduction of the Level-1-vs-Level-2 headline —
+    the additional realized reduction (the backward work Level 2's suffix cut
+    saves over the Level 1 baseline, measured in a real run). The §7 proxy
+    comparison (:func:`compare_freeze_levels`) reports this headline as a point
+    derived from model-free arithmetic; this record is the landing zone for the
+    *measured spread* across N reproductions, so a future CUDA A/B run can deposit
+    its per-run observations and the comparison reports an honest
+    across-reproduction bracket instead of a bare point. The bracket does not
+    flip the §7 verdict — it is an uncertainty report on the headline, the same
+    role :class:`ConfidenceBand` plays for a single level's realized reduction
+    (10_guard_experiment.md §6.3); the verdict's honesty is already carried by the
+    width (§6.1) and realizability (§6.2) bounds.
+
+    A record below :data:`MIN_SAMPLE_FOR_CONFIDENCE_BAND` reproductions is thin
+    evidence: it is recorded for the audit (the count is shown) but the bracket
+    is labelled ``THIN_EVIDENCE``, not presented as a calibrated confidence
+    interval — two reproductions of a headline number are not a confidence
+    interval, for the same reason :class:`ReductionSample` refuses to call one or
+    two observations a confidence band. ``None`` (the default on
+    :func:`compare_freeze_levels`) leaves the comparison a point estimate, so
+    every existing verdict and its rendered output is unchanged unless real
+    evidence is supplied — the same landing-point contract as
+    :class:`Level1RealizationRecord`, orthogonal to it: the record bounds
+    *realizability* (§6.2 ceiling); this record bounds *measurement spread*
+    (§6.3 bracket).
+    """
+
+    observations: tuple[float, ...]
+    source: str = ""
+
+    def __post_init__(self) -> None:
+        if len(self.observations) < 1:
+            raise ValueError(
+                "a ReproductionRecord needs at least one observation; "
+                "pass record=None for no evidence"
+            )
+        if any(v < 0.0 for v in self.observations):
+            raise ValueError(
+                f"reductions must be non-negative, got {self.observations}"
+            )
+
+    @property
+    def n(self) -> int:
+        return len(self.observations)
+
+    @property
+    def sample(self) -> ReductionSample:
+        """The observations as a :class:`ReductionSample` for band calibration."""
+        return ReductionSample.from_values(self.observations)
+
+    @property
+    def is_thin_evidence(self) -> bool:
+        """Too few reproductions to calibrate a bracket (matches the §6.3 bar)."""
+        return self.n < MIN_SAMPLE_FOR_CONFIDENCE_BAND
+
+
+def calibrate_reproduction_bracket(
+    record: ReproductionRecord | None,
+    *,
+    method: str = CALIBRATION_EMPIRICAL_ENVELOPE,
+    z: float = 1.96,
+) -> ConfidenceBand | None:
+    """The across-reproduction §6.3 bracket on the A/B headline, or ``None``.
+
+    Returns ``None`` when there is no record, so :func:`compare_freeze_levels`
+    left un-supplied with evidence stays a point estimate whose rendered output
+    is byte-identical to before. With a record, the headline's measured spread
+    across reproductions calibrates a :class:`ConfidenceBand` by reusing
+    :func:`calibrate_reduction_band` over the record's sample: the empirical
+    envelope ``[min, max]`` by default, or a ``mean ± z·stddev`` normal interval.
+
+    A thin record still returns a band — but with ``is_thin_evidence=True`` — so
+    :func:`format_level_comparison` labels it ``THIN_EVIDENCE`` (and shows the
+    count) rather than presenting it as a calibrated bracket. This is the
+    across-reproduction "thicken the N=2 bracket" landing point the steering
+    feedback named: today's point headline becomes an honest,
+    reproduction-counted bracket once a real A/B run deposits its observations.
+    """
+    if record is None:
+        return None
+    return calibrate_reduction_band(record.sample, method=method, z=z)
 
 
 def frozen_at_epoch_from_freeze_log(

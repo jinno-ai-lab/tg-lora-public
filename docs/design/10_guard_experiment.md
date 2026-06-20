@@ -129,6 +129,8 @@ in-vivo 検証（`tests/test_progressive_freeze_invivo.py`、CPU-proxy h=24, L=8
 
 これは steering フィードバックの「実 CUDA/9B 計測を行う **or** 分散に対して band を較正する」の後者。CUDA が利用できない反復では、band が少なくとも**測定された spread に対して正直**になる。実 9B 計測が得られれば、その per-cycle / per-run 観測を同じ `ReductionSample` に蓄積するだけで band が真の測定分散に較正される。
 
+**比較ヘッドラインの再生産 bracket 着地点 (§6.3 → Phase 3)**: 上記の band は一つの level の実現削減率の per-cycle spread を較正するが、Phase 3 の A/B ヘッドライン `additional_realized_reduction`（Level 2 の suffix 切断が Level 1 基盤の上で追加実現する後方削減）は、`compare_freeze_levels()` では proxy 算術からの**点推定**としてしか報告されず、再生産をまたぐ測定分散を受け取る着地点がなかった。`ReproductionRecord`（N 件の実測ヘッドライン削減 + `source`）と `calibrate_reproduction_bracket()` がその着地点である: N 件の実 A/B 再生産観測を `ReductionSample` / `calibrate_reduction_band` と同じ枠で §6.3 `ConfidenceBand` に較正し、`LevelComparison.reproduction_bracket` に載せ、`format_level_comparison()` が監査行として出力する。これは §7 判定を反転させない**不確実性報告**であり（per-level band と同じ honesty 役割をヘッドラインについて担う）、関門の厳格化ではない — steering が「既に厳格な gate をこれ以上硬化するな」と明示した点にも合致する。既定（record なし）は `None` で出力は byte-identical、薄い証拠（`MIN_SAMPLE_FOR_CONFIDENCE_BAND` 未満）は `THIN_EVIDENCE` + 件数を明示し confidence 区間の体裁をとらない。これが steering bullet 2 の「thin (N=2) bracket を厚くする」着地点: 実 CUDA A/B run が N 件の観測を供給すれば、点だったヘッドラインは正直で再生産件数付きの bracket になる。実測値の供給は GPU 依存の別作業であり、本着地点はそれを受け取る pluggable な口のみを提供する（実 9B 計測を一切偽造しない）。
+
 ## 7. 判定基準
 
 - **第一関門 (速度) PASS**: B の総GPU秒 ≤ A × 0.90 (10%以上短縮) + 正味削減確認

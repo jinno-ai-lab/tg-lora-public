@@ -28,12 +28,14 @@ from src.tg_lora.freeze_cost import (
     LevelComparison,
     RealizedReduction,
     ReductionSample,
+    ReproductionRecord,
     SpeedGateVerdict,
     VERDICT_FAIL,
     VERDICT_PASS,
     VERDICT_PROVISIONAL_PASS,
     VERDICT_REQUIRES_SCALE_MEASUREMENT,
     calibrate_reduction_band,
+    calibrate_reproduction_bracket,
     compare_freeze_levels,
     extrapolation_confidence,
     format_level_comparison,
@@ -963,6 +965,112 @@ class TestPerCycleRealizedReductions:
         assert band.stddev > 0.0
 
 
+class TestReproductionBracket:
+    """§6.3 across-reproduction bracket on the A/B comparison headline.
+
+    The proxy comparison reports ``additional_realized_reduction`` as a point
+    from model-free arithmetic. ``ReproductionRecord`` is the landing zone for N
+    real A/B reproductions of that headline; ``calibrate_reproduction_bracket``
+    reuses ``calibrate_reduction_band`` to turn them into a §6.3 bracket. Default
+    (``None``) is a no-op so the proxy headline stays a bare point — the same
+    contract ``Level1RealizationRecord`` applies to the §6.2 ceiling, orthogonal
+    to it: the ceiling bounds realizability, the bracket bounds measurement
+    spread. Reference observations [0.21, 0.23, 0.27, 0.29] -> min 0.21, max
+    0.29, mean 0.25.
+    """
+
+    def test_record_carries_observations_and_source(self):
+        record = ReproductionRecord((0.21, 0.29), source="9b_ab_run")
+        assert record.observations == (0.21, 0.29)
+        assert record.n == 2
+        assert record.source == "9b_ab_run"
+
+    def test_source_defaults_to_empty(self):
+        assert ReproductionRecord((0.2,)).source == ""
+
+    def test_rejects_negative_observation(self):
+        with pytest.raises(ValueError):
+            ReproductionRecord((-0.01, 0.2))
+
+    def test_rejects_empty_observations(self):
+        # No evidence is expressed as record=None, not an empty record.
+        with pytest.raises(ValueError):
+            ReproductionRecord(())
+
+    def test_thin_below_three_reproductions(self):
+        # The same bar as ReductionSample / Level1RealizationRecord: one or two
+        # reproductions are not enough to call the bracket a confidence interval.
+        for obs in [(0.2,), (0.2, 0.3)]:
+            assert ReproductionRecord(obs).is_thin_evidence is True
+
+    def test_boundary_three_is_not_thin(self):
+        # MIN_SAMPLE_FOR_CONFIDENCE_BAND == 3; three reproductions clear the bar.
+        assert ReproductionRecord((0.2, 0.25, 0.3)).is_thin_evidence is False
+
+    def test_sample_is_a_reduction_sample(self):
+        record = ReproductionRecord((0.21, 0.23, 0.27, 0.29))
+        assert record.sample == ReductionSample.from_values(
+            (0.21, 0.23, 0.27, 0.29)
+        )
+
+    def test_calibrate_none_returns_none(self):
+        # No record -> no bracket -> the comparison stays a point estimate.
+        assert calibrate_reproduction_bracket(None) is None
+
+    def test_calibrate_thin_record_is_flagged_not_silent(self):
+        # A thin record still returns a band (so the audit records the count) but
+        # is flagged thin — never dressed as a calibrated confidence interval.
+        band = calibrate_reproduction_bracket(ReproductionRecord((0.22, 0.28)))
+        assert band is not None
+        assert band.is_thin_evidence is True
+        assert band.n == 2
+
+    def test_calibrated_envelope_spans_observed_range(self):
+        # empirical_envelope: the bracket is [min, max] over the reproductions.
+        band = calibrate_reproduction_bracket(
+            ReproductionRecord((0.21, 0.23, 0.27, 0.29))
+        )
+        assert band.is_thin_evidence is False
+        assert band.lower == pytest.approx(0.21)
+        assert band.upper == pytest.approx(0.29)
+        assert band.width == pytest.approx(0.08)
+        assert band.center == pytest.approx(0.25)
+
+    def test_calibrated_carries_measured_spread_provenance(self):
+        # min_obs / max_obs / stddev / n carry the measured spread the width was
+        # calibrated from — the "min/max/stddev and N" provenance the bracket
+        # exists to surface alongside the headline.
+        band = calibrate_reproduction_bracket(
+            ReproductionRecord((0.21, 0.23, 0.27, 0.29))
+        )
+        assert band.min_obs == pytest.approx(0.21)
+        assert band.max_obs == pytest.approx(0.29)
+        assert band.n == 4
+        assert band.stddev == pytest.approx(0.0365, abs=1e-3)
+
+    def test_normal_method_brackets_mean_plus_minus_z_stddev(self):
+        # The normal method delegates to calibrate_reduction_band: mean ± z·stddev.
+        band = calibrate_reproduction_bracket(
+            ReproductionRecord((0.21, 0.23, 0.27, 0.29)),
+            method=CALIBRATION_NORMAL,
+            z=1.96,
+        )
+        assert band.method == CALIBRATION_NORMAL
+        # mean 0.25 ± 1.96 * 0.0365 ≈ 0.25 ± 0.0716
+        assert band.center == pytest.approx(0.25)
+        assert band.lower == pytest.approx(0.25 - 1.96 * 0.0365, abs=1e-3)
+        assert band.upper == pytest.approx(0.25 + 1.96 * 0.0365, abs=1e-3)
+
+    def test_delegates_method_and_z_validation(self):
+        # Unknown method / non-positive z are rejected by the underlying band
+        # calibration; the bracket does not silently swallow them.
+        record = ReproductionRecord((0.2, 0.3, 0.4))
+        with pytest.raises(ValueError):
+            calibrate_reproduction_bracket(record, method="bogus")
+        with pytest.raises(ValueError):
+            calibrate_reproduction_bracket(record, z=0.0)
+
+
 class TestCompareFreezeLevels:
     """Level-1-vs-Level-2 quantitative comparison (GOAL §5 / §1.6.3 / Phase 3).
 
@@ -1116,6 +1224,93 @@ class TestCompareFreezeLevels:
         assert VERDICT_FAIL in text
         assert VERDICT_PASS in text
         assert "realized=0.2500" in text
+
+    # --- §6.3 across-reproduction bracket on the comparison headline ---
+
+    def test_default_comparison_has_no_bracket(self):
+        # No record supplied -> no bracket. The headline stays a point estimate,
+        # so the comparison is byte-identical to before this landing point existed.
+        comp = compare_freeze_levels(self._acc(), target_width=2048)
+        assert comp.reproduction_bracket is None
+
+    def test_default_format_omits_bracket_line(self):
+        comp = compare_freeze_levels(self._acc(), target_width=2048)
+        assert "reproduction_bracket" not in format_level_comparison(comp)
+
+    def test_reproduction_record_threads_bracket_into_comparison(self):
+        # A non-thin record resolves to a calibrated bracket on the headline and
+        # is attached to the comparison; the formatter surfaces it.
+        record = ReproductionRecord(
+            (0.21, 0.23, 0.27, 0.29), source="9b_ab_4runs"
+        )
+        comp = compare_freeze_levels(
+            self._acc(), target_width=2048, reproduction_record=record
+        )
+        assert comp.reproduction_bracket is not None
+        assert comp.reproduction_bracket.is_thin_evidence is False
+        text = format_level_comparison(comp)
+        assert "reproduction_bracket" in text
+        assert "calibrated" in text
+        assert "n=4" in text
+
+    def test_thin_record_bracket_labelled_thin_evidence(self):
+        # Two reproductions (the steering feedback's "currently thin N=2 bracket")
+        # are surfaced as THIN_EVIDENCE with the count shown — never dressed as a
+        # calibrated confidence interval.
+        record = ReproductionRecord((0.22, 0.28), source="9b_ab_2runs")
+        comp = compare_freeze_levels(
+            self._acc(), target_width=2048, reproduction_record=record
+        )
+        assert comp.reproduction_bracket.is_thin_evidence is True
+        text = format_level_comparison(comp)
+        assert "reproduction_bracket" in text
+        assert "THIN_EVIDENCE" in text
+        assert "n=2" in text
+
+    def test_calibrated_bracket_bounds_span_observations(self):
+        record = ReproductionRecord((0.21, 0.23, 0.27, 0.29))
+        comp = compare_freeze_levels(
+            self._acc(), target_width=2048, reproduction_record=record
+        )
+        band = comp.reproduction_bracket
+        assert band.lower == pytest.approx(0.21)
+        assert band.upper == pytest.approx(0.29)
+
+    def test_bracket_is_orthogonal_to_level1_ceiling_record(self):
+        # §6.2 ceiling (realizability) and §6.3 bracket (measurement spread) are
+        # independent landing points: supplying both raises the Level-1 ceiling
+        # AND attaches the bracket — neither silences the other.
+        acc = self._acc()
+        record = ReproductionRecord((0.21, 0.23, 0.27, 0.29))
+        level1_record = Level1RealizationRecord(0.125, num_runs=3)
+        comp = compare_freeze_levels(
+            acc,
+            target_width=2048,
+            level1_record=level1_record,
+            reproduction_record=record,
+        )
+        assert comp.level1_ceiling == pytest.approx(0.125)
+        assert comp.reproduction_bracket is not None
+        assert comp.reproduction_bracket.is_thin_evidence is False
+
+    def test_bracket_does_not_flip_the_verdict(self):
+        # The bracket is an uncertainty report, not a gate change (§6.3): the
+        # §7 verdicts and additional_passes are identical with and without a
+        # record. This is the "do not harden the gate" contract made testable.
+        acc = self._acc()
+        bare = compare_freeze_levels(acc, target_width=2048)
+        bracketed = compare_freeze_levels(
+            acc,
+            target_width=2048,
+            reproduction_record=ReproductionRecord((0.21, 0.23, 0.27, 0.29)),
+        )
+        assert bare.level1.verdict == bracketed.level1.verdict
+        assert bare.level2.verdict == bracketed.level2.verdict
+        assert bare.additional_passes == bracketed.additional_passes
+        assert (
+            bare.additional_realized_reduction
+            == bracketed.additional_realized_reduction
+        )
 
 
 class TestLevel1CeilingRecovery:
