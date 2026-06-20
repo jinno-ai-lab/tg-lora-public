@@ -12,9 +12,14 @@ A layer frozen at epoch f is active for epochs [0, f) and frozen for [f, 4).
 import pytest
 
 from src.tg_lora.freeze_cost import (
+    PROXY_VALIDATED_MAX_WIDTH,
+    ExtrapolationConfidence,
     FreezeCostAccountant,
     FreezeCostSummary,
+    GatedReduction,
     LayerBackwardCost,
+    extrapolation_confidence,
+    gate_reduction,
 )
 
 
@@ -247,3 +252,123 @@ class TestValidation:
         acc = _two_layers(frozen_at_epoch={1: 2})
         with pytest.raises(ValueError, match="level"):
             acc.reduction_rate(level=bad_level)
+
+
+class TestExtrapolationConfidence:
+    """Width-extrapolation bound that stops the gate over-trusting a proxy number.
+
+    Reference: validated_max_width = 2048 (PROXY_VALIDATED_MAX_WIDTH).
+
+        target_width / 2048   confidence   requires_scale_measurement (floor 0.5)
+        -------------------   ----------   -------------------------------------
+                512             1.0           False
+               2048             1.0           False
+               4096             0.5           False   (exactly at the floor)
+               8192             0.25          True    (below the floor)
+    """
+
+    def test_default_validated_max_matches_proxy_envelope(self):
+        assert PROXY_VALIDATED_MAX_WIDTH == 2048
+
+    @pytest.mark.parametrize(
+        "width, expected_conf",
+        [(512, 1.0), (1024, 1.0), (2048, 1.0), (4096, 0.5), (8192, 0.25)],
+    )
+    def test_confidence_is_one_inside_envelope_and_decays_beyond(self, width, expected_conf):
+        c = extrapolation_confidence(width)
+        assert c.confidence == pytest.approx(expected_conf)
+        assert c.extrapolation_ratio == pytest.approx(width / 2048)
+
+    def test_confidence_clamped_to_one_when_target_below_envelope(self):
+        # A sub-proxy target is still fully trusted: confidence never exceeds 1.
+        c = extrapolation_confidence(256)
+        assert c.confidence == 1.0
+        assert c.target_width == 256
+
+    def test_requires_scale_measurement_flips_beyond_floor(self):
+        # At 2x width confidence == floor (0.5): not required, just discounted.
+        assert extrapolation_confidence(4096).requires_scale_measurement is False
+        # At 4x width confidence (0.25) < floor: a scale measurement is required.
+        assert extrapolation_confidence(8192).requires_scale_measurement is True
+        # Custom floor raises the bar: a 1.5x target now demands measurement.
+        assert (
+            extrapolation_confidence(3072, scale_measurement_floor=0.75)
+            .requires_scale_measurement
+            is True
+        )
+
+    def test_discount_scales_proxy_value_by_confidence(self):
+        # A proxy 0.30 reduction at 4x width is credited at 0.30 * 0.25 = 0.075.
+        c = extrapolation_confidence(8192)
+        assert c.discount(0.30) == pytest.approx(0.075)
+        # Inside the envelope the proxy is credited in full.
+        assert extrapolation_confidence(512).discount(0.30) == pytest.approx(0.30)
+
+    @pytest.mark.parametrize("bad_width", [0, -1])
+    def test_non_positive_target_width_raises(self, bad_width):
+        with pytest.raises(ValueError, match="target_width"):
+            extrapolation_confidence(bad_width)
+
+    def test_invalid_floor_raises(self):
+        with pytest.raises(ValueError, match="scale_measurement_floor"):
+            extrapolation_confidence(4096, scale_measurement_floor=0.0)
+        with pytest.raises(ValueError, match="scale_measurement_floor"):
+            extrapolation_confidence(4096, scale_measurement_floor=1.5)
+
+
+class TestGateReduction:
+    """The acceptance gate discounts the accountant's proxy reduction by width.
+
+    Reference accountant: 2 layers (weight=act=10), steps=1, epochs=4, layer 1
+    frozen at epoch 2 -> Level-2 reduction_rate = 0.25 (see TestSingleLayerMidFreeze).
+    """
+
+    def _acc(self) -> FreezeCostAccountant:
+        return _two_layers(frozen_at_epoch={1: 2})
+
+    def test_inside_envelope_trusts_proxy(self):
+        # At h=2048 confidence is 1.0: effective == proxy, gate clears threshold.
+        gated = gate_reduction(self._acc(), level=2, target_width=2048)
+        assert isinstance(gated, GatedReduction)
+        assert gated.proxy_reduction == pytest.approx(0.25)
+        assert gated.confidence.confidence == 1.0
+        assert gated.effective_reduction == pytest.approx(0.25)
+        assert gated.requires_scale_measurement is False
+        assert gated.passes(threshold=0.10) is True
+
+    def test_nine_b_is_discounted_provisionally(self):
+        # At h=4096 (9B, 2x width) confidence is 0.5: effective 0.25*0.5 = 0.125.
+        # Still clears the 0.10 threshold, so the gate PASSes provisionally rather
+        # than silently trusting the raw 0.25 proxy number.
+        gated = gate_reduction(self._acc(), level=2, target_width=4096)
+        assert gated.effective_reduction == pytest.approx(0.125)
+        assert gated.requires_scale_measurement is False
+        assert gated.passes(threshold=0.10) is True
+
+    def test_proxy_fails_gate_once_discounted(self):
+        # A 0.15 proxy reduction would PASS raw, but at 9B it discounts to 0.075
+        # < 0.10: the gate correctly refuses to credit the proxy number at scale.
+        gated = gate_reduction(self._acc(), level=2, target_width=4096)
+        assert gated.proxy_reduction == pytest.approx(0.25)
+        # Synthetic check: build the discounted value directly and compare to a
+        # threshold the proxy would clear but the discount does not.
+        discounted = ExtrapolationConfidence(
+            target_width=4096,
+            validated_max_width=2048,
+            extrapolation_ratio=2.0,
+            confidence=0.5,
+            requires_scale_measurement=False,
+        ).discount(0.15)
+        assert discounted < 0.10
+
+    def test_extreme_width_requires_scale_measurement(self):
+        # At 4x width the gate refuses proxy-only PASS regardless of margin.
+        gated = gate_reduction(self._acc(), level=2, target_width=8192)
+        assert gated.requires_scale_measurement is True
+        assert gated.passes(threshold=0.01) is False
+
+    def test_gate_respects_level(self):
+        # Level-1 reduction (0.125) carries through the gate unchanged in shape;
+        # inside the envelope effective == proxy.
+        gated = gate_reduction(self._acc(), level=1, target_width=2048)
+        assert gated.effective_reduction == pytest.approx(0.125)

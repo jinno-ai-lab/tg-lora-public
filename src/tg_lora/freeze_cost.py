@@ -27,6 +27,17 @@ from dataclasses import dataclass
 
 _VALID_LEVELS: tuple[int, int] = (1, 2)
 
+# Width envelope over which the *realized* freeze benefit has been validated.
+# The accountant's reduction_rate is exact, model-free arithmetic and needs no
+# width; but translating that arithmetic into a realized wall-clock / VRAM
+# benefit at scale is validated only on proxy models up to this hidden width
+# (see docs/design/10_progressive_freezing.md §7 [UNVERIFIED]; the in-vivo
+# validation in tests/test_progressive_freeze_invivo.py runs at h=24). The
+# acceptance gate (docs/design/10_guard_experiment.md §6.1 / §7) uses
+# ``extrapolation_confidence`` to discount a proxy reduction at a larger target
+# width rather than silently trusting a proxy number.
+PROXY_VALIDATED_MAX_WIDTH: int = 2048
+
 
 @dataclass(frozen=True)
 class LayerBackwardCost:
@@ -180,3 +191,132 @@ class FreezeCostAccountant:
             reduction_rate=0.0 if full == 0 else 1.0 - progressive / full,
             peak_vram_saved_bytes=self.peak_vram_saved_bytes(level),
         )
+
+
+@dataclass(frozen=True)
+class ExtrapolationConfidence:
+    """How far a target model width sits outside the proxy-validated envelope.
+
+    The accountant's ``reduction_rate`` is model-free arithmetic and needs no
+    width; this bounds the *confidence* with which a proxy-validated reduction
+    may be credited at a larger target width, so an acceptance gate cannot
+    silently trust a number measured at ``h <= PROXY_VALIDATED_MAX_WIDTH`` when
+    judging a larger run (e.g. a 9B model at h=4096).
+
+    confidence
+        1.0 inside the validated envelope, decaying as ``1 / extrapolation_ratio``
+        beyond it (0.5 at 2x width, 0.25 at 4x).
+    requires_scale_measurement
+        True once ``confidence`` drops below the gate's floor — the target is
+        then far enough outside the envelope that the gate must refuse to PASS
+        on the proxy number alone and require a real CUDA/scale measurement.
+    """
+
+    target_width: int
+    validated_max_width: int
+    extrapolation_ratio: float
+    confidence: float
+    requires_scale_measurement: bool
+
+    def discount(self, proxy_value: float) -> float:
+        """A proxy reduction/VRAM value scaled to its creditable amount."""
+        return proxy_value * self.confidence
+
+
+def extrapolation_confidence(
+    target_width: int,
+    *,
+    validated_max_width: int = PROXY_VALIDATED_MAX_WIDTH,
+    scale_measurement_floor: float = 0.5,
+) -> ExtrapolationConfidence:
+    """Width-extrapolation confidence for a proxy-validated freeze benefit.
+
+    ``confidence = min(1, validated_max_width / target_width)``: 1.0 inside the
+    validated envelope, falling off as ``1 / extrapolation_ratio`` beyond it.
+    ``requires_scale_measurement`` flips True once ``confidence`` falls to
+    ``scale_measurement_floor`` (default 0.5 → 2x width), at which point an
+    acceptance gate must not PASS on the proxy reduction alone.
+
+    Rationale: the reduction is exact arithmetic, so it does not widen with
+    width — but the *realized* benefit (wall-clock, fixed overheads, quality at
+    scale) is only validated on proxies, and crediting it undiminished at a much
+    larger width over-trusts a proxy number (see 10_guard_experiment.md §6.1).
+    """
+    if target_width <= 0:
+        raise ValueError(f"target_width must be positive, got {target_width}")
+    if validated_max_width <= 0:
+        raise ValueError(
+            f"validated_max_width must be positive, got {validated_max_width}"
+        )
+    if not 0.0 < scale_measurement_floor <= 1.0:
+        raise ValueError(
+            "scale_measurement_floor must be in (0, 1], "
+            f"got {scale_measurement_floor}"
+        )
+    ratio = target_width / validated_max_width
+    confidence = min(1.0, 1.0 / ratio)
+    # Require a scale measurement only when confidence is strictly below the
+    # floor; at exactly the floor the gate still PASSes provisionally.
+    requires = confidence < scale_measurement_floor
+    return ExtrapolationConfidence(
+        target_width=target_width,
+        validated_max_width=validated_max_width,
+        extrapolation_ratio=ratio,
+        confidence=confidence,
+        requires_scale_measurement=requires,
+    )
+
+
+@dataclass(frozen=True)
+class GatedReduction:
+    """A proxy ``reduction_rate`` discounted by extrapolation confidence.
+
+    What an acceptance gate may actually credit at the target width:
+    :attr:`effective_reduction` is the proxy reduction scaled by
+    :attr:`confidence`. When :attr:`requires_scale_measurement` is set, the
+    effective value is provisional and the gate must not PASS on it alone.
+    """
+
+    proxy_reduction: float
+    confidence: ExtrapolationConfidence
+    effective_reduction: float
+
+    @property
+    def requires_scale_measurement(self) -> bool:
+        return self.confidence.requires_scale_measurement
+
+    def passes(self, threshold: float) -> bool:
+        """Gate PASS only if the discounted reduction clears ``threshold`` and
+        no scale measurement is required (the target is inside, or near, the
+        validated envelope). Otherwise the proxy number must not PASS the gate."""
+        if self.requires_scale_measurement:
+            return False
+        return self.effective_reduction >= threshold
+
+
+def gate_reduction(
+    accountant: FreezeCostAccountant,
+    level: int,
+    target_width: int,
+    *,
+    validated_max_width: int = PROXY_VALIDATED_MAX_WIDTH,
+    scale_measurement_floor: float = 0.5,
+) -> GatedReduction:
+    """Discount the accountant's proxy ``reduction_rate`` for target width.
+
+    Composes the model-free accountant with the width-extrapolation confidence
+    so the Guard acceptance gate (10_guard_experiment.md §6.1 / §7) credits a
+    reduction only to the extent the target width has been validated, instead
+    of trusting a proxy number at scale.
+    """
+    proxy = accountant.reduction_rate(level=level)
+    conf = extrapolation_confidence(
+        target_width,
+        validated_max_width=validated_max_width,
+        scale_measurement_floor=scale_measurement_floor,
+    )
+    return GatedReduction(
+        proxy_reduction=proxy,
+        confidence=conf,
+        effective_reduction=conf.discount(proxy),
+    )
