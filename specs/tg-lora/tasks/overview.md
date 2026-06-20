@@ -1566,9 +1566,28 @@ freeze_frontier(Phase2) ──────┘
 
 ---
 
+## Phase 66: Progressive Freezing 多層化（design §4.1）
+
+**期間**: 0.5日
+**目標**: `ProgressiveFreezeController` を単層ゲート（Phase 1）から、`FreezeSchedule` に駆動される真の多層プログレッシブ凍結（design §4.1: X→X-1→X-2 と凍結集合が単調増加）へ昇格させる。Phase 65 の E2E は層ごとに別コントローラを生成するワークアラウンドでこの単層制約を回避していたが、単一コントローラでスケジュール全体を駆動する機構が欠けていた——「Progressive」Freezing の名の由来である核心機能を閉じる。
+**成果物**: `progressive_freeze.py` の progressive API（`apply_freeze_layer` / `layers_due_at` / `progress` / 層別 xin キャッシュ / `compute_local_loss(layer_idx=)`）、15件の progressive ユニットテスト + 1件の単一コントローラ E2E（tests/test_progressive_freeze_progressive.py, test_progressive_freeze_e2e.py）。単層挙動は完全保持（既存33テスト緑）。
+
+### タスク一覧
+
+- [x] [TASK-0131: ProgressiveFreezeController 多層プログレッシブ凍結（design §4.1）](TASK-0131.md) - 2h (TDD) 🔵 ✅ 2026-06-20
+
+### 依存関係
+
+```
+freeze_schedule(Phase2) ──┐
+TASK-0130(Phase65 E2E) ───┴── TASK-0131
+```
+
+---
+
 ## 次のステップ
 
-Phase 65 完了。残存する未完了タスク:
+Phase 66 完了。残存する未完了タスク:
 
 - **TASK-0094** (Phase 43): GPU依存のaccel param sweep実行
 - **TASK-0106** (Phase 50): GPU依存のマルチシード実験実行

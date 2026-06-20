@@ -1,9 +1,27 @@
-"""Progressive Freezing Phase 1: single-layer freeze gate controller.
+"""Progressive Freezing controller (GOAL §1.6, design §4.1).
 
-Level 1 freeze: sets requires_grad=False on the target layer's LoRA params.
-Activation gradients still flow through the frozen layer during backprop.
-The xin cache captures the input activation entering the frozen layer at the
-moment of freezing, for later Level 2 activation matching experiments.
+Two operating modes share one controller:
+
+* **Single-shot gate (Phase 1)** — freeze one target layer
+  (:meth:`should_freeze` / :meth:`cache_xin` / :meth:`apply_freeze`). The
+  original Level 1 freeze: ``requires_grad=False`` on the target layer's LoRA
+  params, with the ``xin`` cache captured at freeze time for the Level 2
+  activation-matching local loss.
+
+* **Progressive multi-layer (Phase 2, design §4.1)** — freeze layers
+  cumulatively across epochs, one after another, driven by a
+  :class:`~src.tg_lora.freeze_schedule.FreezeSchedule`
+  (:meth:`layers_due_at` / :meth:`apply_freeze_layer` / :meth:`progress`).
+  This is the literal mechanism "Progressive" Freezing is named after: the run
+  freezes ``X`` at ``T1``, ``X-1`` at ``T2``, ``X-2`` at ``T3`` ... and the
+  frozen set only ever grows (design §4.1). Each frozen layer keeps its own
+  ``xin`` cache so :meth:`compute_local_loss` can train each front layer
+  against the input *its* frozen successor expected.
+
+Level 1 freeze sets ``requires_grad=False`` on the target layer's LoRA params.
+Activation gradients still flow through the frozen layer during backprop. The
+``xin`` cache captures the input activation entering the frozen layer at the
+moment of freezing, for the Level 2 activation-matching local loss.
 
 See docs/design/10_progressive_freezing.md for the design rationale.
 """
@@ -19,6 +37,7 @@ import torch.nn as nn
 from src.model.lora_utils import iter_all_lora_params_by_layer
 from src.tg_lora.activation_cache import _get_decoder_layers
 from src.tg_lora.activation_matching import ActivationMatchingLoss
+from src.tg_lora.freeze_schedule import FreezeSchedule
 
 logger = logging.getLogger("tg-lora")
 
@@ -32,9 +51,9 @@ class FreezeResult:
 
 
 class ProgressiveFreezeController:
-    """Manages the single-layer progressive freeze gate (Phase 1).
+    """Manages the progressive freeze gate (Phase 1 single-shot + Phase 2 multi-layer).
 
-    Usage in the training cycle loop::
+    Single-shot usage in the training cycle loop::
 
         ctrl = ProgressiveFreezeController(
             start_cycle=3,
@@ -45,6 +64,23 @@ class ProgressiveFreezeController:
         if ctrl.should_freeze(cycle):
             _, xin_shape = ctrl.cache_xin(model, valid_loader, device)
             result = ctrl.apply_freeze(model)
+
+    Progressive usage (design §4.1), one controller driving the whole run::
+
+        schedule = FreezeSchedule.plan(FreezeScheduleConfig(...))
+        ctrl = ProgressiveFreezeController(
+            start_cycle=schedule.config.start_epoch,
+            active_layer_indices=set(schedule.config.active_layer_indices),
+            schedule=schedule,
+        )
+        for epoch in range(num_epochs):
+            ctrl.progress(model, epoch, valid_loader, device)   # freezes layers due this epoch
+            # ... train the still-active front; for any frozen layer X,
+            # ctrl.compute_local_loss(model, batch, loss_fn, layer_idx=X) ...
+
+    Both modes share the frozen-set and per-layer ``xin`` state, so a controller
+    may also be driven layer-by-layer via :meth:`apply_freeze_layer` without a
+    schedule.
     """
 
     def __init__(
@@ -52,24 +88,54 @@ class ProgressiveFreezeController:
         start_cycle: int,
         freeze_layer: int | str = "last_active",
         active_layer_indices: set[int] | None = None,
+        schedule: FreezeSchedule | None = None,
     ) -> None:
         self._start_cycle = start_cycle
         self._freeze_layer_spec = freeze_layer
         self._active_layer_indices = active_layer_indices or set()
-        self._is_frozen = False
-        self._frozen_layer_idx: int | None = None
+        self._schedule = schedule
+        # Cumulative state shared by both modes. The single-shot gate sets one
+        # entry; progressive mode grows the set across epochs. ``_last_frozen``
+        # backs the ``frozen_layer_idx`` property (single-shot compat + the most
+        # recent progressive freeze).
+        self._frozen_layers: set[int] = set()
+        self._last_frozen_layer: int | None = None
+        # Single-shot target store: {batch_idx: [xin]} for the one frozen layer.
         self._xin_cache: dict[int, list[torch.Tensor]] = {}
+        # Progressive per-layer target store: {layer_idx: {batch_idx: [xin]}}.
+        self._xin_caches: dict[int, dict[int, list[torch.Tensor]]] = {}
+
+    # -- state ---------------------------------------------------------------
 
     @property
     def is_frozen(self) -> bool:
-        return self._is_frozen
+        """True once any layer has been frozen (single-shot: the one target)."""
+        return bool(self._frozen_layers)
 
     @property
     def frozen_layer_idx(self) -> int | None:
-        return self._frozen_layer_idx
+        """Index of the most recently frozen layer (``None`` until first freeze)."""
+        return self._last_frozen_layer
+
+    @property
+    def frozen_layers(self) -> frozenset[int]:
+        """Cumulative set of frozen layer indices (grows monotonically)."""
+        return frozenset(self._frozen_layers)
+
+    @property
+    def schedule(self) -> FreezeSchedule | None:
+        return self._schedule
+
+    # -- single-shot gate (Phase 1) ------------------------------------------
 
     def should_freeze(self, cycle: int) -> bool:
-        return not self._is_frozen and cycle >= self._start_cycle
+        """Single-shot gate: due at ``start_cycle`` and not yet frozen.
+
+        Progressive callers use :meth:`layers_due_at` instead — once the first
+        layer freezes this returns False, which is correct for the one-shot gate
+        but would wrongly halt a progressive loop.
+        """
+        return not self._frozen_layers and cycle >= self._start_cycle
 
     def _resolve_target_layer(self, model: nn.Module) -> int:
         if isinstance(self._freeze_layer_spec, int):
@@ -88,10 +154,191 @@ class ProgressiveFreezeController:
         dataloader,
         device: torch.device | str,
     ) -> tuple[dict[int, list[torch.Tensor]], tuple[int, ...] | None]:
-        """Capture xin (layer input activation) via forward pre-hook."""
+        """Single-shot: capture ``xin`` for the resolved target layer (1 batch)."""
         target_idx = self._resolve_target_layer(model)
+        xin_cache, xin_shape = self._capture_xin_for_layer(
+            model, target_idx, dataloader, device
+        )
+        self._xin_cache = xin_cache
+        return xin_cache, xin_shape
+
+    def apply_freeze(self, model: nn.Module) -> FreezeResult:
+        """Single-shot: freeze the resolved target layer's LoRA params.
+
+        Raises ``RuntimeError`` if that layer is already frozen (idempotency
+        guard). Progressive freezing calls :meth:`apply_freeze_layer` with a
+        different layer each epoch instead.
+        """
+        target_idx = self._resolve_target_layer(model)
+        if target_idx in self._frozen_layers:
+            raise RuntimeError(f"Layer {target_idx} already frozen")
+        return self._freeze_layer(model, target_idx, xin_cache=self._xin_cache)
+
+    # -- progressive multi-layer (Phase 2, design §4.1) ----------------------
+
+    def layers_due_at(self, epoch: int) -> list[int]:
+        """Layers the schedule freezes at ``epoch`` (ascending, for determinism).
+
+        Requires construction with ``schedule=``. A layer absent from the result
+        either never freezes or freezes at a different epoch.
+        """
+        if self._schedule is None:
+            raise RuntimeError(
+                "layers_due_at requires a schedule; construct the controller "
+                "with schedule=FreezeSchedule.plan(...)"
+            )
+        due = [
+            layer
+            for layer, at_epoch in self._schedule.frozen_at_epoch.items()
+            if at_epoch == epoch
+        ]
+        return sorted(due)
+
+    def apply_freeze_layer(
+        self,
+        model: nn.Module,
+        layer_idx: int,
+        dataloader,
+        device: torch.device | str = "cpu",
+    ) -> FreezeResult:
+        """Progressive primitive: cache ``xin`` for ``layer_idx`` then freeze it.
+
+        Captures the layer's input activation (its ``xin``) at this moment and
+        freezes its LoRA params. Idempotent per layer — re-freezing an already
+        frozen layer raises (design §4.1: the frozen set only grows, never
+        re-freezes). Distinct layers may be frozen across successive calls.
+        """
+        if layer_idx in self._frozen_layers:
+            raise RuntimeError(f"Layer {layer_idx} already frozen")
+        xin_cache, _ = self._capture_xin_for_layer(
+            model, layer_idx, dataloader, device
+        )
+        self._xin_caches[layer_idx] = xin_cache
+        return self._freeze_layer(model, layer_idx, xin_cache=xin_cache)
+
+    def progress(
+        self,
+        model: nn.Module,
+        epoch: int,
+        dataloader,
+        device: torch.device | str = "cpu",
+    ) -> list[FreezeResult]:
+        """Freeze every layer the schedule names for ``epoch`` (design §4.1).
+
+        Returns one :class:`FreezeResult` per layer frozen this epoch (empty if
+        none are due). Safe to call every epoch: layers already frozen are
+        skipped by the schedule, and :meth:`apply_freeze_layer` guards the rest.
+        """
+        return [
+            self.apply_freeze_layer(model, layer_idx, dataloader, device)
+            for layer_idx in self.layers_due_at(epoch)
+        ]
+
+    # -- Level 2 activation-matching local loss ------------------------------
+
+    def compute_local_loss(
+        self,
+        model: nn.Module,
+        batch: dict,
+        loss_fn: ActivationMatchingLoss,
+        *,
+        batch_idx: int = 0,
+        device: torch.device | str = "cpu",
+        layer_idx: int | None = None,
+    ) -> torch.Tensor:
+        """Front-layer activation-matching loss against a cached ``xin``.
+
+        The Level 2 training signal (GOAL §1.6.1, design §8 items 3-4): once
+        layer ``X`` is frozen, run the model forward and capture ``X``'s input
+        — which is exactly the front layer ``X-1``'s current output. Pair it
+        with the cached ``xin`` (the *past* input ``X`` received at freeze time)
+        and return ``loss_fn(front_output, xin, mask)``. The scalar carries a
+        gradient into the front layer's parameters; the frozen layer's
+        parameters receive none (``requires_grad=False`` from the freeze).
+
+        The gap is non-zero only because ``xin`` is a past observation that the
+        still-training front layer no longer emits (design §3.3) — so this is a
+        genuine learning signal, not "current output vs itself".
+
+        Parameters
+        ----------
+        model:
+            Model with the target layer already frozen.
+        batch:
+            Batch dict with ``input_ids`` and ``attention_mask``; padded
+            positions are masked out of the loss (leak-free, GOAL §3.3).
+        loss_fn:
+            :class:`ActivationMatchingLoss`. The Phase 1 gate uses the pure-MSE
+            default.
+        batch_idx:
+            Which cached ``xin`` batch to pair against. Phase 1 captures batch 0.
+        device:
+            Device for the forward pass and ``xin`` target alignment.
+        layer_idx:
+            Which frozen layer's cached ``xin`` to match against. ``None``
+            (default) selects the single-shot frozen layer
+            (:meth:`apply_freeze`); an index selects a progressively frozen
+            layer (:meth:`apply_freeze_layer`). The captured front activation is
+            that frozen layer's current input.
+
+        Raises
+        ------
+        RuntimeError
+            If the layer is not frozen, no ``xin`` is cached for it at
+            ``batch_idx``, or the forward did not reach the frozen layer.
+        """
+        if layer_idx is None:
+            if self._last_frozen_layer is None:
+                raise RuntimeError(
+                    "compute_local_loss requires apply_freeze() first"
+                )
+            target_idx = self._last_frozen_layer
+            cached = self._xin_cache.get(batch_idx)
+            if not cached:
+                raise RuntimeError(
+                    f"no cached xin for batch {batch_idx}; call cache_xin() first"
+                )
+        else:
+            if layer_idx not in self._frozen_layers:
+                raise RuntimeError(
+                    f"layer {layer_idx} is not frozen; "
+                    "call apply_freeze_layer() first"
+                )
+            per_layer = self._xin_caches.get(layer_idx)
+            if not per_layer or batch_idx not in per_layer:
+                raise RuntimeError(
+                    f"no cached xin for layer {layer_idx} batch {batch_idx}; "
+                    "call apply_freeze_layer() first"
+                )
+            target_idx = layer_idx
+            cached = per_layer[batch_idx]
+
+        predicted = self._capture_live_layer_input(model, target_idx, batch, device)
+        target = cached[0].to(device)
+        mask = batch.get("attention_mask")
+        if mask is not None:
+            mask = mask.to(device=device, dtype=predicted.dtype).unsqueeze(-1)
+
+        return loss_fn(predicted, target, mask=mask)
+
+    # -- private helpers -----------------------------------------------------
+
+    @torch.no_grad()
+    def _capture_xin_for_layer(
+        self,
+        model: nn.Module,
+        layer_idx: int,
+        dataloader,
+        device: torch.device | str,
+    ) -> tuple[dict[int, list[torch.Tensor]], tuple[int, ...] | None]:
+        """Capture ``xin`` (layer input) for ``layer_idx`` via forward pre-hook.
+
+        Phase 1: one batch is sufficient for shape verification and the local
+        loss target (the same data is seen many times in the few-data,
+        many-epoch regime this method targets, design §4.3).
+        """
         decoder_layers = _get_decoder_layers(model)
-        target_layer = decoder_layers[target_idx]
+        target_layer = decoder_layers[layer_idx]
 
         captured: list[torch.Tensor] = []
 
@@ -130,113 +377,27 @@ class ProgressiveFreezeController:
             if was_training:
                 model.train()
 
-        self._xin_cache = xin_cache
         return xin_cache, xin_shape
 
-    def apply_freeze(self, model: nn.Module) -> FreezeResult:
-        """Freeze the target layer's LoRA parameters (requires_grad=False)."""
-        if self._is_frozen:
-            raise RuntimeError("Layer already frozen")
-
-        target_idx = self._resolve_target_layer(model)
-        layer_map = iter_all_lora_params_by_layer(model)
-        frozen_names: list[str] = []
-
-        if target_idx in layer_map:
-            for name, param in layer_map[target_idx]:
-                param.requires_grad = False
-                frozen_names.append(name)
-
-        self._is_frozen = True
-        self._frozen_layer_idx = target_idx
-
-        xin_shape = None
-        if self._xin_cache and 0 in self._xin_cache:
-            xin_shape = tuple(self._xin_cache[0][0].shape)
-
-        result = FreezeResult(
-            frozen_layer_idx=target_idx,
-            num_frozen_params=len(frozen_names),
-            frozen_param_names=frozen_names,
-            xin_shape=xin_shape,
-        )
-
-        logger.info(
-            "Progressive freeze applied: layer=%d params=%d xin_shape=%s",
-            target_idx,
-            len(frozen_names),
-            xin_shape,
-        )
-        return result
-
-    def compute_local_loss(
+    def _capture_live_layer_input(
         self,
         model: nn.Module,
+        layer_idx: int,
         batch: dict,
-        loss_fn: ActivationMatchingLoss,
-        *,
-        batch_idx: int = 0,
-        device: torch.device | str = "cpu",
+        device: torch.device | str,
     ) -> torch.Tensor:
-        """Front-layer activation-matching loss against the cached ``xin``.
+        """Forward capture of ``layer_idx``'s input, kept on the autograd graph.
 
-        The Level 2 training signal (GOAL §1.6.1, design §8 items 3-4): once
-        layer ``X`` is frozen, run the model forward and capture ``X``'s input
-        — which is exactly the front layer ``X-1``'s current output. Pair it
-        with the cached ``xin`` (the *past* input ``X`` received at freeze time)
-        and return ``loss_fn(front_output, xin, mask)``. The scalar carries a
-        gradient into the front layer's parameters; the frozen layer's
-        parameters receive none (``requires_grad=False`` from
-        :meth:`apply_freeze`).
-
-        The gap is non-zero only because ``xin`` is a past observation that the
-        still-training front layer no longer emits (design §3.3) — so this is a
-        genuine learning signal, not "current output vs itself".
-
-        Parameters
-        ----------
-        model:
-            Model with the target layer already frozen (call
-            :meth:`apply_freeze` first).
-        batch:
-            Batch dict with ``input_ids`` and ``attention_mask``; padded
-            positions are masked out of the loss (leak-free, GOAL §3.3).
-        loss_fn:
-            :class:`ActivationMatchingLoss`. The Phase 1 gate uses the pure-MSE
-            default.
-        batch_idx:
-            Which cached ``xin`` batch to pair against (captured by
-            :meth:`cache_xin`). Phase 1 captures batch 0.
-        device:
-            Device for the forward pass and ``xin`` target alignment.
-
-        Raises
-        ------
-        RuntimeError
-            If the layer is not frozen, no ``xin`` is cached for ``batch_idx``,
-            or the forward did not reach the frozen layer.
+        Unlike :meth:`_capture_xin_for_layer` this is a live capture that must
+        stay differentiable so the local loss backprops into the front layer.
         """
-        if not self._is_frozen:
-            raise RuntimeError(
-                "compute_local_loss requires apply_freeze() first"
-            )
-        cached = self._xin_cache.get(batch_idx)
-        if not cached:
-            raise RuntimeError(
-                f"no cached xin for batch {batch_idx}; call cache_xin() first"
-            )
-
-        target_idx = self._frozen_layer_idx
         decoder_layers = _get_decoder_layers(model)
-        target_layer = decoder_layers[target_idx]
+        target_layer = decoder_layers[layer_idx]
 
         captured: list[torch.Tensor] = []
 
         def _hook_fn(module, args, kwargs):
             del module
-            # Keep grad + device: unlike cache_xin this is a live capture that
-            # must stay on the autograd graph so the loss backprops into the
-            # front layer.
             if args:
                 captured.append(args[0])
             elif "hidden_states" in kwargs:
@@ -262,13 +423,51 @@ class ProgressiveFreezeController:
                 "activation captured"
             )
 
-        predicted = captured[0]
-        target = cached[0].to(device)
-        mask = batch_dev.get("attention_mask")
-        if mask is not None:
-            mask = mask.to(device=device, dtype=predicted.dtype).unsqueeze(-1)
+        return captured[0]
 
-        return loss_fn(predicted, target, mask=mask)
+    def _freeze_layer(
+        self,
+        model: nn.Module,
+        layer_idx: int,
+        *,
+        xin_cache: dict[int, list[torch.Tensor]],
+    ) -> FreezeResult:
+        """Set ``requires_grad=False`` on ``layer_idx``'s LoRA params and record it.
+
+        Shared by single-shot :meth:`apply_freeze` and progressive
+        :meth:`apply_freeze_layer`. Callers are responsible for the per-layer
+        idempotency guard and for having populated ``xin_cache``.
+        """
+        layer_map = iter_all_lora_params_by_layer(model)
+        frozen_names: list[str] = []
+        if layer_idx in layer_map:
+            for name, param in layer_map[layer_idx]:
+                param.requires_grad = False
+                frozen_names.append(name)
+
+        self._frozen_layers.add(layer_idx)
+        self._last_frozen_layer = layer_idx
+
+        xin_shape = None
+        if xin_cache and 0 in xin_cache:
+            xin_shape = tuple(xin_cache[0][0].shape)
+
+        result = FreezeResult(
+            frozen_layer_idx=layer_idx,
+            num_frozen_params=len(frozen_names),
+            frozen_param_names=frozen_names,
+            xin_shape=xin_shape,
+        )
+
+        logger.info(
+            "Progressive freeze applied: layer=%d params=%d xin_shape=%s "
+            "cumulative_frozen=%s",
+            layer_idx,
+            len(frozen_names),
+            xin_shape,
+            sorted(self._frozen_layers),
+        )
+        return result
 
     def clear_xin_cache(self) -> None:
         self._xin_cache.clear()

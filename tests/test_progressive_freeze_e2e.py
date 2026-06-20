@@ -367,3 +367,63 @@ class TestLocalLossTrainsFront:
         # design §3.3: the front-vs-xin gap is a real signal — descent shrinks it.
         assert losses[0] > 0
         assert losses[-1] < losses[0]
+
+
+# ---------------------------------------------------------------------------
+# 4. One controller drives the whole progressive schedule (design §4.1)
+#    — the N-controller _drive_schedule workaround above is no longer needed.
+# ---------------------------------------------------------------------------
+
+
+class TestSingleControllerProgressiveFreeze:
+    """The controller's native progressive path (Phase 2, design §4.1).
+
+    ``_drive_schedule`` above admits it works around "the controller is a
+    single-freeze gate" by spinning up one controller per layer. With the
+    schedule-driven progressive API a *single* controller now drives the entire
+    multi-epoch, multi-layer plan: the frozen set grows exactly as the schedule
+    predicts, and the local-loss backward still partitions gradient across the
+    final cumulative suffix.
+    """
+
+    def test_one_controller_drives_full_schedule_cumulatively(self):
+        # output_first, max_depth=5 over 6 layers: {5:1, 4:2, 3:3, 2:4, 1:5}.
+        schedule = FreezeSchedule.plan(
+            FreezeScheduleConfig(
+                active_layer_indices=list(range(NUM_LAYERS)),
+                num_epochs=NUM_LAYERS,
+                max_depth=NUM_LAYERS - 1,
+                start_epoch=1,
+                spacing=1,
+                policy="output_first",
+            )
+        )
+        model = _build_model()
+        loader = _loader()
+        ctrl = ProgressiveFreezeController(
+            start_cycle=1,
+            active_layer_indices=set(range(NUM_LAYERS)),
+            schedule=schedule,
+        )
+
+        for epoch in range(NUM_LAYERS):
+            ctrl.progress(model, epoch, loader, "cpu")
+            expected = {l for l, e in schedule.frozen_at_epoch.items() if e <= epoch}
+            # One controller, one growing frozen set — exactly the schedule.
+            assert ctrl.frozen_layers == expected
+            assert _frozen_layer_indices(model) == expected
+
+        assert ctrl.frozen_layers == {1, 2, 3, 4, 5}
+        # Layer 0 is the deepest trainable front; local loss on layer 1's xin
+        # backprops into it and into nothing of the 5-layer frozen suffix.
+        with torch.no_grad():
+            model.layers[0].proj.lora_B.add_(0.5)
+        model.zero_grad(set_to_none=True)
+        loss = ctrl.compute_local_loss(
+            model, loader[0], ActivationMatchingLoss(), layer_idx=1
+        )
+        loss.backward()
+        assert model.layers[0].proj.lora_B.grad is not None
+        assert model.layers[0].proj.lora_B.grad.abs().sum().item() > 0
+        for i in range(1, NUM_LAYERS):
+            assert model.layers[i].proj.lora_B.grad is None
