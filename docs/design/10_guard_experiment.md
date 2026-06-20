@@ -114,6 +114,7 @@ in-vivo 検証（`tests/test_progressive_freeze_invivo.py`、CPU-proxy h=24, L=8
 - **第一関門 (速度) PASS**: B の総GPU秒 ≤ A × 0.90 (10%以上短縮) + 正味削減確認
   - 削減量を proxy（h ≤ 2048）の会計から判定する場合、§6.1 の外挿信頼度で割り引いた `effective_reduction` で判定すること。検証範囲を外れる幅では proxy 数をそのまま信じない。
   - **実現性**: `effective_reduction` は §6.2 の実現性補正を経た値を使うこと。Level-1（freeze-only）の算術削減率は in-vivo で実現しないため、関門はこれを信用せず Level-2（trio）のみを信用する。
+  - **判定の実装**: 上記2補正を経た proxy 判定は `freeze_cost.speed_gate_verdict()`（閾値 `SPEED_GATE_THRESHOLD = 0.10`）がそのまま出力する。生の `passes()` 真偽値では表現できない段階的判定 (`PASS` / `PROVISIONAL_PASS` / `REQUIRES_SCALE_MEASUREMENT` / `FAIL`) を返し、proxy 数が関門を黙り越しで通過することを構造的に防ぐ。Level-1 はいかなる幅でも `FAIL`、9B(h=4096) は条件付き `PROVISIONAL_PASS`、4×幅以上は実計測を要求する。
 - **第二関門 (質)**: gold ≥ G* (§5.2 停止規則に統合済み)
 - 両関門 PASS で主張成立
 

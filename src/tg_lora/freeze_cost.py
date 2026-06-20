@@ -380,3 +380,106 @@ def gate_reduction(
         confidence=conf,
         effective_reduction=conf.discount(realized.realized_reduction),
     )
+
+
+# §7 first-gate speed bar (10_guard_experiment.md §7): the Guard headline claim is
+# ">=10% wall-clock shortening". When that bar must be judged from proxy FLOP
+# accounting (CUDA/scale unavailable), :func:`speed_gate_verdict` credits a
+# reduction only as far as it is realized in vivo (§6.2) and validated at the
+# target width (§6.1) — never the raw proxy number.
+SPEED_GATE_THRESHOLD: float = 0.10
+
+# Graduated verdict labels emitted by :func:`speed_gate_verdict`. A bare boolean
+# (``GatedReduction.passes``) cannot express the honesty gradation below, which is
+# exactly what stops a gate from silently trusting a proxy number.
+VERDICT_PASS = "PASS"
+VERDICT_PROVISIONAL_PASS = "PROVISIONAL_PASS"
+VERDICT_FAIL = "FAIL"
+VERDICT_REQUIRES_SCALE_MEASUREMENT = "REQUIRES_SCALE_MEASUREMENT"
+
+
+@dataclass(frozen=True)
+class SpeedGateVerdict:
+    """The §7 first-gate verdict judged from proxy FLOP accounting.
+
+    Wraps :func:`gate_reduction` in the verdict an acceptance gate actually
+    emits, with provenance, so the proxy path of the speed gate
+    (10_guard_experiment.md §7) is concrete and testable rather than prose. The
+    categorization is graduated so the gate never silently trusts a proxy number:
+
+    * :data:`VERDICT_FAIL` — nothing realizable to credit (e.g. a Level-1 freeze,
+      whose reduction is ~0 in vivo), or a real reduction below the bar.
+    * :data:`VERDICT_REQUIRES_SCALE_MEASUREMENT` — a *real* reduction at a width
+      so far outside the validated envelope that no PASS/FAIL may be drawn from
+      the proxy; a CUDA/scale run is mandatory.
+    * :data:`VERDICT_PROVISIONAL_PASS` — clears the bar after the width discount,
+      but at a width only partly validated (e.g. 9B, 2x); PASSes the gate yet is
+      explicitly provisional, not a silent full credit of the proxy number.
+    * :data:`VERDICT_PASS` — clears the bar at a fully validated width.
+    """
+
+    verdict: str
+    target_width: int
+    proxy_reduction: float
+    realized_reduction: float
+    effective_reduction: float
+    confidence: ExtrapolationConfidence
+    threshold: float
+
+    @property
+    def requires_scale_measurement(self) -> bool:
+        return self.confidence.requires_scale_measurement
+
+    @property
+    def passes(self) -> bool:
+        """True only for PASS / PROVISIONAL_PASS (consistent with GatedReduction)."""
+        return self.verdict in (VERDICT_PASS, VERDICT_PROVISIONAL_PASS)
+
+
+def speed_gate_verdict(
+    accountant: FreezeCostAccountant,
+    level: int,
+    target_width: int,
+    *,
+    threshold: float = SPEED_GATE_THRESHOLD,
+    validated_max_width: int = PROXY_VALIDATED_MAX_WIDTH,
+    scale_measurement_floor: float = 0.5,
+) -> SpeedGateVerdict:
+    """Judge the §7 speed gate from proxy FLOP accounting (the CUDA-less path).
+
+    Composes :func:`gate_reduction` (realizability §6.2 + width §6.1) into the
+    acceptance verdict. A proxy reduction clears the 10% bar only as far as it is
+    *realized* (Level-1 → 0) and *validated* (width-discounted): a 9B target
+    (h=4096) that still clears the bar PASSes *provisionally* rather than
+    silently, and a 4x-width target (h≥8192) is refused pending a real
+    measurement. A Level-1 reduction is a width-independent FAIL because its
+    realized reduction is ~0 in vivo regardless of width.
+    """
+    gated = gate_reduction(
+        accountant,
+        level,
+        target_width,
+        validated_max_width=validated_max_width,
+        scale_measurement_floor=scale_measurement_floor,
+    )
+    if gated.realized_reduction <= 0.0:
+        # Nothing realizable to credit (Level-1, or a schedule that freezes
+        # nothing): FAIL at every width — a realizability failure, not a width one.
+        verdict = VERDICT_FAIL
+    elif gated.requires_scale_measurement:
+        verdict = VERDICT_REQUIRES_SCALE_MEASUREMENT
+    elif gated.effective_reduction < threshold:
+        verdict = VERDICT_FAIL
+    elif gated.confidence.confidence >= 1.0:
+        verdict = VERDICT_PASS
+    else:
+        verdict = VERDICT_PROVISIONAL_PASS
+    return SpeedGateVerdict(
+        verdict=verdict,
+        target_width=target_width,
+        proxy_reduction=gated.proxy_reduction,
+        realized_reduction=gated.realized_reduction,
+        effective_reduction=gated.effective_reduction,
+        confidence=gated.confidence,
+        threshold=threshold,
+    )

@@ -14,15 +14,22 @@ import pytest
 from src.tg_lora.freeze_cost import (
     LEVEL1_REALIZED_REDUCTION_CEILING,
     PROXY_VALIDATED_MAX_WIDTH,
+    SPEED_GATE_THRESHOLD,
     ExtrapolationConfidence,
     FreezeCostAccountant,
     FreezeCostSummary,
     GatedReduction,
     LayerBackwardCost,
     RealizedReduction,
+    SpeedGateVerdict,
+    VERDICT_FAIL,
+    VERDICT_PASS,
+    VERDICT_PROVISIONAL_PASS,
+    VERDICT_REQUIRES_SCALE_MEASUREMENT,
     extrapolation_confidence,
     gate_reduction,
     realizable_reduction,
+    speed_gate_verdict,
 )
 
 
@@ -433,3 +440,81 @@ class TestRealizableReduction:
     def test_invalid_level_raises(self, bad_level):
         with pytest.raises(ValueError, match="level"):
             realizable_reduction(self._acc(), level=bad_level)
+
+
+class TestSpeedGateVerdict:
+    """§7 first gate judged from proxy accounting, as a graduated verdict.
+
+    Reference accountant: layer 1 frozen at epoch 2 -> Level-2 reduction 0.25,
+    Level-1 reduction 0.125 (see TestSingleLayerMidFreeze). The verdict categories
+    are what a bare ``passes()`` boolean cannot express, and are what stop the
+    gate silently trusting a proxy number (10_guard_experiment.md §6.1/§6.2/§7).
+    """
+
+    def _acc(self) -> FreezeCostAccountant:
+        return _two_layers(frozen_at_epoch={1: 2})
+
+    def test_default_threshold_is_ten_percent(self):
+        assert SPEED_GATE_THRESHOLD == 0.10
+
+    def test_validated_width_is_clean_pass(self):
+        # h=2048: confidence 1.0, effective 0.25 >= 0.10 -> a clean, full PASS.
+        v = speed_gate_verdict(self._acc(), level=2, target_width=2048)
+        assert isinstance(v, SpeedGateVerdict)
+        assert v.verdict == VERDICT_PASS
+        assert v.effective_reduction == pytest.approx(0.25)
+        assert v.passes is True
+        assert v.requires_scale_measurement is False
+
+    def test_nine_b_passes_only_provisionally(self):
+        # h=4096 (9B, 2x width): confidence 0.5 -> effective 0.125 still clears
+        # 0.10, but at a partly-validated width, so PROVISIONAL_PASS — the proxy
+        # number is credited partly, never silently in full.
+        v = speed_gate_verdict(self._acc(), level=2, target_width=4096)
+        assert v.verdict == VERDICT_PROVISIONAL_PASS
+        assert v.effective_reduction == pytest.approx(0.125)
+        assert v.confidence.confidence == pytest.approx(0.5)
+        assert v.passes is True
+
+    def test_extreme_width_requires_scale_measurement(self):
+        # h=8192 (4x width): the gate refuses any verdict from the proxy and
+        # demands a real measurement — it draws neither PASS nor FAIL.
+        v = speed_gate_verdict(self._acc(), level=2, target_width=8192)
+        assert v.verdict == VERDICT_REQUIRES_SCALE_MEASUREMENT
+        assert v.passes is False
+        assert v.requires_scale_measurement is True
+
+    def test_no_realizable_reduction_fails_at_validated_width(self):
+        # A layer scheduled to freeze at/after the run end realizes nothing: at
+        # the fully-validated width the gate correctly FAILs on zero reduction.
+        acc = _two_layers(frozen_at_epoch={1: 4})
+        v = speed_gate_verdict(acc, level=2, target_width=2048)
+        assert v.verdict == VERDICT_FAIL
+        assert v.effective_reduction == 0.0
+        assert v.passes is False
+
+    def test_level1_always_fails_regardless_of_width(self):
+        # Level-1 realizes ~0 in vivo (§6.2); the gate credits none of it, at any
+        # width — even at 4x width this is a realizability FAIL, not a "needs
+        # scale measurement" (the reduction is zero either way).
+        for width in (2048, 4096, 8192):
+            v = speed_gate_verdict(self._acc(), level=1, target_width=width)
+            assert v.verdict == VERDICT_FAIL
+            assert v.realized_reduction == 0.0
+            assert v.effective_reduction == 0.0
+            assert v.passes is False
+
+    def test_custom_threshold_can_flip_pass_to_fail(self):
+        # A 0.20 bar makes the 9B effective 0.125 FAIL even though it would
+        # PROVISIONAL_PASS under the default 0.10 bar.
+        v = speed_gate_verdict(self._acc(), level=2, target_width=4096, threshold=0.20)
+        assert v.verdict == VERDICT_FAIL
+
+    def test_provenance_fields_expose_full_audit_trail(self):
+        # The verdict keeps every figure an auditor needs: the raw proxy, the
+        # realized figure, the discounted effective, the confidence, the width.
+        v = speed_gate_verdict(self._acc(), level=2, target_width=4096)
+        assert v.target_width == 4096
+        assert v.proxy_reduction == pytest.approx(0.25)  # raw, kept for transparency
+        assert v.realized_reduction == pytest.approx(0.25)  # Level-2 realized fully
+        assert v.threshold == 0.10
