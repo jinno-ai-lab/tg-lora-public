@@ -24,6 +24,7 @@ from src.tg_lora.freeze_cost import (
     FreezeCostSummary,
     GatedReduction,
     LayerBackwardCost,
+    Level1RealizationRecord,
     LevelComparison,
     RealizedReduction,
     ReductionSample,
@@ -42,6 +43,7 @@ from src.tg_lora.freeze_cost import (
     gate_reduction,
     per_cycle_realized_reductions,
     realizable_reduction,
+    resolve_level1_ceiling,
     speed_gate_verdict,
     uniform_layer_accountant,
 )
@@ -1114,3 +1116,161 @@ class TestCompareFreezeLevels:
         assert VERDICT_FAIL in text
         assert VERDICT_PASS in text
         assert "realized=0.2500" in text
+
+
+class TestLevel1CeilingRecovery:
+    """§6.2 evidence-plumbing: a measured Level-1 realization recovers the gate.
+
+    The default ceiling (0.0) is the validated CPU-proxy in-vivo result. A
+    measured record that clears the thin-evidence bar raises the credited
+    Level-1 realization, capped at the arithmetic proxy, and may flip a Level-1
+    FAIL to a PASS — the "raise the ceiling to recover it" path the §6.2 design
+    names. Reference accountant: two layers, layer 1 frozen at epoch 2 ->
+    Level-1 proxy reduction 0.125, Level-2 proxy 0.25.
+    """
+
+    def _acc(self) -> FreezeCostAccountant:
+        return _two_layers(frozen_at_epoch={1: 2})
+
+    # --- resolve_level1_ceiling / Level1RealizationRecord ---
+
+    def test_resolve_default_returns_validated_zero(self):
+        assert resolve_level1_ceiling(None) == LEVEL1_REALIZED_REDUCTION_CEILING
+        assert resolve_level1_ceiling(None) == 0.0
+
+    def test_non_thin_record_returns_observed_reduction(self):
+        record = Level1RealizationRecord(0.125, num_runs=3, source="9b_grad_ckpt")
+        assert resolve_level1_ceiling(record) == pytest.approx(0.125)
+
+    def test_thin_record_keeps_validated_zero(self):
+        # One or two runs of a nonzero number are not enough to credit a Level-1
+        # reduction — the same honesty bar the §6.3 band applies.
+        for n in (1, 2):
+            record = Level1RealizationRecord(0.125, num_runs=n)
+            assert resolve_level1_ceiling(record) == 0.0
+
+    def test_boundary_three_runs_is_not_thin(self):
+        # MIN_SAMPLE_FOR_CONFIDENCE_BAND == 3; three runs clear the bar.
+        record = Level1RealizationRecord(0.05, num_runs=3)
+        assert record.is_thin_evidence is False
+        assert resolve_level1_ceiling(record) == pytest.approx(0.05)
+
+    def test_zero_runs_is_thin_evidence(self):
+        record = Level1RealizationRecord(0.125, num_runs=2)
+        assert record.is_thin_evidence is True
+
+    def test_record_rejects_negative_observation(self):
+        with pytest.raises(ValueError):
+            Level1RealizationRecord(-0.01, num_runs=3)
+
+    def test_record_rejects_nonpositive_run_count(self):
+        for bad in (0, -1):
+            with pytest.raises(ValueError):
+                Level1RealizationRecord(0.125, num_runs=bad)
+
+    def test_source_defaults_to_empty(self):
+        record = Level1RealizationRecord(0.125, num_runs=3)
+        assert record.source == ""
+
+    # --- realizable_reduction: the ceiling flows and is capped at the proxy ---
+
+    def test_default_ceiling_keeps_level1_at_zero(self):
+        realized = realizable_reduction(self._acc(), level=1)
+        assert realized.realized_reduction == pytest.approx(0.0)
+        assert realized.proxy_reduction == pytest.approx(0.125)
+
+    def test_supplied_ceiling_raises_level1_realized(self):
+        realized = realizable_reduction(self._acc(), level=1, level1_ceiling=0.125)
+        assert realized.realized_reduction == pytest.approx(0.125)
+
+    def test_ceiling_capped_at_arithmetic_proxy(self):
+        # A measurement above the arithmetic max still realizes only the
+        # arithmetic proxy — you cannot realize more reduction than is possible.
+        realized = realizable_reduction(self._acc(), level=1, level1_ceiling=0.5)
+        assert realized.realized_reduction == pytest.approx(0.125)
+
+    def test_ceiling_is_noop_for_level2(self):
+        # The ceiling applies to Level 1 only; Level 2 passes through unchanged.
+        without = realizable_reduction(self._acc(), level=2)
+        with_ceiling = realizable_reduction(self._acc(), level=2, level1_ceiling=0.5)
+        assert with_ceiling.realized_reduction == without.realized_reduction
+        assert with_ceiling.realized_reduction == pytest.approx(0.25)
+
+    def test_negative_ceiling_raises(self):
+        with pytest.raises(ValueError):
+            realizable_reduction(self._acc(), level=1, level1_ceiling=-0.1)
+
+    # --- speed_gate_verdict: a measurement flips Level-1 FAIL -> PASS ---
+
+    def test_measured_ceiling_recovers_level1_to_pass(self):
+        acc = self._acc()
+        # Baseline: Level 1 is a width-independent FAIL (realized ~0).
+        baseline = speed_gate_verdict(acc, level=1, target_width=2048)
+        assert baseline.verdict == VERDICT_FAIL
+        # A non-thin measurement recovering 0.125 flips it to PASS at the
+        # validated width (effective 0.125 >= 0.10 bar, confidence 1.0).
+        recovered = speed_gate_verdict(
+            acc, level=1, target_width=2048, level1_ceiling=0.125
+        )
+        assert recovered.realized_reduction == pytest.approx(0.125)
+        assert recovered.effective_reduction == pytest.approx(0.125)
+        assert recovered.verdict == VERDICT_PASS
+
+    def test_subthreshold_recovery_still_fails(self):
+        # Recovery above zero but below the 10% bar does not PASS — the
+        # measurement is credited, but it does not clear the headline gate.
+        recovered = speed_gate_verdict(
+            self._acc(), level=1, target_width=2048, level1_ceiling=0.05
+        )
+        assert recovered.realized_reduction == pytest.approx(0.05)
+        assert recovered.verdict == VERDICT_FAIL
+
+    # --- compare_freeze_levels: the researcher-facing entry point ---
+
+    def test_compare_threads_record_into_level1_only(self):
+        acc = self._acc()
+        record = Level1RealizationRecord(0.125, num_runs=3, source="9b_grad_ckpt")
+        comp = compare_freeze_levels(acc, target_width=2048, level1_record=record)
+        assert comp.level1_ceiling == pytest.approx(0.125)
+        assert comp.level1.verdict == VERDICT_PASS
+        assert comp.level1.realized_reduction == pytest.approx(0.125)
+        # Level 2 is untouched by the Level-1 record.
+        assert comp.level2.realized_reduction == pytest.approx(0.25)
+
+    def test_compare_default_level1_ceiling_field_is_zero(self):
+        comp = compare_freeze_levels(self._acc(), target_width=2048)
+        assert comp.level1_ceiling == 0.0
+
+    def test_thin_record_does_not_recover_level1(self):
+        # A thin record is recorded on the comparison (ceiling field stays the
+        # validated 0.0) but does not flip the Level-1 verdict.
+        record = Level1RealizationRecord(0.125, num_runs=2)
+        comp = compare_freeze_levels(self._acc(), target_width=2048, level1_record=record)
+        assert comp.level1_ceiling == 0.0
+        assert comp.level1.verdict == VERDICT_FAIL
+        assert comp.level1.realized_reduction == pytest.approx(0.0)
+
+    def test_recovered_level1_clears_additional_passes(self):
+        # additional_passes is "Level 2 passes where Level 1 does not". Recovering
+        # Level 1 to a PASS removes that sole-carrier story, so the marginal flag
+        # flips False — the record genuinely changes the comparison's conclusion.
+        record = Level1RealizationRecord(0.125, num_runs=3)
+        comp = compare_freeze_levels(self._acc(), target_width=2048, level1_record=record)
+        assert comp.level1.passes is True
+        assert comp.level2.passes is True
+        assert comp.additional_passes is False
+
+    def test_format_shows_ceiling_line_when_raised(self):
+        record = Level1RealizationRecord(0.125, num_runs=3)
+        comp = compare_freeze_levels(self._acc(), target_width=2048, level1_record=record)
+        text = format_level_comparison(comp)
+        assert "level1 ceiling: raised to 0.1250" in text
+        assert "measured in-vivo record" in text
+
+    def test_format_omits_ceiling_line_at_baseline(self):
+        # The default comparison carries no raised ceiling, so the audit block is
+        # byte-identical to the pre-evidence format (no spurious ceiling line).
+        comp = compare_freeze_levels(self._acc(), target_width=2048)
+        text = format_level_comparison(comp)
+        assert "level1 ceiling" not in text
+

@@ -109,6 +109,8 @@ in-vivo 検証（`tests/test_progressive_freeze_invivo.py`、CPU-proxy h=24, L=8
 
 したがって §7 第一関門は Level-1 の削減率を**信用してはならない**。`gate_reduction(level=1)` は算術値を保持（`proxy_reduction`、透明性のため）しつつ、`realized_reduction` を `LEVEL1_REALIZED_REDUCTION_CEILING = 0.0` に据え、`effective_reduction` を 0 にする。結果として Level-1 はいかなる幅でも第一関門（10% 短縮）を通らない。これは CPU-proxy in-vivo 証拠に基づく境界であり、実 9B 計測ではない（§6.1 の幅境界と同じ honesty）。将来の in-vivo 計測で Level-1 に非零の実現削減が観測されれば（例: gradient checkpointing 併用下）、この ceiling を引き上げて回復させる。
 
+**回復の着地点（§6.2 証拠配管）**: 上記の「ceiling を引き上げて回復させる」を、定数の手書き修正ではなく監査可能な証拠経路で実現する着地点が `freeze_cost.py` に存在する。`Level1RealizationRecord(observed_reduction, num_runs, source)` が計測1件の証拠を運び、`resolve_level1_ceiling(record)` が関門が信用する ceiling 値を解決する——record が薄い証拠（`MIN_SAMPLE_FOR_CONFIDENCE_BAND` 未満 = §6.3 と同値の3件未満）なら検証済み `0.0` を維持し、bar を超えれば観測値を返す。解決された ceiling は `realizable_reduction(level1_ceiling=)` → `gate_reduction` → `speed_gate_verdict` → `compare_freeze_levels(level1_record=)` へ直列に伝播し、実現削減率は `min(ceiling, proxy)` で**算術上限を超えて信用しない**。非薄の record が供給されれば Level-1 判定は `FAIL` から `PASS`/`PROVISIONAL_PASS` へ回復し得る。2026-06 時点では**実 9B 計測は未供給**で既定は `0.0` のままであり、関門の判定は一切変化しない——これは gate の厳格化ではなく、実測値が得られた時にそれを反映するための pluggable な着地点である。
+
 ### 6.3 分散較正バンド（観測分散 → band 幅）— 薄い証拠で band を名乗らない第三の境界
 
 §6.1（幅: proxy → scale）と §6.2（実現性: 算術 → in-vivo）は関門が信用する**点推定** `effective_reduction` を段階的に補正する。本節は直交する第三の次元「**観測分散**」を扱う: 関門が提示する削減率を、その**測定されたばらつき**とともに記録し、band 幅を**測定分散**から較正する。 steering フィードバックが指摘した失敗モード — "中央値の2回再現は confidence band と呼ぶには薄い証拠" — を、判断ではなく**強制可能な監査可能ルール**として退場させる。

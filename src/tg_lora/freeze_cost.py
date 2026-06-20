@@ -282,6 +282,68 @@ LEVEL1_REALIZED_REDUCTION_CEILING: float = 0.0
 
 
 @dataclass(frozen=True)
+class Level1RealizationRecord:
+    """A measured in-vivo Level-1 realized reduction — the §6.2 ceiling's evidence.
+
+    The default :data:`LEVEL1_REALIZED_REDUCTION_CEILING` (0.0) is the validated
+    CPU-proxy in-vivo result: a freeze-only (``requires_grad=False``) schedule
+    realizes ~0 backward reduction because the activation gradient still runs
+    through the frozen layer. Both the §6.2 design (10_guard_experiment.md §6.2)
+    and the ceiling's own comment anticipate that a future in-vivo run — e.g.
+    under gradient checkpointing, where the frozen layer's forward recompute is
+    skipped — may observe a *nonzero* Level-1 realization the gate should credit
+    rather than silently over-trust. This record is the landing zone for that
+    measurement: it carries the observed reduction, how many runs observed it,
+    and a free-text ``source`` (e.g. ``"9b_cuda_grad_ckpt"``) so any credit it
+    unlocks is fully auditable instead of a hand-edited magic constant.
+
+    A record below :data:`MIN_SAMPLE_FOR_CONFIDENCE_BAND` runs is thin evidence:
+    it is recorded for the audit but does NOT raise the ceiling (see
+    :func:`resolve_level1_ceiling`), so one or two runs of a nonzero number do
+    not silently flip a Level-1 FAIL to a PASS — the same honesty bar the §6.3
+    band applies to a confidence band.
+    """
+
+    observed_reduction: float
+    num_runs: int
+    source: str = ""
+
+    def __post_init__(self) -> None:
+        if self.observed_reduction < 0.0:
+            raise ValueError(
+                f"observed_reduction must be non-negative, got {self.observed_reduction}"
+            )
+        if self.num_runs < 1:
+            raise ValueError(f"num_runs must be >= 1, got {self.num_runs}")
+
+    @property
+    def is_thin_evidence(self) -> bool:
+        """Too few runs to raise the ceiling (matches the §6.3 sample bar)."""
+        return self.num_runs < MIN_SAMPLE_FOR_CONFIDENCE_BAND
+
+
+def resolve_level1_ceiling(
+    record: Level1RealizationRecord | None = None,
+) -> float:
+    """The Level-1 realized-reduction ceiling the §7 gate credits.
+
+    With no record (the default), returns the validated
+    :data:`LEVEL1_REALIZED_REDUCTION_CEILING` (0.0): the CPU-proxy in-vivo result
+    that holds Level-1 realization at ~0 until a real measurement says
+    otherwise. With a record that clears the thin-evidence bar, returns its
+    observed reduction so the gate credits the measured realization — the
+    "raise the ceiling to recover it" path the §6.2 design names. A thin record
+    is recorded (callers keep it for the audit) but does not raise the ceiling:
+    one or two reproductions of a nonzero number are not enough to credit a
+    Level-1 reduction, for the same reason the §6.3 band refuses to call two
+    reproductions a confidence band.
+    """
+    if record is None or record.is_thin_evidence:
+        return LEVEL1_REALIZED_REDUCTION_CEILING
+    return record.observed_reduction
+
+
+@dataclass(frozen=True)
 class RealizedReduction:
     """A freeze reduction corrected for what is empirically realized in vivo.
 
@@ -305,18 +367,41 @@ class RealizedReduction:
 def realizable_reduction(
     accountant: FreezeCostAccountant,
     level: int,
+    *,
+    level1_ceiling: float | None = None,
 ) -> RealizedReduction:
     """Cap a freeze reduction at what is empirically realized in vivo.
 
     Level-2 reductions pass through unchanged — the trio's suffix cut is
     realized exactly (tests/test_progressive_freeze_invivo.py). Level-1
-    reductions are capped at :data:`LEVEL1_REALIZED_REDUCTION_CEILING`: the
+    reductions are capped at the Level-1 realized-reduction ceiling: the
     weight-grad FLOPs the accountant credits never become fewer backward
     traversals, so crediting them would over-trust a number the in-vivo suite
     shows to be an overstatement (see 10_guard_experiment.md §6.2).
+
+    ``level1_ceiling`` overrides the default
+    :data:`LEVEL1_REALIZED_REDUCTION_CEILING` (0.0) with a measured one — the
+    resolved value of a :class:`Level1RealizationRecord` via
+    :func:`resolve_level1_ceiling`. The realized reduction is the smaller of the
+    ceiling and the arithmetic proxy, so a measurement recovers a Level-1
+    reduction up to what the arithmetic says is possible, never beyond it.
+    ``None`` keeps the validated 0.0 default, so every existing verdict is
+    unchanged unless a caller supplies evidence.
     """
     proxy = accountant.reduction_rate(level=level)
-    realized = LEVEL1_REALIZED_REDUCTION_CEILING if level == 1 else proxy
+    if level1_ceiling is not None and level1_ceiling < 0.0:
+        raise ValueError(
+            f"level1_ceiling must be non-negative, got {level1_ceiling}"
+        )
+    if level == 1:
+        ceiling = (
+            LEVEL1_REALIZED_REDUCTION_CEILING
+            if level1_ceiling is None
+            else level1_ceiling
+        )
+        realized = min(ceiling, proxy)
+    else:
+        realized = proxy
     return RealizedReduction(proxy_reduction=proxy, realized_reduction=realized)
 
 
@@ -359,6 +444,7 @@ def gate_reduction(
     *,
     validated_max_width: int = PROXY_VALIDATED_MAX_WIDTH,
     scale_measurement_floor: float = 0.5,
+    level1_ceiling: float | None = None,
 ) -> GatedReduction:
     """Correct the accountant's reduction for realizability, then for width.
 
@@ -369,8 +455,13 @@ def gate_reduction(
     extent it is *realized in vivo* and the target width has been validated —
     instead of trusting a proxy number that is either unrealized (Level 1) or
     unvalidated at scale.
+
+    ``level1_ceiling`` is threaded straight through to
+    :func:`realizable_reduction`, so a measured Level-1 realization (resolved
+    from a :class:`Level1RealizationRecord`) propagates into the gate's credited
+    reduction. It is a no-op for Level 2.
     """
-    realized = realizable_reduction(accountant, level)
+    realized = realizable_reduction(accountant, level, level1_ceiling=level1_ceiling)
     conf = extrapolation_confidence(
         target_width,
         validated_max_width=validated_max_width,
@@ -446,6 +537,7 @@ def speed_gate_verdict(
     threshold: float = SPEED_GATE_THRESHOLD,
     validated_max_width: int = PROXY_VALIDATED_MAX_WIDTH,
     scale_measurement_floor: float = 0.5,
+    level1_ceiling: float | None = None,
 ) -> SpeedGateVerdict:
     """Judge the §7 speed gate from proxy FLOP accounting (the CUDA-less path).
 
@@ -455,7 +547,11 @@ def speed_gate_verdict(
     (h=4096) that still clears the bar PASSes *provisionally* rather than
     silently, and a 4x-width target (h≥8192) is refused pending a real
     measurement. A Level-1 reduction is a width-independent FAIL because its
-    realized reduction is ~0 in vivo regardless of width.
+    realized reduction is ~0 in vivo regardless of width — *unless* a measured
+    Level-1 realization is supplied via ``level1_ceiling`` (resolved from a
+    :class:`Level1RealizationRecord`), in which case the gate credits it and the
+    verdict may recover from FAIL to PASS / PROVISIONAL_PASS at the measured
+    value.
     """
     gated = gate_reduction(
         accountant,
@@ -463,6 +559,7 @@ def speed_gate_verdict(
         target_width,
         validated_max_width=validated_max_width,
         scale_measurement_floor=scale_measurement_floor,
+        level1_ceiling=level1_ceiling,
     )
     if gated.realized_reduction <= 0.0:
         # Nothing realizable to credit (Level-1, or a schedule that freezes
@@ -541,7 +638,10 @@ class LevelComparison:
     :attr:`additional_realized_reduction` equals Level 2's full realized
     reduction: the suffix cut is the only thing carrying realizable backward
     reduction, which is exactly why GOAL §1.6.3 treats Level 2 as an experiment
-    rather than the production path.
+    rather than the production path. :attr:`level1_ceiling` records the ceiling
+    actually credited (the validated 0.0 default, or a measured value resolved
+    from a supplied :class:`Level1RealizationRecord`), so the audit shows when a
+    real measurement recovered a Level-1 reduction rather than the baseline ~0.
     """
 
     target_width: int
@@ -550,6 +650,7 @@ class LevelComparison:
     additional_arithmetic_reduction: float
     additional_realized_reduction: float
     additional_effective_reduction: float
+    level1_ceiling: float = LEVEL1_REALIZED_REDUCTION_CEILING
 
     @property
     def additional_passes(self) -> bool:
@@ -572,6 +673,7 @@ def compare_freeze_levels(
     threshold: float = SPEED_GATE_THRESHOLD,
     validated_max_width: int = PROXY_VALIDATED_MAX_WIDTH,
     scale_measurement_floor: float = 0.5,
+    level1_record: Level1RealizationRecord | None = None,
 ) -> LevelComparison:
     """Quantitative Level-1-vs-Level-2 comparison (GOAL §5 / Phase 3 deliverable).
 
@@ -588,7 +690,16 @@ def compare_freeze_levels(
     Both verdicts share the same ``threshold`` / ``validated_max_width`` /
     ``scale_measurement_floor`` so the marginal numbers are a clean
     apples-to-apples delta, not a confound of differing gate settings.
+
+    ``level1_record`` is the researcher-facing entry point for §6.2 evidence: a
+    measured in-vivo Level-1 realization (resolved by
+    :func:`resolve_level1_ceiling`) that raises the Level-1 ceiling above the
+    validated 0.0 default. A non-thin record recovers a Level-1 reduction and
+    may flip its verdict from FAIL; a thin record is recorded on the comparison
+    but does not raise the ceiling. ``None`` keeps the validated baseline, so
+    the comparison is unchanged unless real evidence is supplied.
     """
+    level1_ceiling = resolve_level1_ceiling(level1_record)
     level1 = speed_gate_verdict(
         accountant,
         level=1,
@@ -596,6 +707,7 @@ def compare_freeze_levels(
         threshold=threshold,
         validated_max_width=validated_max_width,
         scale_measurement_floor=scale_measurement_floor,
+        level1_ceiling=level1_ceiling,
     )
     level2 = speed_gate_verdict(
         accountant,
@@ -604,6 +716,7 @@ def compare_freeze_levels(
         threshold=threshold,
         validated_max_width=validated_max_width,
         scale_measurement_floor=scale_measurement_floor,
+        level1_ceiling=level1_ceiling,
     )
     return LevelComparison(
         target_width=target_width,
@@ -615,6 +728,7 @@ def compare_freeze_levels(
         - level1.realized_reduction,
         additional_effective_reduction=level2.effective_reduction
         - level1.effective_reduction,
+        level1_ceiling=level1_ceiling,
     )
 
 
@@ -631,19 +745,28 @@ def format_level_comparison(comparison: LevelComparison) -> str:
     thing carrying realizable backward reduction in vivo.
     """
     l1, l2 = comparison.level1, comparison.level2
-    return (
-        f"level_comparison: target_width={comparison.target_width}\n"
+    lines = [
+        f"level_comparison: target_width={comparison.target_width}",
         f"  level1 (progressive freeze): {l1.verdict} "
         f"arith={l1.proxy_reduction:.4f} realized={l1.realized_reduction:.4f} "
-        f"effective={l1.effective_reduction:.4f}\n"
+        f"effective={l1.effective_reduction:.4f}",
         f"  level2 (suffix cut):         {l2.verdict} "
         f"arith={l2.proxy_reduction:.4f} realized={l2.realized_reduction:.4f} "
-        f"effective={l2.effective_reduction:.4f}\n"
+        f"effective={l2.effective_reduction:.4f}",
         f"  additional (level2 - level1): "
         f"arith={comparison.additional_arithmetic_reduction:.4f} "
         f"realized={comparison.additional_realized_reduction:.4f} "
-        f"effective={comparison.additional_effective_reduction:.4f}"
-    )
+        f"effective={comparison.additional_effective_reduction:.4f}",
+    ]
+    if comparison.level1_ceiling > 0.0:
+        # A measured in-vivo record recovered a Level-1 reduction (§6.2): make
+        # the raised ceiling explicit in the audit, so the recovered credit is
+        # never read as the validated ~0 baseline.
+        lines.append(
+            f"  level1 ceiling: raised to {comparison.level1_ceiling:.4f} "
+            f"by a measured in-vivo record"
+        )
+    return "\n".join(lines)
 
 
 # §6.3 variance-calibrated confidence band (10_guard_experiment.md §6.3). The §7
