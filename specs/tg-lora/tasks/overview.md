@@ -1546,9 +1546,29 @@ TASK-0126 ── TASK-0129
 
 ---
 
+## Phase 65: Progressive Freezing E2E統合
+
+**期間**: 0.5日
+**目標**: Progressive Freezing機能群（freeze schedule + freeze frontier + activation-matching local loss）を実モデルの forward+backward で統合検証し、モジュール単体テストでは検出できない「部分凍結多層状態での勾配フロー・schedule/loss 相互作用」の回帰を捕捉する
+**成果物**: 5件のE2E統合テスト（tests/test_progressive_freeze_e2e.py）
+
+### タスク一覧
+
+- [x] [TASK-0130: Progressive Freezing schedule+frontier+local-loss E2E integration test](TASK-0130.md) - 1.5h (TDD) 🔵 ✅ 2026-06-20
+
+### 依存関係
+
+```
+activation_matching(Phase1) ──┐
+freeze_schedule(Phase2) ──────┼── TASK-0130
+freeze_frontier(Phase2) ──────┘
+```
+
+---
+
 ## 次のステップ
 
-Phase 64 完了。残存する未完了タスク:
+Phase 65 完了。残存する未完了タスク:
 
 - **TASK-0094** (Phase 43): GPU依存のaccel param sweep実行
 - **TASK-0106** (Phase 50): GPU依存のマルチシード実験実行
