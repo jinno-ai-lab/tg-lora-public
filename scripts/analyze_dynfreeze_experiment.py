@@ -37,6 +37,13 @@ except ImportError:
     print("matplotlib required: pip install matplotlib")
     sys.exit(1)
 
+from src.tg_lora.freeze_cost import (
+    format_speed_gate_verdict,
+    frozen_at_epoch_from_freeze_log,
+    speed_gate_verdict,
+    uniform_layer_accountant,
+)
+
 # §5.2 protocol constants (design 10_guard_experiment.md §8)
 LOSS_TRIGGER_MARGIN = 0.02  # primary trigger: valid_full <= L* + 0.02
 SPEED_GATE_RATIO = 0.90  # speed gate: B_stop <= A_total * 0.90
@@ -57,7 +64,9 @@ def load_run_metrics(run_dir: Path) -> list[dict]:
     return records
 
 
-def extract_loss_and_time(records: list[dict]) -> tuple[list[float], list[float], list[int]]:
+def extract_loss_and_time(
+    records: list[dict],
+) -> tuple[list[float], list[float], list[int]]:
     times, losses, cycles = [], [], []
     for r in records:
         if r.get("type") == "step" and "loss_valid" in r:
@@ -86,7 +95,9 @@ def extract_freeze_schedule(records: list[dict]) -> dict[int, dict]:
     return schedule
 
 
-def extract_r_A_per_layer(records: list[dict], layer_indices: list[int]) -> dict[int, list[tuple[int, float]]]:
+def extract_r_A_per_layer(
+    records: list[dict], layer_indices: list[int]
+) -> dict[int, list[tuple[int, float]]]:
     """Extract per-cycle r_A for each layer."""
     r_A_data: dict[int, list[tuple[int, float]]] = {li: [] for li in layer_indices}
     for r in records:
@@ -177,11 +188,19 @@ def plot_loss_vs_wallclock(
 ) -> None:
     fig, ax = plt.subplots(figsize=(10, 6))
     if baseline_times:
-        ax.plot(baseline_times, baseline_losses, label="Baseline (A)", color="blue", alpha=0.8)
+        ax.plot(
+            baseline_times,
+            baseline_losses,
+            label="Baseline (A)",
+            color="blue",
+            alpha=0.8,
+        )
     if guard_times:
         ax.plot(guard_times, guard_losses, label="Guard (B)", color="red", alpha=0.8)
     if L_star is not None:
-        ax.axhline(y=L_star, color="green", linestyle="--", alpha=0.5, label=f"L*={L_star:.4f}")
+        ax.axhline(
+            y=L_star, color="green", linestyle="--", alpha=0.5, label=f"L*={L_star:.4f}"
+        )
     ax.set_xlabel("Cumulative Wall-Clock Time (s)")
     ax.set_ylabel("Validation Loss")
     ax.set_title("Loss vs Wall-Clock: Baseline vs Guard")
@@ -204,16 +223,24 @@ def plot_gold_vs_wallclock(
         ax.plot(
             [g["elapsed"] for g in baseline_gold],
             [g["gold_combined"] for g in baseline_gold],
-            label="Baseline (A)", color="blue", marker="o", alpha=0.8,
+            label="Baseline (A)",
+            color="blue",
+            marker="o",
+            alpha=0.8,
         )
     if guard_gold:
         ax.plot(
             [g["elapsed"] for g in guard_gold],
             [g["gold_combined"] for g in guard_gold],
-            label="Guard (B)", color="red", marker="o", alpha=0.8,
+            label="Guard (B)",
+            color="red",
+            marker="o",
+            alpha=0.8,
         )
     if g_star is not None:
-        ax.axhline(y=g_star, color="green", linestyle="--", alpha=0.5, label=f"G*={g_star:.3f}")
+        ax.axhline(
+            y=g_star, color="green", linestyle="--", alpha=0.5, label=f"G*={g_star:.3f}"
+        )
     ax.set_xlabel("Cumulative Wall-Clock Time (s)")
     ax.set_ylabel("Gold combined score")
     ax.set_title("JSON-extraction Gold vs Wall-Clock: Baseline vs Guard")
@@ -256,6 +283,63 @@ def plot_freeze_schedule(
     print(f"Saved: {output_path}")
 
 
+def _proxy_speed_gate_section(
+    schedule: dict[int, dict],
+    layer_indices: list[int],
+    guard_losses: list[float],
+    target_width: int,
+    freeze_level: int,
+) -> list[str]:
+    """Emit the §7 proxy speed-gate verdict (CUDA-less path, design §6.1 + §6.2).
+
+    Judges the 10% bar from the model-free accountant over the *observed* freeze
+    schedule, so a proxy reduction is credited only as far as it is realized in
+    vivo (§6.2) and validated at ``target_width`` (§6.1) — never the raw number.
+    Returns a labelled, indented block for ``gate_decision.txt``; returns a SKIP
+    line when no freeze schedule was observed. This is the concrete proxy path
+    that ``freeze_cost.speed_gate_verdict`` exists for, so the §7 bar does not
+    silently print N/A or trust a raw proxy figure when CUDA is unavailable.
+    """
+    lines = ["", "--- Speed gate (proxy / CUDA-less, §6.1 + §6.2) ---"]
+    # Per-cycle frozen-layer set parsed from the guard block log.
+    block_log: dict[int, set[int]] = {}
+    for cycle, info in schedule.items():
+        parsed = {
+            int(x) for x in str(info.get("block_layers", "")).split(",") if x.strip()
+        }
+        if parsed:
+            block_log[cycle] = parsed
+    if not block_log:
+        lines.append("  SKIP: no freeze schedule observed (no proxy verdict)")
+        return lines
+    # Remap global layer indices (e.g. L24..L31) to local [0, num_layers).
+    global_to_local = {g: i for i, g in enumerate(layer_indices)}
+    local_log = {
+        cycle: {global_to_local[g] for g in layers if g in global_to_local}
+        for cycle, layers in block_log.items()
+    }
+    frozen_at_epoch = frozen_at_epoch_from_freeze_log(local_log)
+    if not frozen_at_epoch:
+        lines.append("  SKIP: observed frozen layers outside the analyzed range")
+        return lines
+    num_cycles = (max(schedule) + 1) if schedule else len(guard_losses)
+    accountant = uniform_layer_accountant(
+        num_layers=len(layer_indices),
+        num_epochs=num_cycles,
+        frozen_at_epoch=frozen_at_epoch,
+    )
+    verdict = speed_gate_verdict(
+        accountant, level=freeze_level, target_width=target_width
+    )
+    lines.append(
+        f"  (homogeneous-stack first-order model; {len(frozen_at_epoch)}/"
+        f"{len(layer_indices)} layers froze over {num_cycles} cycles)"
+    )
+    for rendered in format_speed_gate_verdict(verdict).split("\n"):
+        lines.append("    " + rendered)
+    return lines
+
+
 def write_gate_decision(
     baseline_dir: Path,
     guard_dir: Path,
@@ -267,6 +351,9 @@ def write_gate_decision(
     guard_times: list[float],
     guard_gold: list[dict],
     schedule: dict[int, dict],
+    layer_indices: list[int],
+    target_width: int,
+    freeze_level: int,
     output_path: Path,
 ) -> None:
     lines: list[str] = []
@@ -291,9 +378,16 @@ def write_gate_decision(
     if guard_losses:
         lines.append(f"  Cycles: {len(guard_losses)}")
         lines.append(f"  Best valid loss: {min(guard_losses):.4f}")
-        lines.append(f"  Total wall-clock: {guard_times[-1]:.1f}s" if guard_times else "  N/A")
-        best_guard_gold = max((g["gold_combined"] for g in guard_gold if g["gold_combined"] is not None), default=None)
-        lines.append(f"  Best gold_combined: {best_guard_gold if best_guard_gold is not None else 'N/A'}")
+        lines.append(
+            f"  Total wall-clock: {guard_times[-1]:.1f}s" if guard_times else "  N/A"
+        )
+        best_guard_gold = max(
+            (g["gold_combined"] for g in guard_gold if g["gold_combined"] is not None),
+            default=None,
+        )
+        lines.append(
+            f"  Best gold_combined: {best_guard_gold if best_guard_gold is not None else 'N/A'}"
+        )
         total_cycles = max(schedule.keys()) + 1 if schedule else len(guard_losses)
         frozen_cycles = sum(1 for v in schedule.values() if v.get("block_size", 0) > 0)
         if total_cycles > 0:
@@ -301,7 +395,9 @@ def write_gate_decision(
 
     lines.append("\n--- Gate Decision (§5.2 / §7) ---")
     if l_star is not None:
-        lines.append(f"  L* = {l_star:.4f}   G* = {g_star if g_star is not None else 'N/A'}")
+        lines.append(
+            f"  L* = {l_star:.4f}   G* = {g_star if g_star is not None else 'N/A'}"
+        )
 
     # Quality gate (§5.2): gold >= G* reached within the loss trigger margin
     quality_pass = stop_cycle is not None
@@ -336,8 +432,20 @@ def write_gate_decision(
             f"{speedup_proto:+.1f}% (reference)"
         )
 
+    # §7 proxy speed gate (CUDA-less path, design §6.1 + §6.2): the model-free
+    # accountant over the observed schedule, so a proxy reduction is never
+    # credited raw. Graduated verdict + provenance, always available from the
+    # schedule even without a wall-clock measurement or CUDA.
+    lines.extend(
+        _proxy_speed_gate_section(
+            schedule, layer_indices, guard_losses, target_width, freeze_level
+        )
+    )
+
     overall = quality_pass and fair_pass if g_star is not None else False
-    lines.append(f"\n  Overall (quality AND fair speed): {'PASS ✓' if overall else 'FAIL ✗'}")
+    lines.append(
+        f"\n  Overall (quality AND fair speed): {'PASS ✓' if overall else 'FAIL ✗'}"
+    )
 
     output_path.write_text("\n".join(lines))
     print(f"Saved: {output_path}")
@@ -352,8 +460,15 @@ def write_metrics_csv(
     if not step_records:
         return
     fieldnames = [
-        "cycle", "elapsed_seconds", "loss_valid", "guard_block_size", "guard_block_layers",
-        "gold_combined", "gold_field_f1", "gold_exact_match", "gold_strict_valid",
+        "cycle",
+        "elapsed_seconds",
+        "loss_valid",
+        "guard_block_size",
+        "guard_block_layers",
+        "gold_combined",
+        "gold_field_f1",
+        "gold_exact_match",
+        "gold_strict_valid",
     ]
     for li in layer_indices:
         fieldnames.append(f"guard_r_A_L{li}")
@@ -372,10 +487,23 @@ def main():
     parser.add_argument(
         "--baseline-dir", type=str, default="runs/mlx_9b_jsonex_baseline"
     )
-    parser.add_argument(
-        "--guard-dir", type=str, default="runs/mlx_9b_jsonex_guard"
-    )
+    parser.add_argument("--guard-dir", type=str, default="runs/mlx_9b_jsonex_guard")
     parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument(
+        "--target-width",
+        type=int,
+        default=4096,
+        help="target hidden width for the §7 proxy verdict (9B=4096); "
+        "reductions are discounted beyond the validated width 2048",
+    )
+    parser.add_argument(
+        "--freeze-level",
+        type=int,
+        default=2,
+        choices=[1, 2],
+        help="freeze level for the §7 proxy verdict (2=trio, realized in vivo; "
+        "1=freeze-only, always FAILs the speed bar)",
+    )
     args = parser.parse_args()
 
     baseline_dir = Path(args.baseline_dir)
@@ -388,7 +516,9 @@ def main():
     baseline_records = load_run_metrics(baseline_dir)
     guard_records = load_run_metrics(guard_dir)
 
-    baseline_times, baseline_losses, baseline_cycles = extract_loss_and_time(baseline_records)
+    baseline_times, baseline_losses, baseline_cycles = extract_loss_and_time(
+        baseline_records
+    )
     guard_times, guard_losses, _ = extract_loss_and_time(guard_records)
 
     baseline_gold = extract_gold(baseline_records)
@@ -399,31 +529,48 @@ def main():
     )
 
     plot_loss_vs_wallclock(
-        baseline_times, baseline_losses,
-        guard_times, guard_losses,
+        baseline_times,
+        baseline_losses,
+        guard_times,
+        guard_losses,
         output_dir / "guard_loss_vs_wallclock.png",
         L_star=l_star,
     )
 
     if baseline_gold or guard_gold:
         plot_gold_vs_wallclock(
-            baseline_gold, guard_gold, g_star,
+            baseline_gold,
+            guard_gold,
+            g_star,
             output_dir / "gold_vs_wallclock.png",
         )
 
     schedule = extract_freeze_schedule(guard_records)
     if schedule:
-        plot_freeze_schedule(schedule, layer_indices, output_dir / "freeze_schedule.png")
+        plot_freeze_schedule(
+            schedule, layer_indices, output_dir / "freeze_schedule.png"
+        )
 
     write_gate_decision(
-        baseline_dir, guard_dir,
-        baseline_losses, baseline_cycles, baseline_times, baseline_gold,
-        guard_losses, guard_times, guard_gold,
+        baseline_dir,
+        guard_dir,
+        baseline_losses,
+        baseline_cycles,
+        baseline_times,
+        baseline_gold,
+        guard_losses,
+        guard_times,
+        guard_gold,
         schedule,
+        layer_indices,
+        args.target_width,
+        args.freeze_level,
         output_dir / "gate_decision.txt",
     )
 
-    write_metrics_csv(guard_records, layer_indices, output_dir / "metrics_timeseries.csv")
+    write_metrics_csv(
+        guard_records, layer_indices, output_dir / "metrics_timeseries.csv"
+    )
 
 
 if __name__ == "__main__":

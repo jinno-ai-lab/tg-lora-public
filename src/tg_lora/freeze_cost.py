@@ -483,3 +483,97 @@ def speed_gate_verdict(
         confidence=gated.confidence,
         threshold=threshold,
     )
+
+
+def format_speed_gate_verdict(verdict: SpeedGateVerdict) -> str:
+    """Render a §7 proxy speed-gate verdict with full provenance.
+
+    A compact, deterministic audit block an acceptance gate (or a reader of the
+    experiment's ``gate_decision.txt``) can inspect: the verdict category, the
+    target width, the width confidence and the bar, and the raw proxy / realized
+    / effective reductions. The raw proxy figure stays visible for transparency,
+    while the text makes clear the gate credits only the realized-and-discounted
+    ``effective_reduction`` — never the raw proxy. This is the honesty gradation
+    a bare ``passes`` boolean cannot carry, made concrete and inspectable rather
+    than prose (10_guard_experiment.md §7).
+    """
+    return (
+        f"speed_gate_verdict: {verdict.verdict} (passes={verdict.passes})\n"
+        f"  target_width={verdict.target_width} "
+        f"confidence={verdict.confidence.confidence:.3f} "
+        f"threshold={verdict.threshold:.2f}\n"
+        f"  proxy_reduction={verdict.proxy_reduction:.4f} "
+        f"realized_reduction={verdict.realized_reduction:.4f} "
+        f"effective_reduction={verdict.effective_reduction:.4f}"
+    )
+
+
+def frozen_at_epoch_from_freeze_log(
+    frozen_layers_by_cycle: dict[int, int | set[int]],
+) -> dict[int, int]:
+    """Earliest epoch each layer froze, from a per-cycle freeze log.
+
+    Accepts ``{cycle: layer_index}`` (one layer) or ``{cycle: {layers}}`` (a
+    block), e.g. the guard controller's per-cycle ``guard_block_layers``. A
+    layer's freeze epoch is the smallest cycle at which it is observed frozen;
+    a layer that never appears is omitted (never frozen). The
+    progressive-freeze invariant — a frozen layer stays frozen — is assumed, so
+    observing a layer at cycle ``c`` means it is frozen on ``[c, end)``.
+
+    This turns a real run's observed schedule into the ``frozen_at_epoch`` map a
+    :class:`FreezeCostAccountant` (and thus :func:`speed_gate_verdict`) consumes,
+    so the §7 proxy verdict can be judged from observed data instead of a
+    hand-authored map.
+    """
+    result: dict[int, int] = {}
+    for cycle, layers in sorted(frozen_layers_by_cycle.items()):
+        layer_set = {layers} if isinstance(layers, int) else set(layers)
+        for layer in layer_set:
+            existing = result.get(layer)
+            if existing is None or cycle < existing:
+                result[layer] = cycle
+    return result
+
+
+def uniform_layer_accountant(
+    num_layers: int,
+    num_epochs: int,
+    frozen_at_epoch: dict[int, int],
+    *,
+    steps_per_epoch: int = 1,
+    weight_grad_flops: float = 1.0,
+    act_grad_flops: float = 1.0,
+) -> FreezeCostAccountant:
+    """Homogeneous-stack first-order accountant for the §7 proxy path.
+
+    Builds a :class:`FreezeCostAccountant` whose layers all carry the same
+    backward cost — the natural first-order model for a homogeneous transformer
+    block stack (the Qwen-9B target is 32 such blocks). Because
+    :meth:`FreezeCostAccountant.reduction_rate` is a *ratio*, uniform costs give
+    the exact first-order reduction for a schedule; real per-layer costs
+    (DeltaNet vs. Attention, GOAL §1.5/§8) are the [UNVERIFIED] model-specific
+    refinement, and they do not change the verdict's graduation, which
+    :func:`speed_gate_verdict` already discounts for width (§6.1) and caps for
+    realizability (§6.2).
+
+    ``frozen_at_epoch`` keys must be layer indices in ``range(num_layers)``;
+    layers absent from the map are never frozen. Pair with
+    :func:`frozen_at_epoch_from_freeze_log` to build it from a run's observed
+    schedule. Optimizer/activation-gradient *bytes* default to 0: the §7 speed
+    bar is a FLOP ratio, so VRAM bytes are irrelevant to the verdict.
+    """
+    if num_layers <= 0:
+        raise ValueError(f"num_layers must be positive, got {num_layers}")
+    layer_costs = {
+        i: LayerBackwardCost(
+            weight_grad_flops=weight_grad_flops,
+            act_grad_flops=act_grad_flops,
+        )
+        for i in range(num_layers)
+    }
+    return FreezeCostAccountant(
+        layer_costs=layer_costs,
+        steps_per_epoch=steps_per_epoch,
+        num_epochs=num_epochs,
+        frozen_at_epoch=frozen_at_epoch,
+    )

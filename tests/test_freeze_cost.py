@@ -27,9 +27,12 @@ from src.tg_lora.freeze_cost import (
     VERDICT_PROVISIONAL_PASS,
     VERDICT_REQUIRES_SCALE_MEASUREMENT,
     extrapolation_confidence,
+    format_speed_gate_verdict,
+    frozen_at_epoch_from_freeze_log,
     gate_reduction,
     realizable_reduction,
     speed_gate_verdict,
+    uniform_layer_accountant,
 )
 
 
@@ -518,3 +521,152 @@ class TestSpeedGateVerdict:
         assert v.proxy_reduction == pytest.approx(0.25)  # raw, kept for transparency
         assert v.realized_reduction == pytest.approx(0.25)  # Level-2 realized fully
         assert v.threshold == 0.10
+
+
+class TestUniformLayerAccountant:
+    """Homogeneous-stack first-order accountant for the §7 proxy path.
+
+    ``reduction_rate`` is a ratio, so uniform per-layer costs give the exact
+    first-order reduction for a schedule — equal to a hand-built accountant with
+    explicit uniform costs. Reference: 4 layers (weight=act=1), 10 epochs, layer
+    3 frozen at epoch 5.
+
+        full     = 4 * (1+1) * 10         = 80
+        L2 prog  = 3*(2*10) + (2*5 + 0*5) = 70  -> reduction 0.125
+        L1 prog  = 3*(2*10) + (2*5 + 1*5) = 75  -> reduction 0.0625
+    """
+
+    def test_level2_and_level1_match_hand_calc(self):
+        acc = uniform_layer_accountant(4, 10, {3: 5})
+        assert acc.reduction_rate(level=2) == pytest.approx(0.125)
+        assert acc.reduction_rate(level=1) == pytest.approx(0.0625)
+
+    def test_equals_explicit_uniform_cost_accountant(self):
+        # The helper is a convenience wrapper: identical to an accountant built
+        # by hand with the same uniform per-layer costs.
+        helper = uniform_layer_accountant(4, 10, {3: 5})
+        explicit = FreezeCostAccountant(
+            layer_costs={i: LayerBackwardCost(1.0, 1.0) for i in range(4)},
+            steps_per_epoch=1,
+            num_epochs=10,
+            frozen_at_epoch={3: 5},
+        )
+        assert helper.full_backward_flops() == explicit.full_backward_flops()
+        assert helper.reduction_rate(level=2) == pytest.approx(
+            explicit.reduction_rate(level=2)
+        )
+
+    def test_feeds_speed_gate_verdict_graduation(self):
+        # A schedule clearing the 10% bar raw (L2 reduction 0.125) graduates by
+        # width when judged as a proxy: clean PASS at a validated width, FAIL at
+        # 9B once the 0.5 discount drops 0.0625 below the bar, and
+        # REQUIRES_SCALE_MEASUREMENT at 4x width regardless of margin.
+        acc = uniform_layer_accountant(4, 10, {3: 5})
+        assert (
+            speed_gate_verdict(acc, level=2, target_width=2048).verdict == VERDICT_PASS
+        )
+        v9b = speed_gate_verdict(acc, level=2, target_width=4096)
+        assert v9b.verdict == VERDICT_FAIL
+        assert v9b.effective_reduction == pytest.approx(0.0625)
+        assert (
+            speed_gate_verdict(acc, level=2, target_width=8192).verdict
+            == VERDICT_REQUIRES_SCALE_MEASUREMENT
+        )
+
+    @pytest.mark.parametrize("bad_n", [0, -1])
+    def test_non_positive_layer_count_raises(self, bad_n):
+        with pytest.raises(ValueError, match="num_layers"):
+            uniform_layer_accountant(bad_n, 10, {})
+
+    def test_unknown_layer_in_schedule_raises(self):
+        # frozen_at_epoch referencing a layer >= num_layers is rejected: the
+        # homogeneous model only owns range(num_layers).
+        with pytest.raises(KeyError, match="unknown layer"):
+            uniform_layer_accountant(4, 10, {9: 5})
+
+
+class TestFrozenAtEpochFromFreezeLog:
+    """Earliest-cycle parser turning a per-cycle freeze log into frozen_at_epoch."""
+
+    def test_earliest_cycle_per_layer(self):
+        # Output-side suffix growing: layer 7 first seen at cycle 2, 6 at 3, 5 at 4.
+        log = {2: {7}, 3: {6, 7}, 4: {5, 6, 7}}
+        assert frozen_at_epoch_from_freeze_log(log) == {7: 2, 6: 3, 5: 4}
+
+    def test_int_value_is_single_layer(self):
+        assert frozen_at_epoch_from_freeze_log({2: 7, 3: 6}) == {7: 2, 6: 3}
+
+    def test_keeps_earliest_when_seen_again_later(self):
+        # A layer observed at cycle 5 then cycle 3 keeps the earliest (cycle 3).
+        assert frozen_at_epoch_from_freeze_log({5: {4}, 3: {4}}) == {4: 3}
+
+    def test_never_seen_layer_is_omitted(self):
+        log = {2: {7}, 3: {6}}
+        assert frozen_at_epoch_from_freeze_log(log) == {7: 2, 6: 3}
+        assert 5 not in log.get(2, set())  # layer 5 never appears
+
+    def test_empty_log_returns_empty(self):
+        assert frozen_at_epoch_from_freeze_log({}) == {}
+
+    def test_feeds_uniform_accountant_to_proxy_verdict(self):
+        # End-to-end substrate: a freeze log -> frozen_at_epoch -> uniform
+        # accountant -> a concrete proxy verdict (Level-2, validated width PASS).
+        # 4-layer stack: layer 3 frozen @2, layer 2 frozen @4 -> reduction 0.35.
+        log = {2: {3}, 4: {2, 3}}
+        acc = uniform_layer_accountant(4, 10, frozen_at_epoch_from_freeze_log(log))
+        v = speed_gate_verdict(acc, level=2, target_width=2048)
+        assert v.verdict == VERDICT_PASS
+        assert v.realized_reduction == pytest.approx(0.35)
+
+
+class TestFormatSpeedGateVerdict:
+    """The §7 proxy verdict rendered as an honest, auditable provenance block.
+
+    Reference accountant: layer 1 frozen at epoch 2 -> Level-2 reduction 0.25,
+    Level-1 reduction 0.125 (see TestSingleLayerMidFreeze). The rendered text
+    keeps the raw proxy visible while making clear only the effective figure is
+    credited — the honesty gradation a bare boolean cannot express.
+    """
+
+    def _acc(self) -> FreezeCostAccountant:
+        return _two_layers(frozen_at_epoch={1: 2})
+
+    def test_pass_at_validated_width(self):
+        text = format_speed_gate_verdict(
+            speed_gate_verdict(self._acc(), level=2, target_width=2048)
+        )
+        assert VERDICT_PASS in text
+        assert "passes=True" in text
+        assert "target_width=2048" in text
+        assert "effective_reduction=0.2500" in text
+
+    def test_provisional_pass_at_nine_b(self):
+        text = format_speed_gate_verdict(
+            speed_gate_verdict(self._acc(), level=2, target_width=4096)
+        )
+        assert VERDICT_PROVISIONAL_PASS in text
+        assert "confidence=0.500" in text
+        assert "effective_reduction=0.1250" in text
+        # Raw proxy stays visible for transparency, distinct from the credited figure.
+        assert "proxy_reduction=0.2500" in text
+
+    def test_requires_scale_measurement_at_extreme_width(self):
+        text = format_speed_gate_verdict(
+            speed_gate_verdict(self._acc(), level=2, target_width=8192)
+        )
+        assert VERDICT_REQUIRES_SCALE_MEASUREMENT in text
+        assert "passes=False" in text
+
+    def test_fail_exposes_zero_realized_for_level1(self):
+        text = format_speed_gate_verdict(
+            speed_gate_verdict(self._acc(), level=1, target_width=2048)
+        )
+        assert VERDICT_FAIL in text
+        assert "realized_reduction=0.0000" in text
+        assert "effective_reduction=0.0000" in text
+
+    def test_threshold_rendered(self):
+        text = format_speed_gate_verdict(
+            speed_gate_verdict(self._acc(), level=2, target_width=2048)
+        )
+        assert "threshold=0.10" in text
