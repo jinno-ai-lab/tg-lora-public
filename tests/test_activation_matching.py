@@ -12,6 +12,7 @@ import torch
 from src.tg_lora.activation_matching import (
     ActivationMatchingLoss,
     cosine_matching_loss,
+    distribution_matching_loss,
     mse_matching_loss,
 )
 
@@ -71,6 +72,101 @@ class TestCosineMatching:
         assert torch.allclose(cosine_matching_loss(predicted, target), 1.0 - cos.mean())
 
 
+class TestDistributionMatching:
+    """The Phase 3 distribution-consistency arm (GOAL §3.1 Phase 3, design §6.2).
+
+    MSE measures point-wise agreement and cosine measures per-vector direction;
+    both miss the *joint* second-order structure (covariance, correlation) of the
+    activation batch. Distribution matching closes that gap by matching the
+    batch's per-feature mean and covariance — the ``分布も合わせる版`` arm of the
+    Phase 3 loss ablation. All expectations are hand-computed (GOAL §7).
+    """
+
+    def test_exact_match_is_zero(self):
+        # The "no learning signal" state: identical batches share mean and
+        # covariance -> loss 0 -> no gradient.
+        x = torch.randn(4, 3, 8)
+        assert torch.equal(distribution_matching_loss(x, x), torch.tensor(0.0))
+
+    def test_hand_computed(self):
+        # predicted=[[0,0],[0,0]], target=[[2,0],[0,2]] (no mask), H=2, D=2.
+        # mean: mu_p=[0,0], mu_t=[1,1] -> mean of (0-1)^2 over 2 features = 1.0.
+        # cov: predicted covariance is 0; target centered=[[1,-1],[-1,1]],
+        #   cov_t=(c^T c)/D = [[2,-2],[-2,2]]/2 = [[1,-1],[-1,1]].
+        #   cov_term = mean of squares of [[1,-1],[-1,1]] = 4/4 = 1.0.
+        # loss = 1.0 + 1.0 = 2.0.
+        predicted = torch.tensor([[0.0, 0.0], [0.0, 0.0]])
+        target = torch.tensor([[2.0, 0.0], [0.0, 2.0]])
+        assert torch.allclose(
+            distribution_matching_loss(predicted, target), torch.tensor(2.0)
+        )
+
+    def test_mean_shift_only(self):
+        # A pure constant shift moves the mean but leaves covariance at 0 for
+        # both -> only the mean term fires. mu_p=[0,0], mu_t=[1,1] -> 1.0.
+        predicted = torch.tensor([[0.0, 0.0], [0.0, 0.0]])
+        target = torch.tensor([[1.0, 1.0], [1.0, 1.0]])
+        assert torch.allclose(
+            distribution_matching_loss(predicted, target), torch.tensor(1.0)
+        )
+
+    def test_distribution_shift_is_nonzero(self):
+        # Scaling the target shifts both mean and covariance -> loss > 0, and
+        # strictly larger than a mean-only shift (covariance mismatch fires).
+        predicted = torch.tensor([[2.0, 0.0], [0.0, 2.0]])
+        target = torch.tensor([[4.0, 0.0], [0.0, 4.0]])  # 2x scale
+        shifted = distribution_matching_loss(predicted, target)
+        mean_only = distribution_matching_loss(
+            predicted, torch.tensor([[3.0, 3.0], [3.0, 3.0]])
+        )
+        assert shifted > 0.0
+        assert shifted > mean_only  # covariance mismatch adds on top of the mean
+
+    def test_permutation_invariant_the_honest_null_baseline(self):
+        # GOAL §7 null baseline, framed honestly for a *distribution* statistic:
+        # matching the batch distribution is, by design, blind to which sample
+        # pairs with which xin (the complement of MSE's per-sample signal). A
+        # permutation of the target rows leaves its mean and covariance
+        # unchanged, so the distribution loss stays 0 even though MSE > 0.
+        predicted = torch.tensor([[2.0, 0.0], [0.0, 2.0]])
+        permuted = torch.tensor([[0.0, 2.0], [2.0, 0.0]])  # rows swapped
+        assert torch.allclose(
+            distribution_matching_loss(predicted, permuted), torch.tensor(0.0)
+        )
+        assert mse_matching_loss(predicted, permuted) > 0.0  # MSE is NOT blind to it
+
+    def test_padding_excluded(self):
+        # Same fixture as the MSE mask test: keep token 0, drop token 1.
+        # With one effective row the covariance is 0 on both sides; only the
+        # mean term fires: mu_p=[0,0], mu_t=[2,0] -> mean of (4,0) = 2.0.
+        predicted = torch.zeros(1, 2, 2)
+        target = torch.tensor([[[2.0, 0.0], [9.0, 9.0]]])
+        mask = torch.tensor([[[1.0], [0.0]]])
+        assert torch.allclose(
+            distribution_matching_loss(predicted, target, mask=mask),
+            torch.tensor(2.0),
+        )
+
+    def test_mask_reduces_to_unmasked_when_all_kept(self):
+        predicted = torch.randn(2, 3, 4)
+        target = torch.randn(2, 3, 4)
+        mask = torch.ones(2, 3, 1)
+        assert torch.allclose(
+            distribution_matching_loss(predicted, target, mask=mask),
+            distribution_matching_loss(predicted, target),
+        )
+
+    def test_gradient_flows_only_through_predicted(self):
+        # xin is a cached, detached target, so only the front-layer output
+        # receives a gradient — never the target (same contract as MSE/cosine).
+        predicted = torch.randn(4, 3, requires_grad=True)
+        target = torch.randn(4, 3)  # requires_grad=False, like cached xin
+        distribution_matching_loss(predicted, target).backward()
+        assert predicted.grad is not None
+        assert target.grad is None
+        assert not target.requires_grad
+
+
 class TestGradient:
     def test_gradient_pushes_predicted_toward_target(self):
         # The whole point of the loss: pulling the front-layer output toward
@@ -104,6 +200,8 @@ class TestShapeGuard:
             mse_matching_loss(torch.zeros(2, 3), torch.zeros(3, 2))
         with pytest.raises(ValueError, match="identical shapes"):
             cosine_matching_loss(torch.zeros(2, 3), torch.zeros(2, 4))
+        with pytest.raises(ValueError, match="identical shapes"):
+            distribution_matching_loss(torch.zeros(2, 3), torch.zeros(3, 2))
 
 
 class TestMask:
@@ -199,8 +297,30 @@ class TestCombiner:
     def test_default_is_phase1_pure_mse(self):
         # GOAL §3.1 Phase 1: "starting with MSE". Default weights encode that.
         assert ActivationMatchingLoss() == ActivationMatchingLoss(
-            mse_weight=1.0, cosine_weight=0.0
+            mse_weight=1.0, cosine_weight=0.0, dist_weight=0.0
         )
+
+    def test_pure_distribution_equals_distribution(self):
+        combiner = ActivationMatchingLoss(
+            mse_weight=0.0, cosine_weight=0.0, dist_weight=1.0
+        )
+        predicted = torch.randn(3, 5, 7)
+        target = torch.randn(3, 5, 7)
+        assert torch.allclose(
+            combiner(predicted, target),
+            distribution_matching_loss(predicted, target),
+        )
+
+    def test_weighted_sum_three_terms(self):
+        combiner = ActivationMatchingLoss(mse_weight=2.0, cosine_weight=3.0, dist_weight=4.0)
+        predicted = torch.randn(3, 5, 7)
+        target = torch.randn(3, 5, 7)
+        expected = (
+            2.0 * mse_matching_loss(predicted, target)
+            + 3.0 * cosine_matching_loss(predicted, target)
+            + 4.0 * distribution_matching_loss(predicted, target)
+        )
+        assert torch.allclose(combiner(predicted, target), expected)
 
 
 class TestCombinerValidation:
@@ -216,4 +336,18 @@ class TestCombinerValidation:
         # A zeroed combiner emits no gradient — reject rather than silently
         # stall training (GOAL §7: no signal is not a signal).
         with pytest.raises(ValueError, match="positive"):
-            ActivationMatchingLoss(mse_weight=0.0, cosine_weight=0.0)
+            ActivationMatchingLoss(mse_weight=0.0, cosine_weight=0.0, dist_weight=0.0)
+
+    def test_negative_dist_weight_rejected(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            ActivationMatchingLoss(mse_weight=1.0, cosine_weight=0.0, dist_weight=-0.1)
+
+    def test_dist_only_allowed(self):
+        # The pure-distribution arm of the Phase 3 ablation must be selectable
+        # on its own (distribution alone still emits a gradient).
+        loss = ActivationMatchingLoss(
+            mse_weight=0.0, cosine_weight=0.0, dist_weight=1.0
+        )
+        predicted = torch.randn(2, 3, 4)
+        target = torch.randn(2, 3, 4)
+        assert torch.isfinite(loss(predicted, target))
