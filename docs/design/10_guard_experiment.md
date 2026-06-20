@@ -98,10 +98,22 @@ requires_scale_measurement = (confidence < floor)   # 既定 floor = 0.5（= 2×
 
 これは steering フィードバックの二者択一（実 CUDA/9B 計測を行う **or** proxy 数を過信しない境界を置く）の後者。CUDA が利用できない反復では、境界によって「proxy 数が関門を素通りする」ことを構造的に防ぐ。実 9B 計測は依然 next iteration の推奨であり、それが得られれば `validated_max_width` を引き上げて `confidence` を回復させる。
 
+### 6.2 実現性補正（Level-1 過大評価排除）— 算術削減率を過信しない第二の境界
+
+§6.1 が「幅（proxy → scale）」の境界なら、本節は直交する「**実現性（算術 → in-vivo）**」の境界である。`freeze_cost.py` の `realizable_reduction` は、`FreezeCostAccountant.reduction_rate` の**算術値**が in-vivo で**実際に実現する**削減に一致するかを補正する。
+
+in-vivo 検証（`tests/test_progressive_freeze_invivo.py`、CPU-proxy h=24, L=8）が empirically に示したこと:
+
+- **Level 1（freeze-only, `requires_grad=False`）**: 重み勾配 FLOP は会計上「削減」と計上されるが、活性勾配は凍結層を貫通して伝播するため、実際の backward 通過数は 1 件も減らない。**実現削減率 ≈ 0**（`test_accountant_level1_overstates_realizable_savings_in_vivo`）。
+- **Level 2（trio: `activation_cache` + `split_layer` + `dynamic_freeze`）**: 境界 local loss が凍結 suffix への逆伝播を物理的に断つため、**実現削減率 == 算術予測に完全一致**（`test_in_vivo_level2_matches_accountant_prediction_exactly`）。
+
+したがって §7 第一関門は Level-1 の削減率を**信用してはならない**。`gate_reduction(level=1)` は算術値を保持（`proxy_reduction`、透明性のため）しつつ、`realized_reduction` を `LEVEL1_REALIZED_REDUCTION_CEILING = 0.0` に据え、`effective_reduction` を 0 にする。結果として Level-1 はいかなる幅でも第一関門（10% 短縮）を通らない。これは CPU-proxy in-vivo 証拠に基づく境界であり、実 9B 計測ではない（§6.1 の幅境界と同じ honesty）。将来の in-vivo 計測で Level-1 に非零の実現削減が観測されれば（例: gradient checkpointing 併用下）、この ceiling を引き上げて回復させる。
+
 ## 7. 判定基準
 
 - **第一関門 (速度) PASS**: B の総GPU秒 ≤ A × 0.90 (10%以上短縮) + 正味削減確認
   - 削減量を proxy（h ≤ 2048）の会計から判定する場合、§6.1 の外挿信頼度で割り引いた `effective_reduction` で判定すること。検証範囲を外れる幅では proxy 数をそのまま信じない。
+  - **実現性**: `effective_reduction` は §6.2 の実現性補正を経た値を使うこと。Level-1（freeze-only）の算術削減率は in-vivo で実現しないため、関門はこれを信用せず Level-2（trio）のみを信用する。
 - **第二関門 (質)**: gold ≥ G* (§5.2 停止規則に統合済み)
 - 両関門 PASS で主張成立
 

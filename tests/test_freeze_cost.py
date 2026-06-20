@@ -12,14 +12,17 @@ A layer frozen at epoch f is active for epochs [0, f) and frozen for [f, 4).
 import pytest
 
 from src.tg_lora.freeze_cost import (
+    LEVEL1_REALIZED_REDUCTION_CEILING,
     PROXY_VALIDATED_MAX_WIDTH,
     ExtrapolationConfidence,
     FreezeCostAccountant,
     FreezeCostSummary,
     GatedReduction,
     LayerBackwardCost,
+    RealizedReduction,
     extrapolation_confidence,
     gate_reduction,
+    realizable_reduction,
 )
 
 
@@ -274,7 +277,9 @@ class TestExtrapolationConfidence:
         "width, expected_conf",
         [(512, 1.0), (1024, 1.0), (2048, 1.0), (4096, 0.5), (8192, 0.25)],
     )
-    def test_confidence_is_one_inside_envelope_and_decays_beyond(self, width, expected_conf):
+    def test_confidence_is_one_inside_envelope_and_decays_beyond(
+        self, width, expected_conf
+    ):
         c = extrapolation_confidence(width)
         assert c.confidence == pytest.approx(expected_conf)
         assert c.extrapolation_ratio == pytest.approx(width / 2048)
@@ -292,8 +297,9 @@ class TestExtrapolationConfidence:
         assert extrapolation_confidence(8192).requires_scale_measurement is True
         # Custom floor raises the bar: a 1.5x target now demands measurement.
         assert (
-            extrapolation_confidence(3072, scale_measurement_floor=0.75)
-            .requires_scale_measurement
+            extrapolation_confidence(
+                3072, scale_measurement_floor=0.75
+            ).requires_scale_measurement
             is True
         )
 
@@ -367,8 +373,63 @@ class TestGateReduction:
         assert gated.requires_scale_measurement is True
         assert gated.passes(threshold=0.01) is False
 
-    def test_gate_respects_level(self):
-        # Level-1 reduction (0.125) carries through the gate unchanged in shape;
-        # inside the envelope effective == proxy.
+    def test_gate_credits_level1_as_unrealized(self):
+        # Level-1 freeze-only realizes ~0 backward reduction in vivo: the
+        # weight-grad FLOPs it credits never become fewer traversals (see
+        # test_progressive_freeze_invivo.py ::
+        # test_accountant_level1_overstates_realizable_savings_in_vivo). The
+        # gate must not credit that number: the raw arithmetic (0.125) is kept
+        # for transparency, but the realizability correction caps the credited
+        # reduction at 0, so the gate cannot PASS the 10% speed bar at any width.
         gated = gate_reduction(self._acc(), level=1, target_width=2048)
-        assert gated.effective_reduction == pytest.approx(0.125)
+        assert gated.proxy_reduction == pytest.approx(0.125)  # raw arithmetic kept
+        assert gated.realized_reduction == 0.0  # realizability cap
+        assert gated.effective_reduction == 0.0
+        assert gated.passes(threshold=0.10) is False
+
+
+class TestRealizableReduction:
+    """Realizability correction: only Level-2 (the trio) is realized in vivo.
+
+    Level-1 freeze-only credits weight-grad FLOPs that never become fewer
+    backward traversals, so the realized reduction is ~0 while the accountant
+    reports > 0 — the overstatement the in-vivo suite pins down in
+    test_progressive_freeze_invivo.py :: test_accountant_level1_overstates_
+    realizable_savings_in_vivo. This is orthogonal to the width bound
+    (TestExtrapolationConfidence): it is a width-independent, empirically proven
+    over-trust of the accountant's own Level-1 model.
+    """
+
+    def _acc(self) -> FreezeCostAccountant:
+        return _two_layers(frozen_at_epoch={1: 2})
+
+    def test_level2_passes_through_unchanged(self):
+        # The trio's suffix cut is realized exactly in vivo, so the creditable
+        # reduction equals the accountant's Level-2 arithmetic.
+        r = realizable_reduction(self._acc(), level=2)
+        assert isinstance(r, RealizedReduction)
+        assert r.proxy_reduction == pytest.approx(0.25)
+        assert r.realized_reduction == r.proxy_reduction
+        assert r.is_realized is True
+
+    def test_level1_capped_to_ceiling(self):
+        # Level-1 reports a positive reduction in arithmetic (0.125) but realizes
+        # ~0 in vivo; the correction caps it at the Level-1 ceiling (0.0) while
+        # still exposing the raw proxy figure for transparency.
+        r = realizable_reduction(self._acc(), level=1)
+        assert r.proxy_reduction == pytest.approx(0.125)
+        assert r.realized_reduction == LEVEL1_REALIZED_REDUCTION_CEILING
+        assert r.realized_reduction == 0.0
+        assert r.is_realized is False
+
+    def test_no_freeze_realizes_zero_for_both_levels(self):
+        # A schedule that freezes nothing saves nothing (reduction_rate == 0);
+        # the realizability correction stays at 0 for both levels.
+        acc = _two_layers(frozen_at_epoch={})
+        assert realizable_reduction(acc, level=1).realized_reduction == 0.0
+        assert realizable_reduction(acc, level=2).realized_reduction == 0.0
+
+    @pytest.mark.parametrize("bad_level", [0, 3, -1])
+    def test_invalid_level_raises(self, bad_level):
+        with pytest.raises(ValueError, match="level"):
+            realizable_reduction(self._acc(), level=bad_level)

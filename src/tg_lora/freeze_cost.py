@@ -250,8 +250,7 @@ def extrapolation_confidence(
         )
     if not 0.0 < scale_measurement_floor <= 1.0:
         raise ValueError(
-            "scale_measurement_floor must be in (0, 1], "
-            f"got {scale_measurement_floor}"
+            f"scale_measurement_floor must be in (0, 1], got {scale_measurement_floor}"
         )
     ratio = target_width / validated_max_width
     confidence = min(1.0, 1.0 / ratio)
@@ -267,17 +266,73 @@ def extrapolation_confidence(
     )
 
 
-@dataclass(frozen=True)
-class GatedReduction:
-    """A proxy ``reduction_rate`` discounted by extrapolation confidence.
+# A Level-1 (freeze-only, ``requires_grad=False``) schedule realizes ~0 backward
+# reduction in vivo: the weight-grad FLOPs the accountant credits as saved never
+# become fewer backward traversals, because the activation gradient still runs
+# through the frozen layer. Validated empirically by
+# tests/test_progressive_freeze_invivo.py ::
+# test_accountant_level1_overstates_realizable_savings_in_vivo (Level-1 realized
+# reduction is ~0 while the accountant reports > 0); Level 2 (the trio) is
+# realized exactly. The speed gate must not credit a Level-1 reduction; this
+# ceiling is empirically derived and may be raised if a future in-vivo run (e.g.
+# under gradient checkpointing) shows nonzero Level-1 realization.
+LEVEL1_REALIZED_REDUCTION_CEILING: float = 0.0
 
-    What an acceptance gate may actually credit at the target width:
-    :attr:`effective_reduction` is the proxy reduction scaled by
-    :attr:`confidence`. When :attr:`requires_scale_measurement` is set, the
-    effective value is provisional and the gate must not PASS on it alone.
+
+@dataclass(frozen=True)
+class RealizedReduction:
+    """A freeze reduction corrected for what is empirically realized in vivo.
+
+    The accountant's ``reduction_rate`` is exact FLOP arithmetic, but not every
+    credited FLOP becomes a saved backward traversal. Level 1 (freeze-only)
+    still propagates the activation gradient through the frozen layer, so the
+    weight-grad FLOPs it credits realize ~0 backward reduction; Level 2 (the
+    trio: activation_cache + split_layer + dynamic_freeze) cuts the
+    backward-graph suffix, so its reduction is realized exactly.
     """
 
     proxy_reduction: float
+    realized_reduction: float
+
+    @property
+    def is_realized(self) -> bool:
+        """True when the proxy reduction survives the realizability correction."""
+        return self.realized_reduction > 0.0
+
+
+def realizable_reduction(
+    accountant: FreezeCostAccountant,
+    level: int,
+) -> RealizedReduction:
+    """Cap a freeze reduction at what is empirically realized in vivo.
+
+    Level-2 reductions pass through unchanged — the trio's suffix cut is
+    realized exactly (tests/test_progressive_freeze_invivo.py). Level-1
+    reductions are capped at :data:`LEVEL1_REALIZED_REDUCTION_CEILING`: the
+    weight-grad FLOPs the accountant credits never become fewer backward
+    traversals, so crediting them would over-trust a number the in-vivo suite
+    shows to be an overstatement (see 10_guard_experiment.md §6.2).
+    """
+    proxy = accountant.reduction_rate(level=level)
+    realized = LEVEL1_REALIZED_REDUCTION_CEILING if level == 1 else proxy
+    return RealizedReduction(proxy_reduction=proxy, realized_reduction=realized)
+
+
+@dataclass(frozen=True)
+class GatedReduction:
+    """A freeze reduction corrected for realizability, then discounted by width.
+
+    What an acceptance gate may actually credit at the target width:
+    :attr:`effective_reduction` is the *realized* reduction (the Level-1
+    overstatement removed by :func:`realizable_reduction`) scaled by
+    :attr:`confidence`. :attr:`proxy_reduction` keeps the raw accountant figure
+    for transparency — it is *not* what the gate credits. When
+    :attr:`requires_scale_measurement` is set, the effective value is provisional
+    and the gate must not PASS on it alone.
+    """
+
+    proxy_reduction: float
+    realized_reduction: float
     confidence: ExtrapolationConfidence
     effective_reduction: float
 
@@ -286,9 +341,10 @@ class GatedReduction:
         return self.confidence.requires_scale_measurement
 
     def passes(self, threshold: float) -> bool:
-        """Gate PASS only if the discounted reduction clears ``threshold`` and
-        no scale measurement is required (the target is inside, or near, the
-        validated envelope). Otherwise the proxy number must not PASS the gate."""
+        """Gate PASS only if the realized-and-discounted reduction clears
+        ``threshold`` and no scale measurement is required (the target is
+        inside, or near, the validated envelope). Otherwise the proxy number
+        must not PASS the gate."""
         if self.requires_scale_measurement:
             return False
         return self.effective_reduction >= threshold
@@ -302,21 +358,25 @@ def gate_reduction(
     validated_max_width: int = PROXY_VALIDATED_MAX_WIDTH,
     scale_measurement_floor: float = 0.5,
 ) -> GatedReduction:
-    """Discount the accountant's proxy ``reduction_rate`` for target width.
+    """Correct the accountant's reduction for realizability, then for width.
 
-    Composes the model-free accountant with the width-extrapolation confidence
-    so the Guard acceptance gate (10_guard_experiment.md §6.1 / §7) credits a
-    reduction only to the extent the target width has been validated, instead
-    of trusting a proxy number at scale.
+    Composes the model-free accountant with the realizability correction
+    (:func:`realizable_reduction`, removes the Level-1 overstatement) and the
+    width-extrapolation confidence so the Guard acceptance gate
+    (10_guard_experiment.md §6.1 / §6.2 / §7) credits a reduction only to the
+    extent it is *realized in vivo* and the target width has been validated —
+    instead of trusting a proxy number that is either unrealized (Level 1) or
+    unvalidated at scale.
     """
-    proxy = accountant.reduction_rate(level=level)
+    realized = realizable_reduction(accountant, level)
     conf = extrapolation_confidence(
         target_width,
         validated_max_width=validated_max_width,
         scale_measurement_floor=scale_measurement_floor,
     )
     return GatedReduction(
-        proxy_reduction=proxy,
+        proxy_reduction=realized.proxy_reduction,
+        realized_reduction=realized.realized_reduction,
         confidence=conf,
-        effective_reduction=conf.discount(proxy),
+        effective_reduction=conf.discount(realized.realized_reduction),
     )
