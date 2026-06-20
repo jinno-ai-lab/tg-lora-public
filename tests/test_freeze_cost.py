@@ -743,6 +743,26 @@ class TestReductionSample:
         with pytest.raises(ValueError, match="non-negative"):
             ReductionSample.from_values([-0.1, 0.2])
 
+    def test_from_runs_accumulates_across_runs(self):
+        # Each positional series is one run's per-cycle observations; they flatten
+        # into one sample so the band is calibrated *across runs* (§6.3), not over
+        # a single run's ramp — the steering feedback's 'across runs' path.
+        s = ReductionSample.from_runs([0.0, 0.25], [0.1, 0.4])
+        assert s.observations == (0.0, 0.25, 0.1, 0.4)
+        assert s.n == 4
+        assert s.min == 0.0
+        assert s.max == 0.4
+
+    def test_from_runs_single_series_matches_from_values(self):
+        assert ReductionSample.from_runs([0.0, 0.25, 0.5]) == ReductionSample.from_values(
+            [0.0, 0.25, 0.5]
+        )
+
+    def test_from_runs_rejects_negative(self):
+        # The non-negative invariant holds across the combined series too.
+        with pytest.raises(ValueError, match="non-negative"):
+            ReductionSample.from_runs([0.1, 0.2], [-0.05, 0.3])
+
 
 class TestCalibrateReductionBand:
     """Band width calibrated against the sample's measured spread (§6.3).
@@ -829,6 +849,40 @@ class TestCalibrateReductionBand:
         assert "THIN_EVIDENCE" in thin
         assert "n=2" in thin
 
+    def test_band_carries_measured_spread_provenance(self):
+        # The §6.3 audit must record the full measured spread — min/max/stddev —
+        # not only the calibrated interval. stddev was computed on the sample but
+        # lost on the band; surfacing it retires that gap (steering feedback:
+        # "min/max/stddev and N"). Reference [0.0, 0.25, 0.5]: stddev 0.25.
+        band = calibrate_reduction_band(self._sample())
+        assert band.min_obs == 0.0
+        assert band.max_obs == 0.5
+        assert band.stddev == pytest.approx(0.25)
+
+    def test_normal_band_keeps_raw_min_max_distinct_from_interval(self):
+        # For the normal method the interval (mean ± z·stddev) is NOT the observed
+        # range; the band must still carry the raw min/max so the audit shows both
+        # the calibrated interval and what was actually observed.
+        band = calibrate_reduction_band(
+            self._sample(), method=CALIBRATION_NORMAL, z=2.0
+        )
+        assert band.lower == pytest.approx(-0.25)  # interval can dip below zero
+        assert band.min_obs == 0.0  # ...but the observed range stays non-negative
+        assert band.max_obs == 0.5
+        assert band.stddev == pytest.approx(0.25)
+
+    def test_format_records_measured_spread_line(self):
+        out = format_reduction_band(calibrate_reduction_band(self._sample()))
+        # The headline interval line is unchanged ...
+        assert "lower=0.0000" in out
+        assert "upper=0.5000" in out
+        # ... and a measured_spread line records min/max/mean/stddev explicitly,
+        # so the headline number is never presented without its measured spread.
+        assert "measured_spread:" in out
+        assert "min=0.0000" in out
+        assert "max=0.5000" in out
+        assert "stddev=0.2500" in out
+
 
 class TestPerCycleRealizedReductions:
     """The per-cycle observed spread a confidence band is calibrated over (§6.3).
@@ -891,6 +945,20 @@ class TestPerCycleRealizedReductions:
         band = calibrate_reduction_band(ReductionSample.from_values(series))
         assert band.is_thin_evidence is True
         assert band.n == 2
+
+    def test_cross_run_band_calibrated_over_combined_spread(self):
+        # End-to-end across-runs path (§6.3): two runs' per-cycle series feed one
+        # sample, so N counts every observed cycle across both runs and the band
+        # spans their combined measured spread — not one run's ramp in isolation.
+        run_a = per_cycle_realized_reductions(self._acc(), level=2, num_cycles=4)
+        run_b = per_cycle_realized_reductions(
+            _two_layers(frozen_at_epoch={1: 1}), level=2, num_cycles=4
+        )
+        combined = ReductionSample.from_runs(run_a, run_b)
+        assert combined.observations == tuple(run_a) + tuple(run_b)
+        band = calibrate_reduction_band(combined)
+        assert band.n == len(run_a) + len(run_b)
+        assert band.stddev > 0.0
 
 
 class TestCompareFreezeLevels:

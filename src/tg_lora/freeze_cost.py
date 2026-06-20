@@ -687,6 +687,21 @@ class ReductionSample:
             raise ValueError(f"reductions must be non-negative, got {obs}")
         return cls(observations=obs)
 
+    @classmethod
+    def from_runs(cls, *series: Iterable[float]) -> ReductionSample:
+        """Build a sample accumulating per-cycle series across runs (§6.3).
+
+        Each positional ``series`` is one run's realized-reduction observations —
+        e.g. the list :func:`per_cycle_realized_reductions` returns for that run's
+        accountant. They flatten into one sample, so a :class:`ConfidenceBand`
+        calibrated from it has its width grounded in measured spread *across
+        runs*, not a single run's ramp. This is the across-runs calibration path
+        the steering feedback named (``per_cycle_realized_reductions`` is per-run;
+        accumulate its output here before building the band). The non-negative
+        invariant is enforced over the combined series, as in :meth:`from_values`.
+        """
+        return cls.from_values(v for run in series for v in run)
+
     @property
     def n(self) -> int:
         return len(self.observations)
@@ -736,6 +751,13 @@ class ConfidenceBand:
     :attr:`lower` / :attr:`upper` come from the sample's measured variance
     (the full observed range, or a mean ± z·stddev normal interval), so the
     band width grows with what was actually observed — not a guess.
+    :attr:`min_obs` / :attr:`max_obs` / :attr:`stddev` carry the *measured
+    spread* the width was calibrated from, so a holder of the band sees the
+    full ``min/max/stddev`` provenance (not just the calibrated interval) —
+    the steering feedback's "min/max/stddev and N". For the normal method these
+    are the raw observed range and its standard deviation, distinct from the
+    ``lower`` / ``upper`` interval, so the audit shows both what was calibrated
+    and what was measured.
     :attr:`is_thin_evidence` records when the sample was too small to support
     the band, so a gate never calls two reproductions of a median a
     "confidence band" (10_guard_experiment.md §6.3). This is an uncertainty
@@ -748,6 +770,9 @@ class ConfidenceBand:
     upper: float
     center: float
     half_width: float
+    min_obs: float
+    max_obs: float
+    stddev: float
     n: int
     is_thin_evidence: bool
     method: str
@@ -805,6 +830,9 @@ def calibrate_reduction_band(
         upper=upper,
         center=sample.mean,
         half_width=(upper - lower) / 2.0,
+        min_obs=sample.min,
+        max_obs=sample.max,
+        stddev=sample.stddev,
         n=sample.n,
         is_thin_evidence=sample.is_thin_evidence,
         method=method,
@@ -858,16 +886,19 @@ def format_reduction_band(band: ConfidenceBand) -> str:
     """Render a §6.3 variance-calibrated band with full provenance.
 
     A compact, deterministic audit block: the calibration method, the sample
-    size, the calibrated bounds and width, and the thin-evidence verdict. When
-    ``is_thin_evidence`` the label states plainly that the band must not be
-    read as a calibrated confidence band — the statistics are recorded for the
-    audit, but two reproductions of a median do not earn the name.
+    size, the calibrated bounds and width, the measured spread the width came
+    from, and the thin-evidence verdict. When ``is_thin_evidence`` the label
+    states plainly that the band must not be read as a calibrated confidence
+    band — the statistics are recorded for the audit, but two reproductions of
+    a median do not earn the name.
     """
     label = "THIN_EVIDENCE" if band.is_thin_evidence else "calibrated"
     return (
         f"reduction_band: {band.method} ({label})\n"
         f"  n={band.n} lower={band.lower:.4f} upper={band.upper:.4f} "
-        f"center={band.center:.4f} width={band.width:.4f}"
+        f"center={band.center:.4f} width={band.width:.4f}\n"
+        f"  measured_spread: min={band.min_obs:.4f} max={band.max_obs:.4f} "
+        f"mean={band.center:.4f} stddev={band.stddev:.4f}"
     )
 
 
