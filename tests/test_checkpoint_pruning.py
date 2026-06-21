@@ -10,6 +10,7 @@ removed and the total checkpoint footprint must stay bounded across many saves,
 not grow linearly with the cycle count.
 """
 
+import ast
 import shutil
 from collections import namedtuple
 from pathlib import Path
@@ -17,7 +18,11 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 from src.training.config_schema import load_validate_and_build_config
-from src.utils.checkpoint import prune_checkpoint_cycles, prune_checkpoint_cycles_from_cfg
+from src.utils.checkpoint import (
+    prune_checkpoint_cycles,
+    prune_checkpoint_cycles_from_cfg,
+    save_periodic_cycle_checkpoint,
+)
 
 CHECKPOINT_DIR_PREFIX = "checkpoint-cycle-"
 PAYLOAD_BYTES = 1024 * 1024  # 1 MiB per checkpoint dir
@@ -400,3 +405,161 @@ class TestM10ConfigsValidateThroughSchema:
             removed = prune_checkpoint_cycles_from_cfg(typed_cfg, run_dir)
             assert [_cycle_of(p) for p in _checkpoint_dirs(run_dir)] == [6, 7, 8]
             assert len(removed) == 5
+
+
+class TestPeriodicSavePathBoundedDisk:
+    """The training loop's periodic-save path bounds disk across many saves.
+
+    Closes the residual gap after db3c08f/3c2c9d7/d2218ed: those commits proved
+    prune_checkpoint_cycles bounds accumulation and that the M10 configs carry
+    the knobs and survive the schema gate — but every test calls the prune
+    function *directly*. None exercised the actual periodic-save block in
+    train_tg_lora, whose inline save->prune call was an anonymous line in a
+    multi-thousand-line loop. ``save_periodic_cycle_checkpoint`` is that block
+    extracted into a testable seam; these tests drive the exact function the
+    loop calls across many saves and assert bounded disk + per-save artifact
+    logging — the real "the protection fires in the save path" proof, not the
+    "the function works in isolation" proof the earlier tests give.
+    """
+
+    @staticmethod
+    def _fake_save(model, tokenizer, save_dir):
+        """Stand-in for save_checkpoint: create the dir + a fixed-size payload.
+
+        The model-save internals are tested elsewhere (test_artifact_logging,
+        resume E2E); here we test the save->artifact->prune orchestration that
+        bounds disk, so a payload file stands in for the real safetensors write.
+        """
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        (Path(save_dir) / "adapter_model.safetensors").write_bytes(b"\x00" * PAYLOAD_BYTES)
+
+    def test_loop_save_path_bounds_disk_across_many_saves(self, tmp_path, monkeypatch):
+        import src.utils.checkpoint as ckpt
+
+        monkeypatch.setattr(ckpt, "save_checkpoint", self._fake_save)
+        monkeypatch.setattr(ckpt, "save_training_state", lambda state, path: None)
+
+        # Real M10 config file -> schema -> typed cfg the trainer holds at runtime.
+        _, typed_cfg = load_validate_and_build_config(
+            _REPO_ROOT / "configs/9b_tg_lora_m10_dynfreeze.yaml"
+        )
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        keep_last = int(typed_cfg.logging.keep_last_checkpoints)
+
+        peak_bytes = 0
+        for cycle in range(1, 41):
+            checkpoint_dir = run_dir / f"{CHECKPOINT_DIR_PREFIX}{cycle}"
+            save_periodic_cycle_checkpoint(
+                model=None,
+                tokenizer=None,
+                checkpoint_dir=checkpoint_dir,
+                run_dir=run_dir,
+                cfg=typed_cfg,
+                training_state=object(),
+                log_artifact=lambda d, a: None,
+            )
+            peak_bytes = max(peak_bytes, _checkpoint_total_bytes(run_dir))
+
+        # Only the newest keep_last survive; older dirs are truly gone.
+        assert [_cycle_of(p) for p in _checkpoint_dirs(run_dir)] == [38, 39, 40]
+        # Footprint bounded to ~keep_last payloads, not the linear 40 the
+        # unguarded path would reach.
+        assert _checkpoint_total_bytes(run_dir) <= keep_last * PAYLOAD_BYTES
+        assert peak_bytes < 40 * PAYLOAD_BYTES
+
+    def test_loop_save_path_logs_artifact_each_save(self, tmp_path, monkeypatch):
+        import src.utils.checkpoint as ckpt
+
+        monkeypatch.setattr(ckpt, "save_checkpoint", self._fake_save)
+        monkeypatch.setattr(ckpt, "save_training_state", lambda state, path: None)
+
+        _, typed_cfg = load_validate_and_build_config(
+            _REPO_ROOT / "configs/9b_tg_lora_m10_dynfreeze_baseline.yaml"
+        )
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+
+        logged = []
+        for cycle in range(1, 6):
+            checkpoint_dir = run_dir / f"{CHECKPOINT_DIR_PREFIX}{cycle}"
+            save_periodic_cycle_checkpoint(
+                model=None,
+                tokenizer=None,
+                checkpoint_dir=checkpoint_dir,
+                run_dir=run_dir,
+                cfg=typed_cfg,
+                training_state=object(),
+                log_artifact=lambda d, a: logged.append((str(d), a)),
+            )
+
+        # Every save logged its checkpoint dir as a "checkpoints" artifact —
+        # the artifact coupling is preserved by the extraction.
+        assert len(logged) == 5
+        assert all(artifact == "checkpoints" for _, artifact in logged)
+        assert logged[-1] == (str(run_dir / f"{CHECKPOINT_DIR_PREFIX}5"), "checkpoints")
+
+    def test_loop_save_path_defaults_off_keeps_every_dir(self, tmp_path, monkeypatch):
+        # With the knobs off (a non-M10 config), the seam must NOT prune — the
+        # default-off contract that leaves unrelated runs untouched.
+        import src.utils.checkpoint as ckpt
+
+        monkeypatch.setattr(ckpt, "save_checkpoint", self._fake_save)
+        monkeypatch.setattr(ckpt, "save_training_state", lambda state, path: None)
+
+        cfg = {"logging": {"keep_last_checkpoints": 0, "min_free_disk_gb": 0.0}}
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+
+        for cycle in range(1, 6):
+            checkpoint_dir = run_dir / f"{CHECKPOINT_DIR_PREFIX}{cycle}"
+            removed = save_periodic_cycle_checkpoint(
+                model=None,
+                tokenizer=None,
+                checkpoint_dir=checkpoint_dir,
+                run_dir=run_dir,
+                cfg=cfg,
+                training_state=object(),
+            )
+
+        assert removed == []
+        assert [_cycle_of(p) for p in _checkpoint_dirs(run_dir)] == [1, 2, 3, 4, 5]
+
+
+class TestTrainLoopWiresTheGuard:
+    """Structural guard: the periodic-save block actually calls the seam.
+
+    The behavioral tests above prove ``save_periodic_cycle_checkpoint`` bounds
+    disk; this pins that train_tg_lora's periodic-save path imports and invokes
+    it, so a refactor that silently drops the call (re-opening the disk-death
+    class) fails here rather than slipping past while every seam test stays
+    green.
+    """
+
+    def test_periodic_save_block_imports_and_calls_the_seam(self):
+        source = (_REPO_ROOT / "src/training/train_tg_lora.py").read_text()
+        tree = ast.parse(source)
+
+        imported = False
+        call_count = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "src.utils.checkpoint":
+                imported |= any(
+                    a.name == "save_periodic_cycle_checkpoint" for a in node.names
+                )
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "save_periodic_cycle_checkpoint"
+            ):
+                call_count += 1
+
+        assert imported, (
+            "train_tg_lora.py must import save_periodic_cycle_checkpoint "
+            "(the M10.3 disk-death guard seam)"
+        )
+        assert call_count >= 1, (
+            "train_tg_lora.py periodic-save path must call "
+            "save_periodic_cycle_checkpoint — dropping it re-opens unbounded "
+            "checkpoint-cycle-* accumulation (M10.3 disk-death class)"
+        )

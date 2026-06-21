@@ -82,8 +82,8 @@ from src.training.trajectory_delta_artifact import (
 from src.utils.checkpoint import (
     TrainingState,
     load_training_state,
-    prune_checkpoint_cycles_from_cfg,
     save_checkpoint,
+    save_periodic_cycle_checkpoint,
     save_training_state,
 )
 from src.utils.logging import ensure_dir
@@ -3893,7 +3893,6 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
             # Periodic save
             if cycle > 0 and cycle % cfg.logging.get("save_every_cycles", 25) == 0:
                 checkpoint_dir = run_dir / f"checkpoint-cycle-{cycle}"
-                save_checkpoint(model, tokenizer, checkpoint_dir)
                 ts = TrainingState(
                     cycle_state=cycle_state,
                     controller_state=controller.state,
@@ -3905,18 +3904,18 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                     accepted_valid_history=list(accepted_valid_history),
                     dynfreeze_state=dynfreeze.state_dict() if dynfreeze is not None else None,
                 )
-                save_training_state(ts, checkpoint_dir / "training_state.pt")
-                mlf.log_artifact(checkpoint_dir, "checkpoints")
-
-                # Bound on-disk checkpoint growth (M10.3 disk-death guard).
-                # Config-driven pruning: keep_last retains only the newest N
-                # checkpoint-cycle-* dirs; min_free_disk_gb reclaims
-                # oldest-first when the filesystem is low. Both default to 0
-                # (off) so unrelated runs are untouched; the M10 configs enable
-                # them so bounded accumulation is the default for the autonomous
-                # run paths. The config->prune coupling lives in
-                # prune_checkpoint_cycles_from_cfg (the unit-tested seam).
-                removed = prune_checkpoint_cycles_from_cfg(cfg, run_dir)
+                # Bound on-disk checkpoint growth (M10.3 disk-death guard): the
+                # save -> training-state -> artifact -> prune sequence lives in
+                # save_periodic_cycle_checkpoint, the unit-tested seam extracted
+                # from this block. keep_last retains only the newest N
+                # checkpoint-cycle-* dirs; min_free_disk_gb reclaims oldest-first
+                # when the filesystem is low. Both default to 0 (off) so unrelated
+                # runs are untouched; the M10 configs enable them so bounded
+                # accumulation is the default for the autonomous run paths.
+                removed = save_periodic_cycle_checkpoint(
+                    model, tokenizer, checkpoint_dir, run_dir, cfg, ts,
+                    log_artifact=mlf.log_artifact,
+                )
                 for d in removed:
                     logger.info("Pruned old checkpoint to bound disk: %s", d)
 

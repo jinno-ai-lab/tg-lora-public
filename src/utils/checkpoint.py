@@ -140,6 +140,43 @@ def prune_checkpoint_cycles_from_cfg(cfg, run_dir: Path) -> list[Path]:
     )
 
 
+def save_periodic_cycle_checkpoint(
+    model: torch.nn.Module,
+    tokenizer,
+    checkpoint_dir: Path,
+    run_dir: Path,
+    cfg,
+    training_state: "TrainingState",
+    *,
+    log_artifact=None,
+) -> list[Path]:
+    """Periodic-save path: persist a cycle checkpoint, log it, then prune old dirs.
+
+    The exact save -> state -> artifact -> prune sequence the TG-LoRA training
+    loop runs every ``save_every_cycles``. Extracted from an inline block so the
+    M10.3 disk-death guard — the config-driven prune step — is a named,
+    importable, unit-tested seam rather than an anonymous call inside a
+    multi-thousand-line loop. A silent drop or mis-guard of the prune step here
+    re-opens the unbounded ``checkpoint-cycle-*`` accumulation class while every
+    isolated ``prune_checkpoint_cycles`` test stays green: the protection would
+    exist but never fire in the real save path.
+
+    Order matters: ``save_checkpoint`` writes model+tokenizer, then
+    ``save_training_state`` adds ``training_state.pt`` into the same dir, so the
+    artifact logged next carries the full checkpoint. Pruning runs last and
+    never touches the just-written (newest) dir. ``log_artifact`` is optional so
+    the seam is exercisable without a logger; the trainer passes the bound
+    ``mlf.log_artifact`` (which no-ops when MLflow is disabled). Returns the dirs
+    pruned, oldest-first; empty when both ``cfg.logging`` knobs are off (the safe
+    default that preserves unbounded behavior for unrelated runs).
+    """
+    save_checkpoint(model, tokenizer, checkpoint_dir)
+    save_training_state(training_state, checkpoint_dir / "training_state.pt")
+    if log_artifact is not None:
+        log_artifact(checkpoint_dir, "checkpoints")
+    return prune_checkpoint_cycles_from_cfg(cfg, run_dir)
+
+
 @dataclass
 class TrainingState:
     """All state needed to resume a TG-LoRA training job from a checkpoint."""
