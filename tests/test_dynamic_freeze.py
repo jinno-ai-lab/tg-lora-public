@@ -76,6 +76,25 @@ def _make(**overrides) -> DynamicFreezeController:
     return DynamicFreezeController(**defaults)
 
 
+def _set_lora_B_identity(model: _Model, idx: int, scale: float) -> None:
+    """Set layer ``idx``'s ``lora_B := scale·I`` so ``A_fro = scale·‖A‖_F``.
+
+    Gives a controlled, layer-local ``‖BA‖_F`` magnitude without training — used
+    to construct negligible vs legitimately-small series for ``a_mask_ratio``
+    tests. ``lora_B`` is square (hidden×hidden) so the identity is exact.
+    """
+    layer = model.layers[idx]
+    with torch.no_grad():
+        layer.lora_B.copy_(torch.eye(layer.lora_A.shape[0]) * scale)
+
+
+def _series_A_fro(model: _Model, idx: int) -> float:
+    """Current ``‖B @ A‖_F`` for layer ``idx`` (the same trace-trick ``compute_r_A`` uses)."""
+    a = model.layers[idx].lora_A.detach().float()
+    b = model.layers[idx].lora_B.detach().float()
+    return torch.trace((b.T @ b) @ (a @ a.T)).sqrt().item()
+
+
 # ---------------------------------------------------------------------------
 # §3: decide_freeze — output-side contiguous block from quiet layers
 # ---------------------------------------------------------------------------
@@ -448,3 +467,128 @@ class TestEndToEndReversibleRelease:
         # Still protected one cycle later (1 < window).
         cycle_step(release_cycle + 1)
         assert dfc.decide_freeze(release_cycle + 1) == []
+
+    def test_stir_does_not_fire_before_interval_under_real_steps(self):
+        """Negative E2E for the §4(a) stir timer — the false-positive side the
+        headline test above leaves open.
+
+        With the block frozen and the §4(b) activity trigger taken out of the
+        equation (huge ``upstream_activity_factor``), the stir release must NOT
+        fire a single cycle early, and the frozen layers must receive *no*
+        gradient across every one of those cycles (the freeze is behaviorally
+        stable, not merely a flag ``decide_unfreeze`` declines to clear). The
+        on-time release exactly at ``R`` is the positive control proving the
+        timer is *not early*, not broken.
+        """
+        torch.manual_seed(0)
+        model = _build_model()
+        optimizer = torch.optim.SGD(model.parameters(), lr=1e-1)
+        # §4(b) threshold := τ · 1e9 → unreachable; isolates the §4(a) timer.
+        dfc = _make(stir_interval=10, upstream_activity_factor=1e9)
+        dfc.apply_freeze(model, [5, 4, 3], cycle=0)
+        assert dfc.frozen_block == [5, 4, 3]
+
+        frozen = {idx: self._layer_params(model, idx) for idx in (3, 4, 5)}
+        snaps = {
+            idx: {name: p.detach().clone() for name, p in ps.items()}
+            for idx, ps in frozen.items()
+        }
+
+        # Cycles 1..9: held 1..9 cycles, all < R=10 → stir must stay armed, and
+        # the frozen block must be inert at the weight level under real steps.
+        for c in range(1, 10):
+            self._train_step(model, optimizer)
+            dfc.compute_r_A(model, c)  # real signal flows; behavioral, not timer-relevant
+            assert dfc.decide_unfreeze(c) == [], (
+                f"§4(a) stir fired early at cycle {c} (held {c} < R=10)"
+            )
+            for idx, ps in frozen.items():
+                for name, p in ps.items():
+                    assert p.grad is None, f"frozen L{idx} {name} got grad at cycle {c}"
+                    assert torch.equal(p, snaps[idx][name]), (
+                        f"frozen L{idx} {name} moved at cycle {c} — freeze not holding"
+                    )
+
+        # Positive control at the boundary: held exactly R cycles → releases on time.
+        assert dfc.decide_unfreeze(10) == [3]
+
+
+# ---------------------------------------------------------------------------
+# Negative tests: the §4 release + a_mask_ratio guards must NOT over-fire on
+# legitimate readings. The positive E2E tests prove the guards fire when they
+# should; these pin their *false-positive rate* so a future commit cannot
+# silently widen a guard (the in-repo analog of "the overclaim is caught but
+# not its false-positive rate").
+# ---------------------------------------------------------------------------
+
+
+class TestGuardsDoNotOverFire:
+    def test_quiet_upstream_does_not_trigger_activity_release(self):
+        """§4(b) negative, isolated: with the stir timer well within its
+        interval, a QUIET upstream neighbor (``r_A_window ≤ τ·factor``) must NOT
+        trigger a release. The existing combined negative
+        (``test_no_trigger_releases_nothing``) suppresses both triggers at once;
+        this isolates §4(b) and pairs it with a noisy-upstream sanity check so
+        the guard is proven *selective*, not just inert.
+        """
+        dfc = _make(stir_interval=1000, upstream_activity_factor=1.5)  # isolate §4(b)
+        dfc._frozen_block = [5, 4, 3]
+        dfc._frozen_since_cycle = 0
+        _set_history(dfc, {li: 0.001 for li in range(NUM_LAYERS)})  # all quiet incl. L2
+        # Upstream neighbor of the block is L2 = min([5,4,3]) - 1; window 0.001 vs
+        # threshold τ·1.5 = 0.02·1.5 = 0.03 → quiet → no release.
+        assert dfc.decide_unfreeze(4) == []
+        # Sanity: the same setup with L2 noisy DOES release (guard works).
+        dfc._r_A_history[2] = deque([0.05] * dfc._window, maxlen=dfc._window)
+        assert dfc.decide_unfreeze(4) == [3]
+
+    def test_a_mask_ratio_masks_negligible_series(self):
+        """Positive control for the ``a_mask_ratio`` heuristic (``compute_r_A``
+        zeroes ``r_A`` for series with ``‖BA‖_F < a_mask_ratio·median``): it DOES
+        fire on a genuinely negligible series — even one that is moving."""
+        torch.manual_seed(0)
+        model = _build_model()
+        dfc = _make(a_mask_ratio=0.1)  # default all_layer_indices = 0..5
+        for i in (0, 1, 2, 3, 4):
+            _set_lora_B_identity(model, i, scale=1.0)  # large → drives the median
+        _set_lora_B_identity(model, 5, scale=0.01)  # negligible
+
+        large = _series_A_fro(model, 0)
+        tiny = _series_A_fro(model, 5)
+        assert tiny < dfc._a_mask_ratio * large  # precondition: below mask threshold
+
+        # Seed median + prior so the mask branch is active and every series is
+        # "moving" (prior = half of current). Without the mask, L5 would report
+        # a real r_A ≈ 1.0; the mask must zero it.
+        dfc._median_A = large
+        dfc._prev_A_fro = {
+            f"layers.{i}": _series_A_fro(model, i) * 0.5 for i in range(NUM_LAYERS)
+        }
+        r_A = dfc.compute_r_A(model, 0)
+        assert r_A[5] == 0.0, "negligible moving series not masked"
+        assert r_A[0] > 0.0, "legitimate large series unexpectedly masked"
+
+    def test_a_mask_ratio_does_not_mask_legitimately_small_moving_series(self):
+        """False-positive pin for ``a_mask_ratio``: a series that is SMALL but
+        above the mask threshold (``≥ a_mask_ratio·median``) and genuinely moving
+        must report its real ``r_A > 0``, NOT be zeroed. A future commit that
+        widens the heuristic (e.g. masks anything below the median) would silently
+        suppress a legitimately training small series — this test fails first.
+        """
+        torch.manual_seed(0)
+        model = _build_model()
+        dfc = _make(a_mask_ratio=0.1)
+        for i in (0, 1, 2, 3, 4):
+            _set_lora_B_identity(model, i, scale=1.0)
+        _set_lora_B_identity(model, 5, scale=0.5)  # small but legitimate (> threshold)
+
+        large = _series_A_fro(model, 0)
+        small = _series_A_fro(model, 5)
+        assert small >= dfc._a_mask_ratio * large  # precondition: above mask threshold
+
+        dfc._median_A = large
+        dfc._prev_A_fro = {
+            f"layers.{i}": _series_A_fro(model, i) * 0.5 for i in range(NUM_LAYERS)
+        }
+        r_A = dfc.compute_r_A(model, 0)
+        assert r_A[5] > 0.0, "legitimately small moving series was masked (over-correction)"
