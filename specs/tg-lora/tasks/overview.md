@@ -1640,5 +1640,6 @@ Phase 66 完了。残存する未完了タスク:
 - [TASK-0132: §6.2 Level-1 証拠配管 — 計測された in-vivo 実現削減が ceiling を引き上げて回復する着地点（design §6.2）](TASK-0132.md)
 - [TASK-0133: §6.3 比較ヘッドライン再生産 bracket 着地点 — A/B 再生産観測が additional_realized_reduction の bracket を較正する着地点（design §6.3 / Phase 3）](TASK-0133.md)
 - [TASK-0134: §6.3 分散較正バンドの非負床注記 — `format_reduction_band` が負の下限を達成可能と読ませない着地点（design §6.3）](TASK-0134.md)
+- [TASK-0135: §6.2/§6.3 証拠配管を CPU-proxy in-vivo A/B 実測へ配線 — 薄い証拠の着地点を本物の観測で厚くし、判定経路を観察可能にする（design §6.2/§6.3 → Phase 3 A/B）](TASK-0135.md)
 
 <!-- spine:references:end -->
