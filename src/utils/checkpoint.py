@@ -51,6 +51,13 @@ def save_checkpoint(model: torch.nn.Module, tokenizer, save_dir: Path) -> None:
 
 _CYCLE_DIR_RE = re.compile(r"^checkpoint-cycle-(\d+)$")
 
+# Baseline QLoRA trainer writes ``checkpoint-<global_step>`` (no ``-cycle-``
+# token). Disjoint from ``_CYCLE_DIR_RE``: ``checkpoint-cycle-5`` has no digits
+# immediately after ``checkpoint-`` so this never matches it, and a cycle run_dir
+# never contains bare ``checkpoint-<N>`` dirs — so the step and cycle pruners can
+# never touch each other's recovery points.
+_STEP_DIR_RE = re.compile(r"^checkpoint-(\d+)$")
+
 # trajectory_delta_artifacts/{mode}_{anchor}_{cycle|step}_NNNNNN.pt — the integer
 # suffix (group 1) orders them; anchor name is variable-length so we anchor on
 # the trailing _cycle/_step token, not the mode/anchor prefix.
@@ -65,6 +72,32 @@ def _sorted_cycle_checkpoint_dirs(run_dir: Path) -> list[tuple[int, Path]]:
     for p in Path(run_dir).iterdir():
         if p.is_dir():
             m = _CYCLE_DIR_RE.match(p.name)
+            if m:
+                found.append((int(m.group(1)), p))
+    found.sort(key=lambda t: t[0])
+    return found
+
+
+def _sorted_step_checkpoint_dirs(run_dir: Path) -> list[tuple[int, Path]]:
+    """Return ``(step, dir)`` pairs for ``checkpoint-<N>`` under *run_dir*,
+    oldest step first.
+
+    The baseline QLoRA trainer (``train_baseline_qlora``) writes
+    ``checkpoint-<global_step>`` every ``save_every_steps`` — a different naming
+    scheme from the TG-LoRA loop's ``checkpoint-cycle-<N>``, which the cycle
+    guard's :data:`_CYCLE_DIR_RE` deliberately does not match. Sibling of
+    :func:`_sorted_cycle_checkpoint_dirs`; non-numeric siblings
+    (``best_model``, ``oom_checkpoint``) are ignored, never pruned. A missing
+    *run_dir* yields ``[]`` (safe noop), mirroring
+    :func:`_sorted_trajectory_delta_artifact_files`.
+    """
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        return []
+    found: list[tuple[int, Path]] = []
+    for p in run_dir.iterdir():
+        if p.is_dir():
+            m = _STEP_DIR_RE.match(p.name)
             if m:
                 found.append((int(m.group(1)), p))
     found.sort(key=lambda t: t[0])
@@ -195,6 +228,41 @@ def prune_checkpoint_cycles(
     )
 
 
+def prune_step_checkpoints(
+    run_dir: Path,
+    keep_last: int = 0,
+    min_free_disk_gb: float = 0.0,
+) -> list[Path]:
+    """Bound on-disk growth of the baseline trainer's ``checkpoint-<step>`` dirs.
+
+    :func:`prune_checkpoint_cycles` (the first M10.3 vector) matches only
+    ``checkpoint-cycle-*``. But the baseline QLoRA trainer
+    (``train_baseline_qlora``) writes ``checkpoint-<global_step>`` every
+    ``save_every_steps`` into *run_dir* and never removes old ones — the same
+    unbounded per-save accumulation class, on the other training entrypoint,
+    with a naming scheme the cycle regex deliberately does not match. A long
+    baseline run or a sweep re-introduces the M10.3 incident class here unless
+    this pruner fires.
+
+    Identical contract to :func:`prune_checkpoint_cycles`: ``keep_last`` retains
+    only the newest ``keep_last`` step dirs; ``min_free_disk_gb`` reclaims oldest
+    first when the filesystem is low, never below the single newest step. Either
+    may be ``0`` to disable (the safe default preserving unbounded behavior for
+    runs that have not opted in). The two are disjoint by construction — see
+    :data:`_STEP_DIR_RE` — so a cycle run_dir handed here prunes nothing.
+    Returns dirs removed, oldest-first. Idempotent; safe with no dirs.
+    """
+    run_dir = Path(run_dir)
+    min_free_bytes = max(0.0, float(min_free_disk_gb)) * (1024 ** 3)
+    return _bound_keyed_paths(
+        run_dir,
+        _sorted_step_checkpoint_dirs(run_dir),
+        keep_last,
+        min_free_bytes,
+        remove=lambda p: shutil.rmtree(p, ignore_errors=True),
+    )
+
+
 def prune_trajectory_delta_artifacts(
     run_dir: Path,
     keep_last: int = 0,
@@ -250,6 +318,32 @@ def prune_checkpoint_cycles_from_cfg(cfg, run_dir: Path) -> list[Path]:
     if keep_last <= 0 and min_free <= 0.0:
         return []
     return prune_checkpoint_cycles(
+        run_dir, keep_last=keep_last, min_free_disk_gb=min_free
+    )
+
+
+def prune_step_checkpoints_from_cfg(cfg, run_dir: Path) -> list[Path]:
+    """Read the pruning knobs from ``cfg.logging`` and prune ``checkpoint-<step>``.
+
+    The baseline entrypoint's mirror of :func:`prune_checkpoint_cycles_from_cfg`.
+    Targets the baseline trainer's ``checkpoint-<global_step>`` dirs — the
+    cycle guard's regex never matches them, so without this seam the same
+    ``keep_last_checkpoints`` / ``min_free_disk_gb`` knobs that bound the TG-LoRA
+    path are inert for ``make train-baseline`` (the "protection exists but
+    doesn't fire on this code path" class). Reads the SAME knobs so a single
+    opt-in bounds every on-disk vector across both training entrypoints; the
+    baseline configs ship default-off, so this is a no-op for them until they
+    opt in. Returns pruned dirs, oldest-first; empty when both knobs are off.
+
+    ``cfg`` may be an OmegaConf ``DictConfig`` (prod) or a plain dict (tests);
+    both expose ``.get``.
+    """
+    logging_cfg = cfg.get("logging", {}) if cfg is not None else {}
+    keep_last = int(logging_cfg.get("keep_last_checkpoints", 0))
+    min_free = float(logging_cfg.get("min_free_disk_gb", 0.0))
+    if keep_last <= 0 and min_free <= 0.0:
+        return []
+    return prune_step_checkpoints(
         run_dir, keep_last=keep_last, min_free_disk_gb=min_free
     )
 

@@ -21,6 +21,8 @@ from src.training.config_schema import load_validate_and_build_config
 from src.utils.checkpoint import (
     prune_checkpoint_cycles,
     prune_checkpoint_cycles_from_cfg,
+    prune_step_checkpoints,
+    prune_step_checkpoints_from_cfg,
     prune_trajectory_delta_artifacts,
     prune_trajectory_delta_artifacts_from_cfg,
     save_periodic_cycle_checkpoint,
@@ -938,3 +940,313 @@ class TestTrainLoopWiresTheArtifactGuard:
             "unbounded trajectory_delta_artifacts/*.pt accumulation, the second "
             "M10.3 disk-death vector the cycle guard alone leaves open"
         )
+
+
+# =============================================================================
+# Step-checkpoint pruning — the M10.3 guard's third vector (baseline entrypoint).
+#
+# The cycle + artifact guards above closed the disk-death class on the TG-LoRA
+# trainer. But the baseline QLoRA trainer (train_baseline_qlora, `make
+# train-baseline`) writes checkpoint-<global_step> dirs every save_every_steps
+# AND, when save_trajectory_delta_artifacts is on, .pt files into
+# trajectory_delta_artifacts/ — and called NO pruner. The cycle guard's regex
+# (^checkpoint-cycle-(\d+)$) deliberately does not match checkpoint-<step>, so
+# those knobs were "on" but inert for the baseline code path: the exact
+# "protection exists but doesn't fire" class. prune_step_checkpoints targets the
+# step-naming scheme; the baseline trainer now calls BOTH it and the (existing)
+# artifact pruner, reusing the SAME knobs. Default-off, so the shipped baseline
+# configs keep today's behavior until they opt in.
+# =============================================================================
+
+STEP_CHECKPOINT_PREFIX = "checkpoint-"
+
+
+def _save_step_checkpoint_dir(run_dir, step, payload_bytes=PAYLOAD_BYTES):
+    """Stand-in for the baseline trainer's ``checkpoint-<global_step>`` save."""
+    ckpt_dir = run_dir / f"{STEP_CHECKPOINT_PREFIX}{step}"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    (ckpt_dir / "adapter_model.safetensors").write_bytes(b"\x00" * payload_bytes)
+    return ckpt_dir
+
+
+def _step_checkpoint_dirs(run_dir):
+    def _is_step_dir(name):
+        # checkpoint-<digits> only; excludes checkpoint-cycle-* (rest not all
+        # digits) and checkpoint-best / best_model / oom_checkpoint.
+        rest = name[len(STEP_CHECKPOINT_PREFIX):]
+        return name.startswith(STEP_CHECKPOINT_PREFIX) and rest.isdigit()
+
+    return sorted(
+        (p for p in run_dir.iterdir() if p.is_dir() and _is_step_dir(p.name)),
+        key=lambda p: int(p.name[len(STEP_CHECKPOINT_PREFIX):]),
+    )
+
+
+def _step_of(path):
+    return int(path.name[len(STEP_CHECKPOINT_PREFIX):])
+
+
+class TestStepCheckpointBounding:
+    """keep_last bounds the baseline trainer's per-step checkpoint accumulation."""
+
+    def test_older_step_dirs_truly_removed_after_many_saves(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        keep_last = 3
+        for step in range(250, 10001, 250):  # 40 step-saves, like max_steps=10000
+            _save_step_checkpoint_dir(run_dir, step)
+            prune_step_checkpoints(run_dir, keep_last=keep_last)
+
+        remaining = _step_checkpoint_dirs(run_dir)
+        assert [_step_of(p) for p in remaining] == [9250, 9500, 9750, 10000][-keep_last:]
+        # Older steps are truly gone.
+        for step in range(250, 9250, 250):
+            assert not (run_dir / f"{STEP_CHECKPOINT_PREFIX}{step}").exists()
+
+    def test_step_count_never_exceeds_keep_last_during_loop(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        keep_last = 3
+        for step in range(250, 10001, 250):
+            _save_step_checkpoint_dir(run_dir, step)
+            prune_step_checkpoints(run_dir, keep_last=keep_last)
+            assert len(_step_checkpoint_dirs(run_dir)) <= keep_last
+
+
+class TestStepCheckpointContract:
+    """Edge behaviour of the step-checkpoint count bound + naming disjointness."""
+
+    def test_defaults_off_preserves_unbounded_behavior(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for step in (250, 500, 750):
+            _save_step_checkpoint_dir(run_dir, step)
+        assert prune_step_checkpoints(run_dir) == []  # keep_last=0, min_free=0
+        assert len(_step_checkpoint_dirs(run_dir)) == 3
+
+    def test_keep_last_larger_than_count_is_noop(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for step in (250, 500):
+            _save_step_checkpoint_dir(run_dir, step)
+        assert prune_step_checkpoints(run_dir, keep_last=10) == []
+        assert len(_step_checkpoint_dirs(run_dir)) == 2
+
+    def test_no_step_dirs_is_safe_noop(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        assert prune_step_checkpoints(run_dir, keep_last=3) == []
+        assert prune_step_checkpoints(tmp_path / "never", keep_last=3) == []
+
+    def test_non_numeric_checkpoint_dirs_are_never_touched(self, tmp_path):
+        # best_model / oom_checkpoint / checkpoint-best must survive: the
+        # ^checkpoint-(\d+)$ regex only matches numeric step dirs.
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for step in (250, 500, 750):
+            _save_step_checkpoint_dir(run_dir, step)
+        (run_dir / "best_model").mkdir()
+        (run_dir / "oom_checkpoint").mkdir()
+        (run_dir / "checkpoint-best").mkdir()
+
+        removed = prune_step_checkpoints(run_dir, keep_last=1)
+
+        assert [_step_of(p) for p in _step_checkpoint_dirs(run_dir)] == [750]
+        assert {p.name for p in removed} == {f"{STEP_CHECKPOINT_PREFIX}250",
+                                             f"{STEP_CHECKPOINT_PREFIX}500"}
+        assert (run_dir / "best_model").exists()
+        assert (run_dir / "oom_checkpoint").exists()
+        assert (run_dir / "checkpoint-best").exists()
+
+    def test_step_prune_never_touches_cycle_dirs(self, tmp_path):
+        # Forward disjointness: the step regex must not match checkpoint-cycle-*.
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for step in (250, 500, 750):
+            _save_step_checkpoint_dir(run_dir, step)
+        _save_checkpoint_dir(run_dir, 5)  # checkpoint-cycle-5
+
+        prune_step_checkpoints(run_dir, keep_last=1)
+
+        assert [_step_of(p) for p in _step_checkpoint_dirs(run_dir)] == [750]
+        assert len(_checkpoint_dirs(run_dir)) == 1  # the cycle dir survived
+
+    def test_cycle_prune_never_touches_step_dirs(self, tmp_path):
+        # Reverse disjointness: the cycle regex must not match checkpoint-<step>.
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for step in (250, 500, 750):
+            _save_step_checkpoint_dir(run_dir, step)
+        _save_checkpoint_dir(run_dir, 5)  # checkpoint-cycle-5
+
+        prune_checkpoint_cycles(run_dir, keep_last=1)
+
+        assert [_cycle_of(p) for p in _checkpoint_dirs(run_dir)] == [5]
+        assert len(_step_checkpoint_dirs(run_dir)) == 3  # all step dirs survived
+
+
+class TestStepCheckpointDiskFloor:
+    """min_free_disk_gb reclaims oldest step dirs first, never the newest step."""
+
+    def test_floor_never_deletes_the_last_step(self, tmp_path, monkeypatch):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for step in (250, 500, 750):
+            _save_step_checkpoint_dir(run_dir, step)
+
+        # Impossible floor on a tiny disk -> reclaims everything it can but the
+        # policy holds the single newest step as a recovery point.
+        monkeypatch.setattr(
+            shutil,
+            "disk_usage",
+            lambda path: _DiskUsage(total=100 * 1024 ** 3, used=99 * 1024 ** 3,
+                                     free=0),
+        )
+        removed = prune_step_checkpoints(run_dir, keep_last=0, min_free_disk_gb=1000.0)
+
+        assert sorted(_step_of(p) for p in removed) == [250, 500]
+        assert [_step_of(p) for p in _step_checkpoint_dirs(run_dir)] == [750]
+
+
+class TestStepCheckpointConfigDrivenWiring:
+    """prune_step_checkpoints_from_cfg — the seam wired into the baseline
+    periodic-save path. Reads the SAME knobs as the cycle/artifact guards."""
+
+    @staticmethod
+    def _cfg(keep_last=0, min_free=0.0):
+        return {"logging": {"keep_last_checkpoints": keep_last,
+                            "min_free_disk_gb": min_free}}
+
+    def test_knobs_fire_count_bound(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for step in (250, 500, 750, 1000, 1250):
+            _save_step_checkpoint_dir(run_dir, step)
+
+        removed = prune_step_checkpoints_from_cfg(self._cfg(2, 0.0), run_dir)
+
+        assert sorted(_step_of(p) for p in removed) == [250, 500, 750]
+        assert [_step_of(p) for p in _step_checkpoint_dirs(run_dir)] == [1000, 1250]
+
+    def test_defaults_off_is_noop(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for step in (250, 500):
+            _save_step_checkpoint_dir(run_dir, step)
+        assert prune_step_checkpoints_from_cfg(self._cfg(), run_dir) == []
+        assert prune_step_checkpoints_from_cfg({}, run_dir) == []
+
+    def test_missing_logging_section_is_noop(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _save_step_checkpoint_dir(run_dir, 250)
+        assert prune_step_checkpoints_from_cfg(
+            {"experiment": {"name": "x"}}, run_dir
+        ) == []
+        assert prune_step_checkpoints_from_cfg(None, run_dir) == []
+
+    def test_works_with_omegaconf_dictconfig(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for step in (250, 500, 750):
+            _save_step_checkpoint_dir(run_dir, step)
+        cfg = OmegaConf.create({"logging": {"keep_last_checkpoints": 1,
+                                            "min_free_disk_gb": 0.0}})
+
+        removed = prune_step_checkpoints_from_cfg(cfg, run_dir)
+
+        assert [_step_of(p) for p in removed] == [250, 500]
+        assert [_step_of(p) for p in _step_checkpoint_dirs(run_dir)] == [750]
+
+
+class TestBaselineConfigFiresStepPruneEndToEnd:
+    """Closed loop: a real baseline config + schema + opt-in knobs -> bounded
+    step-checkpoint count.
+
+    No shipped baseline config sets the knobs (default-off preserves today's
+    behavior for the comparison/paper runs). This flips them on through the real
+    startup path (load_validate_and_build_config overrides -> Pydantic
+    round-trip) to prove the knob survives the schema for a baseline config and
+    that the typed cfg the baseline trainer holds at runtime fires pruning.
+    """
+
+    def test_baseline_config_with_knobs_bounds_step_dirs(self, tmp_path):
+        _, typed_cfg = load_validate_and_build_config(
+            _REPO_ROOT / "configs/9b_baseline.yaml",
+            overrides=["logging.keep_last_checkpoints=3",
+                       "logging.min_free_disk_gb=0.0"],
+        )
+        assert int(typed_cfg.logging.keep_last_checkpoints) == 3  # survived schema
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for step in range(250, 2001, 250):  # 8 step-saves, keep_last=3 -> keep newest 3
+            _save_step_checkpoint_dir(run_dir, step)
+
+        removed = prune_step_checkpoints_from_cfg(typed_cfg, run_dir)
+
+        assert [_step_of(p) for p in _step_checkpoint_dirs(run_dir)] == [1500, 1750, 2000]
+        assert len(removed) == 5
+
+
+class TestBaselineLoopWiresTheGuard:
+    """Structural guard: the baseline periodic-save block calls BOTH prune seams.
+
+    Mirrors TestTrainLoopWiresTheArtifactGuard for the other training entrypoint.
+    A refactor that silently drops either call re-opens unbounded accumulation
+    on the baseline path while every isolated seam test stays green. ``make
+    train-baseline`` saves checkpoint-<step> dirs every save_every_steps and,
+    with save_trajectory_delta_artifacts: true, .pt files every step — both must
+    be pruned through the cfg seams for the knobs to take effect there.
+    """
+
+    @staticmethod
+    def _imports_and_calls(source, name):
+        tree = ast.parse(source)
+        imported = False
+        call_count = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "src.utils.checkpoint":
+                imported |= any(a.name == name for a in node.names)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == name
+            ):
+                call_count += 1
+        return imported, call_count
+
+    def test_periodic_save_block_imports_and_calls_step_prune(self):
+        source = (_REPO_ROOT / "src/training/train_baseline_qlora.py").read_text()
+        imported, call_count = self._imports_and_calls(
+            source, "prune_step_checkpoints_from_cfg"
+        )
+        assert imported, (
+            "train_baseline_qlora.py must import prune_step_checkpoints_from_cfg "
+            "(the step-checkpoint arm of the M10.3 disk-death guard for the "
+            "baseline entrypoint — the cycle regex never matches checkpoint-<step>)"
+        )
+        assert call_count >= 1, (
+            "train_baseline_qlora.py periodic-save path must call "
+            "prune_step_checkpoints_from_cfg — dropping it re-opens unbounded "
+            "checkpoint-<step> accumulation on the baseline code path"
+        )
+
+    def test_periodic_save_block_imports_and_calls_artifact_prune(self):
+        source = (_REPO_ROOT / "src/training/train_baseline_qlora.py").read_text()
+        imported, call_count = self._imports_and_calls(
+            source, "prune_trajectory_delta_artifacts_from_cfg"
+        )
+        assert imported, (
+            "train_baseline_qlora.py must import "
+            "prune_trajectory_delta_artifacts_from_cfg — the baseline saves "
+            "trajectory_delta_artifacts/*.pt (save_trajectory_delta_artifacts: "
+            "true) on the same path the TG-LoRA guard already covers"
+        )
+        assert call_count >= 1, (
+            "train_baseline_qlora.py periodic-save path must call "
+            "prune_trajectory_delta_artifacts_from_cfg — dropping it re-opens "
+            "unbounded trajectory_delta_artifacts/*.pt accumulation on the "
+            "baseline code path"
+        )
+

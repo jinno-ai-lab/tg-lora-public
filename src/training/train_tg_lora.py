@@ -3927,14 +3927,6 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 # despite keep_last_checkpoints being "on". Same knobs, same default-off.
                 for f in prune_trajectory_delta_artifacts_from_cfg(cfg, run_dir):
                     logger.info("Pruned old trajectory artifact to bound disk: %s", f)
-                # Bound trajectory-delta-artifact growth — the second vector of the
-                # M10.3 disk-death class. The cycle guard above only matches
-                # checkpoint-cycle-* dirs, but save_trajectory_delta_artifacts also
-                # writes 1-2 .pt files per cycle into run_dir/trajectory_delta_artifacts/
-                # and never removed old ones, so this run accumulated them linearly
-                # despite keep_last_checkpoints being "on". Same knobs, same default-off.
-
-
 
     except torch.cuda.OutOfMemoryError as _oom:
         from src.utils.device import is_gpu_oom_error

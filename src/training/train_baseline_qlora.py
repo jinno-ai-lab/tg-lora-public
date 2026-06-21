@@ -28,6 +28,8 @@ from src.training.trajectory_delta_artifact import (
 from src.utils.checkpoint import (
     BaselineTrainingState,
     load_baseline_training_state,
+    prune_step_checkpoints_from_cfg,
+    prune_trajectory_delta_artifacts_from_cfg,
     save_baseline_training_state,
     save_checkpoint,
 )
@@ -506,6 +508,18 @@ def train_baseline(cfg: DictConfig, resume_path: str | None = None) -> None:
                     save_baseline_training_state(bs, optimizer, scheduler, ckpt_dir / "training_state.pt")
                 except NameError:
                     pass  # optimizer deleted on final eval step
+                # Bound on-disk growth (M10.3 disk-death guard) — mirrors the
+                # TG-LoRA periodic-save path. The baseline writes
+                # checkpoint-<step> dirs (the cycle regex never matches these)
+                # and, when save_trajectory_delta_artifacts is on, one .pt per
+                # step into trajectory_delta_artifacts/. Same knobs, same
+                # default-off contract: a no-op until a baseline config opts in
+                # via keep_last_checkpoints / min_free_disk_gb, preserving
+                # today's unbounded behavior for the shipped baseline configs.
+                for d in prune_step_checkpoints_from_cfg(cfg, run_dir):
+                    logger.info("Pruned old checkpoint to bound disk: %s", d)
+                for f in prune_trajectory_delta_artifacts_from_cfg(cfg, run_dir):
+                    logger.info("Pruned old trajectory artifact to bound disk: %s", f)
 
         pbar.close()
     except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
