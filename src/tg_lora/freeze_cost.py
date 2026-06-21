@@ -24,6 +24,7 @@ tables this engine implements.
 from __future__ import annotations
 
 import math
+import statistics
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -341,6 +342,58 @@ def resolve_level1_ceiling(
     if record is None or record.is_thin_evidence:
         return LEVEL1_REALIZED_REDUCTION_CEILING
     return record.observed_reduction
+
+
+def level1_realization_record_from_measurements(
+    baseline_backward: float,
+    level1_backwards: Iterable[float],
+    *,
+    source: str = "cpu_proxy_level1",
+) -> Level1RealizationRecord:
+    """Build the §6.2 ceiling record from measured Level-1 backward traversals.
+
+    Wires the §6.2 ceiling to an actual measurement source: each
+    ``level1_backward`` is the total backward-traversal count of one Level-1
+    (freeze-only) reproduction — e.g. the ``_BackwardCounter.total()`` the
+    in-vivo suite reads off the live autograd graph — and ``baseline_backward``
+    is the matching full-backprop count. The observed Level-1 realized
+    reduction for a reproduction is ``1 − level1/baseline`` (the backward work
+    the freeze elided, measured not predicted), and the record carries the
+    *median* across reproductions with ``num_runs`` set to the reproduction
+    count, so its thin-evidence bar reflects how many real runs underpin it
+    rather than a hand count.
+
+    On the CPU proxy this records the honest in-vivo finding: freezing a
+    layer's weight grad does not stop the activation gradient from traversing
+    it, so the traversal count is unchanged and the observed reduction is ~0
+    (the validated ``LEVEL1_REALIZED_REDUCTION_CEILING``) — a non-thin record
+    of ~0 keeps the ceiling at 0 and the Level-1 verdict at FAIL, honestly. A
+    future run that elides the frozen layer's traversal (e.g. under gradient
+    checkpointing) deposits a nonzero value here through the same adapter, and
+    :func:`resolve_level1_ceiling` then raises the ceiling to recover it.
+    """
+    base = float(baseline_backward)
+    if base <= 0.0:
+        raise ValueError(
+            f"baseline_backward must be positive, got {baseline_backward}"
+        )
+    backs = tuple(float(b) for b in level1_backwards)
+    if len(backs) < 1:
+        raise ValueError(
+            "at least one Level-1 measurement is required; "
+            "pass level1_record=None for no evidence"
+        )
+    reductions = [1.0 - b / base for b in backs]
+    if any(r < 0.0 for r in reductions):
+        raise ValueError(
+            "a Level-1 reproduction realized more backward work than the "
+            f"baseline (reductions={reductions}); a freeze cannot increase "
+            "backward traversals"
+        )
+    observed = statistics.median(reductions)
+    return Level1RealizationRecord(
+        observed_reduction=observed, num_runs=len(backs), source=source
+    )
 
 
 @dataclass(frozen=True)
@@ -1162,6 +1215,55 @@ def calibrate_reproduction_bracket(
     if record is None:
         return None
     return calibrate_reduction_band(record.sample, method=method, z=z)
+
+
+def reproduction_record_from_ab_measurements(
+    baseline_backward: float,
+    reproduction_backwards: Iterable[float],
+    *,
+    source: str = "cpu_proxy_ab",
+) -> ReproductionRecord:
+    """Build the §6.3 bracket record from measured A/B backward traversals.
+
+    Wires the §6.3 across-reproduction bracket to an actual measurement
+    source: each ``reproduction_backward`` is the total backward-traversal
+    count of one Level-2 (suffix-cut) reproduction of the A/B headline — e.g.
+    the ``_BackwardCounter.total()`` the in-vivo suite reads off the live
+    autograd graph — and ``baseline_backward`` is the matching full-backprop
+    count. The observed headline reduction for a reproduction is
+    ``1 − reproduction/baseline`` (the additional backward work the suffix cut
+    elided over the baseline, measured not predicted), and the returned
+    :class:`ReproductionRecord` is exactly what
+    ``compare_freeze_levels(reproduction_record=)`` consumes — so the headline
+    becomes a real, reproduction-counted bracket instead of a bare point
+    (10_guard_experiment.md §6.3).
+
+    Rejects a non-positive baseline and any reproduction that realizes *more*
+    backward work than the baseline (a freeze cannot increase traversals), so
+    no ill-conditioned measurement becomes evidence. The record's own
+    thin-evidence bar (``MIN_SAMPLE_FOR_CONFIDENCE_BAND``) decides whether the
+    bracket is calibrated or flagged ``THIN_EVIDENCE`` — supply ``N >= 3``
+    reproductions for a non-thin bracket.
+    """
+    base = float(baseline_backward)
+    if base <= 0.0:
+        raise ValueError(
+            f"baseline_backward must be positive, got {baseline_backward}"
+        )
+    backs = tuple(float(b) for b in reproduction_backwards)
+    if len(backs) < 1:
+        raise ValueError(
+            "at least one reproduction measurement is required; "
+            "pass reproduction_record=None for no evidence"
+        )
+    observations = tuple(1.0 - b / base for b in backs)
+    if any(o < 0.0 for o in observations):
+        raise ValueError(
+            "a reproduction realized more backward work than the baseline "
+            f"(observations={observations}); a freeze cannot increase "
+            "backward traversals"
+        )
+    return ReproductionRecord(observations=observations, source=source)
 
 
 def frozen_at_epoch_from_freeze_log(

@@ -43,8 +43,10 @@ from src.tg_lora.freeze_cost import (
     format_speed_gate_verdict,
     frozen_at_epoch_from_freeze_log,
     gate_reduction,
+    level1_realization_record_from_measurements,
     per_cycle_realized_reductions,
     realizable_reduction,
+    reproduction_record_from_ab_measurements,
     resolve_level1_ceiling,
     speed_gate_verdict,
     uniform_layer_accountant,
@@ -1506,4 +1508,103 @@ class TestLevel1CeilingRecovery:
         comp = compare_freeze_levels(self._acc(), target_width=2048)
         text = format_level_comparison(comp)
         assert "level1 ceiling" not in text
+
+
+class TestMeasurementSourceAdapters:
+    """Wiring an actual measurement source to the §6.2/§6.3 landing points.
+
+    ``reproduction_record_from_ab_measurements`` and
+    ``level1_realization_record_from_measurements`` convert raw A/B
+    backward-traversal counts (the in-vivo ``_BackwardCounter`` output) into the
+    typed evidence records the landing points consume — the wiring the design
+    deferred to a "real measurement" task. These are the pure-arithmetic
+    guarantees; the end-to-end "N>=3 real reproductions populate a non-thin
+    bracket" runtime outcome lives in ``tests/test_progressive_freeze_invivo.py``.
+    """
+
+    # --- reproduction_record_from_ab_measurements ---
+
+    def test_ab_reductions_and_source_passthrough(self):
+        # baseline 360, reproductions 315/300/285 -> 1 - b/360 =
+        # (0.125, 0.1667, 0.2083); each is one measured headline reduction.
+        record = reproduction_record_from_ab_measurements(360, (315, 300, 285))
+        assert record.observations == pytest.approx((0.125, 0.1667, 0.2083), abs=1e-4)
+        assert record.n == 3
+        assert record.source == "cpu_proxy_ab"
+
+    def test_ab_custom_source_is_auditable(self):
+        record = reproduction_record_from_ab_measurements(
+            100, (80,), source="9b_cuda_ab"
+        )
+        assert record.observations == pytest.approx((0.2,))
+        assert record.source == "9b_cuda_ab"
+
+    def test_ab_three_reproductions_is_non_thin(self):
+        # N>=3 observations clear the bracket's thin-evidence bar.
+        record = reproduction_record_from_ab_measurements(100, (75, 80, 85))
+        assert record.is_thin_evidence is False
+
+    def test_ab_feeds_calibrate_reproduction_bracket(self):
+        # The adapter output is exactly what calibrate_reproduction_bracket
+        # consumes — the wiring closes: measurements -> record -> bracket.
+        record = reproduction_record_from_ab_measurements(100, (75, 80, 85))
+        band = calibrate_reproduction_bracket(record)
+        assert band is not None
+        assert band.is_thin_evidence is False
+        assert band.lower == pytest.approx(0.15)  # 1 - 85/100
+        assert band.upper == pytest.approx(0.25)  # 1 - 75/100
+
+    def test_ab_rejects_nonpositive_baseline(self):
+        for bad in (0, -10):
+            with pytest.raises(ValueError):
+                reproduction_record_from_ab_measurements(bad, (50,))
+
+    def test_ab_rejects_empty_reproductions(self):
+        with pytest.raises(ValueError):
+            reproduction_record_from_ab_measurements(100, ())
+
+    def test_ab_rejects_reproduction_above_baseline(self):
+        # A freeze cannot increase backward traversals; a count above baseline
+        # would fabricate a negative reduction and must not become evidence.
+        with pytest.raises(ValueError):
+            reproduction_record_from_ab_measurements(100, (120, 80))
+
+    # --- level1_realization_record_from_measurements ---
+
+    def test_level1_median_and_run_count(self):
+        # Median across reproductions; num_runs = reproduction count. Three
+        # runs of ~0 (the honest CPU-proxy Level-1 finding).
+        record = level1_realization_record_from_measurements(360, (360, 360, 360))
+        assert record.observed_reduction == pytest.approx(0.0)
+        assert record.num_runs == 3
+        assert record.source == "cpu_proxy_level1"
+
+    def test_level1_median_is_robust_to_an_outlier(self):
+        # A nonzero outlier among zero realizations does not move the median —
+        # the central tendency is robust, not dragged by one run.
+        record = level1_realization_record_from_measurements(
+            100, (100, 100, 50)
+        )  # reductions (0.0, 0.0, 0.5); median 0.0
+        assert record.observed_reduction == pytest.approx(0.0)
+        assert record.num_runs == 3
+
+    def test_level1_non_thin_record_resolves_to_observed(self):
+        # The adapter output is exactly what resolve_level1_ceiling consumes:
+        # a non-thin record returns its observed reduction.
+        record = level1_realization_record_from_measurements(100, (50, 55, 60))
+        assert resolve_level1_ceiling(record) == pytest.approx(0.45)  # median of 0.5/0.45/0.4
+
+    def test_level1_zero_or_one_reproduction_is_thin(self):
+        for backs in ((100,), (90, 100)):
+            record = level1_realization_record_from_measurements(100, backs)
+            assert record.is_thin_evidence is True
+
+    def test_level1_rejects_nonpositive_baseline(self):
+        with pytest.raises(ValueError):
+            level1_realization_record_from_measurements(0, (50,))
+
+    def test_level1_rejects_measurement_above_baseline(self):
+        with pytest.raises(ValueError):
+            level1_realization_record_from_measurements(100, (120, 100))
+
 

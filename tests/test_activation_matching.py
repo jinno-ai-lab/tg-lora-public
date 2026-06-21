@@ -351,3 +351,76 @@ class TestCombinerValidation:
         predicted = torch.randn(2, 3, 4)
         target = torch.randn(2, 3, 4)
         assert torch.isfinite(loss(predicted, target))
+
+
+class TestDistributionLossActive:
+    """Phase-3 distribution-consistency loss is active (non-zero) and observable.
+
+    The distribution arm was implemented behind ``dist_weight=0`` (the Phase 1
+    default) and only exercised by relational combiner tests. These pin concrete
+    before/after values so its L3 ablation status is *observed*, not assumed:
+    on a batch whose covariance differs while the per-element gap is fixed,
+    MSE (Phase 1) misses the joint second-order structure the distribution arm
+    catches (GOAL §3.1 Phase 3, design §6.2).
+    """
+
+    # predicted and target share the same per-element magnitude pattern but
+    # have *different covariance*: MSE sees the point-wise gap; the distribution
+    # arm additionally sees the covariance gap MSE is blind to.
+    PREDICTED = [[1.0, 0.0], [-1.0, 0.0]]
+    TARGET = [[0.0, 1.0], [0.0, -1.0]]
+
+    def test_phase1_before_is_pure_mse(self):
+        # dist_weight=0 (the Phase 1 gate) -> the loss is MSE only.
+        predicted = torch.tensor(self.PREDICTED)
+        target = torch.tensor(self.TARGET)
+        before = ActivationMatchingLoss()(predicted, target)
+        assert before.item() == pytest.approx(1.0)  # == mse_matching_loss
+        assert before.item() == pytest.approx(
+            mse_matching_loss(predicted, target).item()
+        )
+
+    def test_distribution_term_is_nonzero_and_observed(self):
+        # The distribution term is active: on this batch it is 0.5 (the
+        # covariance gap), a signal MSE alone does not carry.
+        predicted = torch.tensor(self.PREDICTED)
+        target = torch.tensor(self.TARGET)
+        dist_term = distribution_matching_loss(predicted, target)
+        assert dist_term.item() == pytest.approx(0.5)
+        assert dist_term.item() > 0.0
+
+    def test_phase3_after_equals_before_plus_distribution_term(self):
+        # Raising dist_weight realises the Phase 3 arm and the loss moves from
+        # the Phase 1 value (1.0) to 1.5 — before/after pinned, observable.
+        predicted = torch.tensor(self.PREDICTED)
+        target = torch.tensor(self.TARGET)
+        before = ActivationMatchingLoss()(predicted, target)
+        after = ActivationMatchingLoss(mse_weight=1.0, dist_weight=1.0)(
+            predicted, target
+        )
+        assert before.item() == pytest.approx(1.0)
+        assert after.item() == pytest.approx(1.5)
+        assert after.item() > before.item()
+
+    def test_coefficient_scales_the_distribution_term(self):
+        # The arm is a weight, not a switch: dist_weight=2 doubles the
+        # contribution (1.0 + 2*0.5 = 2.0) — the ablation is a weight change.
+        predicted = torch.tensor(self.PREDICTED)
+        target = torch.tensor(self.TARGET)
+        doubled = ActivationMatchingLoss(mse_weight=1.0, dist_weight=2.0)(
+            predicted, target
+        )
+        assert doubled.item() == pytest.approx(2.0)
+
+    def test_distribution_arm_emits_gradient(self):
+        # Active in the optimisation sense: the distribution term backprops a
+        # non-zero gradient into the front-layer output, so it is a real
+        # training signal, not a no-op slot.
+        predicted = torch.tensor(self.PREDICTED, requires_grad=True)
+        target = torch.tensor(self.TARGET)
+        ActivationMatchingLoss(mse_weight=1.0, dist_weight=1.0)(
+            predicted, target
+        ).backward()
+        assert predicted.grad is not None
+        assert float(predicted.grad.abs().sum()) > 0.0
+
