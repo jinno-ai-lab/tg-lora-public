@@ -1594,3 +1594,51 @@ Phase 66 完了。残存する未完了タスク:
 - **TASK-0108** (Phase 51): GPU依存の外部品質評価パイプライン
 
 プロジェクトの実装・テスト・ドキュメントは実質的に完了状態（2538テスト全パス、カバレッジ99%、517/517受け入れ基準）。
+
+
+<!-- spine:references:begin -->
+## Spine: external references
+
+- [TASK-0020: docs/llm-wiki git tracking 解除とクリーンアップ](TASK-0020.md)
+- [TASK-0021: _InfiniteBatchIterator StopIteration テスト強化](TASK-0021.md)
+- [TASK-0022: MLflow 実験ロギング統合](TASK-0022.md)
+- [TASK-0023: GitHub Actions CI/CD パイプライン構築](TASK-0023.md)
+- [TASK-0024: Docker 開発環境構築](TASK-0024.md)
+- [TASK-0025: データスキーマバリデーション追加](TASK-0025.md)
+- [TASK-0026: 比較レポート可視化強化](TASK-0026.md)
+- [TASK-0027: GPU学習環境準備とモデル読み込み検証](TASK-0027.md)
+- [TASK-0028: TG-LoRA 10サイクル学習スモークテスト](TASK-0028.md)
+- [TASK-0029: ベースラインQLoRA学習実行](TASK-0029.md)
+- [TASK-0030: 公正比較実験と結果分析](TASK-0030.md)
+- [TASK-0031: Phase 9 受け入れ基準・ドキュメント更新](TASK-0031.md)
+- [TASK-0032: 実外挿コードによるNaN検出統合テスト](TASK-0032.md)
+- [TASK-0033: 多様化障害サイクル統合テスト](TASK-0033.md)
+- [TASK-0034: Phase 14 信頼性修正の全テストスイート検証とリグレッション確認](TASK-0034.md)
+- [TASK-0035: Phase 15 ドキュメント・受け入れ基準更新](TASK-0035.md)
+- [TASK-0036: ベースライン学習にEvalLossResult統合](TASK-0036.md)
+- [TASK-0037: 未使用Config項目の整理と早期停止パラメータ露出](TASK-0037.md)
+- [TASK-0038: MLflow ロギングのベースライン/TG-LoRA間一貫性確保](TASK-0038.md)
+- [TASK-0039: Layer Sampler temperatureパラメータ統合テスト](TASK-0039.md)
+- [TASK-0040: RunMetrics perplexity出力とEvalLossResult E2Eテスト](TASK-0040.md)
+- [TASK-0041: 空テストスタブ補完とエッジケースカバレッジ向上](TASK-0041.md)
+- [TASK-0042: Phase 16-17 ドキュメント更新](TASK-0042.md)
+- [TASK-0046: Phase 19 完了ドキュメント更新](TASK-0046.md)
+- [TASK-0047: GPUテストOOM保護とリソース競合対策](TASK-0047.md)
+- [TASK-0048: テストスイート全通過確認とリグレッションテスト](TASK-0048.md)
+- [TASK-0050: Phase 21 全テストスイート検証とoverview更新](TASK-0050.md)
+- [TASK-0066: Ruff lint・format クリーンアップ](TASK-0066.md)
+- [TASK-0067: テストスイート全通過確認とoverview整合性更新](TASK-0067.md)
+- [TASK-0078: Phase 33 overview.md更新とテスト数修正](TASK-0078.md)
+- [TASK-0106: Stage 2 マルチシード実験実行とGate評価](TASK-0106.md)
+- [TASK-0107: Stage 3 メモリフロンティアスイープ自動化スクリプト](TASK-0107.md)
+- [TASK-0108: 外部品質評価パイプライン（G3 Gate）](TASK-0108.md)
+- [TASK-0109: 因果分析評価ロジック拡張（G4 Gate）](TASK-0109.md)
+- [TASK-0110: 論文結果統合・テーブル自動生成スクリプト](TASK-0110.md)
+- [TASK-0111: Stage 2 実行前Smoke検証強化](TASK-0111.md)
+- [TASK-0130: Progressive Freezing schedule+frontier+local-loss E2E integration test](TASK-0130.md)
+- [TASK-0131: ProgressiveFreezeController 多層プログレッシブ凍結（design §4.1）](TASK-0131.md)
+- [TASK-0132: §6.2 Level-1 証拠配管 — 計測された in-vivo 実現削減が ceiling を引き上げて回復する着地点（design §6.2）](TASK-0132.md)
+- [TASK-0133: §6.3 比較ヘッドライン再生産 bracket 着地点 — A/B 再生産観測が additional_realized_reduction の bracket を較正する着地点（design §6.3 / Phase 3）](TASK-0133.md)
+- [TASK-0134: §6.3 分散較正バンドの非負床注記 — `format_reduction_band` が負の下限を達成可能と読ませない着地点（design §6.3）](TASK-0134.md)
+
+<!-- spine:references:end -->
