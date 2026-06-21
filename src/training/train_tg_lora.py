@@ -1646,13 +1646,12 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
             # --- Dynamic Reversible Freeze (M10) ---
             dynfreeze_all_frozen = False
             if dynfreeze is not None:
-                dynfreeze_r_A = dynfreeze.compute_r_A(model, cycle)
-                to_unfreeze = dynfreeze.decide_unfreeze(cycle)
-                dynfreeze.apply_unfreeze(model, to_unfreeze, cycle=cycle)
-                to_freeze = dynfreeze.decide_freeze(cycle)
-                dynfreeze.apply_freeze(model, to_freeze, cycle)
-                # If all layers are frozen, skip the expensive training steps
-                dynfreeze_all_frozen = dynfreeze.block_size == len(dynfreeze._all_layers)
+                # One composed per-cycle step (compute → decide/apply unfreeze →
+                # decide/apply freeze). The order inside run_cycle is load-bearing:
+                # apply_unfreeze must precede decide_freeze so a §4-released layer's
+                # cooldown (not its frozen-period 0.0 r_A history) holds it out of
+                # the freeze decision — see DynamicFreezeController.run_cycle.
+                dynfreeze_all_frozen = dynfreeze.run_cycle(model, cycle)
 
             # 2b. Measurement: noise SNR (multiple independent batch gradients at W0)
             _measurement_noise = cfg.training.get("measurement_noise_samples", 0)

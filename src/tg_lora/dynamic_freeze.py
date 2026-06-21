@@ -333,6 +333,36 @@ class DynamicFreezeController:
         return unfrozen_count
 
     # ------------------------------------------------------------------
+    # Per-cycle trainer seam
+    # ------------------------------------------------------------------
+
+    def run_cycle(self, model: nn.Module, cycle: int) -> bool:
+        """One trainer per-cycle step in the load-bearing order.
+
+        Executes ``compute_r_A → decide_unfreeze → apply_unfreeze →
+        decide_freeze → apply_freeze`` as a single unit — the exact sequence
+        ``train_tg_lora.py`` runs each cycle — and returns whether every
+        trainable layer is now frozen (the trainer then skips the expensive
+        training steps; ``10_guard_experiment.md`` §9 "スキップ").
+
+        The order is not arbitrary: ``apply_unfreeze`` MUST precede
+        ``decide_freeze``. A §4-released layer's frozen-period r_A history is
+        all ``0.0`` (an artifact of being frozen, not real quietness), so if
+        ``decide_freeze`` ran first it would re-freeze the layer in the same
+        cycle and the reversible release would be a silent no-op.
+        ``apply_unfreeze(cycle=)`` arms the release cooldown that holds the
+        layer out of the freeze decision, and re-arms the §4(a) stir timer so
+        stir is periodic rather than draining the block one layer per cycle.
+        Dropping the ``cycle`` kwarg breaks both.
+        """
+        self.compute_r_A(model, cycle)
+        to_unfreeze = self.decide_unfreeze(cycle)
+        self.apply_unfreeze(model, to_unfreeze, cycle=cycle)
+        to_freeze = self.decide_freeze(cycle)
+        self.apply_freeze(model, to_freeze, cycle)
+        return self.block_size == len(self._all_layers)
+
+    # ------------------------------------------------------------------
     # active_names filtering for M9
     # ------------------------------------------------------------------
 

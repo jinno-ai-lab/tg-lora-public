@@ -592,3 +592,99 @@ class TestGuardsDoNotOverFire:
         }
         r_A = dfc.compute_r_A(model, 0)
         assert r_A[5] > 0.0, "legitimately small moving series was masked (over-correction)"
+
+
+# ---------------------------------------------------------------------------
+# Trainer seam: the per-cycle call ``train_tg_lora.py`` makes is
+# ``DynamicFreezeController.run_cycle`` — the whole load-bearing order
+# (compute_r_A → decide_unfreeze → apply_unfreeze → decide_freeze → apply_freeze)
+# executed as one unit. The tests above drive the controller's methods one at a
+# time, so a refactor that reordered those calls or dropped the ``cycle`` kwarg
+# (which re-arms the §4(a) stir timer and arms the release cooldown) in the
+# *trainer* would pass every other test and only fail in a GPU burn. These drive
+# the composed seam — the actual runtime path — so the order is pinned where it
+# runs, not just where it is unit-tested.
+# ---------------------------------------------------------------------------
+
+
+class TestRunCycleTrainerSeam:
+    def test_stir_release_holds_and_resumes_in_one_seam_call(self):
+        """The headline §4 property through the composed seam the trainer calls.
+
+        The trainer invokes ``run_cycle`` once per cycle. This proves its
+        internal order makes the §4(a) reversible release take effect *within a
+        single call*: ``decide_unfreeze`` releases the upstream end, then the
+        SAME call's ``decide_freeze`` must NOT re-freeze it —
+        ``apply_unfreeze(cycle=)`` armed the cooldown that holds it. Reorder the
+        seam (``decide_freeze`` before ``apply_unfreeze``) or drop the ``cycle``
+        kwarg and L3's frozen-period 0.0 history re-freezes it here, so this
+        test pins both load-bearing facts of the trainer wiring. Real SGD steps
+        make ``compute_r_A`` a genuine signal and let the released layer
+        actually resume training on the next step (the steering's "resumes
+        gradient updates" property, now at the runtime-seam level).
+        """
+        torch.manual_seed(0)
+        model = _build_model()
+        optimizer = torch.optim.SGD(model.parameters(), lr=1e-1)
+        window, stir = 3, 4
+        dfc = _make(window=window, stir_interval=stir, a_mask_ratio=0.0)
+
+        # Warm-up: real steps so the open layers accumulate genuine r_A history.
+        for _ in range(window):
+            optimizer.zero_grad(set_to_none=True)
+            model(torch.randn(4, 8)).sum().backward()
+            optimizer.step()
+
+        dfc.apply_freeze(model, [5, 4, 3], cycle=window)
+        assert dfc.frozen_block == [5, 4, 3]
+        p3 = dict(iter_all_lora_params_by_layer(model)[3])  # upstream end
+        p5 = dict(iter_all_lora_params_by_layer(model)[5])  # still-frozen output
+        snap3_b = p3["layers.3.lora_B"].detach().clone()
+        snap5_b = p5["layers.5.lora_B"].detach().clone()
+
+        release_cycle = window + stir  # frozen `stir` cycles → §4(a) fires
+        optimizer.zero_grad(set_to_none=True)
+        model(torch.randn(4, 8)).sum().backward()
+        optimizer.step()
+        # The trainer's single composed per-cycle call.
+        assert dfc.run_cycle(model, release_cycle) is False  # layers 0..2 open
+
+        # Released by decide_unfreeze+apply_unfreeze, NOT re-frozen by the same
+        # call's decide_freeze+apply_freeze (cooldown holds it).
+        assert dfc.frozen_block == [5, 4], (
+            f"run_cycle re-froze the just-released L3 ({dfc.frozen_block}) — "
+            "the seam's call order or cycle= kwarg is wrong"
+        )
+        for p in p3.values():
+            assert p.requires_grad
+
+        # Behavioral: the released layer resumes training on the next real step,
+        # while the still-frozen output side never moves.
+        optimizer.zero_grad(set_to_none=True)
+        model(torch.randn(4, 8)).sum().backward()
+        optimizer.step()
+        assert not torch.equal(p3["layers.3.lora_B"], snap3_b), (
+            "released L3 did not resume training through the seam"
+        )
+        assert torch.equal(p5["layers.5.lora_B"], snap5_b), (
+            "still-frozen L5 moved — freeze not holding through the seam"
+        )
+
+    def test_all_frozen_short_circuit_flag(self):
+        """§9 trainer duty (``10_guard_experiment.md`` §9 "スキップ"): when every
+        layer is frozen, ``run_cycle`` returns True so the trainer skips the
+        expensive training steps; otherwise False. This flag had zero coverage.
+        Called within the stir interval so §4(a) releases nothing and the flag
+        is read off a stable all-frozen block.
+        """
+        model = _build_model()
+        dfc = _make(window=3, stir_interval=100)
+        # Partial block → not all frozen (the headline test above also asserts
+        # the False return during a partial freeze; this fixes the True pole).
+        dfc.apply_freeze(model, [5, 4, 3], cycle=0)
+        assert dfc.block_size < len(dfc._all_layers)
+        # Every layer frozen → short-circuit True, and the block is untouched.
+        dfc.apply_freeze(model, [2, 1, 0], cycle=0)
+        assert dfc.block_size == len(dfc._all_layers)
+        assert dfc.run_cycle(model, 5) is True
+        assert dfc.frozen_block == [5, 4, 3, 2, 1, 0]
