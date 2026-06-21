@@ -424,3 +424,88 @@ class TestDistributionLossActive:
         assert predicted.grad is not None
         assert float(predicted.grad.abs().sum()) > 0.0
 
+
+class TestBreakdown:
+    """Per-arm observability: each Phase-3 arm's contribution is directly queryable.
+
+    The distribution/cosine arms were only observable *indirectly* — by calling
+    the loss twice (``dist_weight=0`` vs ``dist_weight>0``) and subtracting the
+    two scalars. That infers the arm's contribution but never states it, so a
+    training run cannot log "the distribution term contributed X this step"
+    without a recompute-and-subtract. :meth:`ActivationMatchingLoss.breakdown`
+    names each arm's weighted contribution as a first-class value, so the
+    Phase-3 ablation is *observable* (GOAL §3.1) — exactly the "active
+    (non-zero coefficient), not assumed" status the constitution's §7 honesty
+    rule requires before trusting the arm downstream.
+    """
+
+    # Same covariance-differs / point-wise-fixed fixture as TestDistributionLossActive:
+    # MSE = 1.0, the distribution term = 0.5, the Phase-3 total = 1.5.
+    PREDICTED = [[1.0, 0.0], [-1.0, 0.0]]
+    TARGET = [[0.0, 1.0], [0.0, -1.0]]
+
+    def test_total_equals_call_scalar(self):
+        # The breakdown is the decomposition of __call__: its total is the scalar
+        # the loss returns, byte-identical (so wiring the breakdown changes
+        # nothing about the gradient the trainer sees).
+        predicted = torch.randn(3, 5, 7)
+        target = torch.randn(3, 5, 7)
+        for loss in (
+            ActivationMatchingLoss(),
+            ActivationMatchingLoss(mse_weight=1.0, cosine_weight=1.0),
+            ActivationMatchingLoss(mse_weight=1.0, dist_weight=1.0),
+            ActivationMatchingLoss(mse_weight=2.0, cosine_weight=3.0, dist_weight=4.0),
+        ):
+            bd = loss.breakdown(predicted, target)
+            assert torch.allclose(bd.total, loss(predicted, target))
+
+    def test_inactive_arms_report_zero(self):
+        # Pure-MSE (the Phase 1 gate): only the mse slot is set; cosine/dist are
+        # exactly zero, so a reader of the breakdown sees plainly that those arms
+        # are off — no recompute-and-subtract to confirm it.
+        predicted = torch.tensor(self.PREDICTED)
+        target = torch.tensor(self.TARGET)
+        bd = ActivationMatchingLoss().breakdown(predicted, target)
+        assert torch.allclose(bd.mse, mse_matching_loss(predicted, target))
+        assert float(bd.cosine) == 0.0
+        assert float(bd.dist) == 0.0
+
+    def test_each_active_arm_matches_its_weighted_raw_loss(self):
+        # Each slot is the arm's weighted contribution, computed once (not twice
+        # and subtracted): mse = mse_weight*mse, cosine = cosine_weight*cos, etc.
+        predicted = torch.randn(3, 5, 7)
+        target = torch.randn(3, 5, 7)
+        loss = ActivationMatchingLoss(mse_weight=2.0, cosine_weight=3.0, dist_weight=4.0)
+        bd = loss.breakdown(predicted, target)
+        assert torch.allclose(bd.mse, 2.0 * mse_matching_loss(predicted, target))
+        assert torch.allclose(bd.cosine, 3.0 * cosine_matching_loss(predicted, target))
+        assert torch.allclose(bd.dist, 4.0 * distribution_matching_loss(predicted, target))
+
+    def test_distribution_contribution_observed_directly_not_subtracted(self):
+        # The Phase-3 before/after, observed as a named value: the distribution
+        # slot IS the after-minus-before delta (0.5), read off one breakdown
+        # rather than two loss objects — so "the arm is active by 0.5" is a
+        # stated fact, not an inference.
+        predicted = torch.tensor(self.PREDICTED)
+        target = torch.tensor(self.TARGET)
+        before = ActivationMatchingLoss().breakdown(predicted, target)
+        after = ActivationMatchingLoss(mse_weight=1.0, dist_weight=1.0).breakdown(
+            predicted, target
+        )
+        assert before.total.item() == pytest.approx(1.0)  # Phase 1
+        assert after.total.item() == pytest.approx(1.5)  # Phase 3
+        assert after.dist.item() == pytest.approx(0.5)  # the arm, named
+        assert (after.total - before.total).item() == pytest.approx(after.dist.item())
+
+    def test_breakdown_total_carries_gradient(self):
+        # The breakdown is the same graph as __call__: backpropping its total
+        # pulls the front toward the target exactly as the scalar loss does.
+        predicted = torch.tensor(self.PREDICTED, requires_grad=True)
+        target = torch.tensor(self.TARGET)
+        ActivationMatchingLoss(mse_weight=1.0, dist_weight=1.0).breakdown(
+            predicted, target
+        ).total.backward()
+        assert predicted.grad is not None
+        assert float(predicted.grad.abs().sum()) > 0.0
+
+

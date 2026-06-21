@@ -52,6 +52,7 @@ genuinely removes a layer from the gradient flow — the same faithful property
 the e2e suite relies on.
 """
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -287,15 +288,22 @@ def _run_trio(
     *,
     total: int = TOTAL,
     warmup: int = WARMUP,
+    loss_fn: ActivationMatchingLoss | None = None,
 ) -> tuple[list[float], int]:
-    """MS-007 trio: progressive freeze + boundary local loss (Level-2 suffix cut)."""
+    """MS-007 trio: progressive freeze + boundary local loss (Level-2 suffix cut).
+
+    ``loss_fn`` defaults to the Phase-1 pure-MSE combiner; pass one with a
+    non-zero cosine/dist weight to run the GOAL §3.1 Phase-3 loss ablation over
+    the trio's real trajectory (the boundary local loss trains on it directly).
+    """
     model = _build_model(0)
     opt = torch.optim.SGD(_trainable_params(model), lr=LR)
     bc = _BackwardCounter(model)
     ctrl = ProgressiveFreezeController(
         start_cycle=warmup, active_layer_indices=set(range(NUM_LAYERS)), schedule=schedule
     )
-    loss_fn = ActivationMatchingLoss()
+    if loss_fn is None:
+        loss_fn = ActivationMatchingLoss()
     evals = [_eval_loss(model, batches)]
     for epoch in range(total):
         ctrl.progress(model, epoch, batches, "cpu")
@@ -880,6 +888,105 @@ class TestDistributionLossInTrainingPath:
         # the real compute_local_loss call, exactly as the tensor test predicts.
         assert before.item() > 0.0
         assert after.item() > before.item()
+
+
+class TestDistributionLossInTrajectory:
+    """The Phase-3 distribution arm observed over a real trio training trajectory.
+
+    ``TestDistributionLossActive`` pinned the arm's isolated-tensor before/after
+    (1.0 -> 1.5); ``TestDistributionLossInTrainingPath`` drove the front off the
+    pin once and read a scalar delta. Neither exercised the arm over an *actual
+    training trajectory* — the trio always trained on pure MSE. This class runs
+    the trio with the distribution arm live (``dist_weight>0``) over its real
+    frozen schedule and reads the arm's contribution through the controller's
+    :meth:`local_loss_breakdown` at the boundary, so its Phase-3 status is
+    observed step-by-step in the training path rather than reconstructed from a
+    one-shot scalar subtraction — the "active, not assumed" status GOAL §3.1 /
+    §7 ask for.
+
+    Honest regime (design §3.3 / §6.2): the boundary local loss PINS the front to
+    the cached ``xin``, so in steady state the distribution term sits at ~0 — the
+    arm is live (it fires the instant the front leaves the pin) but quiescent
+    while the pin holds. That is the proxy-loss-limit note: the arm earns its
+    keep when MSE underfits the target distribution, not in the exact-pin regime
+    the CPU-proxy trio reaches. Pinned honestly rather than claiming a quality win
+    the pin regime does not produce.
+    """
+
+    def test_trio_trains_end_to_end_with_distribution_arm(self):
+        # The Phase-3 arm in the real training path, not a one-shot probe: the
+        # trio runs to completion with dist_weight>0, learns (final eval below the
+        # init), and cuts exactly the same backward traversals as the pure-MSE
+        # trio — the arm adds a loss term, never a backward pass (the suffix cut
+        # is set by the shared schedule, not the loss).
+        batches = _make_batches()
+        schedule = _schedule()
+        _, mse_bw = _run_trio(batches, schedule)
+        dist_evals, dist_bw = _run_trio(
+            batches,
+            schedule,
+            loss_fn=ActivationMatchingLoss(mse_weight=1.0, dist_weight=1.0),
+        )
+        assert math.isfinite(dist_evals[-1])
+        assert dist_evals[-1] < dist_evals[0]  # the arm does not stop the trio learning
+        assert dist_bw == mse_bw  # same schedule -> identical suffix cut
+
+    def test_distribution_term_observed_via_breakdown_not_subtracted(self):
+        # Over the real trajectory: warm up on the final loss, freeze + cache xin
+        # at the boundary, then read the boundary local loss's breakdown through
+        # the controller. On the pin the distribution slot is ~0 (honest steady
+        # state); drive the front off the pin and the distribution slot rises
+        # above 0 — read off ONE breakdown, not subtracted from a second scalar.
+        # The breakdown total equals compute_local_loss, so the two views agree.
+        batches = _make_batches()
+        model = _build_model(0)
+        opt = torch.optim.SGD(_trainable_params(model), lr=LR)
+        for _ in range(_REPRO_WARMUP):  # warm up on the final task loss
+            for b in batches:
+                opt.zero_grad(set_to_none=True)
+                out = model(input_ids=b["input_ids"], attention_mask=b["attention_mask"])
+                _lm_loss(out.logits, b).backward()
+                opt.step()
+        schedule = _schedule_at_depth(1, total=_REPRO_TOTAL, warmup=_REPRO_WARMUP)
+        ctrl = ProgressiveFreezeController(
+            start_cycle=_REPRO_WARMUP,
+            active_layer_indices=set(range(NUM_LAYERS)),
+            schedule=schedule,
+        )
+        ctrl.progress(model, _REPRO_WARMUP, batches, "cpu")  # freeze + cache xin
+        boundary = min(ctrl.frozen_layers)
+        loss_fn = ActivationMatchingLoss(mse_weight=1.0, dist_weight=1.0)
+        b = batches[0]
+
+        # On the pin, the cached xin is exactly the front's current output, so the
+        # distribution slot is ~0 (the arm is live but quiescent); the breakdown
+        # total equals the scalar compute_local_loss, so the two views agree.
+        on_pin = ctrl.local_loss_breakdown(
+            model, b, loss_fn, batch_idx=0, layer_idx=boundary
+        )
+        assert on_pin.dist.item() == pytest.approx(0.0, abs=1e-6)
+        assert on_pin.total.item() == pytest.approx(
+            ctrl.compute_local_loss(
+                model, b, loss_fn, batch_idx=0, layer_idx=boundary
+            ).item()
+        )
+
+        # Drive the front off the pin (the state in which the arm carries signal):
+        layer_map = iter_all_lora_params_by_layer(model)
+        front_params = [p for li in range(boundary) for _, p in layer_map[li]]
+        with torch.no_grad():
+            for p in front_params:
+                p.add_(0.05 * torch.randn_like(p))
+
+        # Off the pin the distribution slot is directly observed > 0 — the arm is
+        # active in the training-path loss object, read off one breakdown (not a
+        # subtracted scalar), and its total rises above the on-pin value.
+        off_pin = ctrl.local_loss_breakdown(
+            model, b, loss_fn, batch_idx=0, layer_idx=boundary
+        )
+        assert off_pin.dist.item() > 0.0
+        assert off_pin.total.item() > on_pin.total.item()
+
 
 
 

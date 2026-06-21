@@ -36,7 +36,10 @@ import torch.nn as nn
 
 from src.model.lora_utils import iter_all_lora_params_by_layer
 from src.tg_lora.activation_cache import _get_decoder_layers
-from src.tg_lora.activation_matching import ActivationMatchingLoss
+from src.tg_lora.activation_matching import (
+    ActivationMatchingBreakdown,
+    ActivationMatchingLoss,
+)
 from src.tg_lora.freeze_schedule import FreezeSchedule
 
 logger = logging.getLogger("tg-lora")
@@ -287,6 +290,56 @@ class ProgressiveFreezeController:
             If the layer is not frozen, no ``xin`` is cached for it at
             ``batch_idx``, or the forward did not reach the frozen layer.
         """
+        predicted, target, mask = self._local_loss_inputs(
+            model, batch, batch_idx=batch_idx, device=device, layer_idx=layer_idx
+        )
+        return loss_fn(predicted, target, mask=mask)
+
+    def local_loss_breakdown(
+        self,
+        model: nn.Module,
+        batch: dict,
+        loss_fn: ActivationMatchingLoss,
+        *,
+        batch_idx: int = 0,
+        device: torch.device | str = "cpu",
+        layer_idx: int | None = None,
+    ) -> ActivationMatchingBreakdown:
+        """Per-arm breakdown of the boundary local loss — the Phase-3 arms, observed.
+
+        The decomposed counterpart of :meth:`compute_local_loss`: same forward,
+        same cached ``xin``, same mask, but returns
+        :meth:`ActivationMatchingLoss.breakdown` so each Phase-3 arm's weighted
+        contribution (``mse`` / ``cosine`` / ``dist``) is read off the training
+        path rather than inferred by calling the scalar loss with and without an
+        arm's weight. Use this to log which arm is active (non-zero) at each
+        post-freeze step of the Level-2 trajectory — the Phase-3 ablation made
+        observable in the training path (GOAL §3.1; design §6.2), the status the
+        constitution's §7 honesty rule requires before the arm is trusted
+        downstream. ``loss_fn.total`` equals :meth:`compute_local_loss` for the
+        same inputs, so the two never disagree.
+        """
+        predicted, target, mask = self._local_loss_inputs(
+            model, batch, batch_idx=batch_idx, device=device, layer_idx=layer_idx
+        )
+        return loss_fn.breakdown(predicted, target, mask=mask)
+
+    def _local_loss_inputs(
+        self,
+        model: nn.Module,
+        batch: dict,
+        *,
+        batch_idx: int = 0,
+        device: torch.device | str = "cpu",
+        layer_idx: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Resolve the ``(predicted, target, mask)`` triple the local loss trains on.
+
+        Shared by :meth:`compute_local_loss` (which returns the scalar) and
+        :meth:`local_loss_breakdown` (which returns the per-arm decomposition), so
+        the two observe an identical forward / cached ``xin`` / mask and can never
+        diverge. Raises the same ``RuntimeError`` cases as :meth:`compute_local_loss`.
+        """
         if layer_idx is None:
             if self._last_frozen_layer is None:
                 raise RuntimeError(
@@ -318,8 +371,7 @@ class ProgressiveFreezeController:
         mask = batch.get("attention_mask")
         if mask is not None:
             mask = mask.to(device=device, dtype=predicted.dtype).unsqueeze(-1)
-
-        return loss_fn(predicted, target, mask=mask)
+        return predicted, target, mask
 
     # -- private helpers -----------------------------------------------------
 

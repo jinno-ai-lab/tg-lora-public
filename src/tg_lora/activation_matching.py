@@ -200,6 +200,39 @@ def distribution_matching_loss(
 
 
 @dataclass(frozen=True)
+class ActivationMatchingBreakdown:
+    """The weighted per-arm contributions of one :class:`ActivationMatchingLoss` call.
+
+    Each field is the amount one Phase-3 arm adds to the scalar: ``mse`` is
+    ``mse_weight·MSE``, ``cosine`` is ``cosine_weight·(1−cos)``, ``dist`` is
+    ``dist_weight·distribution``. An arm whose weight is 0 reports ``0.0`` — so a
+    reader sees plainly that the arm is off, rather than inferring it by calling
+    the loss twice and subtracting. :attr:`total` is their sum, byte-identical to
+    :meth:`ActivationMatchingLoss.__call__`.
+
+    This makes the Phase-3 ablation *observable* (GOAL §3.1): a training run can
+    log "the distribution term contributed ``dist`` this step" as a first-class
+    value, so the arm's "active (non-zero coefficient)" status is a stated fact,
+    not an assumption reconstructed from two scalars (design §6.2; GOAL §7:
+    observe the mechanism before trusting it downstream).
+
+    The active arms carry differentiable tensors (so :attr:`total` backprops as
+    the scalar loss does); the ``0.0`` defaults are plain floats for inactive
+    arms. At least one arm is always active (:class:`ActivationMatchingLoss`
+    rejects an all-zero combiner), so :attr:`total` is always a tensor on real
+    input.
+    """
+
+    mse: torch.Tensor | float = 0.0
+    cosine: torch.Tensor | float = 0.0
+    dist: torch.Tensor | float = 0.0
+
+    @property
+    def total(self) -> torch.Tensor | float:
+        return self.mse + self.cosine + self.dist
+
+
+@dataclass(frozen=True)
 class ActivationMatchingLoss:
     """Weighted combination of MSE, cosine, and distribution matching losses.
 
@@ -243,13 +276,42 @@ class ActivationMatchingLoss:
         *,
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        loss = self.mse_weight * mse_matching_loss(predicted, target, mask=mask)
+        return self.breakdown(predicted, target, mask=mask).total
+
+    def breakdown(
+        self,
+        predicted: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
+    ) -> ActivationMatchingBreakdown:
+        """Each Phase-3 arm's weighted contribution (the ablation, made observable).
+
+        Returns an :class:`ActivationMatchingBreakdown` whose ``mse`` / ``cosine``
+        / ``dist`` slots are the weighted contributions of the active arms (and
+        ``0.0`` for the inactive ones), summing to the scalar :meth:`__call__`
+        returns. Each active arm's term is computed once and named, so a training
+        run observes "the distribution term contributed ``dist``" directly rather
+        than reconstructing it by calling the loss with and without
+        ``dist_weight`` — the Phase-3 ablation's "active, not assumed" status
+        (GOAL §3.1, design §6.2).
+
+        Inactive arms (weight ``0``) are skipped rather than multiplied through,
+        matching :meth:`__call__`'s lazy evaluation: the ``H×H`` covariance of
+        the distribution arm is not computed when ``dist_weight=0``, so observing
+        the breakdown costs no more than the scalar loss would.
+        """
+        mse: torch.Tensor | float = 0.0
+        cosine: torch.Tensor | float = 0.0
+        dist: torch.Tensor | float = 0.0
+        if self.mse_weight > 0:
+            mse = self.mse_weight * mse_matching_loss(predicted, target, mask=mask)
         if self.cosine_weight > 0:
-            loss = loss + self.cosine_weight * cosine_matching_loss(
+            cosine = self.cosine_weight * cosine_matching_loss(
                 predicted, target, mask=mask
             )
         if self.dist_weight > 0:
-            loss = loss + self.dist_weight * distribution_matching_loss(
+            dist = self.dist_weight * distribution_matching_loss(
                 predicted, target, mask=mask
             )
-        return loss
+        return ActivationMatchingBreakdown(mse=mse, cosine=cosine, dist=dist)
