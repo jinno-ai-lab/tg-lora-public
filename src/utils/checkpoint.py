@@ -533,6 +533,12 @@ def save_training_state(state: TrainingState, path: Path) -> None:
                 "prev_A_fro": state.dynfreeze_state.prev_A_fro,
                 "median_A": state.dynfreeze_state.median_A,
                 "epsilon": state.dynfreeze_state.epsilon,
+                # §4 release-cooldown map (layer_idx → cycle last released). Must
+                # survive the round-trip: a run that checkpoints while a layer is
+                # mid-cooldown and resumes otherwise loses the cooldown and §3
+                # silently re-freezes the just-released layer on its stale 0.0
+                # r_A history — the §4 reversible release undone on resume.
+                "released_at": state.dynfreeze_state.released_at,
             }
             if state.dynfreeze_state is not None
             else None
@@ -605,6 +611,10 @@ def load_training_state(path: Path) -> TrainingState:
             prev_A_fro=dynfreeze_raw.get("prev_A_fro", {}),
             median_A=dynfreeze_raw.get("median_A", 0.0),
             epsilon=dynfreeze_raw.get("epsilon", 1e-6),
+            # Absent on pre-fix checkpoints → no active cooldown (the only sane
+            # reading of a checkpoint that predates the field). Mirrors the
+            # controller's own legacy tolerance in ``load_state_dict``.
+            released_at=dynfreeze_raw.get("released_at", {}),
         )
 
     return TrainingState(

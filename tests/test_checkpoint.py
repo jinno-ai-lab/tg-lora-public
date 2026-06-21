@@ -1,6 +1,7 @@
 """Tests for save_checkpoint, save/load_training_state, _sanitize_tensors."""
 
 import logging
+from collections import deque
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -8,6 +9,7 @@ import torch
 
 from src.tg_lora.cycle_state import CycleState
 from src.tg_lora.delta_tracker import DeltaTracker
+from src.tg_lora.dynamic_freeze import DynamicFreezeController, DynFreezeState
 from src.tg_lora.random_walk_controller import ControllerState
 from src.tg_lora.velocity import Velocity
 from src.utils.checkpoint import (
@@ -170,6 +172,103 @@ class TestTrainingStateRoundtrip:
             == state.velocity.predicted_consistency()
         )
         assert loaded.delta_tracker.norm_history == state.delta_tracker.norm_history
+
+
+class TestDynFreezeStateRoundtrip:
+    """The §4 release-cooldown map (``released_at``) must survive a real
+    ``save_training_state``→``load_training_state`` round-trip.
+
+    The controller-level fix (``5a8bb7f``) added ``released_at`` to
+    ``DynFreezeState`` and made ``DynamicFreezeController.load_state_dict``
+    tolerant of its absence — but the checkpoint plumbing here never serialized
+    it, so a run that checkpoints while a layer is mid-cooldown and resumes
+    received ``released_at={}`` and §3 silently re-froze the just-released layer
+    on its stale ``0.0`` r_A history: the §4 reversible release undone on resume.
+    These pin both the data round-trip and the resumed *behavior* (the
+    controller's own ``released_at`` unit test only checks the dict, never that a
+    resumed ``decide_freeze`` actually respects it).
+    """
+
+    @staticmethod
+    def _state_with_released_at() -> TrainingState:
+        cs = CycleState(cycle=11, full_backward_passes=30, best_loss=2.5)
+        ctrl = ControllerState(
+            K=3,
+            N=5,
+            alpha=0.3,
+            beta=0.8,
+            lr=5e-4,
+            active_layer_strategy="last_25_percent_plus_random_2",
+            relative_update_cap=0.005,
+        )
+        # Block [5,4] after §4 released L3 at cycle 10; L3 is one cycle into its
+        # window=4 cooldown. L3's restored r_A history is stale frozen-period 0.0.
+        dyn = DynFreezeState(
+            frozen_layer_indices=[5, 4],
+            r_A_history={3: [0.0, 0.0, 0.0, 0.0]},
+            frozen_since_cycle=10,
+            released_at={3: 10},
+        )
+        return TrainingState(
+            cycle_state=cs,
+            controller_state=ctrl,
+            velocity=Velocity(max_history=100),
+            delta_tracker=DeltaTracker(max_history=50),
+            dynfreeze_state=dyn,
+        )
+
+    def test_released_at_survives_checkpoint_roundtrip(self, tmp_path):
+        """Data-level: ``released_at`` round-trips through the real checkpoint."""
+        state = self._state_with_released_at()
+        path = tmp_path / "state.pt"
+        save_training_state(state, path)
+        loaded = load_training_state(path)
+
+        assert loaded.dynfreeze_state is not None
+        assert loaded.dynfreeze_state.released_at == {3: 10}
+        assert loaded.dynfreeze_state.frozen_layer_indices == [5, 4]
+
+    def test_resumed_controller_honors_release_cooldown(self, tmp_path):
+        """Behavioral: a controller rebuilt from the *loaded* state must NOT
+        re-freeze a layer still in §4 cooldown, even though its r_A history reads
+        quiet — and it MAY re-freeze once the cooldown expires (so the fix does
+        not over-hold on resume either)."""
+        path = tmp_path / "state.pt"
+        save_training_state(self._state_with_released_at(), path)
+        loaded = load_training_state(path)
+
+        dfc = DynamicFreezeController(
+            tau=0.02, window=4, all_layer_indices=list(range(6))
+        )
+        dfc.load_state_dict(loaded.dynfreeze_state)
+        # Everything upstream of the released L3 is genuinely noisy, so the ONLY
+        # re-freeze candidate is L3 (whose restored history is stale-quiet).
+        for li in (2, 1, 0):
+            dfc._r_A_history[li] = deque([0.05] * dfc._window, maxlen=dfc._window)
+
+        # Mid-cooldown (11 - 10 = 1 < window 4): must NOT re-freeze the released
+        # layer. Pre-fix released_at was {} here, so this returned [3].
+        assert dfc.decide_freeze(11) == [], (
+            "resumed controller re-froze released L3 mid-cooldown — "
+            "§4 release undone on resume"
+        )
+        # Cooldown expired (14 - 10 = 4, not < 4): reversibility holds — L3 may
+        # re-freeze. Pins the false-positive side so the fix cannot over-correct.
+        assert dfc.decide_freeze(14) == [3]
+
+    def test_legacy_checkpoint_without_released_at_loads_clean(self, tmp_path):
+        """A pre-fix checkpoint omits ``released_at``; load must not break and
+        must read as 'no active cooldown' (empty map)."""
+        path = tmp_path / "legacy.pt"
+        save_training_state(self._state_with_released_at(), path)
+        # Strip the field to simulate a pre-fix checkpoint blob.
+        blob = torch.load(path, weights_only=False)
+        blob["dynfreeze_state"].pop("released_at", None)
+        torch.save(blob, path)
+
+        loaded = load_training_state(path)
+        assert loaded.dynfreeze_state is not None
+        assert loaded.dynfreeze_state.released_at == {}
 
 
 class TestSanitizeTensors:
