@@ -1,4 +1,6 @@
 import logging
+import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,6 +47,73 @@ def save_checkpoint(model: torch.nn.Module, tokenizer, save_dir: Path) -> None:
         file_count = sum(1 for _ in save_dir.iterdir())
         if file_count == 0:
             logger.warning("Checkpoint directory is empty after save: %s", save_dir)
+
+
+_CYCLE_DIR_RE = re.compile(r"^checkpoint-cycle-(\d+)$")
+
+
+def _sorted_cycle_checkpoint_dirs(run_dir: Path) -> list[Path]:
+    """Return ``checkpoint-cycle-<N>`` dirs under *run_dir*, oldest cycle first."""
+    found: list[tuple[int, Path]] = []
+    for p in Path(run_dir).iterdir():
+        if p.is_dir():
+            m = _CYCLE_DIR_RE.match(p.name)
+            if m:
+                found.append((int(m.group(1)), p))
+    found.sort(key=lambda t: t[0])
+    return [p for _, p in found]
+
+
+def prune_checkpoint_cycles(
+    run_dir: Path,
+    keep_last: int = 0,
+    min_free_disk_gb: float = 0.0,
+) -> list[Path]:
+    """Bound on-disk checkpoint growth by removing old ``checkpoint-cycle-*`` dirs.
+
+    Two independent guards; either may be ``0`` to disable (the safe default,
+    preserving today's unbounded behavior for arbitrary configs):
+
+    - ``keep_last``: when > 0, retain only the newest ``keep_last`` checkpoint
+      dirs and delete the rest. This is the primary bound against the M10.3
+      disk-death class — a run saving every cycle otherwise accumulates one dir
+      per cycle forever.
+    - ``min_free_disk_gb``: when > 0, if free space on *run_dir*'s filesystem is
+      below this floor, delete the oldest checkpoint dirs first until the floor
+      is met. This is emergency reclamation: it MAY go below ``keep_last``, but
+      never deletes the single newest checkpoint, so one recovery point always
+      survives.
+
+    Cycle order is read from the integer suffix of ``checkpoint-cycle-<N>``.
+    Returns the dirs removed, oldest-first. Idempotent; safe with no dirs.
+    """
+    run_dir = Path(run_dir)
+    dirs = _sorted_cycle_checkpoint_dirs(run_dir)  # oldest -> newest
+    if not dirs:
+        return []
+
+    keep_last = max(0, int(keep_last))
+    min_free_bytes = max(0.0, float(min_free_disk_gb)) * (1024 ** 3)
+    removed: list[Path] = []
+
+    # 1) Count bound: delete everything older than the newest `keep_last`.
+    if keep_last > 0:
+        cut = len(dirs) - keep_last
+        if cut > 0:
+            for d in dirs[:cut]:
+                shutil.rmtree(d, ignore_errors=True)
+                removed.append(d)
+            dirs = dirs[cut:]
+
+    # 2) Disk floor: prune oldest survivors until the floor is met, but never
+    #    below the single newest checkpoint.
+    if min_free_bytes > 0:
+        while len(dirs) > 1 and shutil.disk_usage(str(run_dir)).free < min_free_bytes:
+            oldest = dirs.pop(0)
+            shutil.rmtree(oldest, ignore_errors=True)
+            removed.append(oldest)
+
+    return removed
 
 
 @dataclass

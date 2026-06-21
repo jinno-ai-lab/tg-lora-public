@@ -82,6 +82,7 @@ from src.training.trajectory_delta_artifact import (
 from src.utils.checkpoint import (
     TrainingState,
     load_training_state,
+    prune_checkpoint_cycles,
     save_checkpoint,
     save_training_state,
 )
@@ -3906,6 +3907,21 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 )
                 save_training_state(ts, checkpoint_dir / "training_state.pt")
                 mlf.log_artifact(checkpoint_dir, "checkpoints")
+
+                # Bound on-disk checkpoint growth (M10.3 disk-death guard).
+                # keep_last retains only the newest N checkpoint-cycle-* dirs;
+                # min_free_disk_gb reclaims oldest-first when the filesystem is
+                # low. Both default to 0 (off) so unrelated runs are untouched;
+                # the M10 baseline enables them to make bounded accumulation
+                # the default for the autonomous run path.
+                keep_last = int(cfg.logging.get("keep_last_checkpoints", 0))
+                min_free = float(cfg.logging.get("min_free_disk_gb", 0.0))
+                if keep_last > 0 or min_free > 0.0:
+                    removed = prune_checkpoint_cycles(
+                        run_dir, keep_last=keep_last, min_free_disk_gb=min_free
+                    )
+                    for d in removed:
+                        logger.info("Pruned old checkpoint to bound disk: %s", d)
 
 
 

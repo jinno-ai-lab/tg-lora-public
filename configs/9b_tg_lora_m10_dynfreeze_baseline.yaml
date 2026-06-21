@@ -154,6 +154,13 @@ logging:
   log_every_cycles: 1
   save_every_cycles: 1
   run_dir: runs/${experiment.name}
+  # M10.3 disk-death guard (default OFF elsewhere). This baseline saves a
+  # checkpoint every cycle for up to 120 cycles; without pruning that is 120
+  # unbounded checkpoint-cycle-* dirs. keep_last bounds the count;
+  # min_free_disk_gb reclaims oldest-first when the filesystem is low (never
+  # below the single newest checkpoint).
+  keep_last_checkpoints: 3
+  min_free_disk_gb: 2.0
   mlflow:
     enabled: false
     tracking_uri: ""
