@@ -38,12 +38,17 @@ except ImportError:
     sys.exit(1)
 
 from src.tg_lora.freeze_cost import (
+    Level1RealizationRecord,
     ReductionSample,
+    ReproductionRecord,
     calibrate_reduction_band,
+    compare_freeze_levels,
+    format_level_comparison,
     format_reduction_band,
     format_speed_gate_verdict,
     frozen_at_epoch_from_freeze_log,
     per_cycle_realized_reductions,
+    resolve_level1_ceiling,
     speed_gate_verdict,
     uniform_layer_accountant,
 )
@@ -293,6 +298,9 @@ def _proxy_speed_gate_section(
     guard_losses: list[float],
     target_width: int,
     freeze_level: int,
+    *,
+    level1_record: Level1RealizationRecord | None = None,
+    reproduction_record: ReproductionRecord | None = None,
 ) -> list[str]:
     """Emit the §7 proxy speed-gate verdict (CUDA-less path, §6.1 + §6.2 + §6.3).
 
@@ -307,6 +315,25 @@ def _proxy_speed_gate_section(
     observed. This is the concrete proxy path that ``freeze_cost.speed_gate_verdict``
     exists for, so the §7 bar does not silently print N/A or trust a raw proxy
     figure when CUDA is unavailable.
+
+    The block also emits the GOAL §5 / Phase 3 Level-1-vs-Level-2 comparison
+    (:func:`compare_freeze_levels`): over the *same* observed schedule it judges
+    both implementation levels under identical §6.1/§6.2 bounds and surfaces the
+    *marginal* reduction the Level-2 suffix cut earns on top of the Level-1
+    baseline (``additional_*_reduction``) plus ``additional_passes`` — i.e. whether
+    the suffix cut is what carries the gate where Level-1 alone would FAIL. This is
+    the Phase-3 deliverable reaching the real ``gate_decision.txt`` rather than
+    living only in the ``freeze_cost`` unit suite.
+
+    ``level1_record`` / ``reproduction_record`` make the §6.2 ceiling and §6.3
+    reproduction-bracket landing points reachable from the real pipeline path, not
+    just the ``freeze_cost`` API: a measured in-vivo Level-1 realization (e.g. a
+    future grad-ckpt run) raises the Level-1 ceiling and may recover its verdict,
+    and N>=3 A/B reproductions thicken the headline from a point into a
+    reproduction-counted bracket. Both default to ``None``, so today's CUDA-less
+    output carries the comparison with no ceiling recovery and no bracket line —
+    byte-identical to the no-evidence path, advancing only when evidence is
+    supplied.
     """
     lines = ["", "--- Speed gate (proxy / CUDA-less, §6.1 + §6.2 + §6.3) ---"]
     # Per-cycle frozen-layer set parsed from the guard block log.
@@ -336,8 +363,16 @@ def _proxy_speed_gate_section(
         num_epochs=num_cycles,
         frozen_at_epoch=frozen_at_epoch,
     )
+    # Resolve the §6.2 Level-1 ceiling once so the single-level verdict and the
+    # Phase-3 comparison judge the same accountant under the same evidence: a
+    # supplied level1_record raises the ceiling consistently in both blocks (the
+    # default ``None`` keeps the validated 0.0, so no-evidence output is unchanged).
+    level1_ceiling = resolve_level1_ceiling(level1_record)
     verdict = speed_gate_verdict(
-        accountant, level=freeze_level, target_width=target_width
+        accountant,
+        level=freeze_level,
+        target_width=target_width,
+        level1_ceiling=level1_ceiling,
     )
     lines.append(
         f"  (homogeneous-stack first-order model; {len(frozen_at_epoch)}/"
@@ -355,6 +390,25 @@ def _proxy_speed_gate_section(
         band = calibrate_reduction_band(ReductionSample.from_values(series))
         for rendered in format_reduction_band(band).split("\n"):
             lines.append("    " + rendered)
+    # GOAL §5 / Phase 3: the Level-1-vs-Level-2 comparison over the *same*
+    # observed schedule. The per-level verdict + §6.3 band above pin the
+    # experiment's own level; this block is the cross-level view — the marginal
+    # reduction the Level-2 suffix cut earns over the Level-1 baseline and
+    # whether the suffix cut is what carries the gate (additional_passes). The
+    # §6.2 ceiling and §6.3 reproduction-bracket landing points are reachable
+    # here via level1_record / reproduction_record: None (default) leaves the
+    # Level-1 ceiling at the validated ~0 and the headline a point estimate, so
+    # this block advances only when real evidence is supplied (byte-identical
+    # otherwise — no bracket line, no recovered ceiling).
+    comparison = compare_freeze_levels(
+        accountant,
+        target_width=target_width,
+        level1_record=level1_record,
+        reproduction_record=reproduction_record,
+    )
+    lines.append("  --- Level comparison (Phase 3, §5 / §6.2 / §6.3) ---")
+    for rendered in format_level_comparison(comparison).split("\n"):
+        lines.append("    " + rendered)
     return lines
 
 

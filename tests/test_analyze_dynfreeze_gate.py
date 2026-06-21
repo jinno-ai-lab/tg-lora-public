@@ -35,10 +35,14 @@ from src.tg_lora.freeze_cost import (
     PROXY_VALIDATED_MAX_WIDTH,
     ReductionSample,
     calibrate_reduction_band,
+    compare_freeze_levels,
+    format_level_comparison,
     format_reduction_band,
     format_speed_gate_verdict,
     frozen_at_epoch_from_freeze_log,
+    level1_realization_record_from_measurements,
     per_cycle_realized_reductions,
+    reproduction_record_from_ab_measurements,
     speed_gate_verdict,
     uniform_layer_accountant,
     VERDICT_FAIL,
@@ -133,6 +137,8 @@ def _emit(
     freeze_by_cycle: dict[int, list[int]] | None = None,
     layer_indices: list[int] | None = None,
     num_cycles: int = 6,
+    level1_record=None,
+    reproduction_record=None,
 ) -> list[str]:
     layer_indices = layer_indices or LAYER_INDICES
     # ``is None`` (not ``or``) so an explicitly-passed empty ``{}`` (no freeze
@@ -146,6 +152,40 @@ def _emit(
         guard_losses=_GUARD_LOSSES[:num_cycles],
         target_width=target_width,
         freeze_level=freeze_level,
+        level1_record=level1_record,
+        reproduction_record=reproduction_record,
+    )
+
+
+def _expected_comparison(
+    schedule: dict[int, dict],
+    layer_indices: list[int],
+    target_width: int,
+    *,
+    level1_record=None,
+    reproduction_record=None,
+    guard_losses: list[float] | None = None,
+):
+    """Re-derive the Phase-3 comparison the pipeline *should* emit.
+
+    Mirrors :func:`_expected_verdict` but builds :func:`compare_freeze_levels`
+    over the same accountant the pipeline constructs, so a test can assert the
+    pipeline's comparison block equals the canonical
+    :func:`format_level_comparison` output — catching drift in the comparison
+    wiring exactly as the verdict wiring is caught.
+    """
+    accountant, _ = _expected_verdict(
+        schedule,
+        layer_indices,
+        freeze_level=2,
+        target_width=target_width,
+        guard_losses=guard_losses,
+    )
+    return compare_freeze_levels(
+        accountant,
+        target_width,
+        level1_record=level1_record,
+        reproduction_record=reproduction_record,
     )
 
 
@@ -372,3 +412,127 @@ class TestProxySpeedGateMatchesFreezeCost:
         block = "\n".join(_emit(freeze_level=2, target_width=target_width))
         for line in format_reduction_band(band).split("\n"):
             assert "    " + line in block
+
+
+# ---------------------------------------------------------------------------
+# 6. The Phase-3 Level-1-vs-Level-2 comparison reaches the real gate output
+#    (GOAL §5 / Phase 3; §6.2 ceiling + §6.3 reproduction-bracket landing points)
+# ---------------------------------------------------------------------------
+
+
+class TestProxySpeedGateLevelComparison:
+    """The Phase-3 Level-1-vs-Level-2 comparison is emitted into gate_decision.txt.
+
+    ``compare_freeze_levels`` (GOAL §5 / Phase 3) shipped as a ``freeze_cost`` API
+    exercised only in the unit suite; the real pipeline emitted just one level's
+    verdict + band. This class pins that the pipeline now carries the cross-level
+    comparison — both levels' verdicts over the *same* observed schedule, the
+    marginal reduction the Level-2 suffix cut earns on top of the Level-1
+    baseline (``additional_*_reduction``), and whether the suffix cut is what
+    carries the gate (``additional_passes``) — emitted exactly as the canonical
+    formatter produces. It also pins that the §6.2 ceiling and §6.3
+    reproduction-bracket landing points are *reachable from the real pipeline
+    path*: a supplied record moves the pipeline's output (a recovered Level-1
+    verdict; a point headline thickened into a reproduction-counted bracket),
+    where the default (no record) stays byte-identical.
+    """
+
+    def test_comparison_header_present(self):
+        block = "\n".join(_emit(freeze_level=2, target_width=PROXY_VALIDATED_MAX_WIDTH))
+        assert "Level comparison (Phase 3" in block
+
+    @pytest.mark.parametrize(
+        "target_width",
+        [
+            PROXY_VALIDATED_MAX_WIDTH,
+            PROXY_VALIDATED_MAX_WIDTH * 2,
+            PROXY_VALIDATED_MAX_WIDTH * 4,
+        ],
+    )
+    def test_comparison_block_matches_canonical_formatter(self, target_width):
+        # Whatever the pipeline prints for the comparison must equal the indented
+        # output of format_level_comparison over the *same* accountant — so a
+        # drift in the comparison wiring (a dropped ceiling, a wrong width) fails
+        # here, not silently in gate_decision.txt.
+        schedule = _schedule(_FREEZE_BY_CYCLE)
+        comparison = _expected_comparison(
+            schedule, LAYER_INDICES, target_width, guard_losses=_GUARD_LOSSES
+        )
+        block = "\n".join(_emit(freeze_level=2, target_width=target_width))
+        for line in format_level_comparison(comparison).split("\n"):
+            assert "    " + line in block
+
+    def test_suffix_cut_carries_gate_where_level1_fails(self):
+        # The Phase-3 headline, now in the real output: Level-1 realizes ~0 in
+        # vivo (§6.2 ceiling) so it FAILs at every width, while Level-2's suffix
+        # cut realizes the reduction and PASSes — the suffix cut is the sole
+        # thing carrying the gate (additional_passes). The pipeline surfaces this
+        # rather than reporting one level in isolation.
+        block = "\n".join(_emit(freeze_level=2, target_width=PROXY_VALIDATED_MAX_WIDTH))
+        assert "level1 (progressive freeze): FAIL" in block
+        assert "level1 (progressive freeze): FAIL arith=" in block
+        assert "realized=0.0000" in block  # §6.2 ceiling pins Level-1 at 0
+        assert "level2 (suffix cut):         PASS" in block
+        # The additional (level2 - level1) realized reduction clears the 10% bar.
+        assert "additional (level2 - level1):" in block
+
+    def test_no_evidence_leaves_point_headline_byte_identical(self):
+        # Default (no record): the headline is a point estimate. No
+        # reproduction_bracket line and no recovered-ceiling audit line appear,
+        # so the comparison advances only when evidence is supplied.
+        block = "\n".join(_emit(freeze_level=2, target_width=PROXY_VALIDATED_MAX_WIDTH))
+        assert "reproduction_bracket" not in block
+        assert "raised" not in block
+
+    def test_reproduction_record_thickens_bracket_in_pipeline_output(self):
+        # The §6.3 landing point reaches the real pipeline path: supply N=3 A/B
+        # reproduction observations (through the same adapter a real run uses) and
+        # the headline — a point by default — becomes a calibrated,
+        # reproduction-counted bracket line in gate_decision.txt.
+        baseline_backward = 1000.0
+        # Three reproductions whose realized reductions wrap the accountant's
+        # Level-2 headline (~0.2917 here) with a small honest spread.
+        r = 0.2917
+        reproduction_backwards = [
+            baseline_backward * (1 - r),          # == headline
+            baseline_backward * (1 - r * 0.95),   # slightly less reduction
+            baseline_backward * (1 - r * 1.05),   # slightly more
+        ]
+        record = reproduction_record_from_ab_measurements(
+            baseline_backward, reproduction_backwards
+        )
+        assert record.n == 3 and not record.is_thin_evidence
+        block = "\n".join(
+            _emit(
+                freeze_level=2,
+                target_width=PROXY_VALIDATED_MAX_WIDTH,
+                reproduction_record=record,
+            )
+        )
+        assert "reproduction_bracket" in block
+        assert "(calibrated, n=3)" in block
+
+    def test_level1_record_recovers_verdict_consistently_in_pipeline(self):
+        # The §6.2 landing point reaches the real pipeline path AND stays
+        # consistent across both blocks: a non-thin nonzero Level-1 realization
+        # (the form a grad-ckpt run deposits through the same adapter) raises the
+        # ceiling, flipping Level-1 from FAIL to PASS in BOTH the single-level
+        # verdict block and the Phase-3 comparison block — a real verdict change
+        # driven through the pipeline, not just the freeze_cost API.
+        record = level1_realization_record_from_measurements(
+            1000.0, [850.0, 845.0, 855.0], source="hypothetical_grad_ckpt"
+        )
+        without = "\n".join(_emit(freeze_level=1, target_width=PROXY_VALIDATED_MAX_WIDTH))
+        assert f"speed_gate_verdict: {VERDICT_FAIL}" in without
+        assert "level1 (progressive freeze): FAIL" in without
+        with_record = "\n".join(
+            _emit(
+                freeze_level=1,
+                target_width=PROXY_VALIDATED_MAX_WIDTH,
+                level1_record=record,
+            )
+        )
+        # Both the single-level verdict and the comparison recover to PASS.
+        assert f"speed_gate_verdict: {VERDICT_PASS}" in with_record
+        assert "level1 (progressive freeze): PASS" in with_record
+        assert "level1 ceiling: raised" in with_record
