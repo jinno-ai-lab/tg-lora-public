@@ -17,6 +17,7 @@ from collections import deque
 import torch
 import torch.nn as nn
 
+from src.model.lora_utils import iter_all_lora_params_by_layer
 from src.tg_lora.dynamic_freeze import DynamicFreezeController, DynFreezeState
 
 NUM_LAYERS = 6  # indices 0..5; output side = 5
@@ -43,6 +44,11 @@ class _Model(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.layers = nn.ModuleList([_Layer() for _ in range(NUM_LAYERS)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
 
 def _build_model() -> _Model:
@@ -170,8 +176,6 @@ class TestApplyUnfreeze:
         assert dfc.apply_unfreeze(model, [3], cycle=10) > 0
         assert dfc.frozen_block == [5, 4]
         # Released layer's params are trainable again.
-        from src.model.lora_utils import iter_all_lora_params_by_layer
-
         for _name, p in iter_all_lora_params_by_layer(model)[3]:
             assert p.requires_grad
 
@@ -298,3 +302,149 @@ class TestStateRoundTrip:
         dfc.load_state_dict(legacy_obj)
         assert dfc.frozen_block == [5, 4]
         assert dfc._released_at == {}
+
+
+# ---------------------------------------------------------------------------
+# E2E: real forward/backward/optimizer step — the §4 runtime property no
+# timer-state unit test can prove (a released layer actually re-trains)
+# ---------------------------------------------------------------------------
+
+
+class TestEndToEndReversibleRelease:
+    """End-to-end behavior under a *real* PyTorch training step.
+
+    Every other test in this file hand-seeds ``_r_A_history`` /
+    ``_frozen_block`` / ``_frozen_since_cycle`` and asserts on controller *state*
+    (timer values, block contents). None ever runs a backward pass, so the §4
+    promise that a released LoRA module *resumes gradient updates* was only ever
+    inferred from state, never observed at the weight level. A real
+    ``model(x).sum().backward(); optimizer.step()`` is what actually proves it:
+    a frozen param receives no grad (the optimizer skips it) while a released
+    one accumulates grad and moves. See ``docs/design/10_guard_experiment.md``
+    §4 ("解放ロジック … 可逆").
+    """
+
+    @staticmethod
+    def _train_step(model, optimizer):
+        """One real SGD step over whatever is currently trainable."""
+        x = torch.randn(4, 8)
+        optimizer.zero_grad(set_to_none=True)
+        model(x).sum().backward()
+        optimizer.step()
+
+    @staticmethod
+    def _layer_params(model, idx):
+        return dict(iter_all_lora_params_by_layer(model)[idx])
+
+    def test_frozen_holds_then_release_resumes_gradient_updates(self):
+        """The headline §4 property, proven at the weight level.
+
+        (1) While frozen, layer 3 receives *no* grad and is bit-identical after a
+        real step; (2) the §4(a) stir path releases L3 via the real ``decide``
+        code; (3) on the very next real step L3's ``lora_B`` accumulates grad and
+        moves (resumes updates), and ``lora_A`` follows once B != 0; (4) the
+        still-frozen output-side layer 5 never moves — the freeze is real, not
+        just a flag, and so is the release.
+        """
+        torch.manual_seed(0)
+        model = _build_model()
+        optimizer = torch.optim.SGD(model.parameters(), lr=1e-1)
+        dfc = _make(stir_interval=10)
+
+        # Freeze the output-side block via the real apply path; trainable = {0,1,2}.
+        dfc.apply_freeze(model, [5, 4, 3], cycle=0)
+        assert dfc.frozen_block == [5, 4, 3]
+
+        p3 = self._layer_params(model, 3)  # just-frozen upstream end
+        p5 = self._layer_params(model, 5)  # still-frozen output side
+        snap3 = {k: v.detach().clone() for k, v in p3.items()}
+        snap5_b = p5["layers.5.lora_B"].detach().clone()
+        snap5_a = p5["layers.5.lora_A"].detach().clone()
+
+        # --- (1) While frozen: a real step must leave layer 3 untouched. ---
+        self._train_step(model, optimizer)
+        for name, p in p3.items():
+            assert p.grad is None, f"{name} received a grad while frozen"
+            assert torch.equal(p, snap3[name]), f"{name} moved while frozen"
+
+        # --- (2) §4(a) stir: real decide path releases the upstream end (L3). ---
+        released = dfc.decide_unfreeze(cycle=10)  # 10 - 0 >= R=10
+        assert released == [3]
+        dfc.apply_unfreeze(model, released, cycle=10)  # requires_grad := True
+        assert dfc.frozen_block == [5, 4]
+        for p in p3.values():
+            assert p.requires_grad
+
+        # --- (3) After release: a real step must drive layer 3 again. ---
+        # lora_B sits downstream of A so it gets a nonzero grad at once; lora_A
+        # only once B != 0, hence the second step. Both must move.
+        self._train_step(model, optimizer)
+        assert p3["layers.3.lora_B"].grad is not None
+        assert p3["layers.3.lora_B"].grad.abs().sum() > 0
+        assert not torch.equal(p3["layers.3.lora_B"], snap3["layers.3.lora_B"]), (
+            "released layer's lora_B did not move — §4 release is inert at the "
+            "weight level"
+        )
+        self._train_step(model, optimizer)  # now B != 0 → A gets a real grad too
+        assert not torch.equal(p3["layers.3.lora_A"], snap3["layers.3.lora_A"]), (
+            "released layer's lora_A did not resume training"
+        )
+
+        # --- (4) Contrast: the still-frozen output-side layer 5 never moved. ---
+        assert torch.equal(p5["layers.5.lora_B"], snap5_b)
+        assert torch.equal(p5["layers.5.lora_A"], snap5_a)
+
+    def test_real_compute_rA_loop_respects_release_cooldown(self):
+        """Drive the trainer's real per-cycle order
+        (``compute_r_A → decide_unfreeze → apply_unfreeze → decide_freeze →
+        apply_freeze``) over real SGD steps — no seeded history.
+
+        Proves (a) ``compute_r_A`` is a genuine signal: layers that actually
+        trained report r_A > 0 while frozen ones report exactly 0.0; and (b)
+        right after a §4 release the just-released layer's history is empty
+        (reads as "quiet"), yet ``decide_freeze`` does *not* re-freeze it — the
+        release cooldown, not a hand-seeded fixture, is what holds it for a full
+        window. ``a_mask_ratio=0`` disables the early-cycle masking heuristic so
+        the r_A signal is uncluttered.
+        """
+        torch.manual_seed(0)
+        model = _build_model()
+        optimizer = torch.optim.SGD(model.parameters(), lr=1e-1)
+        window = 3
+        dfc = _make(window=window, stir_interval=window + 1, a_mask_ratio=0.0)
+
+        def cycle_step(cycle):
+            self._train_step(model, optimizer)
+            return dfc.compute_r_A(model, cycle)
+
+        # Warm-up: train every layer so real r_A history accumulates (all noisy).
+        for c in range(window):
+            r_A = cycle_step(c)
+        assert all(r_A[i] > 0 for i in (0, 1, 2)), (
+            f"compute_r_A not reporting real weight movement: {[r_A[i] for i in (0,1,2)]}"
+        )
+
+        # Freeze the output block; now only {0,1,2} train (r_A > 0) while the
+        # frozen {3,4,5} record exactly 0.0 via compute_r_A's frozen branch.
+        dfc.apply_freeze(model, [5, 4, 3], cycle=window)
+        r_A = cycle_step(window)
+        assert all(r_A[i] == 0.0 for i in (3, 4, 5))
+        assert all(r_A[i] > 0 for i in (0, 1, 2))
+
+        # Hold until §4(a) stir fires (frozen >= R cycles) → release L3.
+        release_cycle = window + dfc._stir_interval
+        for c in range(window + 1, release_cycle + 1):
+            cycle_step(c)
+        assert dfc.decide_unfreeze(release_cycle) == [3]
+        dfc.apply_unfreeze(model, [3], cycle=release_cycle)
+
+        # Trainer order runs decide_freeze in the SAME cycle right after the
+        # release. L3's history was just popped (empty → reads quiet), so without
+        # the cooldown §3 would re-freeze it here. The cooldown must hold it.
+        assert dfc.decide_freeze(release_cycle) == [], (
+            "just-released L3 re-frozen in the release cycle against real history "
+            "— release cooldown not holding"
+        )
+        # Still protected one cycle later (1 < window).
+        cycle_step(release_cycle + 1)
+        assert dfc.decide_freeze(release_cycle + 1) == []
