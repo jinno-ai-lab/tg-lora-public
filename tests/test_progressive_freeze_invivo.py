@@ -63,7 +63,9 @@ from src.model.lora_utils import iter_all_lora_params_by_layer, set_trainable_lo
 from src.tg_lora.activation_matching import ActivationMatchingLoss
 from src.tg_lora.dynamic_freeze import DynamicFreezeController
 from src.tg_lora.freeze_cost import (
+    SPEED_GATE_THRESHOLD,
     VERDICT_FAIL,
+    VERDICT_PASS,
     FreezeCostAccountant,
     LayerBackwardCost,
     compare_freeze_levels,
@@ -710,6 +712,102 @@ class TestInvivoEvidenceWiring:
         comp = compare_freeze_levels(acc, target_width=HIDDEN, level1_record=record)
         assert comp.level1_ceiling == pytest.approx(0.0, abs=1e-9)
         assert comp.level1.verdict == VERDICT_FAIL
+
+
+class TestVerdictMovesOnEvidence:
+    """The evidence landing points actually move the §7 verdict.
+
+    Phase 70 wired the in-vivo ``_BackwardCounter`` A/B into the §6.2 / §6.3
+    records and asserted the honest *negative* half — the measured Level-1
+    realization is ~0, so the ceiling stays 0 and Level-1 stays FAIL (no
+    over-claim). This class completes the story by showing the gate's verdict
+    is *driven* by the evidence rather than merely receiving it:
+
+    * **The realized positive outcome.** With the real measured trio headline,
+      Level-2 PASSes where Level-1 FAILs and ``additional_passes`` is True —
+      the suffix cut is what carries the gate, demonstrated from measured
+      (not arithmetic-only) backward counts (10_guard_experiment.md §7).
+    * **The FAIL→PASS recovery mechanism.** A non-thin *nonzero* Level-1
+      record (the form a future grad-ckpt run would deposit through the same
+      adapter) raises the ceiling above the bar and flips the Level-1 verdict
+      from FAIL to PASS — the "raise the ceiling to recover it" path the §6.2
+      design names, shown effective rather than merely plumbed.
+
+    Both are the runtime-outcome motion the landing points exist to enable:
+    without evidence the verdict is unchanged (byte-identical default), and
+    with evidence it moves. The honest ~0 in-vivo Level-1 result (no flip on
+    the real CPU proxy) is pinned in
+    :class:`TestInvivoEvidenceWiring`; these tests pin the motion a real
+    nonzero measurement would unlock.
+    """
+
+    def test_measured_level2_drives_pass_where_level1_fails(self, _ab_repro):
+        # The headline claim demonstrated from real measurement: Level-2's
+        # suffix cut clears the §7 bar (PASS) where the Level-1 baseline does
+        # not (FAIL). The PASS is grounded in the measured trio headline, not
+        # just the model-free accountant — Phase 70 already showed the two are
+        # equal on the live graph, so the realized reduction that clears the
+        # bar is the measured one.
+        acc = _accountant_at_depth(3)
+        comp = compare_freeze_levels(acc, target_width=HIDDEN)
+        assert comp.level1.verdict == VERDICT_FAIL
+        assert comp.level2.verdict == VERDICT_PASS
+        idx3 = list(_ab_repro.depths).index(3)
+        measured_l2 = 1.0 - _ab_repro.trio_bws[idx3] / _ab_repro.base_bw
+        # The measured trio headline equals the accountant's realized Level-2
+        # reduction (validated on the live graph in TestInvivoEvidenceWiring),
+        # and it clears the bar — so the PASS is earned by measurement.
+        assert measured_l2 == pytest.approx(comp.level2.realized_reduction, rel=1e-9)
+        assert measured_l2 >= SPEED_GATE_THRESHOLD
+        assert comp.additional_passes is True
+        assert comp.additional_realized_reduction >= SPEED_GATE_THRESHOLD
+
+    def test_nonzero_level1_measurement_flips_verdict_fail_to_pass(self):
+        # The literal FAIL→PASS the §6.2 ceiling exists to allow. Without a
+        # record the ceiling is the validated 0.0 and Level-1 FAILs at every
+        # width (its realization is ~0 in vivo). Supply a non-thin nonzero
+        # record — built from backward counts through the same adapter a real
+        # run uses, here a hypothetical grad-ckpt reproduction (clearly
+        # labelled, not the honest ~0 CPU-proxy result pinned elsewhere) — and
+        # the ceiling rises above the bar, flipping Level-1 to PASS.
+        acc = _accountant_at_depth(3)
+        no_evidence = compare_freeze_levels(acc, target_width=HIDDEN)
+        assert no_evidence.level1.verdict == VERDICT_FAIL
+        assert no_evidence.level1_ceiling == pytest.approx(0.0, abs=1e-12)
+
+        # Three reproductions of a 15% Level-1 realization (baseline 1000
+        # traversals, ~850 measured) -> median 0.15, non-thin (num_runs=3).
+        record = level1_realization_record_from_measurements(
+            1000.0, [850.0, 845.0, 855.0], source="hypothetical_grad_ckpt"
+        )
+        assert record.is_thin_evidence is False
+        assert record.observed_reduction == pytest.approx(0.15, abs=1e-9)
+
+        recovered = compare_freeze_levels(acc, target_width=HIDDEN, level1_record=record)
+        assert recovered.level1_ceiling == pytest.approx(0.15, abs=1e-9)
+        assert recovered.level1.verdict == VERDICT_PASS
+        # The credited realization is the smaller of the ceiling and the
+        # arithmetic proxy (0.1750 at depth 3), so the measurement recovers
+        # the reduction up to — never beyond — what the arithmetic allows.
+        assert recovered.level1.realized_reduction == pytest.approx(0.15, abs=1e-9)
+
+    def test_recovery_flattens_additional_passes(self):
+        # The comparison-level verdict motion: the landing point changes the
+        # *output* a real consumer reads. Without evidence the suffix cut is
+        # the sole carrier (additional_passes=True); once a measured Level-1
+        # realization recovers the Level-1 verdict, Level-1 also PASSes and the
+        # suffix cut is no longer the only thing carrying the gate
+        # (additional_passes=False). That flip is the landing point moving a
+        # runtime verdict — the opposite of a dead, byte-identical stub.
+        acc = _accountant_at_depth(3)
+        without = compare_freeze_levels(acc, target_width=HIDDEN)
+        assert without.additional_passes is True  # Level-2 alone carries it
+        record = level1_realization_record_from_measurements(
+            1000.0, [850.0, 845.0, 855.0], source="hypothetical_grad_ckpt"
+        )
+        with_record = compare_freeze_levels(acc, target_width=HIDDEN, level1_record=record)
+        assert with_record.level1.verdict == VERDICT_PASS
+        assert with_record.additional_passes is False  # Level-1 recovered too
 
 
 class TestDistributionLossInTrainingPath:
