@@ -203,6 +203,14 @@ class LoggingConfig(BaseModel):
     save_every_cycles: int = Field(default=25, ge=1)
     run_dir: str
     mlflow: MLflowConfig = Field(default_factory=MLflowConfig)
+    # M10.3 disk-death guard knobs, read by prune_checkpoint_cycles_from_cfg on
+    # the periodic-save path. Both default to 0 (off): the safe behavior for
+    # arbitrary configs, preserving today's unbounded accumulation unless a run
+    # opts in. The M10 autonomous configs set both > 0 because they save every
+    # cycle (save_every_cycles: 1) for up to 120 cycles — one dir/cycle forever
+    # is the M10.3 disk-death class. ge=0 keeps a disable value expressible.
+    keep_last_checkpoints: int = Field(default=0, ge=0)
+    min_free_disk_gb: float = Field(default=0.0, ge=0.0)
 
 
 class TGLoRAParams(BaseModel):

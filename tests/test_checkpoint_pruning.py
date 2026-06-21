@@ -16,6 +16,7 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
+from src.training.config_schema import load_validate_and_build_config
 from src.utils.checkpoint import prune_checkpoint_cycles, prune_checkpoint_cycles_from_cfg
 
 CHECKPOINT_DIR_PREFIX = "checkpoint-cycle-"
@@ -357,3 +358,45 @@ class TestM10ConfigsShipPruningKnobs:
         # prune is exactly the unbounded accumulation class.
         for rel in _M10_CONFIGS:
             assert int(self._logging(rel).save_every_cycles) == 1, rel
+
+
+class TestM10ConfigsValidateThroughSchema:
+    """The M10.3 guard knobs must survive the Pydantic schema gate at startup.
+
+    db3c08f/3c2c9d7 shipped keep_last_checkpoints/min_free_disk_gb into the M10
+    configs and proved the prune logic fires (TestKeepLastBoundsAccumulation) and
+    that the YAML carries the knobs (TestM10ConfigsShipPruningKnobs). But
+    LoggingConfig has extra="forbid", and the knobs were added to the YAML
+    *without* being declared on the schema — so main()'s
+    load_validate_and_build_config raised ValidationError and the guarded run
+    could never start: the protection existed but the run died before training.
+
+    TestM10ConfigsShipPruningKnobs loads via raw OmegaConf.load (bypassing the
+    schema), which is exactly why it missed the crash. These load through the real
+    startup path and close the loop the incident requires: config -> schema ->
+    runtime prune seam -> bounded disk.
+    """
+
+    def test_both_m10_configs_load_through_schema_gate(self):
+        # main() -> load_validate_and_build_config is the actual startup path;
+        # it must not reject the guard knobs. The knobs must also survive the
+        # Pydantic round-trip into the typed cfg prune_checkpoint_cycles_from_cfg
+        # reads at runtime (validated.model_dump -> typed_cfg).
+        for rel in _M10_CONFIGS:
+            validated, typed_cfg = load_validate_and_build_config(_REPO_ROOT / rel)
+            assert int(typed_cfg.logging.keep_last_checkpoints) > 0, rel
+            assert float(typed_cfg.logging.min_free_disk_gb) > 0.0, rel
+
+    def test_guarded_cfg_fires_prune_seam_end_to_end(self, tmp_path):
+        # The validated cfg the trainer actually holds must fire pruning through
+        # the runtime seam — not just carry the knobs. This is the closed loop:
+        # a real M10 config file -> schema -> typed cfg -> bounded on-disk count.
+        for rel in _M10_CONFIGS:
+            _, typed_cfg = load_validate_and_build_config(_REPO_ROOT / rel)
+            run_dir = tmp_path / rel.replace("/", "_")
+            run_dir.mkdir()
+            for cycle in range(1, 9):  # 8 dirs, keep_last=3 -> keep newest 3
+                _save_checkpoint_dir(run_dir, cycle)
+            removed = prune_checkpoint_cycles_from_cfg(typed_cfg, run_dir)
+            assert [_cycle_of(p) for p in _checkpoint_dirs(run_dir)] == [6, 7, 8]
+            assert len(removed) == 5
