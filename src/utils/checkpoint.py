@@ -116,6 +116,30 @@ def prune_checkpoint_cycles(
     return removed
 
 
+def prune_checkpoint_cycles_from_cfg(cfg, run_dir: Path) -> list[Path]:
+    """Read the pruning knobs from ``cfg.logging`` and prune ``checkpoint-cycle-*``.
+
+    The config-driven entry point wired into the periodic-save path of
+    ``train_tg_lora``. Extracted from an inline read+call so the config->prune
+    coupling is the unit-testable seam: an untested inline block was a silent
+    "protection exists but never fires" risk (a renamed key would leave the
+    guard inert while every isolated ``prune_checkpoint_cycles`` test still
+    passed). Returns the pruned dirs, oldest-first; empty when both knobs are
+    off (the safe default).
+
+    ``cfg`` may be an OmegaConf ``DictConfig`` (prod) or a plain dict (tests);
+    both expose ``.get``.
+    """
+    logging_cfg = cfg.get("logging", {}) if cfg is not None else {}
+    keep_last = int(logging_cfg.get("keep_last_checkpoints", 0))
+    min_free = float(logging_cfg.get("min_free_disk_gb", 0.0))
+    if keep_last <= 0 and min_free <= 0.0:
+        return []
+    return prune_checkpoint_cycles(
+        run_dir, keep_last=keep_last, min_free_disk_gb=min_free
+    )
+
+
 @dataclass
 class TrainingState:
     """All state needed to resume a TG-LoRA training job from a checkpoint."""

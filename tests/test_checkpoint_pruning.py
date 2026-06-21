@@ -12,8 +12,11 @@ not grow linearly with the cycle count.
 
 import shutil
 from collections import namedtuple
+from pathlib import Path
 
-from src.utils.checkpoint import prune_checkpoint_cycles
+from omegaconf import OmegaConf
+
+from src.utils.checkpoint import prune_checkpoint_cycles, prune_checkpoint_cycles_from_cfg
 
 CHECKPOINT_DIR_PREFIX = "checkpoint-cycle-"
 PAYLOAD_BYTES = 1024 * 1024  # 1 MiB per checkpoint dir
@@ -239,3 +242,118 @@ class TestMinFreeDiskFloor:
 
         assert [_cycle_of(p) for p in removed] == [1, 2, 3, 4, 5, 6, 7]
         assert [_cycle_of(p) for p in _checkpoint_dirs(run_dir)] == [8]
+
+
+class TestConfigDrivenWiring:
+    """The config->prune coupling wired into train_tg_lora's periodic-save path.
+
+    These exercise prune_checkpoint_cycles_from_cfg — the unit-tested seam
+    extracted from an inline read+call. They prove the knobs (read from
+    cfg.logging) actually fire pruning, closing the "protection exists but
+    never fires" gap an untested inline block left open: a renamed key or
+    inverted guard would leave the disk-death protection inert while every
+    isolated prune_checkpoint_cycles test still passed.
+    """
+
+    @staticmethod
+    def _cfg(keep_last=0, min_free=0.0):
+        return {"logging": {"keep_last_checkpoints": keep_last,
+                            "min_free_disk_gb": min_free}}
+
+    def test_m10_baseline_knobs_fire_count_bound(self, tmp_path):
+        # The exact knobs shipped in the M10 baseline + guard configs.
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for cycle in range(1, 9):  # 8 dirs
+            _save_checkpoint_dir(run_dir, cycle)
+
+        removed = prune_checkpoint_cycles_from_cfg(self._cfg(3, 2.0), run_dir)
+
+        assert [_cycle_of(p) for p in removed] == [1, 2, 3, 4, 5]
+        assert [_cycle_of(p) for p in _checkpoint_dirs(run_dir)] == [6, 7, 8]
+
+    def test_defaults_off_is_noop(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for cycle in range(1, 6):
+            _save_checkpoint_dir(run_dir, cycle)
+
+        assert prune_checkpoint_cycles_from_cfg(self._cfg(), run_dir) == []
+        assert prune_checkpoint_cycles_from_cfg({}, run_dir) == []
+        assert len(_checkpoint_dirs(run_dir)) == 5
+
+    def test_missing_logging_section_is_noop(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _save_checkpoint_dir(run_dir, 1)
+        assert prune_checkpoint_cycles_from_cfg(
+            {"experiment": {"name": "x"}}, run_dir
+        ) == []
+        assert prune_checkpoint_cycles_from_cfg(None, run_dir) == []
+
+    def test_min_free_only_fires_from_cfg(self, tmp_path, monkeypatch):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for cycle in range(1, 4):
+            _save_checkpoint_dir(run_dir, cycle)
+        monkeypatch.setattr(
+            shutil, "disk_usage",
+            lambda p: _DiskUsage(total=100, used=100, free=0),
+        )
+        removed = prune_checkpoint_cycles_from_cfg(
+            self._cfg(keep_last=0, min_free=1000.0), run_dir
+        )
+        assert [_cycle_of(p) for p in removed] == [1, 2]
+        assert [_cycle_of(p) for p in _checkpoint_dirs(run_dir)] == [3]
+
+    def test_works_with_omegaconf_dictconfig(self, tmp_path):
+        # Prod passes an OmegaConf DictConfig, not a plain dict.
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for cycle in range(1, 6):
+            _save_checkpoint_dir(run_dir, cycle)
+        cfg = OmegaConf.create({"logging": {"keep_last_checkpoints": 2,
+                                            "min_free_disk_gb": 0.0}})
+        removed = prune_checkpoint_cycles_from_cfg(cfg, run_dir)
+        assert [_cycle_of(p) for p in removed] == [1, 2, 3]
+        assert [_cycle_of(p) for p in _checkpoint_dirs(run_dir)] == [4, 5]
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_M10_CONFIGS = [
+    "configs/9b_tg_lora_m10_dynfreeze.yaml",
+    "configs/9b_tg_lora_m10_dynfreeze_baseline.yaml",
+]
+
+
+class TestM10ConfigsShipPruningKnobs:
+    """Guard feedback point (1) against regression.
+
+    The M10 autonomous run configs must actually enable
+    keep_last_checkpoints>0 and min_free_disk_gb>0 — both save every cycle
+    (save_every_cycles: 1), so without these knobs either run accumulates one
+    checkpoint-cycle-* dir per cycle forever (the M10.3 disk-death class).
+    db3c08f enabled them on the baseline only; this asserts the TG-LoRA guard
+    config stays symmetric. A future commit that zeroes/removes the knobs on
+    either config fails here.
+    """
+
+    @staticmethod
+    def _logging(rel):
+        return OmegaConf.load(_REPO_ROOT / rel).logging
+
+    def test_keep_last_checkpoints_enabled_in_both_m10_configs(self):
+        for rel in _M10_CONFIGS:
+            value = int(self._logging(rel).keep_last_checkpoints)
+            assert value > 0, f"{rel}: keep_last_checkpoints must be > 0, got {value}"
+
+    def test_min_free_disk_gb_enabled_in_both_m10_configs(self):
+        for rel in _M10_CONFIGS:
+            value = float(self._logging(rel).min_free_disk_gb)
+            assert value > 0.0, f"{rel}: min_free_disk_gb must be > 0.0, got {value}"
+
+    def test_m10_configs_save_every_cycle_so_guard_is_required(self):
+        # Documents WHY the guard is mandatory here: a per-cycle save with no
+        # prune is exactly the unbounded accumulation class.
+        for rel in _M10_CONFIGS:
+            assert int(self._logging(rel).save_every_cycles) == 1, rel

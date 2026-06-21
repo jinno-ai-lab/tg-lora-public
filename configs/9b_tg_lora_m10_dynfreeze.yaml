@@ -154,6 +154,16 @@ logging:
   log_every_cycles: 1
   save_every_cycles: 1
   run_dir: runs/${experiment.name}
+  # M10.3 disk-death guard (default OFF elsewhere). This TG-LoRA guard run
+  # saves a checkpoint every cycle; without pruning that is one
+  # checkpoint-cycle-* dir per cycle forever — the same unbounded accumulation
+  # class as the baseline. Mirrors keep_last/min_free_disk_gb from the baseline
+  # config so bounded accumulation is the default for BOTH autonomous run paths,
+  # not just the baseline. keep_last bounds the count; min_free_disk_gb reclaims
+  # oldest-first when the filesystem is low (never below the single newest
+  # checkpoint). See prune_checkpoint_cycles_from_cfg (the config->prune seam).
+  keep_last_checkpoints: 3
+  min_free_disk_gb: 2.0
   mlflow:
     enabled: false
     tracking_uri: ""
