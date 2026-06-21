@@ -21,6 +21,8 @@ from src.training.config_schema import load_validate_and_build_config
 from src.utils.checkpoint import (
     prune_checkpoint_cycles,
     prune_checkpoint_cycles_from_cfg,
+    prune_trajectory_delta_artifacts,
+    prune_trajectory_delta_artifacts_from_cfg,
     save_periodic_cycle_checkpoint,
 )
 
@@ -562,4 +564,377 @@ class TestTrainLoopWiresTheGuard:
             "train_tg_lora.py periodic-save path must call "
             "save_periodic_cycle_checkpoint — dropping it re-opens unbounded "
             "checkpoint-cycle-* accumulation (M10.3 disk-death class)"
+        )
+
+
+# =============================================================================
+# Trajectory-delta-artifact pruning — the M10.3 guard's second vector.
+#
+# db3c08f..43acef0 closed the checkpoint-cycle-* disk-death class and d2218ed /
+# c96a5a0 made the knobs survive the schema gate repo-wide. But
+# save_trajectory_delta_artifacts writes 1-2 .pt files per cycle into
+# run_dir/trajectory_delta_artifacts/ and never removes old ones, and the cycle
+# guard's regex (checkpoint-cycle-*) and min_free_disk_gb floor never scan that
+# path — so the M10 runs (save_every_cycles: 1, save_trajectory_delta_artifacts:
+# true, up to 120 cycles => ~240 delta-tensor files) accumulated this vector
+# unbounded *while keep_last_checkpoints was already on*. These tests prove the
+# same knobs now bound it, and that the trainer actually wires the seam.
+# =============================================================================
+
+ARTIFACT_SUBDIR = "trajectory_delta_artifacts"
+_ARTIFACT_ANCHORS = ("after_pilot", "after_speculative_update")
+
+
+def _save_artifact_files(
+    run_dir, cycle, anchors=_ARTIFACT_ANCHORS, payload_bytes=PAYLOAD_BYTES
+):
+    """Stand-in for save_trajectory_delta_artifact.
+
+    Writes .pt files matching the real artifact_file_name pattern
+    (tg_lora_<anchor>_cycle_NNNNNN.pt), one per anchor for the given cycle. The
+    model-save internals are tested elsewhere; here a fixed payload stands in for
+    the real delta-tensor write so we can assert disk bounding.
+    """
+    art_dir = Path(run_dir) / ARTIFACT_SUBDIR
+    art_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for anchor in anchors:
+        f = art_dir / f"tg_lora_{anchor}_cycle_{cycle:06d}.pt"
+        f.write_bytes(b"\x00" * payload_bytes)
+        written.append(f)
+    return written
+
+
+def _artifact_files(run_dir):
+    art_dir = Path(run_dir) / ARTIFACT_SUBDIR
+    if not art_dir.is_dir():
+        return []
+    return sorted(
+        (p for p in art_dir.iterdir() if p.is_file() and p.suffix == ".pt"),
+        key=lambda p: p.name,
+    )
+
+
+def _artifact_cycle_of(path):
+    # tg_lora_after_pilot_cycle_000003.pt -> 3
+    return int(path.name.rsplit("_", 1)[1].split(".")[0])
+
+
+def _artifact_total_bytes(run_dir):
+    return sum(f.stat().st_size for f in _artifact_files(run_dir))
+
+
+class TestTrajectoryArtifactBounding:
+    """keep_last bounds the per-cycle .pt accumulation the cycle guard doesn't see."""
+
+    def test_older_files_truly_removed_after_many_cycles(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        keep_last = 3
+        for cycle in range(1, 41):
+            _save_artifact_files(run_dir, cycle)
+            prune_trajectory_delta_artifacts(run_dir, keep_last=keep_last)
+
+        remaining = _artifact_files(run_dir)
+        assert sorted({_artifact_cycle_of(p) for p in remaining}) == [38, 39, 40]
+        # All anchors for the surviving cycles are kept together.
+        assert len(remaining) == keep_last * len(_ARTIFACT_ANCHORS)
+        # Older cycles are truly gone.
+        for cycle in range(1, 38):
+            assert not any(_artifact_cycle_of(p) == cycle for p in remaining)
+
+    def test_count_never_exceeds_keep_last_cycles_during_loop(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        keep_last = 3
+        for cycle in range(1, 41):
+            _save_artifact_files(run_dir, cycle)
+            prune_trajectory_delta_artifacts(run_dir, keep_last=keep_last)
+            cycles = {_artifact_cycle_of(p) for p in _artifact_files(run_dir)}
+            assert len(cycles) <= keep_last
+
+    def test_footprint_stays_bounded_not_linear(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        keep_last = 3
+        anchors = len(_ARTIFACT_ANCHORS)
+        peak = 0
+        for cycle in range(1, 41):
+            _save_artifact_files(run_dir, cycle)
+            prune_trajectory_delta_artifacts(run_dir, keep_last=keep_last)
+            peak = max(peak, _artifact_total_bytes(run_dir))
+
+        final = _artifact_total_bytes(run_dir)
+        assert final <= keep_last * anchors * PAYLOAD_BYTES
+        assert peak <= (keep_last + 1) * anchors * PAYLOAD_BYTES
+        assert peak < 40 * anchors * PAYLOAD_BYTES
+
+
+class TestTrajectoryArtifactContract:
+    """Edge behaviour of the count bound, and isolation from the cycle guard."""
+
+    def test_defaults_off_preserves_unbounded_behavior(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for cycle in range(1, 6):
+            _save_artifact_files(run_dir, cycle)
+
+        removed = prune_trajectory_delta_artifacts(run_dir)
+
+        assert removed == []
+        assert len(_artifact_files(run_dir)) == 5 * len(_ARTIFACT_ANCHORS)
+
+    def test_keep_last_larger_than_count_is_noop(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for cycle in range(1, 3):
+            _save_artifact_files(run_dir, cycle)
+
+        removed = prune_trajectory_delta_artifacts(run_dir, keep_last=10)
+
+        assert removed == []
+        assert sorted({_artifact_cycle_of(p) for p in _artifact_files(run_dir)}) == [1, 2]
+
+    def test_no_files_is_safe_noop(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        assert prune_trajectory_delta_artifacts(run_dir, keep_last=3) == []
+        # Even an absent subdir is safe.
+        assert prune_trajectory_delta_artifacts(tmp_path / "never", keep_last=3) == []
+
+    def test_non_pt_and_unsortable_files_are_never_touched(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        manifest = run_dir / ARTIFACT_SUBDIR / "manifest.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text("{}")
+        # No _cycle_N / _step_N suffix -> unsortable, so never pruned.
+        anchorless = run_dir / ARTIFACT_SUBDIR / "tg_lora_summary.pt"
+        anchorless.write_bytes(b"\x00")
+        for cycle in range(1, 6):
+            _save_artifact_files(run_dir, cycle)
+
+        prune_trajectory_delta_artifacts(run_dir, keep_last=2)
+
+        assert manifest.exists()
+        assert anchorless.exists()
+
+    def test_artifact_prune_never_touches_checkpoint_cycle_dirs(self, tmp_path):
+        # The two regexes are disjoint: checkpoint-cycle-N carries the -cycle-
+        # infix the artifact regex cannot match, and artifacts live in a subdir.
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for cycle in range(1, 6):
+            _save_checkpoint_dir(run_dir, cycle)
+            _save_artifact_files(run_dir, cycle)
+
+        prune_trajectory_delta_artifacts(run_dir, keep_last=1)
+
+        assert [_cycle_of(p) for p in _checkpoint_dirs(run_dir)] == [1, 2, 3, 4, 5]
+        assert sorted({_artifact_cycle_of(p) for p in _artifact_files(run_dir)}) == [5]
+
+    def test_cycle_prune_never_touches_artifact_files(self, tmp_path):
+        # Symmetric isolation in the other direction.
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for cycle in range(1, 6):
+            _save_checkpoint_dir(run_dir, cycle)
+            _save_artifact_files(run_dir, cycle)
+
+        prune_checkpoint_cycles(run_dir, keep_last=1)
+
+        assert [_cycle_of(p) for p in _checkpoint_dirs(run_dir)] == [5]
+        assert sorted({_artifact_cycle_of(p) for p in _artifact_files(run_dir)}) == [
+            1, 2, 3, 4, 5,
+        ]
+
+
+class TestTrajectoryArtifactDiskFloor:
+    """min_free_disk_gb prunes oldest cycle-keys until the floor is met."""
+
+    def test_floor_met_stops_pruning(self, tmp_path, monkeypatch):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for cycle in range(1, 6):
+            _save_artifact_files(run_dir, cycle)
+
+        monkeypatch.setattr(
+            shutil,
+            "disk_usage",
+            lambda p: _DiskUsage(total=100, used=0, free=10 * 1024 ** 3),
+        )
+
+        removed = prune_trajectory_delta_artifacts(
+            run_dir, keep_last=0, min_free_disk_gb=2.0
+        )
+
+        assert removed == []
+        assert len(_artifact_files(run_dir)) == 5 * len(_ARTIFACT_ANCHORS)
+
+    def test_low_disk_prunes_oldest_keys_until_floor_met(self, tmp_path, monkeypatch):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for cycle in range(1, 6):
+            _save_artifact_files(run_dir, cycle)
+
+        # Free space rises 1 MiB per check; a 3 MiB floor is met on the 3rd
+        # check, so the two oldest cycle-keys (all their anchors) go first.
+        calls = {"n": 0}
+
+        def fake_du(p):
+            calls["n"] += 1
+            free = (1 + (calls["n"] - 1)) * 1024 * 1024  # 1,2,3,... MiB
+            return _DiskUsage(total=100 * 1024 ** 3, used=0, free=free)
+
+        monkeypatch.setattr(shutil, "disk_usage", fake_du)
+
+        removed = prune_trajectory_delta_artifacts(
+            run_dir, keep_last=0, min_free_disk_gb=3.0 / 1024  # 3 MiB floor
+        )
+
+        assert sorted({_artifact_cycle_of(p) for p in removed}) == [1, 2]
+        assert sorted({_artifact_cycle_of(p) for p in _artifact_files(run_dir)}) == [3, 4, 5]
+
+    def test_floor_never_deletes_the_last_key(self, tmp_path, monkeypatch):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for cycle in range(1, 4):
+            _save_artifact_files(run_dir, cycle)
+
+        monkeypatch.setattr(
+            shutil,
+            "disk_usage",
+            lambda p: _DiskUsage(total=100, used=100, free=0),
+        )
+
+        removed = prune_trajectory_delta_artifacts(
+            run_dir, keep_last=0, min_free_disk_gb=1000.0
+        )
+
+        assert sorted({_artifact_cycle_of(p) for p in removed}) == [1, 2]
+        assert sorted({_artifact_cycle_of(p) for p in _artifact_files(run_dir)}) == [3]
+
+
+class TestTrajectoryArtifactConfigDrivenWiring:
+    """prune_trajectory_delta_artifacts_from_cfg — the seam wired into the
+    periodic-save path. Reads the SAME knobs as the cycle guard, so one opt-in
+    bounds both vectors; the M10 configs already set them."""
+
+    @staticmethod
+    def _cfg(keep_last=0, min_free=0.0):
+        return {"logging": {"keep_last_checkpoints": keep_last,
+                            "min_free_disk_gb": min_free}}
+
+    def test_knobs_fire_count_bound(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for cycle in range(1, 9):
+            _save_artifact_files(run_dir, cycle)
+
+        removed = prune_trajectory_delta_artifacts_from_cfg(self._cfg(3, 2.0), run_dir)
+
+        assert sorted({_artifact_cycle_of(p) for p in removed}) == [1, 2, 3, 4, 5]
+        assert sorted({_artifact_cycle_of(p) for p in _artifact_files(run_dir)}) == [6, 7, 8]
+
+    def test_defaults_off_is_noop(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for cycle in range(1, 6):
+            _save_artifact_files(run_dir, cycle)
+
+        assert prune_trajectory_delta_artifacts_from_cfg(self._cfg(), run_dir) == []
+        assert prune_trajectory_delta_artifacts_from_cfg({}, run_dir) == []
+
+    def test_missing_logging_section_is_noop(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        _save_artifact_files(run_dir, 1)
+        assert prune_trajectory_delta_artifacts_from_cfg(
+            {"experiment": {"name": "x"}}, run_dir
+        ) == []
+        assert prune_trajectory_delta_artifacts_from_cfg(None, run_dir) == []
+
+    def test_works_with_omegaconf_dictconfig(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        for cycle in range(1, 6):
+            _save_artifact_files(run_dir, cycle)
+        cfg = OmegaConf.create({"logging": {"keep_last_checkpoints": 2,
+                                            "min_free_disk_gb": 0.0}})
+
+        removed = prune_trajectory_delta_artifacts_from_cfg(cfg, run_dir)
+
+        assert sorted({_artifact_cycle_of(p) for p in removed}) == [1, 2, 3]
+        assert sorted({_artifact_cycle_of(p) for p in _artifact_files(run_dir)}) == [4, 5]
+
+
+class TestM10ConfigBoundsArtifactsEndToEnd:
+    """Closed loop: a real M10 config file -> schema -> typed cfg -> bounded
+    trajectory_delta_artifacts/ count.
+
+    Both M10 configs ship save_trajectory_delta_artifacts: true AND
+    keep_last_checkpoints=3. Before this guard the knobs were "on" but inert for
+    artifacts — the cycle guard never scanned that path. This proves the same
+    typed cfg the trainer holds at runtime now bounds the artifact dir too.
+    """
+
+    def test_both_m10_configs_bound_the_artifact_dir(self, tmp_path):
+        for rel in _M10_CONFIGS:
+            _, typed_cfg = load_validate_and_build_config(_REPO_ROOT / rel)
+            run_dir = tmp_path / rel.replace("/", "_")
+            run_dir.mkdir()
+            for cycle in range(1, 9):  # 8 cycles, 2 anchors each = 16 files
+                _save_artifact_files(run_dir, cycle)
+
+            removed = prune_trajectory_delta_artifacts_from_cfg(typed_cfg, run_dir)
+
+            assert sorted(
+                {_artifact_cycle_of(p) for p in _artifact_files(run_dir)}
+            ) == [6, 7, 8], rel
+            assert len(removed) == 5 * len(_ARTIFACT_ANCHORS), rel
+
+    def test_both_m10_configs_enable_artifact_saving_so_guard_is_required(self):
+        # Documents WHY this guard is mandatory on the M10 runs: with
+        # save_trajectory_delta_artifacts: true and interval default 1, both
+        # write 1-2 .pt files every cycle that would otherwise accumulate forever.
+        for rel in _M10_CONFIGS:
+            cfg = OmegaConf.load(_REPO_ROOT / rel)
+            assert bool(cfg.training.get("save_trajectory_delta_artifacts", False)), rel
+
+
+class TestTrainLoopWiresTheArtifactGuard:
+    """Structural guard: the periodic-save block actually calls the artifact seam.
+
+    Mirrors TestTrainLoopWiresTheGuard — a refactor that silently drops the call
+    re-opens the trajectory-artifact accumulation vector while every isolated seam
+    test stays green.
+    """
+
+    def test_periodic_save_block_imports_and_calls_artifact_prune(self):
+        source = (_REPO_ROOT / "src/training/train_tg_lora.py").read_text()
+        tree = ast.parse(source)
+        imported = False
+        call_count = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "src.utils.checkpoint":
+                imported |= any(
+                    a.name == "prune_trajectory_delta_artifacts_from_cfg"
+                    for a in node.names
+                )
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "prune_trajectory_delta_artifacts_from_cfg"
+            ):
+                call_count += 1
+
+        assert imported, (
+            "train_tg_lora.py must import prune_trajectory_delta_artifacts_from_cfg "
+            "(the trajectory-artifact arm of the M10.3 disk-death guard)"
+        )
+        assert call_count >= 1, (
+            "train_tg_lora.py periodic-save path must call "
+            "prune_trajectory_delta_artifacts_from_cfg — dropping it re-opens "
+            "unbounded trajectory_delta_artifacts/*.pt accumulation, the second "
+            "M10.3 disk-death vector the cycle guard alone leaves open"
         )

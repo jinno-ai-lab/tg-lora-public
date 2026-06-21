@@ -82,6 +82,7 @@ from src.training.trajectory_delta_artifact import (
 from src.utils.checkpoint import (
     TrainingState,
     load_training_state,
+    prune_trajectory_delta_artifacts_from_cfg,
     save_checkpoint,
     save_periodic_cycle_checkpoint,
     save_training_state,
@@ -3918,6 +3919,20 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 )
                 for d in removed:
                     logger.info("Pruned old checkpoint to bound disk: %s", d)
+                # Bound trajectory-delta-artifact growth — the second vector of the
+                # M10.3 disk-death class. The cycle guard above only matches
+                # checkpoint-cycle-* dirs, but save_trajectory_delta_artifacts also
+                # writes 1-2 .pt files per cycle into run_dir/trajectory_delta_artifacts/
+                # and never removed old ones, so this run accumulated them linearly
+                # despite keep_last_checkpoints being "on". Same knobs, same default-off.
+                for f in prune_trajectory_delta_artifacts_from_cfg(cfg, run_dir):
+                    logger.info("Pruned old trajectory artifact to bound disk: %s", f)
+                # Bound trajectory-delta-artifact growth — the second vector of the
+                # M10.3 disk-death class. The cycle guard above only matches
+                # checkpoint-cycle-* dirs, but save_trajectory_delta_artifacts also
+                # writes 1-2 .pt files per cycle into run_dir/trajectory_delta_artifacts/
+                # and never removed old ones, so this run accumulated them linearly
+                # despite keep_last_checkpoints being "on". Same knobs, same default-off.
 
 
 

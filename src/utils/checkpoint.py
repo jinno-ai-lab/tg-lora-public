@@ -51,9 +51,16 @@ def save_checkpoint(model: torch.nn.Module, tokenizer, save_dir: Path) -> None:
 
 _CYCLE_DIR_RE = re.compile(r"^checkpoint-cycle-(\d+)$")
 
+# trajectory_delta_artifacts/{mode}_{anchor}_{cycle|step}_NNNNNN.pt — the integer
+# suffix (group 1) orders them; anchor name is variable-length so we anchor on
+# the trailing _cycle/_step token, not the mode/anchor prefix.
+_ARTIFACT_KEY_RE = re.compile(r"_(?:cycle|step)_(\d+)\.pt$")
+_TRAJECTORY_ARTIFACT_SUBDIR = "trajectory_delta_artifacts"
 
-def _sorted_cycle_checkpoint_dirs(run_dir: Path) -> list[Path]:
-    """Return ``checkpoint-cycle-<N>`` dirs under *run_dir*, oldest cycle first."""
+
+def _sorted_cycle_checkpoint_dirs(run_dir: Path) -> list[tuple[int, Path]]:
+    """Return ``(cycle, dir)`` pairs for ``checkpoint-cycle-<N>`` under *run_dir*,
+    oldest cycle first."""
     found: list[tuple[int, Path]] = []
     for p in Path(run_dir).iterdir():
         if p.is_dir():
@@ -61,7 +68,97 @@ def _sorted_cycle_checkpoint_dirs(run_dir: Path) -> list[Path]:
             if m:
                 found.append((int(m.group(1)), p))
     found.sort(key=lambda t: t[0])
-    return [p for _, p in found]
+    return found
+
+
+def _sorted_trajectory_delta_artifact_files(
+    run_dir: Path,
+) -> list[tuple[int, Path]]:
+    """Return ``(cycle_or_step, file)`` pairs for ``*.pt`` trajectory-delta
+    artifacts under ``run_dir/trajectory_delta_artifacts/``, oldest key first.
+
+    Filenames are ``{mode}_{anchor_kind}_{cycle|step}_NNNNNN.pt`` (see
+    ``artifact_file_name``); the integer suffix orders them. Files without a
+    parseable suffix (e.g. a future manifest) are left alone — unsortable, so
+    never pruned. Multiple files per key (the pilot + speculative anchors saved
+    each cycle) group together and survive/fall as a unit.
+    """
+    art_dir = Path(run_dir) / _TRAJECTORY_ARTIFACT_SUBDIR
+    if not art_dir.is_dir():
+        return []
+    found: list[tuple[int, Path]] = []
+    for p in art_dir.iterdir():
+        if p.is_file():
+            m = _ARTIFACT_KEY_RE.search(p.name)
+            if m:
+                found.append((int(m.group(1)), p))
+    found.sort(key=lambda t: (t[0], t[1].name))
+    return found
+
+
+def _bound_keyed_paths(
+    run_dir: Path,
+    keyed_paths: list[tuple[int, Path]],
+    keep_last: int,
+    min_free_bytes: float,
+    *,
+    remove,
+) -> list[Path]:
+    """Count-bound then disk-floor a list of ``(key, Path)`` pairs.
+
+    Shared by the checkpoint-dir and trajectory-artifact pruners so the two
+    on-disk growth vectors of the M10.3 disk-death class share one proven
+    policy. ``keyed_paths`` must be oldest-key-first (the caller's sort; ties
+    keep the caller's order). ``keep_last`` bounds the number of **distinct
+    keys** that survive: every path whose key is older than the newest
+    ``keep_last`` keys is removed. ``min_free_bytes`` then removes whole oldest
+    keys until the filesystem floor is met, but never below the single newest
+    key — so one recovery point's worth of data always survives.
+
+    ``remove`` is the per-item destructor (``shutil.rmtree`` for dirs, ``unlink``
+    for files). Returns removed Paths, oldest-first. Idempotent; safe no-op on
+    an empty list. Knobs are clamped non-negative, so ``0`` disables either
+    guard (the safe default preserving unbounded behavior for unrelated runs).
+    """
+    if not keyed_paths:
+        return []
+
+    keep_last = max(0, int(keep_last))
+    min_free_bytes = max(0.0, float(min_free_bytes))
+    removed: list[Path] = []
+
+    distinct_keys = sorted({key for key, _ in keyed_paths})
+    surviving = list(keyed_paths)
+
+    # 1) Count bound: drop every path whose key predates the newest keep_last keys.
+    if keep_last > 0 and keep_last < len(distinct_keys):
+        cut_keys = set(distinct_keys[: len(distinct_keys) - keep_last])
+        kept: list[tuple[int, Path]] = []
+        for key, path in surviving:
+            if key in cut_keys:
+                remove(path)
+                removed.append(path)
+            else:
+                kept.append((key, path))
+        surviving = kept
+
+    # 2) Disk floor: remove whole oldest keys until the floor is met, but never
+    #    below the single newest key.
+    if min_free_bytes > 0:
+        by_key: dict[int, list[Path]] = {}
+        for key, path in surviving:
+            by_key.setdefault(key, []).append(path)
+        live_keys = sorted(by_key)
+        while (
+            len(live_keys) > 1
+            and shutil.disk_usage(str(run_dir)).free < min_free_bytes
+        ):
+            oldest = live_keys.pop(0)
+            for path in by_key[oldest]:
+                remove(path)
+                removed.append(path)
+
+    return removed
 
 
 def prune_checkpoint_cycles(
@@ -88,32 +185,49 @@ def prune_checkpoint_cycles(
     Returns the dirs removed, oldest-first. Idempotent; safe with no dirs.
     """
     run_dir = Path(run_dir)
-    dirs = _sorted_cycle_checkpoint_dirs(run_dir)  # oldest -> newest
-    if not dirs:
-        return []
-
-    keep_last = max(0, int(keep_last))
     min_free_bytes = max(0.0, float(min_free_disk_gb)) * (1024 ** 3)
-    removed: list[Path] = []
+    return _bound_keyed_paths(
+        run_dir,
+        _sorted_cycle_checkpoint_dirs(run_dir),
+        keep_last,
+        min_free_bytes,
+        remove=lambda p: shutil.rmtree(p, ignore_errors=True),
+    )
 
-    # 1) Count bound: delete everything older than the newest `keep_last`.
-    if keep_last > 0:
-        cut = len(dirs) - keep_last
-        if cut > 0:
-            for d in dirs[:cut]:
-                shutil.rmtree(d, ignore_errors=True)
-                removed.append(d)
-            dirs = dirs[cut:]
 
-    # 2) Disk floor: prune oldest survivors until the floor is met, but never
-    #    below the single newest checkpoint.
-    if min_free_bytes > 0:
-        while len(dirs) > 1 and shutil.disk_usage(str(run_dir)).free < min_free_bytes:
-            oldest = dirs.pop(0)
-            shutil.rmtree(oldest, ignore_errors=True)
-            removed.append(oldest)
+def prune_trajectory_delta_artifacts(
+    run_dir: Path,
+    keep_last: int = 0,
+    min_free_disk_gb: float = 0.0,
+) -> list[Path]:
+    """Bound on-disk growth of ``run_dir/trajectory_delta_artifacts/*.pt``.
 
-    return removed
+    The cycle guard (:func:`prune_checkpoint_cycles`) only matches
+    ``checkpoint-cycle-*`` dirs. But ``save_trajectory_delta_artifacts`` writes
+    one ``.pt`` per anchor (pilot + speculative) every
+    ``trajectory_delta_artifact_interval`` cycles (default 1) into
+    ``trajectory_delta_artifacts/`` and never removes old ones — a second
+    unbounded per-cycle accumulation vector on the same autonomous runs the
+    cycle guard protects. With ``save_every_cycles: 1`` and 120 cycles that is
+    up to ~240 delta-tensor files growing linearly and never reclaimed, and the
+    cycle guard's ``min_free_disk_gb`` floor never sees them (different path).
+
+    Same contract as :func:`prune_checkpoint_cycles`: ``keep_last`` retains only
+    the newest ``keep_last`` cycle/step keys' files (all anchors for those keys,
+    kept together); ``min_free_disk_gb`` reclaims oldest keys first when the
+    filesystem is low, never below the single newest key. Either may be ``0`` to
+    disable (the safe default preserving unbounded behavior for unrelated runs).
+    Returns files removed, oldest-first. Idempotent; safe with no dir/files.
+    """
+    run_dir = Path(run_dir)
+    min_free_bytes = max(0.0, float(min_free_disk_gb)) * (1024 ** 3)
+    return _bound_keyed_paths(
+        run_dir,
+        _sorted_trajectory_delta_artifact_files(run_dir),
+        keep_last,
+        min_free_bytes,
+        remove=lambda p: p.unlink(missing_ok=True),
+    )
 
 
 def prune_checkpoint_cycles_from_cfg(cfg, run_dir: Path) -> list[Path]:
@@ -136,6 +250,32 @@ def prune_checkpoint_cycles_from_cfg(cfg, run_dir: Path) -> list[Path]:
     if keep_last <= 0 and min_free <= 0.0:
         return []
     return prune_checkpoint_cycles(
+        run_dir, keep_last=keep_last, min_free_disk_gb=min_free
+    )
+
+
+def prune_trajectory_delta_artifacts_from_cfg(cfg, run_dir: Path) -> list[Path]:
+    """Read the pruning knobs from ``cfg.logging`` and prune trajectory artifacts.
+
+    Mirrors :func:`prune_checkpoint_cycles_from_cfg` but targets the
+    ``trajectory_delta_artifacts/*.pt`` vector. Reads the SAME
+    ``keep_last_checkpoints`` / ``min_free_disk_gb`` knobs so a single opt-in
+    bounds BOTH on-disk growth vectors of the M10.3 class. The M10 configs
+    already set these knobs AND ``save_trajectory_delta_artifacts: true``, so
+    this fires for them with no config change — closing the gap where the knobs
+    were "on" but inert for artifacts (the cycle guard never scanned that path).
+    Returns pruned files, oldest-first; empty when both knobs are off (the safe
+    default that preserves unbounded behavior for unrelated runs).
+
+    ``cfg`` may be an OmegaConf ``DictConfig`` (prod) or a plain dict (tests);
+    both expose ``.get``.
+    """
+    logging_cfg = cfg.get("logging", {}) if cfg is not None else {}
+    keep_last = int(logging_cfg.get("keep_last_checkpoints", 0))
+    min_free = float(logging_cfg.get("min_free_disk_gb", 0.0))
+    if keep_last <= 0 and min_free <= 0.0:
+        return []
+    return prune_trajectory_delta_artifacts(
         run_dir, keep_last=keep_last, min_free_disk_gb=min_free
     )
 
