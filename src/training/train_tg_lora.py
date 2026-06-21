@@ -1648,7 +1648,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
             if dynfreeze is not None:
                 dynfreeze_r_A = dynfreeze.compute_r_A(model, cycle)
                 to_unfreeze = dynfreeze.decide_unfreeze(cycle)
-                dynfreeze.apply_unfreeze(model, to_unfreeze)
+                dynfreeze.apply_unfreeze(model, to_unfreeze, cycle=cycle)
                 to_freeze = dynfreeze.decide_freeze(cycle)
                 dynfreeze.apply_freeze(model, to_freeze, cycle)
                 # If all layers are frozen, skip the expensive training steps

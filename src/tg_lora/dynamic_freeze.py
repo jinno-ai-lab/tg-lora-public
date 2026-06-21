@@ -37,6 +37,10 @@ class DynFreezeState:
     prev_A_fro: dict[str, float] = field(default_factory=dict)
     median_A: float = 0.0
     epsilon: float = 1e-6
+    # layer_idx → cycle at which it was last released by §4. Lets a resumed run
+    # honor the release cooldown (a released layer must re-train for a window
+    # before it can be re-frozen). Absent on pre-existing checkpoints.
+    released_at: dict[int, int] = field(default_factory=dict)
 
 
 class DynamicFreezeController:
@@ -66,6 +70,12 @@ class DynamicFreezeController:
         self._frozen_block: list[int] = []  # e.g. [31, 30, 29]
         self._r_A_history: dict[int, deque[float]] = {}
         self._frozen_since_cycle: int = 0
+        # layer_idx → cycle last released by §4. While a layer is in its release
+        # cooldown (cycle - released_at < window) it may NOT be re-frozen: the
+        # frozen-period 0.0 r_A history is not real quietness, so §4 would
+        # otherwise silently re-freeze the layer in the same cycle it was
+        # released, making the reversible release a no-op.
+        self._released_at: dict[int, int] = {}
         self._prev_A_fro: dict[str, float] = {}
         self._median_A: float = 0.0
         self._epsilon: float = 1e-6
@@ -162,6 +172,17 @@ class DynamicFreezeController:
         """Whether a layer's r_A_window < τ (quiet → can be frozen)."""
         return self._r_A_window(layer_idx) < self._tau
 
+    def _in_release_cooldown(self, layer_idx: int, cycle: int) -> bool:
+        """Whether ``layer_idx`` was released by §4 too recently to re-freeze.
+
+        A released layer must accumulate a full fresh window of real r_A
+        observations (one per cycle) before §3 may judge it quiet again, so the
+        §4 reversible release actually lets the layer re-train instead of being
+        silently re-frozen on its frozen-period 0.0 history.
+        """
+        released_at = self._released_at.get(layer_idx)
+        return released_at is not None and cycle - released_at < self._window
+
     def decide_freeze(self, cycle: int) -> list[int]:
         """§3: Build contiguous block from L31. Return NEW layers to freeze."""
         if cycle < self._window:
@@ -174,6 +195,11 @@ class DynamicFreezeController:
         for layer_idx in self._all_layers:
             if layer_idx in frozen_set:
                 continue  # Already frozen — skip, block continues
+            if self._in_release_cooldown(layer_idx, cycle):
+                # Just released by §4 and still re-training: its 0.0 history is
+                # frozen-period artifact, not real quietness. The block cannot
+                # extend past it (it is the adjacency point), so stop here.
+                break
             if self._is_quiet(layer_idx):
                 new_layers.append(layer_idx)
             else:
@@ -263,8 +289,16 @@ class DynamicFreezeController:
         )
         return frozen_count
 
-    def apply_unfreeze(self, model: nn.Module, layers: list[int]) -> int:
-        """Unfreeze given layers. Returns number of parameters unfrozen."""
+    def apply_unfreeze(
+        self, model: nn.Module, layers: list[int], *, cycle: int | None = None
+    ) -> int:
+        """Unfreeze given layers. Returns number of parameters unfrozen.
+
+        ``cycle`` (passed by the trainer) re-arms the §4(a) stir timer and marks
+        each released layer as in-cooldown so the reversible release takes
+        effect instead of being undone by §3 in the same cycle. Omit it only for
+        ad-hoc/test callers that do not run the full decide→apply loop.
+        """
         if not layers or not self._frozen_block:
             return 0
 
@@ -280,6 +314,17 @@ class DynamicFreezeController:
                         unfrozen_count += 1
 
         self._frozen_block = [l for l in self._frozen_block if l not in release_set]
+
+        if cycle is not None:
+            # Block changed → the "held R cycles" counter for §4(a) stir resets,
+            # so stir is periodic (one release, then wait again) rather than
+            # draining the block one layer per cycle.
+            self._frozen_since_cycle = cycle
+            for layer_idx in release_set:
+                self._released_at[layer_idx] = cycle
+                # Drop the frozen-period 0.0 history so the next window is real.
+                self._r_A_history.pop(layer_idx, None)
+
         if unfrozen_count:
             logger.info(
                 "Guard: released L%s (block now=%s, %d params unfrozen)",
@@ -336,6 +381,7 @@ class DynamicFreezeController:
             prev_A_fro=dict(self._prev_A_fro),
             median_A=self._median_A,
             epsilon=self._epsilon,
+            released_at=dict(self._released_at),
         )
 
     def load_state_dict(self, state: DynFreezeState) -> None:
@@ -348,3 +394,5 @@ class DynamicFreezeController:
         self._prev_A_fro = dict(state.prev_A_fro)
         self._median_A = state.median_A
         self._epsilon = state.epsilon
+        # ``released_at`` is absent on checkpoints predating the cooldown fix.
+        self._released_at = dict(getattr(state, "released_at", {}))
