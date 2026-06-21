@@ -203,3 +203,8 @@ status: generated
 - Generated or refreshed repository wiki for `tg-lora`.
 - Source: deterministic ai-hub fallback writer.
 
+## bootstrap | repo LLM wiki
+
+- Generated or refreshed repository wiki for `tg-lora-public`.
+- Source: deterministic ai-hub fallback writer.
+
