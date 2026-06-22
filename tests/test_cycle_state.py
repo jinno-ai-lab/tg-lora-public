@@ -344,6 +344,68 @@ class TestFromDict:
 
 
 # ---------------------------------------------------------------------------
+# record_full_eval + §5.3 improvement-margin (min_delta)
+# docs/design/10_guard_experiment.md §5.3: "valid_full loss が 10 サイクル連続で
+# 改善幅 < 0.01 なら打ち切り" — an improvement smaller than min_delta must NOT
+# count as a new best (Keras-style min_delta). Default min_delta=0.0 keeps the
+# historical "any strict decrease is a new best" contract bit-identical.
+# ---------------------------------------------------------------------------
+
+
+class TestRecordFullEvalMinDelta:
+    """§5.3 improvement-margin behavior of CycleState.record_full_eval."""
+
+    def test_default_min_delta_any_strict_decrease_is_improvement(self):
+        # min_delta defaults to 0.0: a tiny strict decrease still wins.
+        cs = CycleState(best_loss=2.0, stale_cycles=2)
+        cs.record_full_eval(1.9999)
+        assert cs.stale_cycles == 0
+        assert cs.best_loss == pytest.approx(1.9999)
+        assert cs.best_step == cs.full_backward_passes
+
+    def test_subthreshold_improvement_does_not_reset_stale(self):
+        # improvement 0.005 < min_delta 0.01 -> NOT a new best, stale increments.
+        cs = CycleState(best_loss=2.0, stale_cycles=0)
+        cs.min_delta = 0.01
+        cs.record_full_eval(1.995)
+        assert cs.stale_cycles == 1
+        assert cs.best_loss == pytest.approx(2.0)
+        assert cs.best_step == 0  # unchanged: no new best recorded
+
+    def test_subthreshold_keeps_accumulating_stale(self):
+        # Two consecutive sub-threshold moves: stale climbs 0 -> 1 -> 2.
+        cs = CycleState(best_loss=2.0)
+        cs.min_delta = 0.01
+        cs.record_full_eval(1.998)  # 0.002 < 0.01
+        cs.record_full_eval(1.996)  # 0.004 < 0.01 (vs original 2.0)
+        assert cs.stale_cycles == 2
+        assert cs.best_loss == pytest.approx(2.0)
+
+    def test_above_threshold_improvement_resets_stale(self):
+        # improvement 0.05 > min_delta 0.01 -> genuine new best, stale resets.
+        cs = CycleState(best_loss=2.0, stale_cycles=3)
+        cs.min_delta = 0.01
+        cs.record_full_eval(1.95)
+        assert cs.stale_cycles == 0
+        assert cs.best_loss == pytest.approx(1.95)
+
+    def test_equal_loss_is_not_improvement_under_min_delta(self):
+        cs = CycleState(best_loss=2.0)
+        cs.min_delta = 0.01
+        cs.record_full_eval(2.0)
+        assert cs.stale_cycles == 1
+        assert cs.best_loss == pytest.approx(2.0)
+
+    def test_first_eval_always_new_best_regardless_of_min_delta(self):
+        # best_loss starts at +inf, so the first real loss always wins.
+        cs = CycleState()
+        cs.min_delta = 0.01
+        cs.record_full_eval(5.0)
+        assert cs.stale_cycles == 0
+        assert cs.best_loss == pytest.approx(5.0)
+
+
+# ---------------------------------------------------------------------------
 # Parameter validation
 # ---------------------------------------------------------------------------
 
@@ -363,6 +425,7 @@ class TestValidation:
             ("rejected_count", -1),
             ("alpha_steps_in_cycle", -1),
             ("n_base_recompute", -1),
+            ("min_delta", -0.01),
         ],
     )
     def test_rejects_negative_field(self, field, value):
@@ -371,7 +434,7 @@ class TestValidation:
 
     @pytest.mark.parametrize(
         "field",
-        ["cycle", "full_backward_passes", "extrapolation_steps", "best_step", "stale_cycles", "accepted_count", "rejected_count"],
+        ["cycle", "full_backward_passes", "extrapolation_steps", "best_step", "stale_cycles", "accepted_count", "rejected_count", "min_delta"],
     )
     def test_accepts_zero(self, field):
         CycleState(**{field: 0})

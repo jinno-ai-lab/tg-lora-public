@@ -32,6 +32,12 @@ class CycleState:
     n_base_recompute: int = 0
     consecutive_rejects: int = 0
     interval_net_loss_delta: float | None = None
+    # §5.3 improvement-margin for the full-eval early-stopping signal
+    # (docs/design/10_guard_experiment.md §5.3: "改善幅 < 0.01 なら打ち切り").
+    # A full-eval loss only counts as a new best when the decrease strictly
+    # exceeds min_delta (Keras-style). Default 0.0 keeps the historical "any
+    # strict decrease wins" contract bit-identical.
+    min_delta: float = 0.0
 
     def __post_init__(self) -> None:
         if (
@@ -87,6 +93,8 @@ class CycleState:
                 "v_fixed_since_cycle must be non-negative when set, "
                 f"got {self.v_fixed_since_cycle}"
             )
+        if self.min_delta < 0:
+            raise ValueError(f"min_delta must be non-negative, got {self.min_delta}")
 
     def record_cycle(
         self,
@@ -235,8 +243,13 @@ class CycleState:
         Separate from ``record_cycle`` so the training loop can use quick-eval
         for per-cycle monitoring and full-eval for early-stopping decisions
         without double-counting stale cycles.
+
+        A loss only counts as a new best when the decrease over ``best_loss``
+        strictly exceeds ``min_delta`` (§5.3 improvement-margin insurance).
+        With the default ``min_delta=0.0`` this reduces to ``full_loss <
+        best_loss`` — bit-identical to the pre-§5.3 contract.
         """
-        if full_loss < self.best_loss:
+        if self.best_loss - full_loss > self.min_delta:
             self.best_loss = full_loss
             self.best_step = self.full_backward_passes
             self.stale_cycles = 0

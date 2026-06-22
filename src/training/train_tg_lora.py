@@ -515,9 +515,17 @@ def _evaluate_full_eval_outcome(
     patience: int | None,
     min_cycles: int,
     current_cycle: int,
+    min_delta: float = 0.0,
 ) -> tuple[bool, bool, str]:
-    """Determine full-eval outcomes: (is_new_best, should_stop, reason)."""
-    is_new_best = full_loss < prev_best
+    """Determine full-eval outcomes: (is_new_best, should_stop, reason).
+
+    ``min_delta`` is the §5.3 improvement-margin: a loss only counts as a new
+    best when it beats ``prev_best`` by strictly more than ``min_delta``
+    (Keras-style). Default 0.0 keeps ``full_loss < prev_best`` bit-identical.
+    It must match the margin ``CycleState.record_full_eval`` uses so the
+    computed ``new_stale`` agrees with the state the loop records.
+    """
+    is_new_best = prev_best - full_loss > min_delta
     new_stale = 0 if is_new_best else stale_cycles + 1
     should_stop = (
         patience is not None and new_stale >= patience and current_cycle >= min_cycles
@@ -1338,6 +1346,12 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
 
     early_stop_patience = cfg.training.get("early_stopping_patience", None)
     min_cycles_before_stop = cfg.training.get("min_cycles_before_stop", 10)
+    # §5.3 improvement-margin: a full-eval decrease must beat the best by more
+    # than min_delta to count as a new best (Keras-style). Default 0.0 keeps
+    # the historical contract. Threaded into CycleState + the stop decision so
+    # the recorded stale count and the stop reason always agree.
+    early_stopping_min_delta = cfg.training.get("early_stopping_min_delta", 0.0)
+    cycle_state.min_delta = early_stopping_min_delta
     accept_eval_examples = _resolve_accept_eval_examples(cfg)
 
     # 学習開始前の基準 loss は fresh run だけで計算し、resume 時は保存済み状態を使う。
@@ -3806,6 +3820,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                     early_stop_patience,
                     min_cycles_before_stop,
                     cycle_state.cycle,
+                    early_stopping_min_delta,
                 )
                 if full_loss < best_full_eval_loss:
                     best_full_eval_loss = full_loss

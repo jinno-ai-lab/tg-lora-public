@@ -403,3 +403,65 @@ class TestShouldFallbackToBaselineLike:
         )
         assert is_best is False
         assert "stale=1" in reason
+
+    # -- §5.3 improvement-margin (min_delta) early-stop ----------------------
+    # docs/design/10_guard_experiment.md §5.3: a full-eval loss improvement of
+    # < 0.01 must NOT count as a new best (Keras-style min_delta). The default
+    # min_delta=0.0 keeps the historical "any strict decrease is a new best"
+    # contract bit-identical.
+    def test_min_delta_blocks_subthreshold_improvement(self):
+        # prev_best=2.0, full_loss=1.995 -> improvement 0.005 < min_delta 0.01
+        is_best, stop, reason = _evaluate_full_eval_outcome(
+            1.995,
+            2.0,
+            stale_cycles=0,
+            patience=5,
+            min_cycles=10,
+            current_cycle=12,
+            min_delta=0.01,
+        )
+        assert is_best is False
+        assert "no_improvement" in reason
+        assert "stale=1" in reason
+
+    def test_min_delta_allows_above_threshold_improvement(self):
+        # improvement 0.05 > min_delta 0.01 -> genuine new best
+        is_best, stop, reason = _evaluate_full_eval_outcome(
+            1.95,
+            2.0,
+            stale_cycles=3,
+            patience=5,
+            min_cycles=10,
+            current_cycle=12,
+            min_delta=0.01,
+        )
+        assert is_best is True
+        assert stop is False
+
+    def test_min_delta_default_zero_is_bit_identical(self):
+        # default min_delta=0.0: any strict decrease (even sub-0.01) is a new best
+        is_best, stop, reason = _evaluate_full_eval_outcome(
+            1.9999,
+            2.0,
+            stale_cycles=0,
+            patience=5,
+            min_cycles=10,
+            current_cycle=12,
+        )
+        assert is_best is True
+
+    def test_min_delta_subthreshold_improvement_can_drive_stop(self):
+        # §5.3: sub-threshold non-improvement must accumulate stale so the
+        # insurance early-stop can actually fire. stale 4 -> 5 == patience 5.
+        is_best, stop, reason = _evaluate_full_eval_outcome(
+            1.995,
+            2.0,
+            stale_cycles=4,
+            patience=5,
+            min_cycles=5,
+            current_cycle=5,
+            min_delta=0.01,
+        )
+        assert is_best is False
+        assert stop is True
+        assert "stale=5" in reason

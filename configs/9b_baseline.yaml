@@ -34,6 +34,11 @@ training:
   schedule_type: linear
   save_every_steps: 250
   early_stopping_patience: null
+  # §5.3 improvement-margin (docs/design/10_guard_experiment.md §5.3, 両条件共通).
+  # Same Δ<0.01 as the B-condition guard config so the A/B early-stop signal is
+  # symmetric. Near-inert while patience is null; fixes the §5.3 Δ the moment
+  # patience>=1.
+  early_stopping_min_delta: 0.01
   min_steps_before_stop: 100
 
 eval:

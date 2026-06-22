@@ -36,6 +36,12 @@ training:
   schedule_type: linear
   early_stopping_patience: null
   min_cycles_before_stop: 3
+  # §5.3 improvement-margin (docs/design/10_guard_experiment.md §5.3):
+  # "valid_full loss が 10 サイクル連続で改善幅 < 0.01 なら打ち切り". A full-eval
+  # decrease must beat the best by > 0.01 to count as a new best. 両条件共通 —
+  # mirror this in the A-condition baseline for a fair A/B comparison. Active
+  # for the stale/best signal now; sets §5.3's Δ<0.01 the moment patience>=1.
+  early_stopping_min_delta: 0.01
   min_steps_before_stop: 100
   save_trajectory_delta_artifacts: true
   trainable_lora_scope: last_25_percent

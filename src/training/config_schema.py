@@ -106,6 +106,12 @@ class TrainingConfig(BaseModel):
     schedule_type: ScheduleType = "linear"
     early_stopping_patience: int | None = Field(default=None, ge=1)
     min_cycles_before_stop: int = Field(default=10, ge=1)
+    # §5.3 improvement-margin for the full-eval early-stopping signal
+    # (docs/design/10_guard_experiment.md §5.3: "改善幅 < 0.01 なら打ち切り").
+    # A full-eval loss only counts as a new best when it beats the running best
+    # by strictly more than min_delta (Keras-style). Default 0.0 reproduces the
+    # historical "any strict decrease wins" behavior bit-for-bit.
+    early_stopping_min_delta: float = Field(default=0.0, ge=0.0)
     min_steps_before_stop: int = Field(default=100, ge=1)
     measurement_noise_samples: int = Field(default=0, ge=0)
     measurement_save_per_step_deltas: bool = False
