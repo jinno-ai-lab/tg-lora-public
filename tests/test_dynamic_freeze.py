@@ -17,7 +17,11 @@ from collections import deque
 import torch
 import torch.nn as nn
 
-from src.model.lora_utils import iter_all_lora_params_by_layer
+from src.model.lora_utils import (
+    iter_all_lora_params,
+    iter_all_lora_params_by_layer,
+    iter_lora_params,
+)
 from src.tg_lora.dynamic_freeze import DynamicFreezeController, DynFreezeState
 
 NUM_LAYERS = 6  # indices 0..5; output side = 5
@@ -720,3 +724,138 @@ class TestRunCycleTrainerSeam:
         assert dfc.block_size == len(dfc._all_layers)
         assert dfc.run_cycle(model, 5) is True
         assert dfc.frozen_block == [5, 4, 3, 2, 1, 0]
+
+
+# ---------------------------------------------------------------------------
+# get_frozen_param_names — the trainer's M9 speculative-update exclusion query
+# ---------------------------------------------------------------------------
+#
+# ``train_tg_lora.py`` keeps frozen LoRA weights out of M9 speculative-update
+# targets with ``active_names = active_names - dynfreeze.get_frozen_param_names(model)``.
+# The query had NO direct coverage. The primary exclusion actually happens one
+# step earlier — ``select_active_layers`` iterates ``iter_lora_params`` which
+# filters on ``requires_grad``, so frozen params never enter ``active_names`` —
+# making the subtraction a defense-in-depth *backstop*. For that backstop to be
+# worth anything, ``get_frozen_param_names`` must return names in the SAME format
+# as ``iter_lora_params`` / ``active_names`` (``layers.N.lora_A``-style). A
+# refactor that diverged the two formats (e.g. a module-path rewrite on one side)
+# would silently no-op the subtraction and let M9 speculatively update frozen
+# weights — the dynamic-freeze experiment would *look* like it works while
+# freezing nothing. These tests pin the contract and, critically, that
+# name-alignment invariant. See ``docs/design/10_guard_experiment.md`` §4.
+# ---------------------------------------------------------------------------
+
+
+class TestGetFrozenParamNames:
+    @staticmethod
+    def _lora_names(model: _Model, idx: int) -> set[str]:
+        """All LoRA param names of layer ``idx`` (the format ``active_names`` uses)."""
+        return {name for name, _ in iter_all_lora_params_by_layer(model)[idx]}
+
+    def test_no_block_returns_empty(self):
+        model = _build_model()
+        dfc = _make()
+        assert dfc.get_frozen_param_names(model) == set()
+
+    def test_returns_exactly_the_frozen_layer_param_names(self):
+        model = _build_model()
+        dfc = _make()
+        dfc.apply_freeze(model, [5, 4, 3], cycle=0)
+        expected = (
+            self._lora_names(model, 5)
+            | self._lora_names(model, 4)
+            | self._lora_names(model, 3)
+        )
+        assert dfc.get_frozen_param_names(model) == expected
+
+    def test_excludes_still_trainable_layer_params(self):
+        """Layers left open by the freeze (0,1,2) stay trainable, so their LoRA
+        params must NOT be reported frozen — otherwise the backstop would
+        over-exclude and starve M9 of legitimate targets."""
+        model = _build_model()
+        dfc = _make()
+        dfc.apply_freeze(model, [5, 4, 3], cycle=0)
+        names = dfc.get_frozen_param_names(model)
+        for idx in (0, 1, 2):
+            assert names.isdisjoint(self._lora_names(model, idx))
+
+    def test_reports_requires_grad_truth_not_just_block_membership(self):
+        """The query filters on the model's actual ``requires_grad`` (``not
+        param.requires_grad``), not on ``_frozen_block`` membership alone. If a
+        block layer's param is forced trainable out-of-band, it drops out of the
+        frozen set — so M9 exclusion tracks real freeze state, not a stale block
+        list. Pins that the two are read off the model, not assumed equal."""
+        model = _build_model()
+        dfc = _make()
+        dfc.apply_freeze(model, [5, 4, 3], cycle=0)
+        assert "layers.3.lora_A" in dfc.get_frozen_param_names(model)
+
+        # Force one frozen param back to trainable out-of-band (e.g. a partial
+        # restore). It must leave the frozen set; the rest of layer 3 stays.
+        model.layers[3].lora_A.requires_grad = True
+        names = dfc.get_frozen_param_names(model)
+        assert "layers.3.lora_A" not in names
+        assert "layers.3.lora_B" in names
+        assert "layers.5.lora_A" in names  # untouched frozen layer still reported
+
+    def test_release_removes_the_released_layer_names(self):
+        """After §4 ``apply_unfreeze``, the released layer's params are trainable
+        again and must leave the frozen set; the still-frozen output side stays."""
+        model = _build_model()
+        dfc = _make()
+        dfc.apply_freeze(model, [5, 4, 3], cycle=0)
+        dfc.apply_unfreeze(model, [3], cycle=10)  # block now [5, 4]
+        names = dfc.get_frozen_param_names(model)
+        assert names.isdisjoint(self._lora_names(model, 3))
+        assert names == self._lora_names(model, 5) | self._lora_names(model, 4)
+
+    def test_names_align_with_active_names_so_subtraction_is_a_valid_backstop(self):
+        """THE load-bearing invariant — and it is *non-circular*.
+
+        The trainer keeps frozen weights out of M9 targets with
+        ``active_names = active_names - get_frozen_param_names(model)``. The
+        primary exclusion actually happens earlier: ``select_active_layers``
+        builds ``active_names`` from ``iter_lora_params`` (filters
+        ``requires_grad``), so frozen params are already absent — making the
+        subtraction a defense-in-depth *backstop*. This test pins BOTH layers:
+
+        (1) PRIMARY: today's real ``active_names`` (requires_grad-filtered) is
+            disjoint from the frozen set — so the sampler's filter is doing the
+            job. A switch to ``iter_all_lora_params`` (no filter) on the sampler
+            side would break this and make the backstop load-bearing instead.
+
+        (2) BACKSTOP (non-circular): simulate that failure mode by building
+            ``leaked_active`` from ``iter_all_lora_params`` (NO requires_grad
+            filter — frozen names deliberately leak in). The method's
+            ``frozen_names``, in its OWN format, must then remove *exactly* the
+            frozen params and leave precisely the open layers. Built from an
+            independent source, this catches a format divergence in the method:
+            if ``get_frozen_param_names`` ever returned names in a different
+            shape than ``iter_lora_params`` (``layers.N.lora_A/B``), the
+            subtraction would leave the frozen params in place and
+            ``remaining`` would overspill ``expected_open``.
+        """
+        model = _build_model()
+        dfc = _make()
+        dfc.apply_freeze(model, [5, 4, 3], cycle=0)
+
+        # (1) Primary mechanism: the real requires_grad-filtered active set
+        # already excludes frozen params.
+        real_active = {name for name, _ in iter_lora_params(model)}
+        frozen_names = dfc.get_frozen_param_names(model)
+        assert real_active.isdisjoint(frozen_names)
+
+        # (2) Backstop: independently build the "leaked" active set with NO
+        # requires_grad filter (the failure mode the backstop exists for), then
+        # confirm the method's frozen names recover exactly the open layers.
+        leaked_active = {name for name, _ in iter_all_lora_params(model)}
+        remaining = leaked_active - frozen_names
+        expected_open = (
+            self._lora_names(model, 0)
+            | self._lora_names(model, 1)
+            | self._lora_names(model, 2)
+        )
+        assert remaining == expected_open, (
+            "name formats diverged — M9 exclusion backstop is a silent no-op; "
+            f"frozen names leaked through: {sorted(remaining - expected_open)}"
+        )
