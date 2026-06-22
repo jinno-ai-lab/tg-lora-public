@@ -74,6 +74,46 @@ def test_write_header_and_steps(tmp_path):
     assert footer["best_valid_loss"] == 2.5
 
 
+def test_loss_valid_full_is_emission_surface_not_default_key(tmp_path):
+    # §5.1/§5.2 honesty contract: ``loss_valid_full`` is the full-eval loss the
+    # analyzer prefers over the pilot proxy ``loss_valid``. It is recorded ONLY
+    # on full-eval cycles, and the analyzer detects those cycles by *key
+    # presence* (``LOSS_VALID_FULL_KEY in record``), not by value. So:
+    #   - when supplied, the key is persisted verbatim (the emission surface the
+    #     trainer uses to feed the receiver);
+    #   - when omitted, the key is ABSENT entirely (not ``None``) so legacy /
+    #     pilot-only records stay byte-identical and the receiver stays dormant
+    #     until honest data arrives.
+    m = RunMetrics(tmp_path, mode="baseline")
+    m.record_step(
+        step=1, cycle=1, loss_train=1.0, backward_passes=1, total_backward_passes=1
+    )  # pilot-only cycle: no loss_valid_full
+    m.record_step(
+        step=2,
+        cycle=2,
+        loss_train=1.0,
+        loss_valid=0.99,
+        loss_valid_full=1.08,  # full-eval cycle: honest signal emitted
+        backward_passes=1,
+        total_backward_passes=2,
+    )
+    m.close()
+
+    steps = [
+        json.loads(line)
+        for line in (tmp_path / "run_metrics.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    pilot_only, full_eval = steps
+
+    assert "loss_valid_full" not in pilot_only  # absence == not a full-eval cycle
+    with pytest.raises(KeyError):
+        pilot_only["loss_valid_full"]
+
+    assert full_eval["loss_valid_full"] == 1.08  # presence == honest signal emitted
+    assert full_eval["loss_valid"] == 0.99  # pilot proxy still carried alongside
+
+
 def test_tg_lora_fields(tmp_path):
     cfg = FakeCfg()
 

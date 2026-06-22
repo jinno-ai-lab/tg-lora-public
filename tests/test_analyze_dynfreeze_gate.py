@@ -32,11 +32,13 @@ import pytest
 
 from scripts.analyze_dynfreeze_experiment import (
     LOSS_TRIGGER_MARGIN,
+    LOSS_VALID_FULL_KEY,
     _proxy_speed_gate_section,
     baseline_targets,
     extract_gold,
     extract_loss_and_time,
     guard_stop_point,
+    load_run_metrics,
 )
 from src.tg_lora.freeze_cost import (
     PROXY_VALIDATED_MAX_WIDTH,
@@ -57,6 +59,9 @@ from src.tg_lora.freeze_cost import (
     VERDICT_PROVISIONAL_PASS,
     VERDICT_REQUIRES_SCALE_MEASUREMENT,
 )
+from pathlib import Path
+
+from src.utils.run_metrics import RunMetrics
 
 # Eight output-side decoder blocks (the Qwen-9B target freezes a contiguous run
 # of these). The pipeline speaks *global* indices in the run log; the accountant
@@ -747,3 +752,171 @@ class TestQualityGateDecision:
         guard_gold = extract_gold(records)
         stop_cycle, _ = guard_stop_point(guard_gold, l_star=1.0, g_star=0.5)
         assert stop_cycle is None
+
+
+class TestFullEvalLossHonestyE2E:
+    """End-to-end proof the §5.2 honesty contract is NOT inert.
+
+    ``TestQualityGateDecision`` above pins the decision functions against
+    in-memory record dicts — necessary, but it cannot answer the question the
+    §5.2 fix (commit 276991c) lives or dies by: *does the receiver actually wake
+    up on a real run's persisted metrics?* The fix prefers ``loss_valid_full``
+    over the pilot proxy ``loss_valid``, yet that preference is only as good as
+    the records it reads. If no real run record ever carries ``loss_valid_full``
+    — and the trainer does not yet persist it — the preference silently degrades
+    to the byte-identical pilot proxy and the honesty contract never activates:
+    the code *looks* fixed while the A/B comparison stays contaminated.
+
+    These tests drive the FULL path the trainer uses —
+    ``RunMetrics.record_step`` → ``run_metrics.jsonl`` → ``load_run_metrics`` →
+    the §5.1/§5.2 decision functions — and assert, over an actual run's metrics
+    file, that (1) the gate's L* is computed from the ``loss_valid_full``
+    column, (2) a corrupt-input run where the pilot proxy and the full-eval loss
+    disagree forces the full-eval verdict (the pilot alone would stop; the honest
+    full-eval does not), and (3) when no record carries the key the receiver
+    stays dormant and falls back to the pilot byte-identically. The corrupt-input
+    shape (the test the feedback singled out) is what makes the honesty claim
+    falsifiable rather than a happy-path assertion.
+    """
+
+    @staticmethod
+    def _write_run_records(run_dir: Path, cycles: list[dict]) -> list[dict]:
+        """Persist a run via the real ``RunMetrics.record_step`` path and reload.
+
+        Each dict becomes one step record. ``loss_valid`` is the pilot proxy
+        (every cycle); ``loss_valid_full`` the honest full-eval loss, emitted
+        only on the cycles that carry it (its *presence* is what the analyzer
+        keys on); ``gold_combined`` the §5.2 gold score. Absent keys are not
+        emitted — exactly as the trainer does — so the on-disk records match a
+        real run's, not a hand-built fixture.
+        """
+        m = RunMetrics(run_dir, mode="baseline")
+        for c in cycles:
+            kwargs: dict = {
+                "step": c["cycle"],
+                "cycle": c["cycle"],
+                "loss_train": c.get("loss_train", 1.0),
+                "loss_valid": c["loss_valid"],
+                "backward_passes": 1,
+                "total_backward_passes": c["cycle"],
+            }
+            if "loss_valid_full" in c:
+                kwargs["loss_valid_full"] = c["loss_valid_full"]
+            if "gold_combined" in c:
+                kwargs["gold_combined"] = c["gold_combined"]
+            m.record_step(**kwargs)
+        m.close()
+        return load_run_metrics(run_dir)
+
+    def test_L_star_driven_by_full_eval_curve_over_real_metrics_file(self, tmp_path):
+        # The pilot (loss_valid) and full-eval (loss_valid_full) curves
+        # disagree: the pilot minimum (0.9 @ cycle 4) is NOT the full-eval
+        # minimum (1.1 @ cycle 6). Over a REAL run_metrics.jsonl written by
+        # RunMetrics and read back by load_run_metrics, L* must track the
+        # full-eval curve — otherwise the receiver is silently using the proxy.
+        records = self._write_run_records(
+            tmp_path / "baseline",
+            [
+                {"cycle": 0, "loss_valid": 2.0, "loss_valid_full": 2.5, "gold_combined": 0.3},
+                {"cycle": 1, "loss_valid": 1.6},
+                {"cycle": 2, "loss_valid": 1.5, "loss_valid_full": 1.8},
+                {"cycle": 3, "loss_valid": 1.4},
+                {"cycle": 4, "loss_valid": 0.9, "loss_valid_full": 1.2, "gold_combined": 0.4},
+                {"cycle": 5, "loss_valid": 0.85},
+                {"cycle": 6, "loss_valid": 1.3, "loss_valid_full": 1.1, "gold_combined": 0.45},
+            ],
+        )
+        # The dishonest (pilot) curve would pick 0.85 — the trap the fix closes.
+        _, pilot_losses, _ = extract_loss_and_time(records)
+        assert min(pilot_losses) == 0.85
+
+        full_times, full_losses, full_cycles = extract_loss_and_time(
+            records, full_eval_only=True
+        )
+        assert full_losses == [2.5, 1.8, 1.2, 1.1]
+        assert full_cycles == [0, 2, 4, 6]
+
+        gold = extract_gold(records)
+        l_star, l_star_cycle, _, _ = baseline_targets(
+            full_losses, full_cycles, full_times, gold
+        )
+        assert l_star == 1.1  # full-eval minimum, NOT the pilot's 0.9
+        assert l_star_cycle == 6
+        assert l_star != 0.9  # the receiver did not silently fall back to proxy
+
+    def test_corrupt_input_pilot_would_stop_but_full_eval_does_not(self, tmp_path):
+        # Corrupt-input: the SAME guard cycle carries a pilot proxy (0.99) that
+        # WOULD trip the §5.2 trigger (<= L*+0.02 = 1.02) and a full-eval loss
+        # (1.08) that does NOT. Over a real metrics file the gate must read the
+        # honest full-eval column and decline to stop — proving the receiver is
+        # not inert. (cf. the in-memory test_quality_gate_uses_full_eval_loss_not_pilot,
+        # which proves the plumbing but not the persistence round-trip.)
+        baseline_records = self._write_run_records(
+            tmp_path / "baseline",
+            [
+                {"cycle": 0, "loss_valid": 1.6, "loss_valid_full": 1.5, "gold_combined": 0.3},
+                {"cycle": 2, "loss_valid": 1.1, "loss_valid_full": 1.0, "gold_combined": 0.5},
+                {"cycle": 4, "loss_valid": 1.3, "loss_valid_full": 1.2, "gold_combined": 0.55},
+            ],
+        )
+        guard_records = self._write_run_records(
+            tmp_path / "guard",
+            [
+                {"cycle": 5, "loss_valid": 0.99, "loss_valid_full": 1.08, "gold_combined": 0.60},
+            ],
+        )
+
+        b_times, b_losses, b_cycles = extract_loss_and_time(
+            baseline_records, full_eval_only=True
+        )
+        l_star, _, g_star, _ = baseline_targets(
+            b_losses, b_cycles, b_times, extract_gold(baseline_records)
+        )
+        assert l_star == 1.0
+        assert g_star == 0.5
+
+        guard_gold = extract_gold(guard_records)
+        # The receiver read the honest full-eval column, not the manipulable pilot.
+        assert guard_gold[0]["loss"] == 1.08
+        assert guard_gold[0]["loss"] != 0.99
+        stop_cycle, _ = guard_stop_point(guard_gold, l_star=l_star, g_star=g_star)
+        assert stop_cycle is None  # full-eval 1.08 > 1.02 → no stop
+
+        # Concrete proof the disagreement is verdict-flipping, not cosmetic:
+        # feed the pilot value a corrupt evaluator would have used and the
+        # trigger DOES fire at cycle 5.
+        pilot_row = {
+            "cycle": 5,
+            "elapsed": 0.0,
+            "loss": 0.99,
+            "gold_combined": 0.60,
+        }
+        corrupt_stop, _ = guard_stop_point([pilot_row], l_star=l_star, g_star=g_star)
+        assert corrupt_stop == 5
+
+    def test_byte_identical_fallback_when_no_full_eval_recorded(self, tmp_path):
+        # The dormancy state of today's trainer output: no record carries the
+        # honest key, so the receiver MUST stay dormant — the full-eval curve is
+        # empty and the caller falls back to the pilot proxy, byte-identical to
+        # the pre-fix behavior. The two tests above prove the receiver wakes the
+        # moment honest data arrives; this one locks the safe fallback so the
+        # dormant path can never silently change shape.
+        records = self._write_run_records(
+            tmp_path / "baseline",
+            [
+                {"cycle": 0, "loss_valid": 2.0},
+                {"cycle": 1, "loss_valid": 1.5},
+                {"cycle": 2, "loss_valid": 1.2, "gold_combined": 0.5},
+            ],
+        )
+        assert all(LOSS_VALID_FULL_KEY not in r for r in records)
+        assert extract_loss_and_time(records, full_eval_only=True) == ([], [], [])
+
+        # The documented fallback: empty full-eval curve → use the pilot curve.
+        times, losses, cycles = extract_loss_and_time(records)
+        assert losses == [2.0, 1.5, 1.2]
+        l_star, l_star_cycle, _, _ = baseline_targets(
+            losses, cycles, times, extract_gold(records)
+        )
+        assert l_star == 1.2
+        assert l_star_cycle == 2

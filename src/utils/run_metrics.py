@@ -269,6 +269,7 @@ class RunMetrics:
         cycle: int | None = None,
         loss_train: float,
         loss_valid: float | None = None,
+        loss_valid_full: float | None = None,
         backward_passes: int = 1,
         total_backward_passes: int,
         grad_norm: float | None = None,
@@ -489,6 +490,18 @@ class RunMetrics:
             "act_cosine_mean": act_cosine_mean,
             **extra_fields,
         }
+        # §5.1/§5.2 honesty (pluggable-receiver pattern §6.2/§6.3):
+        # ``loss_valid_full`` is the full-eval loss, recorded ONLY on full-eval
+        # cycles. Its *presence* (not its value) is what the analyzer keys on —
+        # ``extract_loss_and_time(full_eval_only=True)`` selects cycles by
+        # ``LOSS_VALID_FULL_KEY in r`` — so it MUST be written conditionally:
+        # absent on pilot-only cycles (byte-identical legacy records, so the
+        # honesty contract stays dormant until honest data arrives) and present
+        # only on full-eval cycles (which activates the receiver). Writing it
+        # unconditionally as ``None`` would make every cycle look like a
+        # full-eval cycle and silently break L*.
+        if loss_valid_full is not None:
+            record["loss_valid_full"] = loss_valid_full
         self._write(record)
         return record
 
