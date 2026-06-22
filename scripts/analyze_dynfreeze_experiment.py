@@ -96,14 +96,27 @@ def extract_loss_and_time(
     empty and the caller falls back to the proxy curve (byte-identical to the
     pre-fix behavior), so the honesty contract activates only when honest data
     is present.
+
+    A cycle is included only when it carries a *real* loss value: a ``None``
+    (``loss_valid`` is persisted unconditionally and is null on non-eval steps;
+    ``loss_valid_full`` is conditionally persisted but a botched trainer wiring or
+    corrupt/hand-edited jsonl can write it null) is skipped in both paths. This
+    matches ``honesty_contract_status``'s truthiness test, so the two full-eval
+    detectors never disagree, and a null can never reach ``baseline_targets`` —
+    whose ``min(losses)`` would otherwise raise ``TypeError`` and crash L*. The
+    receiver need not trust the producer to keep nulls out of the curve.
     """
     times, losses, cycles = [], [], []
     loss_key = LOSS_VALID_FULL_KEY if full_eval_only else "loss_valid"
     for r in records:
-        if r.get("type") == "step" and loss_key in r:
-            times.append(r.get("elapsed_seconds", 0.0))
-            losses.append(r[loss_key])
-            cycles.append(r.get("cycle", 0))
+        if r.get("type") != "step":
+            continue
+        value = r.get(loss_key)
+        if value is None:
+            continue
+        times.append(r.get("elapsed_seconds", 0.0))
+        losses.append(value)
+        cycles.append(r.get("cycle", 0))
     return times, losses, cycles
 
 

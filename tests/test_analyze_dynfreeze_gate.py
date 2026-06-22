@@ -1099,3 +1099,93 @@ class TestHonestyContractDormancyLoud:
         assert "DORMANT" not in text
         assert "TASK-0141" not in text
         assert "ACTIVE" in text
+
+
+class TestLossCurveSkipsNullValues:
+    """§5.2 receiver honesty: ``extract_loss_and_time`` must skip records whose
+    loss value is ``None``, in both the pilot (``loss_valid``) and full-eval
+    (``loss_valid_full``) curves.
+
+    A ``None`` in the curve poisons it and crashes L* — ``baseline_targets`` does
+    ``min(losses)``, and ``min`` over a ``None``-containing list raises
+    ``TypeError``. For ``loss_valid_full`` a null would *also* disagree with
+    ``honesty_contract_status`` (which already skips nulls), splitting the
+    receiver into two detectors that report different full-eval counts — the
+    silent-mislead state §5.2 exists to prevent.
+
+    The pilot path is not hypothetical: the baseline trainer persists
+    ``loss_valid`` unconditionally (``run_metrics.record_step`` writes it even
+    when ``None``), so every non-eval step in a real ``run_metrics.jsonl`` carries
+    ``loss_valid: null``. Until the trainer emits ``loss_valid_full`` the
+    analyzer is DORMANT and falls back to exactly that pilot curve — so without
+    this skip the §5.2 L* computation crashes on the first real baseline run.
+    """
+
+    def test_pilot_curve_skips_null_loss_valid(self, tmp_path):
+        # Realistic baseline shape: per-step records carry loss_valid=null.
+        records = [
+            {"type": "step", "cycle": 0, "elapsed_seconds": 0.0, "loss_valid": 2.0},
+            {"type": "step", "cycle": 1, "elapsed_seconds": 5.0, "loss_valid": None},
+            {"type": "step", "cycle": 2, "elapsed_seconds": 10.0,
+             "loss_valid": 1.4, "gold_combined": 0.4},
+        ]
+        times, losses, cycles = extract_loss_and_time(records)
+        assert losses == [2.0, 1.4]  # the null cycle 1 is dropped, not included
+        assert cycles == [0, 2]
+        # L* must compute, not crash on the null that would otherwise be in the list.
+        l_star, l_star_cycle, _, _ = baseline_targets(
+            losses, cycles, times, extract_gold(records)
+        )
+        assert l_star == 1.4
+        assert l_star_cycle == 2
+
+    def test_full_eval_curve_skips_null_loss_valid_full(self):
+        # Corrupt input: a botched trainer wiring wrote loss_valid_full=null on a
+        # non-full-eval cycle (key present, value null).
+        records = [
+            {"type": "step", "cycle": 0, "elapsed_seconds": 0.0,
+             "loss_valid": 2.0, "loss_valid_full": 2.5},
+            {"type": "step", "cycle": 1, "elapsed_seconds": 5.0,
+             "loss_valid": 1.6, "loss_valid_full": None},
+            {"type": "step", "cycle": 2, "elapsed_seconds": 10.0,
+             "loss_valid": 1.4, "loss_valid_full": 1.8},
+        ]
+        times, losses, cycles = extract_loss_and_time(records, full_eval_only=True)
+        assert losses == [2.5, 1.8]
+        assert cycles == [0, 2]
+        # No None reaches baseline_targets -> L* computes instead of crashing.
+        l_star, _, _, _ = baseline_targets(losses, cycles, times, extract_gold(records))
+        assert l_star == 1.8
+
+    def test_null_loss_valid_full_keeps_both_detectors_consistent(self):
+        # The two full-eval detectors must agree: a null loss_valid_full is NOT a
+        # full-eval cycle for either. Before the fix, honesty_contract_status
+        # reported 2 full-eval records while extract_loss_and_time returned 3
+        # (including the null) and then crashed L*.
+        records = [
+            {"type": "step", "cycle": 0, "loss_valid": 2.0, "loss_valid_full": 2.5},
+            {"type": "step", "cycle": 1, "loss_valid": 1.6, "loss_valid_full": None},
+            {"type": "step", "cycle": 2, "loss_valid": 1.4, "loss_valid_full": 1.8},
+        ]
+        status = honesty_contract_status(records)
+        _, losses, _ = extract_loss_and_time(records, full_eval_only=True)
+        assert status["full_eval_records"] == len(losses) == 2
+        assert None not in losses
+
+    def test_real_persistence_path_skips_null_loss_valid(self, tmp_path):
+        # End-to-end through the real writer: a record_step call that omits
+        # loss_valid persists "loss_valid": null (unconditional write). The reader
+        # must still skip it so the curve the analyzer builds is clean.
+        m = RunMetrics(tmp_path / "run", mode="baseline")
+        m.record_step(step=1, cycle=0, loss_train=2.0, loss_valid=2.0,
+                      backward_passes=1, total_backward_passes=1)
+        m.record_step(step=2, cycle=1, loss_train=1.9, backward_passes=1,
+                      total_backward_passes=2)  # no loss_valid -> persisted null
+        m.close()
+        records = load_run_metrics(tmp_path / "run")
+        null_records = [r for r in records
+                        if r.get("type") == "step" and r.get("loss_valid") is None]
+        assert null_records, "fixture sanity: a null loss_valid record was persisted"
+        _, losses, _ = extract_loss_and_time(records)
+        assert None not in losses
+        assert losses == [2.0]
