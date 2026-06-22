@@ -594,3 +594,139 @@ class TestJsonReportTimestamp:
         report = json.loads(out.read_text())
         assert "generated_at" in report
         assert report["generated_at"].startswith("20")  # sanity: looks like ISO timestamp
+
+
+class TestKnownLimitation:
+    """Feedback #2: a FAILING gate must self-document its gap as a
+    known-limitation (gap / root_cause / next_action / owner / blocks_claim),
+    derived from WHICH sub-checks failed — not a static string, so a pinned
+    FAIL becomes an actionable, owned gap instead of a silent one. A PASSING
+    gate carries None, so the record is fail-conditioned. These are corrupt-
+    input tests (distinct failing-check sets force distinct attributions),
+    not happy-path assertions — the pattern the feedback singled out.
+    """
+
+    def test_g1_wallclock_fail_attributes_to_efficiency_not_quality(self):
+        """G1.1/G1.3 (wall-clock) fail while G1.4 (quality) passes -> the
+        limitation blames wall-clock fixed costs, with the concrete M6
+        next-action, never quality."""
+        from scripts.evaluate_paper_gates import _check_g1
+        summary = _make_summary(
+            tg_eff=[1.5, 1.5, 1.5],   # < baseline -> G1.1 fail
+            bl_eff=[2.0, 2.0, 2.0],   # ratio 0.75x -> G1.3 fail
+            tg_loss=[2.5, 2.5, 2.5],  # == baseline -> G1.4 pass (0% < 1%)
+            bl_loss=[2.5, 2.5, 2.5],
+        )
+        result = _check_g1(summary)
+        assert not result["passed"]
+        kl = result["known_limitation"]
+        assert kl is not None
+        # gap is check-specific: the wall-clock fixed-cost story, NOT a
+        # quality-blame phrase
+        assert "wall-clock" in kl["gap"].lower()
+        assert "PCIe" in kl["gap"]            # fixed-cost detail, wall-clock only
+        assert "degraded beyond" not in kl["gap"]  # quality-blame phrase absent
+        # next action is the concrete M6 experiment, not a hand-wave
+        assert "final-eval-only" in kl["next_action"]
+        assert "3 seeds" in kl["next_action"]
+        # owner + blocked claim present and concrete
+        assert "TASK-0142" in kl["owner"]
+        assert kl["blocks_claim"] == "C1 (Strong): multi-seed efficiency + quality retention"
+        # root cause grounded in the documented ~0.98x wall-clock state
+        assert "0.98x" in kl["root_cause"]
+
+    def test_g1_quality_fail_attributes_to_quality_not_wallclock(self):
+        """Only G1.4 (quality) fails -> limitation blames quality, proving the
+        derivation is driven by the failing check, not a hardcoded string."""
+        from scripts.evaluate_paper_gates import _check_g1
+        summary = _make_summary(
+            tg_eff=[4.0, 5.0, 3.5],   # > baseline, ratio > 2x -> G1.1/G1.3 pass
+            bl_eff=[2.0, 2.0, 2.0],
+            tg_loss=[2.6, 2.6, 2.6],  # 4% rel degradation -> G1.4 fail
+            bl_loss=[2.5, 2.5, 2.5],
+        )
+        result = _check_g1(summary)
+        assert not result["passed"]
+        kl = result["known_limitation"]
+        assert kl is not None
+        assert "G1.4" in kl["gap"]
+        assert "degraded beyond the 1% tolerance" in kl["gap"]
+        # must NOT emit the wall-clock fixed-cost story for a quality-only fail
+        assert "PCIe" not in kl["gap"]
+        assert "0.98x" not in kl["root_cause"]
+
+    def test_g4_warm_speedup_fail_attributes_optimizer_confound(self):
+        """G4.1 (warm speedup) fails while G4.2 (cache memory) passes -> the
+        limitation blames the optimizer/momentum confound and points at the
+        persistent-optimizer cache-isolation ablation."""
+        from scripts.evaluate_paper_gates import _check_g4
+        warm = _make_summary(
+            seeds=[42, 43, 44],
+            tg_eff=[4.0, 1.5, 3.5],   # seed 43 warm <= cold -> G4.1 fail
+            tg_peak=[5000.0, 5000.0, 5000.0],
+            bl_peak=[8000.0, 8000.0, 8000.0],
+        )
+        cold = _make_summary(seeds=[42, 43, 44], tg_eff=[2.0, 2.0, 2.0])
+        cache_off = _make_summary(
+            seeds=[42, 43, 44],
+            tg_peak=[7000.0, 7000.0, 7000.0],
+            bl_peak=[8000.0, 8000.0, 8000.0],
+        )
+        result = _check_g4(warm, cold_summary=cold, no_cache_summary=cache_off)
+        # only G4.1 fails: cache-on savings (3000) > cache-off savings (1000)
+        g41 = next(c for c in result["checks"] if c["check"].startswith("G4.1"))
+        g42 = next(c for c in result["checks"] if c["check"].startswith("G4.2"))
+        assert not g41["pass"]
+        assert g42["pass"]
+        assert not result["passed"]
+        kl = result["known_limitation"]
+        assert kl is not None
+        assert "G4.1" in kl["gap"]
+        assert "optimizer" in kl["root_cause"].lower()
+        assert "persistent" in kl["next_action"]
+        assert "TASK-0142" in kl["owner"]
+        assert kl["blocks_claim"] == "causal attribution: cache vs extrapolation isolation"
+
+    def test_passing_gates_carry_no_known_limitation(self):
+        """Corrupt-input inversion: a passing G1/G4 must claim NO limitation."""
+        from scripts.evaluate_paper_gates import _check_g1, _check_g4
+        g1 = _check_g1(_make_summary(tg_eff=[4.0, 5.0, 3.5], bl_eff=[2.0, 2.0, 2.0]))
+        assert g1["passed"]
+        assert g1["known_limitation"] is None
+
+        warm = _make_summary(
+            seeds=[42, 43], tg_eff=[4.0, 4.0],
+            tg_peak=[5000.0, 5000.0], bl_peak=[8000.0, 8000.0],
+        )
+        cold = _make_summary(seeds=[42, 43], tg_eff=[2.0, 2.0])
+        cache_off = _make_summary(
+            seeds=[42, 43], tg_peak=[7000.0, 7000.0], bl_peak=[8000.0, 8000.0],
+        )
+        g4 = _check_g4(warm, cold_summary=cold, no_cache_summary=cache_off)
+        assert g4["passed"]
+        assert g4["known_limitation"] is None
+
+    def test_known_limitation_surfaces_in_text_report(self):
+        """User-visible: the formatted report prints the gap, next action, and
+        owner under a failing gate (not a bare FAIL)."""
+        from scripts.evaluate_paper_gates import _check_g1, _format_report
+        result = _check_g1(_make_summary(tg_eff=[1.5, 1.5, 1.5], bl_eff=[2.0, 2.0, 2.0]))
+        report = _format_report([result])
+        assert "Known limitation" in report
+        assert "final-eval-only" in report
+        assert "TASK-0142" in report
+        assert "C1" in report
+
+    def test_passing_gate_report_has_no_known_limitation_line(self):
+        from scripts.evaluate_paper_gates import _check_g1, _format_report
+        result = _check_g1(_make_summary(tg_eff=[4.0, 5.0, 3.5], bl_eff=[2.0, 2.0, 2.0]))
+        report = _format_report([result])
+        assert "Known limitation" not in report
+
+    def test_known_limitation_is_json_serializable(self):
+        """The limitation rides on the result dict into the JSON report output,
+        so it must contain only JSON-native types."""
+        from scripts.evaluate_paper_gates import _check_g1
+        result = _check_g1(_make_summary(tg_eff=[1.5, 1.5, 1.5], bl_eff=[2.0, 2.0, 2.0]))
+        # round-trips without TypeError
+        json.dumps(result["known_limitation"])

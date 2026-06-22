@@ -25,6 +25,7 @@ import argparse
 import json
 import sys
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,197 @@ def _mean(vals: list[float | None]) -> float | None:
     return sum(clean) / len(clean)
 
 
+# ---------------------------------------------------------------------------
+# Known-limitation records.
+#
+# Feedback: "formally record the gap as a known-limitation with a concrete
+# next action and owner — instead of leaving the gates pinned in their failing
+# state." A gate that FAILs carries a ``known_limitation`` record derived from
+# WHICH sub-checks failed (not a static string), grounded in
+# docs/master_plan.md §2.2 (the source of truth for current G0–G4 status). A
+# gate that PASSes carries None — a passing gate claims no limitation — so the
+# record is fail-conditioned. This turns a silent, pinned FAIL into an
+# actionable, owned gap: a re-run reports what evidence is missing and what
+# experiment would flip it, instead of reading as a bare regression.
+# ---------------------------------------------------------------------------
+
+# Claim level each gate feeds (docs/master_plan.md §2.1 Claim Ladder).
+_CLAIM_FOR_GATE: dict[str, str | None] = {
+    "G0": None,
+    "G1": "C1 (Strong): multi-seed efficiency + quality retention",
+    "G2": "C2 (Revolutionary): frontier separation",
+    "G3": "C1 (Strong): external quality retention",
+    "G4": "causal attribution: cache vs extrapolation isolation",
+}
+
+# These gaps are GPU-only to close (no GPU / no private data pipeline in the
+# public mirror), so the owner is the research lead and the tracking artifact
+# is TASK-0142 — the same "record the gap honestly rather than ship it
+# unverified" principle TASK-0141 used for the §5.2 last mile.
+_KNOWN_LIMITATION_OWNER = (
+    "research-lead (GPU) — tracked in specs/tg-lora/tasks/TASK-0142.md"
+)
+
+
+def _g1_known_limitation(failed: list[str]) -> dict[str, Any]:
+    """G1 limitation, attributed to the actually-failing sub-checks.
+
+    The documented research gap (master_plan §2.2 G1, M3 result) is wall-clock
+    efficiency, NOT quality: G1.2/G1.4 PASS while G1.1/G1.3 FAIL at ~0.98x.
+    """
+    wallclock = any(n.startswith("G1.1") or n.startswith("G1.3") for n in failed)
+    quality = any(n.startswith("G1.4") for n in failed)
+    backward = any(n.startswith("G1.2") for n in failed)
+
+    causes: list[str] = []
+    if wallclock:
+        causes.append(
+            "wall-clock efficiency (G1.1/G1.3) below the 1.25x bar — dominated "
+            "by fixed costs (PCIe cache transfer, pilot-validation forwards, "
+            "scheduled full eval), not by optimizer backward work; valid-loss "
+            "quality (G1.4) is unaffected"
+        )
+    if quality:
+        causes.append(
+            "TG best-valid-loss degraded beyond the 1% tolerance (G1.4) — "
+            "possible extrapolation overstep / acceptance threshold"
+        )
+    if backward:
+        causes.append("effective backward-pass accounting (G1.2)")
+
+    if wallclock:
+        next_action = (
+            "extend the final-eval-only config to 3 seeds and decompose the "
+            "pilot-validation / scheduled-full-eval fixed cost (master_plan "
+            "§1.5, M6); if wall-clock stays flat, checkpoint I/O and model "
+            "reload are the next fixed-cost candidates"
+        )
+        root_cause = (
+            "5K-Dolly wall-clock ~0.98x baseline on RTX 3060 12GB "
+            "(fixed-cost bound, not compute bound)"
+        )
+    elif quality:
+        next_action = (
+            "investigate extrapolation acceptance/rollback thresholds "
+            "(master_plan §2.2 G1)"
+        )
+        root_cause = "extrapolation overstep degrading convergence quality"
+    else:
+        next_action = "see failed G1 sub-checks above and master_plan §2.2 G1"
+        root_cause = "see failed sub-checks"
+
+    return {
+        "gap": "; ".join(causes) if causes else "G1 failing",
+        "root_cause": root_cause,
+        "next_action": next_action,
+        "owner": _KNOWN_LIMITATION_OWNER,
+        "blocks_claim": _CLAIM_FOR_GATE["G1"],
+    }
+
+
+def _g4_known_limitation(failed: list[str]) -> dict[str, Any]:
+    """G4 limitation, attributed to the actually-failing sub-checks.
+
+    The documented gap (master_plan §2.2 G4, M6) is the optimizer/momentum
+    confound on warm-vs-cold speedup (G4.1); G4.2 (VRAM) PASSES.
+    """
+    warm = any(n.startswith("G4.1") for n in failed)
+    cache = any(n.startswith("G4.2") for n in failed)
+
+    causes: list[str] = []
+    if warm:
+        causes.append(
+            "warm-vs-cold speedup (G4.1) not established — per-cycle optimizer "
+            "recreation (recreate_per_cycle) confounds the comparison with "
+            "momentum-lifecycle differences"
+        )
+    if cache:
+        causes.append("cache-on vs cache-off memory effect (G4.2) not separated")
+
+    if warm:
+        next_action = (
+            "complete the cache-isolation ablation (A baseline / B cache-only / "
+            "C TG-LoRA) under optimizer policy='persistent' so all conditions "
+            "share one AdamW lifecycle, then re-measure G4.1 warm-vs-cold "
+            "(master_plan §2.2 G4, M6)"
+        )
+        root_cause = (
+            "optimizer lifecycle confound (recreate_per_cycle) on warm/cold "
+            "attribution"
+        )
+    elif cache:
+        next_action = (
+            "provide a cache-off ablation summary and re-measure G4.2 "
+            "(master_plan §2.2 G4.2)"
+        )
+        root_cause = "cache-off ablation missing"
+    else:
+        next_action = (
+            "run the cold-vs-warm and cache-on-vs-off ablation, then "
+            "re-evaluate (master_plan §2.2 G4, M6)"
+        )
+        root_cause = "G4 ablation data not provided"
+
+    return {
+        "gap": "; ".join(causes) if causes else "G4 failing",
+        "root_cause": root_cause,
+        "next_action": next_action,
+        "owner": _KNOWN_LIMITATION_OWNER,
+        "blocks_claim": _CLAIM_FOR_GATE["G4"],
+    }
+
+
+_LIMITATION_BUILDERS: dict[str, Any] = {
+    "G1": _g1_known_limitation,
+    "G4": _g4_known_limitation,
+}
+
+
+def _known_limitation_for(result: dict[str, Any]) -> dict[str, Any] | None:
+    """Structured known-limitation for a FAILING gate, else None.
+
+    Returns None for a passing gate so the record is fail-conditioned (a
+    passing gate must not claim a limitation). For G1/G4 the gap is derived
+    from the failing sub-checks and grounded in master_plan §2.2; other gates
+    get a pointer back to the source-of-truth doc rather than invented
+    specifics.
+    """
+    if result.get("passed"):
+        return None
+    gate = result.get("gate", "")
+    failed = [c["check"] for c in result.get("checks", []) if not c.get("pass")]
+    builder = _LIMITATION_BUILDERS.get(gate)
+    if builder is not None:
+        return builder(failed)
+    return {
+        "gap": f"{gate} ({result.get('name', '')}) failing — see failed sub-checks",
+        "root_cause": "see failed sub-check detail above",
+        "next_action": (
+            "consult docs/master_plan.md §2.2 for this gate's evidence requirements"
+        ),
+        "owner": _KNOWN_LIMITATION_OWNER,
+        "blocks_claim": _CLAIM_FOR_GATE.get(gate),
+    }
+
+
+def _attach_known_limitation(fn):
+    """Decorator: stamp every gate result with its known_limitation record.
+
+    Applied to ``_check_g0``…``_check_g4`` so each gate self-describes its
+    limitation on FAIL (None on PASS). Centralising it here keeps the
+    fail-conditioning in one place rather than at every return statement.
+    """
+
+    @wraps(fn)
+    def _wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        result = fn(*args, **kwargs)
+        result["known_limitation"] = _known_limitation_for(result)
+        return result
+
+    return _wrapper
+
+
+@_attach_known_limitation
 def _check_g0(summary: dict[str, Any]) -> dict[str, Any]:
     """Gate G0: Hygiene — artifacts exist and are well-formed."""
     checks: list[dict[str, Any]] = []
@@ -91,6 +283,7 @@ def _check_g0(summary: dict[str, Any]) -> dict[str, Any]:
     return {"gate": "G0", "name": "Hygiene", "passed": passed, "checks": checks}
 
 
+@_attach_known_limitation
 def _check_g1(
     summary: dict[str, Any],
     *,
@@ -182,6 +375,7 @@ def _check_g1(
     return {"gate": "G1", "name": "Replicated Internal Efficiency", "passed": passed, "checks": checks}
 
 
+@_attach_known_limitation
 def _check_g2(
     summary: dict[str, Any],
     *,
@@ -278,6 +472,7 @@ def _check_g2(
     return {"gate": "G2", "name": "Memory Frontier Separation", "passed": passed, "checks": checks}
 
 
+@_attach_known_limitation
 def _check_g3(
     summary: dict[str, Any],
     *,
@@ -366,6 +561,7 @@ def _check_g3(
     return {"gate": "G3", "name": "External Quality Retention", "passed": passed, "checks": checks}
 
 
+@_attach_known_limitation
 def _check_g4(
     summary: dict[str, Any],
     *,
@@ -597,6 +793,15 @@ def _format_report(results: list[dict[str, Any]]) -> str:
         for c in r.get("checks", []):
             mark = "✓" if c["pass"] else "✗"
             lines.append(f"  {mark} {c['check']}: {c['detail']}")
+
+        kl = r.get("known_limitation")
+        if kl:
+            lines.append(f"  ⚠ Known limitation: {kl['gap']}")
+            lines.append(f"    Root cause: {kl['root_cause']}")
+            lines.append(f"    Next action: {kl['next_action']}")
+            lines.append(
+                f"    Owner: {kl['owner']}  (blocks: {kl.get('blocks_claim')})"
+            )
         lines.append("")
 
     lines.append("=" * 60)
