@@ -163,6 +163,38 @@ class TestDecideUnfreeze:
         assert released == [3]
         assert 5 not in released
 
+    def test_never_releases_output_side_when_block_drains_to_it(self):
+        """§4 invariant (``10_guard_experiment.md`` §4: "出力側は最後まで固定を
+        保ち連続塊を守る"): the output-side layer — the largest index — stays
+        frozen to anchor the contiguous block. ``test_stir_never_releases_output_side``
+        only covers a *multi-layer* block (release target L3 ≠ output L5); it
+        leaves open the case reversible release is built for, where sustained
+        upstream activity means released layers do NOT re-settle and the block
+        drains down to the output layer alone. There ``upstream_end == min(block)
+        == max(block) == output side``, so without an explicit guard BOTH triggers
+        hand back ``[output_layer]`` and the §4 invariant is silently broken.
+        """
+        output = NUM_LAYERS - 1  # L5 = largest idx = output side
+
+        # (a) Stir trigger: block drained to [output], held far past R=10.
+        dfc = _make(stir_interval=10)
+        dfc._frozen_block = [output]
+        dfc._frozen_since_cycle = 0
+        assert dfc.decide_unfreeze(100) == [], (
+            "stir released the output-side layer once the block drained to it — "
+            "§4 output-side protection violated"
+        )
+
+        # (b) Upstream-activity trigger: block=[output], upstream neighbor noisy.
+        dfc2 = _make(stir_interval=1000)  # disable stir, isolate activity trigger
+        dfc2._frozen_block = [output]
+        dfc2._frozen_since_cycle = 0
+        _set_history(dfc2, {li: 0.05 for li in range(NUM_LAYERS)})  # L4 noisy > τ·1.5
+        assert dfc2.decide_unfreeze(NUM_LAYERS) == [], (
+            "upstream activity released the output-side layer — "
+            "§4 output-side protection violated"
+        )
+
     def test_upstream_activity_releases_upstream_end(self):
         # §4(b): the layer just upstream of the block gets noisy → release.
         dfc = _make(stir_interval=1000)  # disable stir, isolate activity trigger

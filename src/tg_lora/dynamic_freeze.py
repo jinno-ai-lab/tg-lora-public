@@ -232,6 +232,19 @@ class DynamicFreezeController:
         # Upstream end = smallest layer index in the block
         upstream_end = min(self._frozen_block)
 
+        # §4 invariant: the output-side layer (largest index) is never released
+        # — it anchors the contiguous frozen block so backward truncation keeps a
+        # frozen boundary (``10_guard_experiment.md`` §4: "出力側は最後まで固定を
+        # 保ち連続塊を守る"). When sustained upstream activity means released
+        # layers do not re-settle, the block drains toward the output side; once
+        # ``upstream_end`` IS the output layer there is nothing upstream left to
+        # release, and both the stir and the activity triggers must stop here
+        # rather than handing back ``[output_layer]``.
+        # ``_all_layers`` is sorted descending (``__init__``), so ``[0]`` is the
+        # output side.
+        if self._all_layers and upstream_end == self._all_layers[0]:
+            return []
+
         # (a) Forced stir
         cycles_frozen = cycle - self._frozen_since_cycle
         if cycles_frozen >= self._stir_interval:
