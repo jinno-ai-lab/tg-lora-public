@@ -2203,6 +2203,11 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                             f"ppl={full_result.perplexity:.2f}"
                         )
                         cycle_state.record_full_eval(full_loss)
+                        metrics.record_full_eval_loss(
+                            cycle=cycle,
+                            full_loss=full_loss,
+                            total_backward_passes=cycle_state.full_backward_passes,
+                        )
                         if full_loss < best_full_eval_loss:
                             best_full_eval_loss = full_loss
                             best_full_eval_perplexity = full_result.perplexity
@@ -2339,6 +2344,11 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                             full_result.perplexity,
                         )
                         cycle_state.record_full_eval(full_loss)
+                        metrics.record_full_eval_loss(
+                            cycle=cycle,
+                            full_loss=full_loss,
+                            total_backward_passes=cycle_state.full_backward_passes,
+                        )
                         if full_loss < best_full_eval_loss:
                             best_full_eval_loss = full_loss
                             best_full_eval_perplexity = full_result.perplexity
@@ -2502,6 +2512,11 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                             f"ppl={full_result.perplexity:.2f}"
                         )
                         cycle_state.record_full_eval(full_loss)
+                        metrics.record_full_eval_loss(
+                            cycle=cycle,
+                            full_loss=full_loss,
+                            total_backward_passes=cycle_state.full_backward_passes,
+                        )
                         if full_loss < best_full_eval_loss:
                             best_full_eval_loss = full_loss
                             best_full_eval_perplexity = full_result.perplexity
@@ -3812,6 +3827,11 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 prev_best = cycle_state.best_loss
                 prev_stale = cycle_state.stale_cycles
                 cycle_state.record_full_eval(full_loss)
+                metrics.record_full_eval_loss(
+                    cycle=cycle,
+                    full_loss=full_loss,
+                    total_backward_passes=cycle_state.full_backward_passes,
+                )
 
                 is_new_best, should_stop, eval_reason = _evaluate_full_eval_outcome(
                     full_loss,
@@ -4001,6 +4021,11 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
         full_loss = full_result.avg_loss
         logger.info(f"Final full validation loss: {full_loss:.4f} (ppl: {full_result.perplexity:.2f})")
         cycle_state.record_full_eval(full_loss)
+        metrics.record_full_eval_loss(
+            cycle=cycle_state.cycle,
+            full_loss=full_loss,
+            total_backward_passes=cycle_state.full_backward_passes,
+        )
         if full_loss < best_full_eval_loss:
             best_full_eval_loss = full_loss
             best_full_eval_perplexity = full_result.perplexity

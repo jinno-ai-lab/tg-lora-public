@@ -1189,3 +1189,105 @@ class TestLossCurveSkipsNullValues:
         _, losses, _ = extract_loss_and_time(records)
         assert None not in losses
         assert losses == [2.0]
+
+
+class TestSupplySideHonestyNonInert:
+    """Closes the §5.2 honesty contract's supply side — TASK-0141 last mile.
+
+    The receiver tests (``TestFullEvalLossHonestyE2E``) proved the gate wakes the
+    moment honest data arrives; the dormancy tests (``TestHonestyContractDormancyLoud``)
+    proved the absence is at least loud. What neither could prove is the piece the
+    §5.2 fix lives or dies by in production: *does the trainer actually emit
+    ``loss_valid_full`` on full-eval cycles?* Until the producer ships, the
+    receiver is provably non-inert in code yet inert on every real run — the exact
+    "code looks fixed but the contract never activates" state the feedback flagged.
+
+    These tests pin the producer three ways, all CPU-verifiable (no GPU run): the
+    producer writes the exact record shape the receiver selects on; the producer's
+    records flip the contract DORMANT→ACTIVE end-to-end and drive L\* off the
+    full-eval curve; and every full-eval site in the trainer is wired to call the
+    producer, so the contract cannot stay dormant on a fresh GPU run because a site
+    was missed (a corrupt-input-style structural guard against future regressions).
+    """
+
+    def test_producer_persists_honest_full_eval_record(self, tmp_path):
+        # The producer (RunMetrics.record_full_eval_loss) must persist a step
+        # record whose loss_valid_full carries the full-eval loss — the *presence*
+        # the receiver keys on — while leaving the pilot proxy loss_valid NULL so
+        # this record cannot pollute the every-cycle proxy curve. Round-trips
+        # through the real run_metrics.jsonl writer/reader the trainer uses.
+        m = RunMetrics(tmp_path / "run", mode="tg_lora")
+        m.record_full_eval_loss(cycle=10, full_loss=1.234, total_backward_passes=800)
+        m.close()
+        records = load_run_metrics(tmp_path / "run")
+        step_records = [r for r in records if r.get("type") == "step"]
+        assert len(step_records) == 1
+        rec = step_records[0]
+        assert rec[LOSS_VALID_FULL_KEY] == 1.234   # the honest signal the receiver selects on
+        assert rec.get("loss_valid") is None        # pilot proxy curve stays clean
+        assert rec["cycle"] == 10
+
+    def test_producer_activates_honesty_contract_end_to_end(self, tmp_path):
+        # Producer → receiver E2E: a run whose full-eval cycles are emitted via the
+        # producer (not hand-built dicts) flips the honesty contract DORMANT→ACTIVE
+        # and L* is taken from loss_valid_full, NOT the pilot proxy. Closes the loop
+        # the receiver tests opened — now the records come from the trainer's own
+        # producer. The pilot and full-eval curves deliberately disagree (pilot min
+        # 0.9 ≠ full-eval min 1.2) so a silent fallback to the proxy is detectable.
+        m = RunMetrics(tmp_path / "run", mode="tg_lora")
+        for cyc, pilot in [(0, 2.0), (1, 1.6), (2, 1.5), (3, 1.4), (4, 0.9)]:
+            m.record_step(
+                step=cyc, cycle=cyc, loss_train=1.0, loss_valid=pilot,
+                backward_passes=1, total_backward_passes=cyc,
+            )
+        # full-eval losses on cycles 0, 2, 4 — emitted via the producer the trainer now calls
+        m.record_full_eval_loss(cycle=0, full_loss=2.5, total_backward_passes=0)
+        m.record_full_eval_loss(cycle=2, full_loss=1.8, total_backward_passes=2)
+        m.record_full_eval_loss(cycle=4, full_loss=1.2, total_backward_passes=4)
+        m.close()
+        records = load_run_metrics(tmp_path / "run")
+
+        # The contract must be ACTIVE — the producer's records carry loss_valid_full.
+        status = honesty_contract_status(records)
+        assert status["state"] == "active"
+        assert status["full_eval_records"] == 3
+
+        # L* tracks the full-eval curve, not the dishonest pilot proxy.
+        _, pilot_losses, _ = extract_loss_and_time(records)
+        assert min(pilot_losses) == 0.9            # the trap: the proxy alone would pick 0.9
+        f_times, f_losses, f_cycles = extract_loss_and_time(records, full_eval_only=True)
+        assert f_losses == [2.5, 1.8, 1.2]
+        l_star, l_star_cycle, _, _ = baseline_targets(
+            f_losses, f_cycles, f_times, extract_gold(records)
+        )
+        assert l_star == 1.2                        # full-eval min, NOT the pilot's 0.9
+        assert l_star != 0.9                        # the receiver did not silently fall back
+        assert l_star_cycle == 4
+
+    def test_every_full_eval_site_is_wired_to_emit_loss_valid_full(self):
+        # Supply-side completeness guard (corrupt-input philosophy): the honesty
+        # contract is non-inert only if EVERY real full-eval site persists
+        # loss_valid_full. Reads the trainer source as text — no GPU run, no import
+        # — and asserts each record_full_eval(full_loss) call (a real eval; the
+        # float('inf') OOM sentinel is excluded by the argument) is followed within
+        # a few lines by a producer emission, co-located under the same
+        # `if is_full_eval_cycle` guard. A future full-eval site that forgets the
+        # producer cannot silently leave the contract DORMANT on a fresh GPU run.
+        source_path = Path(__file__).resolve().parents[1] / "src" / "training" / "train_tg_lora.py"
+        lines = source_path.read_text().splitlines()
+        eval_sites = [
+            i for i, ln in enumerate(lines) if "record_full_eval(full_loss)" in ln
+        ]
+        emit_sites = [
+            i for i, ln in enumerate(lines) if "record_full_eval_loss(" in ln
+        ]
+        assert eval_sites, "fixture sanity: trainer must have full-eval sites"
+        # Every real full-eval call is paired with a producer emission right after it.
+        for site in eval_sites:
+            window = lines[site: site + 5]
+            assert any("record_full_eval_loss(" in w for w in window), (
+                f"full-eval site at line {site + 1} has no loss_valid_full emission "
+                f"in the next 4 lines — the honesty contract stays DORMANT at this site"
+            )
+        # No orphan emissions either: one producer call per real full-eval site.
+        assert len(emit_sites) == len(eval_sites) == 5

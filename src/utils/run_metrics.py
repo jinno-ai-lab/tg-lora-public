@@ -505,6 +505,42 @@ class RunMetrics:
         self._write(record)
         return record
 
+    def record_full_eval_loss(
+        self,
+        *,
+        cycle: int | None,
+        full_loss: float,
+        total_backward_passes: int,
+        step: int | None = None,
+    ) -> dict:
+        """§5.1/§5.2 honesty signal: persist a full-eval loss as ``loss_valid_full``.
+
+        Writes a step record carrying the design-mandated full-eval loss in
+        ``loss_valid_full`` and leaves the pilot proxy ``loss_valid`` null, so
+        this record cannot pollute the every-cycle proxy curve the §5.2 gate
+        falls back to — ``extract_loss_and_time`` null-skips it on the proxy path
+        and selects it on the ``full_eval_only=True`` path. This is the *producer*
+        side of the honesty contract: the analyzer's
+        ``extract_loss_and_time(full_eval_only=True)`` /
+        ``honesty_contract_status`` flip DORMANT→ACTIVE the moment such a record
+        is present, so L\* is taken from the full-eval loss instead of the
+        contaminated pilot proxy (TASK-0141 last mile).
+
+        Co-locate this call with ``cycle_state.record_full_eval(full_loss)`` at
+        every full-eval site: the emission then fires on exactly the cycles the
+        GPU-verified full-eval path already evaluates, so it is inert iff that
+        path is inert — never a silent fallback that looks wired but never runs.
+        """
+        return self.record_step(
+            step=step if step is not None else total_backward_passes,
+            cycle=cycle,
+            loss_train=None,
+            loss_valid=None,
+            loss_valid_full=full_loss,
+            backward_passes=0,
+            total_backward_passes=total_backward_passes,
+        )
+
     def write_footer(
         self,
         best_valid_loss: float,

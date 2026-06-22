@@ -120,9 +120,12 @@ def extract_loss_and_time(
     return times, losses, cycles
 
 
-# The trainer-emission task that flips DORMANT → ACTIVE once it ships on GPU.
-# Referenced from the dormancy diagnostic so the gap stays owned on every
-# analysis run instead of a silent byte-identical fallback.
+# The task that owns the §5.2 honesty contract's supply side. The trainer
+# producer (RunMetrics.record_full_eval_loss) is wired at every full-eval site,
+# but a run only flips DORMANT → ACTIVE once its metrics are regenerated on GPU
+# so the records actually carry loss_valid_full. Referenced from the dormancy
+# diagnostic so the gap stays owned on every analysis run instead of a silent
+# byte-identical fallback.
 _HONESTY_DORMANT_UNBLOCKER = "TASK-0141"
 
 
@@ -133,14 +136,16 @@ def honesty_contract_status(records: list[dict]) -> dict:
     every-cycle pilot proxy ``loss_valid`` for L* (§5.1). It is ACTIVE only when
     at least one step record carries ``loss_valid_full``; otherwise the analyzer
     falls back to the pilot proxy (``main()`` / ``write_gate_decision``) and L*
-    is computed on the contaminated proxy. Until the trainer emits
-    ``loss_valid_full`` (``_HONESTY_DORMANT_UNBLOCKER``, GPU-only) every real
-    run is DORMANT — the "code looks fixed but the receiver is inert" state the
-    §5.2 fix (276991c) exists to prevent. Surfacing this makes the dormancy
-    owned and visible on every analysis run instead of a silent fallback that
-    reads as a working fix. (The receiver's own non-inertness over a real
-    metrics file is pinned by ``TestFullEvalLossHonestyE2E``; this reports
-    whether honest data has actually arrived.)
+    is computed on the contaminated proxy. The trainer producer is wired
+    (``_HONESTY_DORMANT_UNBLOCKER``, shipped), but a run is DORMANT whenever its
+    records carry no ``loss_valid_full`` — true for every run file that predates
+    the wiring, until it is regenerated on GPU. This is the "code looks fixed but
+    the receiver is inert" surface the §5.2 fix (276991c) exists to make visible
+    rather than a silent fallback that reads as a working fix. (The receiver's
+    own non-inertness over a real metrics file is pinned by
+    ``TestFullEvalLossHonestyE2E``; the producer's non-inertness is pinned by
+    ``TestSupplySideHonestyNonInert``; this reports whether honest data has
+    actually arrived.)
     """
     step_records = [r for r in records if r.get("type") == "step"]
     full_eval = [r for r in step_records if r.get(LOSS_VALID_FULL_KEY) is not None]
@@ -173,8 +178,8 @@ def format_honesty_contract_line(status: dict) -> str:
         f"⚠ Honesty contract DORMANT: 0/{n_step} cycles carry "
         f"{LOSS_VALID_FULL_KEY} — L* is on the pilot proxy (loss_valid), NOT "
         f"the design-mandated full-eval loss; the A/B comparison is "
-        f"contaminated until the trainer emits it "
-        f"({_HONESTY_DORMANT_UNBLOCKER}, GPU)."
+        f"contaminated. The trainer producer is wired ({_HONESTY_DORMANT_UNBLOCKER}) "
+        f"but these run files predate it — regenerate on GPU to activate."
     )
 
 
@@ -577,9 +582,10 @@ def write_gate_decision(
 
     # §5.2 honesty visibility: qualify the L* line above with whether it was
     # computed from the honest full-eval loss (ACTIVE) or the silent pilot-proxy
-    # fallback (DORMANT). Until the trainer emits loss_valid_full (TASK-0141,
-    # GPU) every real run is DORMANT, so this line makes that contamination
-    # visible in the persisted artifact rather than reading as a working fix.
+    # fallback (DORMANT). The trainer producer is wired (TASK-0141) but run files
+    # that predate it carry no loss_valid_full, so they are DORMANT — this line
+    # makes that contamination visible in the persisted artifact rather than
+    # reading as a working fix.
     if honesty_status is not None:
         lines.append("  " + format_honesty_contract_line(honesty_status))
 
@@ -708,11 +714,11 @@ def main():
     (_, baseline_full_losses, baseline_full_cycles) = extract_loss_and_time(
         baseline_records, full_eval_only=True
     )
-    # §5.2 honesty visibility: until the trainer emits loss_valid_full
-    # (TASK-0141, GPU) no real run carries it and L* silently falls back to the
-    # pilot proxy below. Surface that dormancy on stdout AND in gate_decision.txt
-    # so a contaminated A/B comparison can never hide behind a byte-identical
-    # fallback that looks fixed.
+    # §5.2 honesty visibility: a run whose records carry no loss_valid_full
+    # (every run file predating the TASK-0141 producer wiring, until regenerated
+    # on GPU) leaves L* silently falling back to the pilot proxy below. Surface
+    # that dormancy on stdout AND in gate_decision.txt so a contaminated A/B
+    # comparison can never hide behind a byte-identical fallback that looks fixed.
     baseline_honesty = honesty_contract_status(baseline_records)
     print(format_honesty_contract_line(baseline_honesty))
     guard_times, guard_losses, _ = extract_loss_and_time(guard_records)
