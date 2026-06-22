@@ -107,6 +107,64 @@ def extract_loss_and_time(
     return times, losses, cycles
 
 
+# The trainer-emission task that flips DORMANT → ACTIVE once it ships on GPU.
+# Referenced from the dormancy diagnostic so the gap stays owned on every
+# analysis run instead of a silent byte-identical fallback.
+_HONESTY_DORMANT_UNBLOCKER = "TASK-0141"
+
+
+def honesty_contract_status(records: list[dict]) -> dict:
+    """Report whether the §5.2 honesty contract is ACTIVE or DORMANT on a run.
+
+    The contract prefers ``loss_valid_full`` (the full-eval loss) over the
+    every-cycle pilot proxy ``loss_valid`` for L* (§5.1). It is ACTIVE only when
+    at least one step record carries ``loss_valid_full``; otherwise the analyzer
+    falls back to the pilot proxy (``main()`` / ``write_gate_decision``) and L*
+    is computed on the contaminated proxy. Until the trainer emits
+    ``loss_valid_full`` (``_HONESTY_DORMANT_UNBLOCKER``, GPU-only) every real
+    run is DORMANT — the "code looks fixed but the receiver is inert" state the
+    §5.2 fix (276991c) exists to prevent. Surfacing this makes the dormancy
+    owned and visible on every analysis run instead of a silent fallback that
+    reads as a working fix. (The receiver's own non-inertness over a real
+    metrics file is pinned by ``TestFullEvalLossHonestyE2E``; this reports
+    whether honest data has actually arrived.)
+    """
+    step_records = [r for r in records if r.get("type") == "step"]
+    full_eval = [r for r in step_records if r.get(LOSS_VALID_FULL_KEY) is not None]
+    return {
+        "state": "active" if full_eval else "dormant",
+        "step_records": len(step_records),
+        "full_eval_records": len(full_eval),
+    }
+
+
+def format_honesty_contract_line(status: dict) -> str:
+    """One-line, user-visible honesty-contract diagnostic for the gate report.
+
+    DORMANT → a prominent ⚠ warning naming the unblocker and stating L* is on
+    the pilot proxy, not the design-mandated full-eval loss. ACTIVE → a quiet
+    confirmation carrying the coverage ratio (so a half-wired trainer that
+    emits on only some full-eval cycles is visible too). Never empty, so a
+    contaminated A/B comparison cannot hide behind a byte-identical fallback
+    that *looks* fixed.
+    """
+    state = status.get("state")
+    n_full = status.get("full_eval_records", 0)
+    n_step = status.get("step_records", 0)
+    if state == "active":
+        return (
+            f"Honesty contract ACTIVE: {n_full}/{n_step} cycles carry "
+            f"{LOSS_VALID_FULL_KEY} — L* computed from the full-eval loss."
+        )
+    return (
+        f"⚠ Honesty contract DORMANT: 0/{n_step} cycles carry "
+        f"{LOSS_VALID_FULL_KEY} — L* is on the pilot proxy (loss_valid), NOT "
+        f"the design-mandated full-eval loss; the A/B comparison is "
+        f"contaminated until the trainer emits it "
+        f"({_HONESTY_DORMANT_UNBLOCKER}, GPU)."
+    )
+
+
 def extract_freeze_schedule(records: list[dict]) -> dict[int, dict]:
     """Extract per-cycle freeze block info.
 
@@ -455,6 +513,7 @@ def write_gate_decision(
     output_path: Path,
     baseline_full_losses: list[float] | None = None,
     baseline_full_cycles: list[int] | None = None,
+    honesty_status: dict | None = None,
 ) -> None:
     lines: list[str] = []
     lines.append("Gate Decision — Guard Experiment (§5.2)")
@@ -502,6 +561,14 @@ def write_gate_decision(
         lines.append(
             f"  L* = {l_star:.4f}   G* = {g_star if g_star is not None else 'N/A'}"
         )
+
+    # §5.2 honesty visibility: qualify the L* line above with whether it was
+    # computed from the honest full-eval loss (ACTIVE) or the silent pilot-proxy
+    # fallback (DORMANT). Until the trainer emits loss_valid_full (TASK-0141,
+    # GPU) every real run is DORMANT, so this line makes that contamination
+    # visible in the persisted artifact rather than reading as a working fix.
+    if honesty_status is not None:
+        lines.append("  " + format_honesty_contract_line(honesty_status))
 
     # Quality gate (§5.2): gold >= G* reached within the loss trigger margin
     quality_pass = stop_cycle is not None
@@ -628,6 +695,13 @@ def main():
     (_, baseline_full_losses, baseline_full_cycles) = extract_loss_and_time(
         baseline_records, full_eval_only=True
     )
+    # §5.2 honesty visibility: until the trainer emits loss_valid_full
+    # (TASK-0141, GPU) no real run carries it and L* silently falls back to the
+    # pilot proxy below. Surface that dormancy on stdout AND in gate_decision.txt
+    # so a contaminated A/B comparison can never hide behind a byte-identical
+    # fallback that looks fixed.
+    baseline_honesty = honesty_contract_status(baseline_records)
+    print(format_honesty_contract_line(baseline_honesty))
     guard_times, guard_losses, _ = extract_loss_and_time(guard_records)
 
     baseline_gold = extract_gold(baseline_records)
@@ -679,6 +753,7 @@ def main():
         output_dir / "gate_decision.txt",
         baseline_full_losses,
         baseline_full_cycles,
+        honesty_status=baseline_honesty,
     )
 
     write_metrics_csv(

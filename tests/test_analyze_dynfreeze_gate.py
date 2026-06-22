@@ -37,8 +37,11 @@ from scripts.analyze_dynfreeze_experiment import (
     baseline_targets,
     extract_gold,
     extract_loss_and_time,
+    format_honesty_contract_line,
     guard_stop_point,
+    honesty_contract_status,
     load_run_metrics,
+    write_gate_decision,
 )
 from src.tg_lora.freeze_cost import (
     PROXY_VALIDATED_MAX_WIDTH,
@@ -920,3 +923,179 @@ class TestFullEvalLossHonestyE2E:
         )
         assert l_star == 1.2
         assert l_star_cycle == 2
+
+
+class TestHonestyContractDormancyLoud:
+    """The §5.2 honesty contract is DORMANT on every real run today: the trainer
+    does not yet emit ``loss_valid_full`` (TASK-0141, GPU-only), so the analyzer
+    SILENTLY falls back to the pilot proxy and L* is computed on the
+    contaminated proxy — the exact "code looks fixed but the receiver is inert"
+    state the §5.2 fix (276991c) exists to prevent. ``TestFullEvalLossHonestyE2E``
+    proved the receiver is not inert in code; that is only honest if the
+    dormancy is also VISIBLE and owned on every real analysis run, not buried in
+    a byte-identical fallback. These corrupt-input tests pin that visibility over
+    a real metrics file written by ``RunMetrics.record_step`` and read back by
+    ``load_run_metrics`` — the same full round-trip the non-inert tests use.
+    """
+
+    def test_dormant_run_warning_names_the_unblocker(self, tmp_path):
+        # Today's reality: a real run with NO loss_valid_full records. The
+        # contract must report DORMANT and the diagnostic must name TASK-0141
+        # (the trainer-emission task that flips it) so the gap is owned, not
+        # buried in a silent byte-identical fallback.
+        records = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "baseline",
+            [
+                {"cycle": 0, "loss_valid": 2.0, "gold_combined": 0.3},
+                {"cycle": 1, "loss_valid": 1.5, "gold_combined": 0.4},
+                {"cycle": 2, "loss_valid": 1.2, "gold_combined": 0.5},
+            ],
+        )
+        status = honesty_contract_status(records)
+        assert status["state"] == "dormant"
+        assert status["full_eval_records"] == 0
+        assert status["step_records"] == 3
+        line = format_honesty_contract_line(status)
+        assert "DORMANT" in line
+        assert "TASK-0141" in line            # the gap is owned, not silent
+        assert "pilot proxy" in line          # states L* is on the proxy
+        assert LOSS_VALID_FULL_KEY in line
+
+    def test_active_run_carries_no_unblocker_warning(self, tmp_path):
+        # Corrupt-input inversion: the SAME run with loss_valid_full on the
+        # full-eval cycles is ACTIVE — no TASK-0141 warning, and the partial
+        # coverage (2/3) is surfaced so a half-wired trainer is visible too.
+        records = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "baseline",
+            [
+                {"cycle": 0, "loss_valid": 2.0, "loss_valid_full": 2.2, "gold_combined": 0.3},
+                {"cycle": 1, "loss_valid": 1.5},
+                {"cycle": 2, "loss_valid": 1.2, "loss_valid_full": 1.3, "gold_combined": 0.5},
+            ],
+        )
+        status = honesty_contract_status(records)
+        assert status["state"] == "active"
+        assert status["full_eval_records"] == 2
+        assert status["step_records"] == 3
+        line = format_honesty_contract_line(status)
+        assert "ACTIVE" in line
+        assert "TASK-0141" not in line        # no unblocker needed when active
+        assert "2/3" in line                  # partial coverage surfaced
+
+    def test_one_full_eval_record_flips_dormant_to_active(self, tmp_path):
+        # Verdict-flip proof the diagnostic is driven by the records, not a
+        # hardcoded string: adding a single loss_valid_full record flips
+        # DORMANT→ACTIVE and removes the TASK-0141 warning.
+        dormant = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "dormant",
+            [{"cycle": 0, "loss_valid": 2.0}, {"cycle": 1, "loss_valid": 1.5}],
+        )
+        active = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "active",
+            [
+                {"cycle": 0, "loss_valid": 2.0, "loss_valid_full": 2.1},
+                {"cycle": 1, "loss_valid": 1.5},
+            ],
+        )
+        d_status = honesty_contract_status(dormant)
+        a_status = honesty_contract_status(active)
+        assert d_status["state"] == "dormant"
+        assert a_status["state"] == "active"
+        assert "TASK-0141" in format_honesty_contract_line(d_status)
+        assert "TASK-0141" not in format_honesty_contract_line(a_status)
+
+    def test_non_step_records_excluded_from_coverage(self, tmp_path):
+        # Corrupt input: footer/header records must not inflate the step total
+        # or be mistaken for honest data. Coverage counts step records only.
+        records = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "baseline",
+            [{"cycle": 0, "loss_valid": 2.0}, {"cycle": 1, "loss_valid": 1.5}],
+        )
+        # load_run_metrics may carry non-step records (footers); ensure they
+        # don't corrupt the coverage denominator.
+        records.append({"type": "footer", "best_valid_loss": 1.5})
+        status = honesty_contract_status(records)
+        assert status["step_records"] == 2
+        assert status["state"] == "dormant"
+
+    def test_dormancy_warning_persists_in_gate_decision_file(self, tmp_path):
+        # User-visible artifact: a re-analysis of a dormant run must write the
+        # warning into gate_decision.txt so the contaminated comparison cannot
+        # ship silently. Drive write_gate_decision with a dormant honesty_status
+        # over a real metrics file and read the artifact back.
+        guard_records = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "guard",
+            [
+                {"cycle": 0, "loss_valid": 2.0, "gold_combined": 0.3},
+                {"cycle": 1, "loss_valid": 1.5, "gold_combined": 0.5},
+            ],
+        )
+        status = honesty_contract_status(guard_records)
+        assert status["state"] == "dormant"
+        out = tmp_path / "gate_decision.txt"
+        write_gate_decision(
+            baseline_dir=tmp_path / "baseline",
+            guard_dir=tmp_path / "guard",
+            baseline_losses=[2.0, 1.5],
+            baseline_cycles=[0, 1],
+            baseline_times=[0.0, 10.0],
+            baseline_gold=[
+                {"cycle": 0, "elapsed": 0.0, "loss": 2.0, "gold_combined": 0.3},
+                {"cycle": 1, "elapsed": 10.0, "loss": 1.5, "gold_combined": 0.5},
+            ],
+            guard_losses=[2.0, 1.5],
+            guard_times=[0.0, 8.0],
+            guard_gold=extract_gold(guard_records),
+            schedule={},
+            layer_indices=[24, 25],
+            target_width=4096,
+            freeze_level=2,
+            output_path=out,
+            baseline_full_losses=[],      # dormant: no full-eval curve
+            baseline_full_cycles=[],
+            honesty_status=status,
+        )
+        text = out.read_text()
+        assert "DORMANT" in text
+        assert "TASK-0141" in text
+
+    def test_active_status_omits_warning_from_gate_decision_file(self, tmp_path):
+        # Corrupt-input inversion of the above: an ACTIVE run must NOT write the
+        # DORMANT/TASK-0141 warning — proving the gate-decision line is driven by
+        # the status, not unconditionally emitted.
+        guard_records = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "guard",
+            [
+                {"cycle": 0, "loss_valid": 2.0, "loss_valid_full": 2.2, "gold_combined": 0.3},
+                {"cycle": 1, "loss_valid": 1.5, "loss_valid_full": 1.6, "gold_combined": 0.5},
+            ],
+        )
+        status = honesty_contract_status(guard_records)
+        assert status["state"] == "active"
+        out = tmp_path / "gate_decision.txt"
+        write_gate_decision(
+            baseline_dir=tmp_path / "baseline",
+            guard_dir=tmp_path / "guard",
+            baseline_losses=[2.0, 1.5],
+            baseline_cycles=[0, 1],
+            baseline_times=[0.0, 10.0],
+            baseline_gold=[
+                {"cycle": 0, "elapsed": 0.0, "loss": 2.0, "gold_combined": 0.3},
+                {"cycle": 1, "elapsed": 10.0, "loss": 1.5, "gold_combined": 0.5},
+            ],
+            guard_losses=[2.0, 1.5],
+            guard_times=[0.0, 8.0],
+            guard_gold=extract_gold(guard_records),
+            schedule={},
+            layer_indices=[24, 25],
+            target_width=4096,
+            freeze_level=2,
+            output_path=out,
+            baseline_full_losses=[2.2, 1.6],   # active: full-eval curve present
+            baseline_full_cycles=[0, 1],
+            honesty_status=status,
+        )
+        text = out.read_text()
+        assert "DORMANT" not in text
+        assert "TASK-0141" not in text
+        assert "ACTIVE" in text
