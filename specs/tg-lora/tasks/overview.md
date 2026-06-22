@@ -1641,5 +1641,8 @@ Phase 66 完了。残存する未完了タスク:
 - [TASK-0133: §6.3 比較ヘッドライン再生産 bracket 着地点 — A/B 再生産観測が additional_realized_reduction の bracket を較正する着地点（design §6.3 / Phase 3）](TASK-0133.md)
 - [TASK-0134: §6.3 分散較正バンドの非負床注記 — `format_reduction_band` が負の下限を達成可能と読ませない着地点（design §6.3）](TASK-0134.md)
 - [TASK-0135: §6.2/§6.3 証拠配管を CPU-proxy in-vivo A/B 実測へ配線 — 薄い証拠の着地点を本物の観測で厚くし、判定経路を観察可能にする（design §6.2/§6.3 → Phase 3 A/B）](TASK-0135.md)
+- [TASK-0136: 起点発射性の repo-wide schema gate — 任意の LoggingConfig/スキーマ変更が出荷 config を壊すのを、feature コミットと同一コミットで捕える（d2218ed 回帰クラスの一般化）](TASK-0136.md)
+- [TASK-0137: M10.3 disk-death guard の第2ベクトル閉包 — `trajectory_delta_artifacts/*.pt` のサイクル毎無限蓄積を、既存の keep_last_checkpoints/min_free_disk_gb knob で抑える](TASK-0137.md)
+- [TASK-0138: M10.3 disk-death guard の第3ベクトル閉包 — ベースライン学習エントリポイント（`checkpoint-<step>` + `trajectory_delta_artifacts/*.pt`）を既存 knob 傘下へ](TASK-0138.md)
 
 <!-- spine:references:end -->
