@@ -57,6 +57,14 @@ from src.tg_lora.freeze_cost import (
 LOSS_TRIGGER_MARGIN = 0.02  # primary trigger: valid_full <= L* + 0.02
 SPEED_GATE_RATIO = 0.90  # speed gate: B_stop <= A_total * 0.90
 GOLD_SCORE_KEY = "gold_combined"
+# §5.1/§5.2/§5.3 fix the quality signal to the *full-eval* loss (valid_full),
+# not the cheap pilot/split-boundary proxy every step also carries under
+# loss_valid. extract_gold / extract_loss_and_time prefer the full-eval loss
+# under LOSS_VALID_FULL_KEY (recorded only on full-eval cycles) and fall back to
+# loss_valid for legacy records (byte-identical), so the honesty contract
+# activates only when honest data is present — the same pluggable-receiver
+# pattern §6.2/§6.3 use for scale measurements.
+LOSS_VALID_FULL_KEY = "loss_valid_full"
 
 
 def load_run_metrics(run_dir: Path) -> list[dict]:
@@ -75,12 +83,26 @@ def load_run_metrics(run_dir: Path) -> list[dict]:
 
 def extract_loss_and_time(
     records: list[dict],
+    *,
+    full_eval_only: bool = False,
 ) -> tuple[list[float], list[float], list[int]]:
+    """Extract the per-cycle validation curve as (times, losses, cycles).
+
+    By default reads ``loss_valid`` — the pilot/split-boundary proxy recorded
+    every cycle — which is the continuous curve for the loss-vs-wallclock plot.
+    With ``full_eval_only=True`` it emits only the cycles that carry a full-eval
+    loss (``loss_valid_full``), the design-mandated §5.1 signal for L* (best
+    *valid_full* loss). When no cycle records a full-eval loss the result is
+    empty and the caller falls back to the proxy curve (byte-identical to the
+    pre-fix behavior), so the honesty contract activates only when honest data
+    is present.
+    """
     times, losses, cycles = [], [], []
+    loss_key = LOSS_VALID_FULL_KEY if full_eval_only else "loss_valid"
     for r in records:
-        if r.get("type") == "step" and "loss_valid" in r:
+        if r.get("type") == "step" and loss_key in r:
             times.append(r.get("elapsed_seconds", 0.0))
-            losses.append(r["loss_valid"])
+            losses.append(r[loss_key])
             cycles.append(r.get("cycle", 0))
     return times, losses, cycles
 
@@ -134,7 +156,11 @@ def extract_gold(records: list[dict]) -> list[dict]:
             {
                 "cycle": r.get("cycle", 0),
                 "elapsed": r.get("elapsed_seconds", 0.0),
-                "loss": r.get("loss_valid"),
+                # §5.1: the §5.2 trigger loss is the full-eval loss when the
+                # trainer records it; fall back to the pilot proxy for legacy.
+                "loss": r[LOSS_VALID_FULL_KEY]
+                if r.get(LOSS_VALID_FULL_KEY) is not None
+                else r.get("loss_valid"),
                 "gold_combined": r.get("gold_combined"),
                 "gold_field_f1": r.get("gold_field_f1"),
                 "gold_exact_match": r.get("gold_exact_match"),
@@ -427,13 +453,19 @@ def write_gate_decision(
     target_width: int,
     freeze_level: int,
     output_path: Path,
+    baseline_full_losses: list[float] | None = None,
+    baseline_full_cycles: list[int] | None = None,
 ) -> None:
     lines: list[str] = []
     lines.append("Gate Decision — Guard Experiment (§5.2)")
     lines.append("=" * 50)
 
+    # §5.1: L* = best *valid_full* loss — prefer the full-eval curve, fall back
+    # to the every-cycle proxy when no full eval was recorded (byte-identical).
+    l_losses = baseline_full_losses if baseline_full_losses else baseline_losses
+    l_cycles = baseline_full_cycles if baseline_full_cycles else baseline_cycles
     l_star, l_star_cycle, g_star, a_total = baseline_targets(
-        baseline_losses, baseline_cycles, baseline_times, baseline_gold
+        l_losses, l_cycles, baseline_times, baseline_gold
     )
     stop_cycle, stop_elapsed = guard_stop_point(guard_gold, l_star, g_star)
     # A's own time-to-quality (fair baseline for the speed comparison).
@@ -591,13 +623,20 @@ def main():
     baseline_times, baseline_losses, baseline_cycles = extract_loss_and_time(
         baseline_records
     )
+    # §5.1: L* is the best *valid_full* loss — prefer the full-eval curve and
+    # fall back to the every-cycle proxy when no full eval was recorded.
+    (_, baseline_full_losses, baseline_full_cycles) = extract_loss_and_time(
+        baseline_records, full_eval_only=True
+    )
     guard_times, guard_losses, _ = extract_loss_and_time(guard_records)
 
     baseline_gold = extract_gold(baseline_records)
     guard_gold = extract_gold(guard_records)
 
+    l_star_losses = baseline_full_losses if baseline_full_losses else baseline_losses
+    l_star_cycles = baseline_full_cycles if baseline_full_cycles else baseline_cycles
     l_star, _, g_star, _ = baseline_targets(
-        baseline_losses, baseline_cycles, baseline_times, baseline_gold
+        l_star_losses, l_star_cycles, baseline_times, baseline_gold
     )
 
     plot_loss_vs_wallclock(
@@ -638,6 +677,8 @@ def main():
         args.target_width,
         args.freeze_level,
         output_dir / "gate_decision.txt",
+        baseline_full_losses,
+        baseline_full_cycles,
     )
 
     write_metrics_csv(

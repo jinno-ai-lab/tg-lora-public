@@ -30,7 +30,14 @@ layer-index remap.
 
 import pytest
 
-from scripts.analyze_dynfreeze_experiment import _proxy_speed_gate_section
+from scripts.analyze_dynfreeze_experiment import (
+    LOSS_TRIGGER_MARGIN,
+    _proxy_speed_gate_section,
+    baseline_targets,
+    extract_gold,
+    extract_loss_and_time,
+    guard_stop_point,
+)
 from src.tg_lora.freeze_cost import (
     PROXY_VALIDATED_MAX_WIDTH,
     ReductionSample,
@@ -536,3 +543,207 @@ class TestProxySpeedGateLevelComparison:
         assert f"speed_gate_verdict: {VERDICT_PASS}" in with_record
         assert "level1 (progressive freeze): PASS" in with_record
         assert "level1 ceiling: raised" in with_record
+
+
+class TestQualityGateDecision:
+    """Direct coverage for the §5.2 two-stage stop decision functions.
+
+    ``baseline_targets`` (§5.1: L* = best *valid_full* loss; G* = gold at L*)
+    and ``guard_stop_point`` (§5.2: first cycle where valid_full <= L*+margin
+    AND gold >= G*) are the Guard experiment's quality gate — the counterpart to
+    the §7 speed gate the rest of this file covers — yet they had *zero* direct
+    tests. Beyond pinning their contract, these lock the §5.1/§5.3 honesty rule
+    the module docstring states but the code did not honour: the quality signal
+    is the **full-eval loss** (``loss_valid_full``), never the cheap
+    pilot/split-boundary proxy (``loss_valid``) every step also carries. The
+    analyzer must read the full-eval loss when the trainer supplies it and fall
+    back to the proxy transparently for legacy records (byte-identical) — the
+    same pluggable-receiver pattern §6.2/§6.3 use for scale measurements.
+    """
+
+    # --- baseline_targets (§5.1) ---
+
+    def test_baseline_targets_picks_best_loss_earliest_cycle_and_gold_there(self):
+        # L* = minimum valid loss at the earliest cycle achieving it; G* = the
+        # gold score recorded at or just before the L* cycle; a_total = run end.
+        losses = [2.0, 1.5, 1.2, 1.2, 1.4]
+        cycles = [0, 1, 2, 3, 4]
+        times = [0.0, 10.0, 20.0, 30.0, 40.0]
+        gold = [
+            {"cycle": 0, "gold_combined": 0.10},
+            {"cycle": 2, "gold_combined": 0.55},
+            {"cycle": 4, "gold_combined": 0.60},
+        ]
+        l_star, l_star_cycle, g_star, a_total = baseline_targets(
+            losses, cycles, times, gold
+        )
+        assert l_star == 1.2  # tie at cycles 2 & 3 -> earliest (cycle 2) wins
+        assert l_star_cycle == 2
+        assert g_star == 0.55  # gold at/before cycle 2
+        assert a_total == 40.0
+
+    def test_baseline_targets_empty_returns_all_none(self):
+        result = baseline_targets([], [], [], [])
+        assert result == (None, None, None, None)
+
+    def test_baseline_targets_g_star_none_without_gold(self):
+        l_star, _, g_star, _ = baseline_targets([2.0, 1.0], [0, 1], [0.0, 5.0], [])
+        assert l_star == 1.0
+        assert g_star is None
+
+    def test_baseline_targets_g_star_falls_back_to_first_gold_when_l_star_precedes_gold(self):
+        # L* lands before the first gold eval: G* falls back to the earliest
+        # recorded gold (the closest available), not None.
+        gold = [{"cycle": 5, "gold_combined": 0.40}]
+        _, _, g_star, _ = baseline_targets([2.0, 1.0], [0, 1], [0.0, 5.0], gold)
+        assert g_star == 0.40
+
+    # --- guard_stop_point (§5.2) ---
+
+    def test_guard_stop_point_first_cycle_meeting_both_conditions(self):
+        # L*=1.0 -> threshold 1.02; G*=0.5. cycle 2 (loss ok, gold 0.40) fails
+        # gold; cycle 4 (loss ok, gold 0.55) is the first to satisfy both.
+        gold = [
+            {"cycle": 2, "elapsed": 20.0, "loss": 1.01, "gold_combined": 0.40},
+            {"cycle": 4, "elapsed": 40.0, "loss": 1.01, "gold_combined": 0.55},
+        ]
+        stop_cycle, stop_elapsed = guard_stop_point(gold, l_star=1.0, g_star=0.5)
+        assert stop_cycle == 4
+        assert stop_elapsed == 40.0
+
+    def test_guard_stop_point_returns_row_elapsed(self):
+        gold = [{"cycle": 3, "elapsed": 33.0, "loss": 1.0, "gold_combined": 0.6}]
+        _, stop_elapsed = guard_stop_point(gold, l_star=1.0, g_star=0.5)
+        assert stop_elapsed == 33.0
+
+    def test_guard_stop_point_none_when_loss_outside_margin(self):
+        gold = [{"cycle": 2, "loss": 1.05, "gold_combined": 0.60}]
+        # loss 1.05 > L*+margin (1.02) -> trigger never fires.
+        assert guard_stop_point(gold, l_star=1.0, g_star=0.5) == (None, None)
+
+    def test_guard_stop_point_none_when_gold_below_g_star(self):
+        gold = [{"cycle": 2, "loss": 1.01, "gold_combined": 0.40}]
+        # loss ok, gold 0.40 < 0.5 -> never stops.
+        assert guard_stop_point(gold, l_star=1.0, g_star=0.5) == (None, None)
+
+    def test_guard_stop_point_none_when_targets_missing(self):
+        # No baseline reference -> no stop decision possible.
+        assert guard_stop_point([], l_star=1.0, g_star=0.5) == (None, None)
+        assert guard_stop_point(
+            [{"cycle": 0, "loss": 1.0, "gold_combined": 0.9}], l_star=None, g_star=0.5
+        ) == (None, None)
+        assert guard_stop_point(
+            [{"cycle": 0, "loss": 1.0, "gold_combined": 0.9}], l_star=1.0, g_star=None
+        ) == (None, None)
+
+    def test_guard_stop_point_uses_configured_margin(self):
+        # Pin LOSS_TRIGGER_MARGIN so a regression that hardcodes 0.02 is caught.
+        assert LOSS_TRIGGER_MARGIN == 0.02
+
+    # --- extract_gold honesty: prefer the full-eval loss (§5.1/§5.3) ---
+
+    def test_extract_gold_prefers_full_eval_loss_over_pilot(self):
+        # A cycle carrying BOTH the pilot proxy (loss_valid) and the honest
+        # full-eval loss (loss_valid_full) must surface the full-eval value as
+        # the row's §5.2 trigger loss.
+        records = [
+            {
+                "type": "step",
+                "cycle": 4,
+                "elapsed_seconds": 40.0,
+                "loss_valid": 0.90,
+                "loss_valid_full": 1.05,
+                "gold_combined": 0.5,
+            }
+        ]
+        rows = extract_gold(records)
+        assert len(rows) == 1
+        assert rows[0]["loss"] == 1.05  # full-eval, not the 0.90 pilot
+
+    def test_extract_gold_falls_back_to_pilot_when_full_eval_absent(self):
+        # Legacy records (no loss_valid_full) -> pilot loss, byte-identical to
+        # the pre-fix behavior.
+        records = [
+            {
+                "type": "step",
+                "cycle": 4,
+                "elapsed_seconds": 40.0,
+                "loss_valid": 0.90,
+                "gold_combined": 0.5,
+            }
+        ]
+        rows = extract_gold(records)
+        assert rows[0]["loss"] == 0.90
+
+    def test_extract_gold_skips_rows_without_gold(self):
+        records = [
+            {"type": "step", "cycle": 1, "loss_valid": 1.0},  # no gold
+            {"type": "step", "cycle": 2, "loss_valid": 1.0, "gold_combined": 0.5},
+        ]
+        rows = extract_gold(records)
+        assert [r["cycle"] for r in rows] == [2]
+
+    # --- extract_loss_and_time: honest L* source (§5.1) ---
+
+    def test_extract_loss_and_time_default_is_pilot_curve(self):
+        records = [
+            {"type": "step", "cycle": 0, "elapsed_seconds": 0.0, "loss_valid": 2.0},
+            {"type": "step", "cycle": 1, "elapsed_seconds": 5.0, "loss_valid": 1.8},
+        ]
+        times, losses, cycles = extract_loss_and_time(records)
+        assert losses == [2.0, 1.8]
+        assert cycles == [0, 1]
+        assert times == [0.0, 5.0]
+
+    def test_extract_loss_and_time_full_eval_only_emits_full_eval_rows(self):
+        # full_eval_only reads loss_valid_full and skips cycles without it — the
+        # honest L* curve, not the every-cycle pilot proxy.
+        records = [
+            {
+                "type": "step",
+                "cycle": 0,
+                "elapsed_seconds": 0.0,
+                "loss_valid": 2.0,
+                "loss_valid_full": 1.9,
+            },
+            {"type": "step", "cycle": 1, "elapsed_seconds": 5.0, "loss_valid": 1.8},
+            {
+                "type": "step",
+                "cycle": 2,
+                "elapsed_seconds": 10.0,
+                "loss_valid": 1.6,
+                "loss_valid_full": 1.55,
+            },
+        ]
+        times, losses, cycles = extract_loss_and_time(records, full_eval_only=True)
+        assert cycles == [0, 2]
+        assert losses == [1.9, 1.55]
+        assert times == [0.0, 10.0]
+
+    def test_extract_loss_and_time_full_eval_only_empty_without_key(self):
+        # No full-eval loss anywhere -> empty (caller falls back to the proxy
+        # curve, byte-identical to legacy).
+        records = [{"type": "step", "cycle": 0, "loss_valid": 2.0}]
+        assert extract_loss_and_time(records, full_eval_only=True) == ([], [], [])
+
+    # --- end-to-end: the fix changes the verdict, not just the plumbing ---
+
+    def test_quality_gate_uses_full_eval_loss_not_pilot(self):
+        # The same guard run scored on the pilot proxy vs the full-eval loss can
+        # flip the verdict. Here the pilot loss (0.99) would trip the trigger
+        # (<= L*+0.02 = 1.02) but the honest full-eval loss (1.08) does not, so
+        # the §5.2 stop must NOT fire. Pre-fix (pilot) this stopped at cycle 2;
+        # post-fix (full-eval) quality never reaches, exactly as §5.1 mandates.
+        records = [
+            {
+                "type": "step",
+                "cycle": 2,
+                "elapsed_seconds": 20.0,
+                "loss_valid": 0.99,
+                "loss_valid_full": 1.08,
+                "gold_combined": 0.60,
+            }
+        ]
+        guard_gold = extract_gold(records)
+        stop_cycle, _ = guard_stop_point(guard_gold, l_star=1.0, g_star=0.5)
+        assert stop_cycle is None
