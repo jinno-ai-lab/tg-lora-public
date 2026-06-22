@@ -1644,5 +1644,6 @@ Phase 66 完了。残存する未完了タスク:
 - [TASK-0136: 起点発射性の repo-wide schema gate — 任意の LoggingConfig/スキーマ変更が出荷 config を壊すのを、feature コミットと同一コミットで捕える（d2218ed 回帰クラスの一般化）](TASK-0136.md)
 - [TASK-0137: M10.3 disk-death guard の第2ベクトル閉包 — `trajectory_delta_artifacts/*.pt` のサイクル毎無限蓄積を、既存の keep_last_checkpoints/min_free_disk_gb knob で抑える](TASK-0137.md)
 - [TASK-0138: M10.3 disk-death guard の第3ベクトル閉包 — ベースライン学習エントリポイント（`checkpoint-<step>` + `trajectory_delta_artifacts/*.pt`）を既存 knob 傘下へ](TASK-0138.md)
+- [TASK-0139: Guard 実験 §4 可逆解放の不活性化欠陥閉包 — `DynamicFreezeController` の攪拌/上流活性リリースが同サイクルで即時再凍結される（リリースが no-op）+ §3/§4 制御カバレッジ](TASK-0139.md)
 
 <!-- spine:references:end -->
