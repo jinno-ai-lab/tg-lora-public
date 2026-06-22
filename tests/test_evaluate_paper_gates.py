@@ -730,3 +730,152 @@ class TestKnownLimitation:
         result = _check_g1(_make_summary(tg_eff=[1.5, 1.5, 1.5], bl_eff=[2.0, 2.0, 2.0]))
         # round-trips without TypeError
         json.dumps(result["known_limitation"])
+
+
+# ---------------------------------------------------------------------------
+# §5.2-honesty-contract analog: a gate that BAILS on a missing input is
+# INSUFFICIENT EVIDENCE (unmeasured), not FAIL (disproven). The evaluate_paper_
+# gates evaluator used to stamp every missing-input gate as passed=False, so a
+# run that simply hadn't gathered its ablation/external-eval evidence read as
+# "AT LEAST ONE GATE FAILED" — the mirror image of the §5.2 "code looks fixed
+# but isn't" trap: here a not-yet-run experiment looked like a disproven claim.
+# These are corrupt-input tests (distinct input-presence forces distinct
+# status), not happy-path assertions — the pattern the feedback singled out.
+# ---------------------------------------------------------------------------
+
+
+class TestInsufficientEvidenceHonesty:
+    """A missing-input gate must report INSUFFICIENT EVIDENCE, not FAIL, and
+    must not misattribute its gap to the G1/G4 task (TASK-0142)."""
+
+    def test_g3_missing_external_eval_is_insufficient_not_fail(self):
+        """G3 with no external-eval file bails -> evaluated=False, and its
+        known-limitation is stamped insufficient_evidence (not a disproven-
+        claim record) and names the missing flag."""
+        from scripts.evaluate_paper_gates import _check_g3
+        result = _check_g3(_make_summary())  # no external_eval_path
+        assert result["passed"] is False
+        assert result.get("evaluated") is False
+        kl = result["known_limitation"]
+        assert kl["status"] == "insufficient_evidence"
+        assert kl["missing_input"] == "--external-eval (TruthfulQA/ARC/HellaSwag on best models)"
+        # an unmeasured gate is NOT the G1/G4 claim gap TASK-0142 owns
+        assert "TASK-0142" not in kl["owner"]
+
+    def test_g4_missing_ablation_is_insufficient_not_fail(self):
+        """G4 with no cold/no-cache summaries bails -> evaluated=False with an
+        insufficient_evidence limitation naming both required flags."""
+        from scripts.evaluate_paper_gates import _check_g4
+        result = _check_g4(_make_summary())  # no ablation summaries
+        assert result["passed"] is False
+        assert result.get("evaluated") is False
+        kl = result["known_limitation"]
+        assert kl["status"] == "insufficient_evidence"
+        assert "--cold-summary" in kl["missing_input"]
+        assert "--no-cache-summary" in kl["missing_input"]
+
+    def test_g3_disproven_is_fail_not_insufficient(self, tmp_path):
+        """Corrupt-input inversion: the SAME gate G3, but WITH its external-eval
+        input present and disproving the claim, is FAIL (evaluated=True) — proving
+        the insufficient-evidence branch is driven by input presence, not by a
+        hardcoded gate-to-status map. Its limitation is a disproven-claim record
+        (no status=insufficient_evidence), and its owner is generic (G3 is not a
+        G1/G4 task), pinning the owner-misattribution fix."""
+        from scripts.evaluate_paper_gates import _check_g3
+        eval_data = {
+            "comparison": {
+                "aggregate_relative_drop": 0.05,  # 5% >> 1% bar -> G3.1 disproven
+                "task_relative_drops": {"hellaswag": 0.04},  # 4% > 3% -> G3.2 disproven
+            },
+            "tasks": ["truthfulqa_mc2", "arc_easy", "hellaswag"],
+        }
+        ep = tmp_path / "external_eval_results.json"
+        ep.write_text(json.dumps(eval_data))
+        result = _check_g3(_make_summary(), external_eval_path=ep)
+        assert result["passed"] is False
+        assert result.get("evaluated", True) is True
+        kl = result["known_limitation"]
+        assert kl.get("status") != "insufficient_evidence"  # disproven, not unmeasured
+        assert "TASK-0142" not in kl["owner"]  # G3 disproven -> generic owner, not G1/G4 task
+
+    def test_insufficient_gate_report_shows_third_status(self):
+        """User-visible: the formatted report renders INSUFFICIENT EVIDENCE with
+        an ℹ marker — distinct from FAIL / ⚠ Known limitation — so a missing-
+        input gate can never be read as a disproven claim."""
+        from scripts.evaluate_paper_gates import _check_g3, _format_report
+        result = _check_g3(_make_summary())
+        report = _format_report([result])
+        assert "INSUFFICIENT EVIDENCE" in report
+        assert "Insufficient evidence" in report  # the ℹ limitation block
+        # must NOT render as a disproven-claim FAIL block
+        assert "## G3: External Quality Retention — FAIL" not in report
+        assert "⚠ Known limitation" not in report
+        # the overall line must not claim a failure when nothing was disproven
+        assert "AT LEAST ONE GATE FAILED" not in report
+
+    def test_disproven_report_shows_fail_not_insufficient(self, tmp_path):
+        """Inversion of the above: a disproven G3 renders FAIL + ⚠ Known
+        limitation, never INSUFFICIENT EVIDENCE — the two states are
+        distinguishable in the user-visible report."""
+        from scripts.evaluate_paper_gates import _check_g3, _format_report
+        eval_data = {
+            "comparison": {"aggregate_relative_drop": 0.05, "task_relative_drops": {}},
+            "tasks": ["truthfulqa_mc2", "arc_easy", "hellaswag"],
+        }
+        ep = tmp_path / "external_eval_results.json"
+        ep.write_text(json.dumps(eval_data))
+        result = _check_g3(_make_summary(), external_eval_path=ep)
+        report = _format_report([result])
+        assert "## G3: External Quality Retention — FAIL" in report
+        assert "INSUFFICIENT EVIDENCE" not in report
+        assert "⚠ Known limitation" in report
+
+    def test_insufficient_does_not_fail_exit_by_default(self, summary_dir):
+        """End-to-end honesty: a run where every evaluated gate passes but G3/G4
+        lack evidence must NOT exit 1 by default (nothing was disproven).
+        --strict restores the legacy fail-unless-everything-arrived behavior."""
+        path = _write_summary(summary_dir, _make_summary())
+        # skip G2 (its G2.3 needs a frontier report we don't provide); G0/G1
+        # pass, G3/G4 are insufficient.
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), str(path), "--skip-gates", "G2"],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == 0, r.stdout
+        assert "INSUFFICIENT EVIDENCE" in r.stdout
+        assert "lack evidence" in r.stdout  # the summary note names them
+
+        r_strict = subprocess.run(
+            [sys.executable, str(SCRIPT), str(path), "--skip-gates", "G2", "--strict"],
+            capture_output=True, text=True,
+        )
+        assert r_strict.returncode == 1  # --strict: missing evidence is a failure
+
+    def test_disproven_gate_still_fails_exit_without_strict(self, summary_dir):
+        """Regression guard: a genuine disproven fail (G1, data present) still
+        exits 1 under the default (non-strict) semantics — the insufficient-
+        evidence carve-out never weakens a real disproven failure."""
+        path = _write_summary(summary_dir, _make_summary(tg_eff=[1.0, 1.0, 1.0], bl_eff=[2.0, 2.0, 2.0]))
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), str(path), "--skip-gates", "G2"],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == 1
+        assert "## G1: Replicated Internal Efficiency — FAIL" in r.stdout
+
+    def test_json_report_carries_insufficient_and_disproven_lists(self, summary_dir):
+        """Machine-readable honesty: the JSON report separates disproven fails
+        from insufficient-evidence gates and reports overall_passed over
+        evaluated gates only."""
+        path = _write_summary(summary_dir, _make_summary(tg_eff=[1.0, 1.0, 1.0], bl_eff=[2.0, 2.0, 2.0]))
+        out = summary_dir / "report.json"
+        subprocess.run(
+            [sys.executable, str(SCRIPT), str(path), "--skip-gates", "G2", "-o", str(out)],
+            capture_output=True, text=True,
+        )
+        report = json.loads(out.read_text())
+        assert report["overall_passed"] is False  # G1 disproven
+        assert "G1" in report["disproven_fail_gates"]
+        assert "G3" in report["insufficient_evidence_gates"]
+        assert "G4" in report["insufficient_evidence_gates"]
+        assert "G1" not in report["insufficient_evidence_gates"]

@@ -77,10 +77,31 @@ _CLAIM_FOR_GATE: dict[str, str | None] = {
 # These gaps are GPU-only to close (no GPU / no private data pipeline in the
 # public mirror), so the owner is the research lead and the tracking artifact
 # is TASK-0142 — the same "record the gap honestly rather than ship it
-# unverified" principle TASK-0141 used for the §5.2 last mile.
+# unverified" principle TASK-0141 used for the §5.2 last mile. TASK-0142 is
+# scoped to the G1/G4 *claim* gates (it is where their known-limitation records
+# are owned), so it is the right owner ONLY for G1/G4.
 _KNOWN_LIMITATION_OWNER = (
     "research-lead (GPU) — tracked in specs/tg-lora/tasks/TASK-0142.md"
 )
+
+# Owner for a gap on a gate WITHOUT a custom limitation builder (G0/G2/G3) or
+# for an INSUFFICIENT-EVIDENCE state (gate bailed on a missing input). These
+# are not the G1/G4 claim gap TASK-0142 owns, so pointing them at TASK-0142
+# would misattribute the gap; the source-of-truth status table is master_plan
+# §2.2 instead.
+_KNOWN_LIMITATION_OWNER_GENERIC = (
+    "research-lead — see docs/master_plan.md §2.2 (G0–G4 status table)"
+)
+
+# The CLI input each evidence-gated gate needs to actually reach a verdict.
+# Drives the INSUFFICIENT-EVIDENCE known-limitation so a bailed gate names the
+# exact flag to provide rather than reading as a disproven claim.
+_GATE_REQUIRED_INPUT: dict[str, str] = {
+    "G2": "--frontier-report (G2.3 frontier sweep)",
+    "G3": "--external-eval (TruthfulQA/ARC/HellaSwag on best models)",
+    "G4": "--cold-summary and --no-cache-summary "
+    "(cold-vs-warm / cache-on-vs-off ablation)",
+}
 
 
 def _g1_known_limitation(failed: list[str]) -> dict[str, Any]:
@@ -200,15 +221,46 @@ _LIMITATION_BUILDERS: dict[str, Any] = {
 def _known_limitation_for(result: dict[str, Any]) -> dict[str, Any] | None:
     """Structured known-limitation for a FAILING gate, else None.
 
-    Returns None for a passing gate so the record is fail-conditioned (a
-    passing gate must not claim a limitation). For G1/G4 the gap is derived
-    from the failing sub-checks and grounded in master_plan §2.2; other gates
-    get a pointer back to the source-of-truth doc rather than invented
-    specifics.
+    Three cases:
+
+    * **Insufficient evidence** (``result["evaluated"] is False``): the gate
+      bailed because its required input was missing, so the underlying claim is
+      *unmeasured*, not disproven. Returns a record stamped
+      ``status="insufficient_evidence"`` that names the missing input — never a
+      disproven-claim record, and never the G1/G4 task owner (TASK-0142), since
+      an unmeasured G2/G3/G4 gap is not the claim gap that task tracks. This is
+      the evaluate_paper_gates analog of the §5.2 honesty contract's
+      ACTIVE/DORMANT split: a missing-input gate must not masquerade as a
+      disproven FAIL.
+    * **Passing gate**: returns ``None`` — a passing (and evaluated) gate claims
+      no limitation, so the disproven-claim record is fail-conditioned.
+    * **Disproven gate** (evaluated, ``passed is False``): for G1/G4 the gap is
+      derived from the failing sub-checks and grounded in master_plan §2.2;
+      other gates get a pointer back to the source-of-truth doc (generic owner,
+      not TASK-0142) rather than invented specifics.
     """
+    gate = result.get("gate", "")
+    if not result.get("evaluated", True):
+        missing = _GATE_REQUIRED_INPUT.get(gate)
+        return {
+            "status": "insufficient_evidence",
+            "gap": "insufficient evidence — gate could not be evaluated",
+            "root_cause": (
+                f"required input missing: {missing}"
+                if missing
+                else "required input missing — see failed sub-checks"
+            ),
+            "missing_input": missing,
+            "next_action": (
+                f"provide {missing} and re-evaluate (master_plan §2.2)"
+                if missing
+                else "provide the required input and re-evaluate (master_plan §2.2)"
+            ),
+            "owner": _KNOWN_LIMITATION_OWNER_GENERIC,
+            "blocks_claim": _CLAIM_FOR_GATE.get(gate),
+        }
     if result.get("passed"):
         return None
-    gate = result.get("gate", "")
     failed = [c["check"] for c in result.get("checks", []) if not c.get("pass")]
     builder = _LIMITATION_BUILDERS.get(gate)
     if builder is not None:
@@ -219,7 +271,7 @@ def _known_limitation_for(result: dict[str, Any]) -> dict[str, Any] | None:
         "next_action": (
             "consult docs/master_plan.md §2.2 for this gate's evidence requirements"
         ),
-        "owner": _KNOWN_LIMITATION_OWNER,
+        "owner": _KNOWN_LIMITATION_OWNER_GENERIC,
         "blocks_claim": _CLAIM_FOR_GATE.get(gate),
     }
 
@@ -550,6 +602,7 @@ def _check_g3(
             "gate": "G3",
             "name": "External Quality Retention",
             "passed": False,
+            "evaluated": False,
             "checks": [{
                 "check": "G3_external_eval",
                 "pass": False,
@@ -722,6 +775,7 @@ def _check_g4(
             "gate": "G4",
             "name": "Causal Attribution",
             "passed": False,
+            "evaluated": False,
             "checks": [{
                 "check": "G4_causal_attribution",
                 "pass": False,
@@ -784,9 +838,17 @@ def _format_report(results: list[dict[str, Any]]) -> str:
     lines.append("")
 
     any_failed = False
+    any_insufficient = False
     for r in results:
-        status = "PASS" if r["passed"] else "FAIL"
-        if not r["passed"]:
+        if not r.get("evaluated", True):
+            # Bailed on a missing input: the claim is unmeasured, not disproven.
+            # Report it as a third state so it cannot read as a FAIL.
+            status = "INSUFFICIENT EVIDENCE"
+            any_insufficient = True
+        elif r["passed"]:
+            status = "PASS"
+        else:
+            status = "FAIL"
             any_failed = True
         lines.append(f"## {r['gate']}: {r['name']} — {status}")
         lines.append("")
@@ -796,16 +858,30 @@ def _format_report(results: list[dict[str, Any]]) -> str:
 
         kl = r.get("known_limitation")
         if kl:
-            lines.append(f"  ⚠ Known limitation: {kl['gap']}")
-            lines.append(f"    Root cause: {kl['root_cause']}")
-            lines.append(f"    Next action: {kl['next_action']}")
-            lines.append(
-                f"    Owner: {kl['owner']}  (blocks: {kl.get('blocks_claim')})"
-            )
+            if kl.get("status") == "insufficient_evidence":
+                lines.append(f"  ℹ Insufficient evidence: {kl['gap']}")
+                if kl.get("missing_input"):
+                    lines.append(f"    Missing input: {kl['missing_input']}")
+                lines.append(f"    Next action: {kl['next_action']}")
+                lines.append(
+                    f"    Owner: {kl['owner']}  (blocks: {kl.get('blocks_claim')})"
+                )
+            else:
+                lines.append(f"  ⚠ Known limitation: {kl['gap']}")
+                lines.append(f"    Root cause: {kl['root_cause']}")
+                lines.append(f"    Next action: {kl['next_action']}")
+                lines.append(
+                    f"    Owner: {kl['owner']}  (blocks: {kl.get('blocks_claim')})"
+                )
         lines.append("")
 
     lines.append("=" * 60)
-    overall = "ALL EVALUATED GATES PASSED" if not any_failed else "AT LEAST ONE GATE FAILED"
+    if any_failed:
+        overall = "AT LEAST ONE GATE FAILED"
+    elif any_insufficient:
+        overall = "ALL EVALUATED GATES PASSED (some gates lack evidence — see above)"
+    else:
+        overall = "ALL EVALUATED GATES PASSED"
     lines.append(f"Overall: {overall}")
     lines.append("=" * 60)
     return "\n".join(lines)
@@ -865,6 +941,15 @@ def main() -> None:
     parser.add_argument("--cold-summary", help="Path to cold-mode aggregate_summary.json for G4.1 warm speedup comparison")
     parser.add_argument("--no-cache-summary", help="Path to cache-off aggregate_summary.json for G4.2 cache memory effect comparison")
     parser.add_argument("--skip-gates", nargs="*", default=[], help="Gates to skip (e.g. G2 G3 G4)")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit 1 when any gate lacks evidence (bails on a missing input). "
+        "By default a gate that could not be evaluated is reported as "
+        "INSUFFICIENT EVIDENCE and does not by itself cause a failure — it is "
+        "unmeasured, not disproven. Use --strict to fail unless every gate "
+        "reached and passed its verdict.",
+    )
     parser.add_argument("--output", "-o", help="Write JSON report to file")
     args = parser.parse_args()
 
@@ -942,16 +1027,35 @@ def main() -> None:
                 print(f"  {key}: {ci['mean']:.4f} [{ci['ci_lower']:.4f}, {ci['ci_upper']:.4f}]")
 
     if args.output:
+        disproven = [r["gate"] for r in results if r.get("evaluated", True) and not r["passed"]]
+        insufficient = [r["gate"] for r in results if not r.get("evaluated", True)]
         report_data = {
             "gates": results,
-            "overall_passed": all(r["passed"] for r in results),
+            # A gate that bailed on a missing input is unmeasured, not disproven,
+            # so overall_passed considers only gates that reached a real verdict.
+            "overall_passed": not disproven,
+            "disproven_fail_gates": disproven,
+            "insufficient_evidence_gates": insufficient,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "statistics": stats_enrichment,
         }
         Path(args.output).write_text(json.dumps(report_data, indent=2, ensure_ascii=False) + "\n")
         print(f"\nJSON report written to {args.output}")
 
-    if any(not r["passed"] for r in results):
+    disproven_fails = [r for r in results if r.get("evaluated", True) and not r["passed"]]
+    insufficient_gates = [r for r in results if not r.get("evaluated", True)]
+    if insufficient_gates:
+        names = ", ".join(r["gate"] for r in insufficient_gates)
+        print(
+            f"Note: {len(insufficient_gates)} gate(s) lack evidence ({names}) — "
+            f"reported above as INSUFFICIENT EVIDENCE, not failures."
+        )
+
+    # Default (honest): exit 1 only when a gate that reached a real verdict was
+    # disproven. A gate that merely bailed on a missing input is not a failure.
+    # --strict restores the legacy "exit 1 unless every gate passed" so a
+    # pipeline can still fail when expected evidence did not arrive.
+    if disproven_fails or (args.strict and insufficient_gates):
         sys.exit(1)
 
 
