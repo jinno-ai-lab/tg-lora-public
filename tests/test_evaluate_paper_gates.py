@@ -882,6 +882,64 @@ class TestInsufficientEvidenceHonesty:
         assert kl.get("status") != "insufficient_evidence"  # disproven, not unmeasured
         assert "TASK-0142" not in kl["owner"]  # G3 disproven -> generic owner, not G1/G4 task
 
+    def test_g3_corrupt_external_eval_is_insufficient_not_fail(self, tmp_path):
+        """A required input that is present but unreadable (corrupt JSON / OS
+        error) means the external-quality claim was never measured — the same
+        INSUFFICIENT EVIDENCE state as a missing input, never a disproven FAIL.
+        The read failure stays loud (a corrupt --external-eval is named, not
+        silently swallowed) and the gap says "unreadable", not "missing"."""
+        from scripts.evaluate_paper_gates import _check_g3
+        ep = tmp_path / "external_eval_results.json"
+        ep.write_text("NOT JSON{{{")  # present, but unparseable
+        result = _check_g3(_make_summary(), external_eval_path=ep)
+        assert result["passed"] is False
+        assert result.get("evaluated") is False
+        # the check detail keeps the concrete read error loud
+        assert "Failed to read" in result["checks"][0]["detail"]
+        kl = result["known_limitation"]
+        assert kl["status"] == "insufficient_evidence"
+        # the reason is surfaced verbatim, not the generic "missing" wording
+        assert "unreadable" in kl["gap"].lower()
+        assert "unreadable" in kl["root_cause"].lower()
+        assert kl["missing_input"] == "--external-eval (TruthfulQA/ARC/HellaSwag on best models)"
+        # an unmeasured gate is NOT the G1/G4 claim gap TASK-0142 owns
+        assert "TASK-0142" not in kl["owner"]
+
+    def test_insufficient_reason_is_honored_by_known_limitation(self):
+        """_known_limitation_for surfaces an optional insufficient_reason
+        verbatim, while a bare insufficient result (no reason) keeps the default
+        'missing' wording byte-for-byte — so only the corrupt-input path changes
+        its record; every other insufficient gate (G3/G4 missing input) is
+        unchanged. This pins the fail-conditioned + reason-extension contract."""
+        from scripts.evaluate_paper_gates import _known_limitation_for
+        with_reason = _known_limitation_for({
+            "gate": "G3", "evaluated": False,
+            "insufficient_reason": "external eval results present but unreadable (boom)",
+        })
+        assert with_reason["status"] == "insufficient_evidence"
+        assert with_reason["gap"] == "external eval results present but unreadable (boom)"
+        assert with_reason["root_cause"] == with_reason["gap"]
+
+        without_reason = _known_limitation_for({"gate": "G3", "evaluated": False})
+        assert without_reason["gap"] == "insufficient evidence — gate could not be evaluated"
+        assert without_reason["root_cause"] == (
+            "required input missing: --external-eval (TruthfulQA/ARC/HellaSwag on best models)"
+        )
+
+    def test_corrupt_g3_report_shows_insufficient_not_fail(self, tmp_path):
+        """User-visible: a corrupt --external-eval renders INSUFFICIENT EVIDENCE
+        (with the unreadable reason), never a disproven-claim FAIL block — so a
+        broken evidence file cannot be read as a refuted quality claim."""
+        from scripts.evaluate_paper_gates import _check_g3, _format_report
+        ep = tmp_path / "external_eval_results.json"
+        ep.write_text("NOT JSON{{{")
+        result = _check_g3(_make_summary(), external_eval_path=ep)
+        report = _format_report([result])
+        assert "INSUFFICIENT EVIDENCE" in report
+        assert "unreadable" in report
+        assert "## G3: External Quality Retention — FAIL" not in report
+        assert "AT LEAST ONE GATE FAILED" not in report
+
     def test_insufficient_gate_report_shows_third_status(self):
         """User-visible: the formatted report renders INSUFFICIENT EVIDENCE with
         an ℹ marker — distinct from FAIL / ⚠ Known limitation — so a missing-

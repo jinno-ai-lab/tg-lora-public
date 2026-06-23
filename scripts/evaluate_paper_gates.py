@@ -249,20 +249,41 @@ def _known_limitation_for(result: dict[str, Any]) -> dict[str, Any] | None:
     gate = result.get("gate", "")
     if not result.get("evaluated", True):
         missing = _GATE_REQUIRED_INPUT.get(gate)
-        return {
-            "status": "insufficient_evidence",
-            "gap": "insufficient evidence — gate could not be evaluated",
-            "root_cause": (
+        # A gate may explain *why* it could not be evaluated via an optional
+        # ``insufficient_reason`` — e.g. a required input that is present but
+        # unreadable (corrupt JSON / OSError). That is still *unmeasured* (the
+        # claim was never tested against it), not disproven, so it stays in the
+        # insufficient_evidence branch — but the reason is surfaced verbatim so
+        # the record does not mislabel a corrupt file as a merely-missing one
+        # (the gap/root_cause default to the "missing" wording only when no
+        # reason is given, keeping every existing insufficient record identical).
+        reason = result.get("insufficient_reason")
+        if reason:
+            gap = reason
+            root_cause = reason
+            next_action = (
+                f"provide a valid {missing} and re-evaluate (master_plan §2.2)"
+                if missing
+                else "provide a valid required input and re-evaluate (master_plan §2.2)"
+            )
+        else:
+            gap = "insufficient evidence — gate could not be evaluated"
+            root_cause = (
                 f"required input missing: {missing}"
                 if missing
                 else "required input missing — see failed sub-checks"
-            ),
-            "missing_input": missing,
-            "next_action": (
+            )
+            next_action = (
                 f"provide {missing} and re-evaluate (master_plan §2.2)"
                 if missing
                 else "provide the required input and re-evaluate (master_plan §2.2)"
-            ),
+            )
+        return {
+            "status": "insufficient_evidence",
+            "gap": gap,
+            "root_cause": root_cause,
+            "missing_input": missing,
+            "next_action": next_action,
             "owner": _KNOWN_LIMITATION_OWNER_GENERIC,
             "blocks_claim": _CLAIM_FOR_GATE.get(gate),
         }
@@ -600,12 +621,30 @@ def _check_g3(
             try:
                 eval_data = json.loads(ep.read_text())
             except (json.JSONDecodeError, OSError) as exc:
+                # A present-but-unreadable required input means the external-
+                # quality claim was never measured, not disproven — the same
+                # honesty contract as the missing-input path below. The check
+                # detail keeps the read error loud (a user who points --external-
+                # eval at a corrupt file sees exactly why); evaluated=False
+                # routes the gate to INSUFFICIENT EVIDENCE so it cannot
+                # masquerade as a disproven FAIL, and insufficient_reason makes
+                # the known-limitation say "unreadable" rather than "missing".
+                # --strict still treats an un-evaluated gate as a failure.
                 checks.append({
                     "check": "G3_external_eval",
                     "pass": False,
                     "detail": f"Failed to read external eval results: {exc}",
                 })
-                return {"gate": "G3", "name": "External Quality Retention", "passed": False, "checks": checks}
+                return {
+                    "gate": "G3",
+                    "name": "External Quality Retention",
+                    "passed": False,
+                    "evaluated": False,
+                    "insufficient_reason": (
+                        f"external eval results present but unreadable ({exc})"
+                    ),
+                    "checks": checks,
+                }
 
     if eval_data is not None:
         comparison = eval_data.get("comparison", {})
