@@ -1645,5 +1645,9 @@ Phase 66 完了。残存する未完了タスク:
 - [TASK-0137: M10.3 disk-death guard の第2ベクトル閉包 — `trajectory_delta_artifacts/*.pt` のサイクル毎無限蓄積を、既存の keep_last_checkpoints/min_free_disk_gb knob で抑える](TASK-0137.md)
 - [TASK-0138: M10.3 disk-death guard の第3ベクトル閉包 — ベースライン学習エントリポイント（`checkpoint-<step>` + `trajectory_delta_artifacts/*.pt`）を既存 knob 傘下へ](TASK-0138.md)
 - [TASK-0139: Guard 実験 §4 可逆解放の不活性化欠陥閉包 — `DynamicFreezeController` の攪拌/上流活性リリースが同サイクルで即時再凍結される（リリースが no-op）+ §3/§4 制御カバレッジ](TASK-0139.md)
+- [TASK-0140: Guard 実験 §5.2 品質ゲートの品質信号誤参照閉包 — 決定関数が pilot/split 境界 proxy 損失（`loss_valid`）を設計が要求する full-eval 損失（`valid_full`）の代わりに読んでいた + §5.1/§5.2/§5.3 決定関数の直接カバレッジ 0](TASK-0140.md)
+- [TASK-0141: Guard §5.2 誠実性契約の最終一哩 — trainer が `loss_valid_full` を step record に永続化して受口を活性化させる](TASK-0141.md)
+- [TASK-0142: 論文 Claim Gate G1/G4 の既知制限を正式記録 — gate 評価器に known-limitation を発火させ、具体 next action + owner で追跡可能にする](TASK-0142.md)
+- [TASK-0143: §5.2 誠実性契約の休眠を可視化 — analyzer が pilot proxy に黙示フォールバックしたとき DORMANT 警告を発し TASK-0141 への所有を付与する](TASK-0143.md)
 
 <!-- spine:references:end -->
