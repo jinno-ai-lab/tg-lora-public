@@ -5,7 +5,15 @@ Reads gate evaluation output, frontier report, and aggregate summaries to produc
 - Claim Ladder determination (C0 / C1 / C2)
 - Markdown summary table
 - LaTeX table for paper inclusion
-- Gate pass/fail overview
+- Gate PASS / FAIL / INSUFFICIENT overview
+
+Gate results carry an ``evaluated`` flag (set by evaluate_paper_gates when a
+gate bails on a missing input). An un-evaluated gate is reported as
+``INSUFFICIENT`` — its claim is *unmeasured*, not disproven — and the claim
+blocker analysis distinguishes "refuted by evidence" from "pending evidence"
+so a run that has not yet produced a gate's input cannot read as a refuted
+claim. When every gate is evaluated, output is byte-identical to the
+historical pass/fail report.
 
 Usage::
 
@@ -43,10 +51,85 @@ def determine_claim_level(gate_results: list[dict[str, Any]]) -> str:
     return "none"
 
 
+# Claim ladder in ascending order: each level subsumes its predecessor's gates.
+_CLAIM_LADDER: list[tuple[str, tuple[str, ...]]] = [
+    ("C0", ("G1",)),
+    ("C1", ("G1", "G3")),
+    ("C2", ("G1", "G2", "G3")),
+]
+
+# Map a 3-state outcome to its human-readable label (mirrors
+# evaluate_paper_gates._format_report's PASS / FAIL / INSUFFICIENT EVIDENCE).
+_STATUS_LABEL: dict[str, str] = {
+    "pass": "PASS",
+    "fail": "FAIL",
+    "insufficient": "INSUFFICIENT",
+}
+
+
+def _gate_outcome(result: dict[str, Any]) -> str:
+    """Three-state outcome for a single gate, mirroring evaluate_paper_gates.
+
+    Returns ``"insufficient"`` for a gate that bailed on a missing input
+    (``evaluated is False``) — its underlying claim is *unmeasured*, not
+    disproven — ``"pass"`` for an evaluated passing gate, and ``"fail"`` for an
+    evaluated gate whose claim was tested and refuted. When every gate is
+    evaluated (the historical case pre-TASK-0144) this collapses to
+    pass/fail, so existing reports stay byte-identical.
+    """
+    if not result.get("evaluated", True):
+        return "insufficient"
+    return "pass" if result.get("passed") else "fail"
+
+
+def _next_claim_level(achieved: str) -> str | None:
+    """Return the claim level strictly above ``achieved``, or None at the top."""
+    levels = [level for level, _ in _CLAIM_LADDER]
+    if achieved not in levels:
+        return "C0"  # achieved == "none"
+    idx = levels.index(achieved)
+    return levels[idx + 1] if idx + 1 < len(levels) else None
+
+
+def claim_blockers(gate_results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Classify why the next claim level above the achieved one is not reached.
+
+    For the next claim level, lists its required gates that are not passed,
+    split into ``disproven`` (tested and refuted) and ``insufficient``
+    (unmeasured). This is the consolidate-side analog of evaluate_paper_gates'
+    INSUFFICIENT EVIDENCE third state: a claim held back by an unmeasured gate
+    must not read as a refuted claim. A gate absent from ``gate_results`` is
+    treated as insufficient (its evidence was never produced).
+    """
+    achieved = determine_claim_level(gate_results)
+    nxt = _next_claim_level(achieved)
+    by_gate = {r["gate"]: r for r in gate_results}
+    disproven: list[str] = []
+    insufficient: list[str] = []
+    if nxt is not None:
+        required = dict(_CLAIM_LADDER)[nxt]
+        for gate in required:
+            result = by_gate.get(gate)
+            if result is not None and result.get("passed"):
+                continue
+            # A required gate absent from the results is evidence never produced
+            # -> insufficient (unmeasured), not disproven.
+            if result is None or _gate_outcome(result) == "insufficient":
+                insufficient.append(gate)
+            else:
+                disproven.append(gate)
+    return {
+        "achieved": achieved,
+        "next": nxt,
+        "disproven": disproven,
+        "insufficient": insufficient,
+    }
+
+
 def _gate_status(gate_results: list[dict[str, Any]], gate: str) -> str:
     for r in gate_results:
         if r["gate"] == gate:
-            return "PASS" if r["passed"] else "FAIL"
+            return _STATUS_LABEL[_gate_outcome(r)]
     return "SKIP"
 
 
@@ -70,7 +153,7 @@ def generate_markdown_table(
     lines.append("| Gate | Name | Status |")
     lines.append("|------|------|--------|")
     for r in gate_results:
-        status = "PASS" if r["passed"] else "FAIL"
+        status = _STATUS_LABEL[_gate_outcome(r)]
         lines.append(f"| {r['gate']} | {r['name']} | {status} |")
     lines.append("")
 
@@ -139,6 +222,27 @@ def generate_markdown_table(
     lines.append("")
     lines.append(f"**Current status: {claim}**")
     lines.append("")
+
+    # Honest provenance for why the next claim is not reached: distinguish
+    # "refuted by evidence" (disproven) from "not yet measured" (insufficient).
+    blockers = claim_blockers(gate_results)
+    if blockers["next"] is not None:
+        if blockers["disproven"]:
+            lines.append(
+                f"- Next claim **{blockers['next']}** is blocked by disproven "
+                f"evidence: {', '.join(blockers['disproven'])}"
+            )
+        if blockers["insufficient"]:
+            lines.append(
+                f"- Next claim **{blockers['next']}** is pending evidence "
+                f"(unmeasured, not refuted): {', '.join(blockers['insufficient'])}"
+            )
+        if not blockers["disproven"] and not blockers["insufficient"]:
+            lines.append(
+                f"- Next claim **{blockers['next']}** is reachable once its "
+                "remaining gates pass"
+            )
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -228,14 +332,24 @@ def build_consolidated_report(
             "C2": "G1 + G2 + G3 passed — frontier separation + efficiency + quality",
         },
         "gates": {
-            r["gate"]: {"name": r["name"], "passed": r["passed"]}
+            r["gate"]: {
+                "name": r["name"],
+                "passed": r["passed"],
+                "evaluated": r.get("evaluated", True),
+                "status": _gate_outcome(r),
+            }
             for r in gate_results
         },
         "gate_summary": {
             "total": len(gate_results),
             "passed": sum(1 for r in gate_results if r["passed"]),
             "failed": sum(1 for r in gate_results if not r["passed"]),
+            "disproven": sum(1 for r in gate_results if _gate_outcome(r) == "fail"),
+            "insufficient": sum(
+                1 for r in gate_results if _gate_outcome(r) == "insufficient"
+            ),
         },
+        "claim_blockers": claim_blockers(gate_results),
     }
 
     if summary:
@@ -339,7 +453,7 @@ def main() -> None:
     # Gate summary
     print("\nGate Summary:")
     for r in gate_results:
-        status = "PASS" if r["passed"] else "FAIL"
+        status = _STATUS_LABEL[_gate_outcome(r)]
         print(f"  {r['gate']}: {r['name']} — {status}")
 
     claim_labels = {"C0": "Safe paper", "C1": "Strong paper", "C2": "Revolutionary paper"}

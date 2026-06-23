@@ -8,7 +8,9 @@ from pathlib import Path
 
 from scripts.consolidate_paper_results import (
     _find_sibling_json,
+    _gate_outcome,
     build_consolidated_report,
+    claim_blockers,
     determine_claim_level,
     generate_latex_table,
     generate_markdown_table,
@@ -252,6 +254,163 @@ class TestBuildConsolidatedReport:
         assert "C2" in report["claim_descriptions"]
 
 
+class TestInsufficientEvidenceHonesty:
+    """Consolidate must distinguish an unmeasured gate (INSUFFICIENT) from a
+    disproven one (FAIL) — the TASK-0144 third state propagated into the
+    claim-level report. A gate whose evidence was never produced must not read
+    as a refuted claim."""
+
+    @staticmethod
+    def _gate(gate: str, name: str, *, passed: bool, evaluated: bool = True) -> dict:
+        result: dict = {"gate": gate, "name": name, "passed": passed, "checks": []}
+        if not evaluated:
+            result["evaluated"] = False
+        return result
+
+    def test_gate_outcome_three_states(self):
+        assert _gate_outcome({"passed": True}) == "pass"
+        assert _gate_outcome({"passed": False}) == "fail"
+        assert _gate_outcome({"passed": False, "evaluated": False}) == "insufficient"
+
+    def test_evaluated_absent_is_fail_not_insufficient(self):
+        # Legacy gate dicts (no evaluated key) stay FAIL — not silently upgraded
+        # to INSUFFICIENT. Byte-identity with pre-TASK-0144 reports.
+        assert _gate_outcome({"passed": False}) == "fail"
+        assert _gate_outcome({"passed": True}) == "pass"
+
+    def test_consolidated_report_carries_status_and_counts(self):
+        gates = [
+            self._gate("G0", "Hygiene", passed=True),
+            self._gate("G1", "Efficiency", passed=True),
+            self._gate("G2", "Frontier", passed=False),  # disproven
+            self._gate("G3", "Quality", passed=False, evaluated=False),  # unmeasured
+            self._gate("G4", "Causal", passed=False, evaluated=False),  # unmeasured
+        ]
+        report = build_consolidated_report(gates, None, None)
+        gs = report["gate_summary"]
+        assert gs["insufficient"] == 2  # G3, G4
+        assert gs["disproven"] == 1  # G2 only — disproven excludes unmeasured
+        assert gs["failed"] == 3  # backward-compat: disproven + insufficient
+        assert gs["passed"] == 2
+        # per-gate entries expose the flag + outcome
+        assert report["gates"]["G3"]["status"] == "insufficient"
+        assert report["gates"]["G3"]["evaluated"] is False
+        assert report["gates"]["G2"]["status"] == "fail"
+        assert report["gates"]["G2"]["evaluated"] is True
+
+    def test_byte_identity_when_all_evaluated(self):
+        # The historical case: no evaluated=False gates -> disproven == failed
+        # and insufficient == 0. Existing reports unchanged.
+        gates = _make_gates(G0=True, G1=True, G2=False, G3=False, G4=False)
+        gs = build_consolidated_report(gates, None, None)["gate_summary"]
+        assert gs["disproven"] == gs["failed"] == 3
+        assert gs["insufficient"] == 0
+
+    def test_claim_blockers_insufficient_not_disproven(self):
+        # G1 passed -> C0 reached; next claim C1 needs G3. G3 unmeasured -> it
+        # must classify as INSUFFICIENT, never disproven. Core honesty: "not yet
+        # measured" != "refuted".
+        gates = [
+            self._gate("G0", "Hygiene", passed=True),
+            self._gate("G1", "Efficiency", passed=True),
+            self._gate("G3", "Quality", passed=False, evaluated=False),
+        ]
+        blockers = claim_blockers(gates)
+        assert blockers["achieved"] == "C0"
+        assert blockers["next"] == "C1"
+        assert blockers["insufficient"] == ["G3"]
+        assert blockers["disproven"] == []
+
+    def test_claim_blockers_disproven_not_insufficient(self):
+        gates = [
+            self._gate("G0", "Hygiene", passed=True),
+            self._gate("G1", "Efficiency", passed=True),
+            self._gate("G3", "Quality", passed=False),  # evaluated, refuted
+        ]
+        blockers = claim_blockers(gates)
+        assert blockers["disproven"] == ["G3"]
+        assert blockers["insufficient"] == []
+
+    def test_claim_blockers_top_claim_has_no_next(self):
+        gates = [
+            self._gate("G1", "Efficiency", passed=True),
+            self._gate("G2", "Frontier", passed=True),
+            self._gate("G3", "Quality", passed=True),
+        ]
+        blockers = claim_blockers(gates)
+        assert blockers["achieved"] == "C2"
+        assert blockers["next"] is None
+        assert blockers["disproven"] == []
+        assert blockers["insufficient"] == []
+
+    def test_reversal_is_data_driven(self):
+        # Toggling evaluated flips disproven <-> insufficient for the same gate.
+        disproven = [
+            self._gate("G0", "Hygiene", passed=True),
+            self._gate("G1", "Efficiency", passed=True),
+            self._gate("G3", "Quality", passed=False),
+        ]
+        insufficient = [
+            self._gate("G0", "Hygiene", passed=True),
+            self._gate("G1", "Efficiency", passed=True),
+            self._gate("G3", "Quality", passed=False, evaluated=False),
+        ]
+        assert claim_blockers(disproven)["disproven"] == ["G3"]
+        assert claim_blockers(insufficient)["insufficient"] == ["G3"]
+
+    def test_markdown_three_state_overview(self):
+        gates = [
+            self._gate("G0", "Hygiene", passed=True),
+            self._gate("G1", "Efficiency", passed=True),
+            self._gate("G2", "Frontier", passed=False),  # FAIL
+            self._gate("G3", "Quality", passed=False, evaluated=False),  # INSUFFICIENT
+        ]
+        md = generate_markdown_table(gates, None, None)
+        assert "INSUFFICIENT" in md
+        assert "FAIL" in md
+        assert "PASS" in md
+
+    def test_markdown_disproven_blocker_line(self):
+        # G1 passes (C0); next claim C1 needs G3, which was tested and refuted.
+        gates = [
+            self._gate("G0", "Hygiene", passed=True),
+            self._gate("G1", "Efficiency", passed=True),
+            self._gate("G3", "Quality", passed=False),  # disproven
+        ]
+        md = generate_markdown_table(gates, None, None)
+        assert "blocked by disproven evidence: G3" in md
+        assert "pending evidence" not in md
+
+    def test_markdown_pending_evidence_line(self):
+        # Same structure, but G3 was never measured -> pending, not disproven.
+        gates = [
+            self._gate("G0", "Hygiene", passed=True),
+            self._gate("G1", "Efficiency", passed=True),
+            self._gate("G3", "Quality", passed=False, evaluated=False),
+        ]
+        md = generate_markdown_table(gates, None, None)
+        assert "pending evidence" in md
+        assert "blocked by disproven evidence" not in md
+
+    def test_claim_blockers_absent_gate_is_insufficient(self):
+        # A required gate entirely missing from the results is evidence never
+        # produced -> insufficient, not disproven.
+        gates = [
+            self._gate("G0", "Hygiene", passed=True),
+            self._gate("G1", "Efficiency", passed=True),
+            # G3 (required for C1) is absent
+        ]
+        blockers = claim_blockers(gates)
+        assert blockers["next"] == "C1"
+        assert blockers["insufficient"] == ["G3"]
+        assert blockers["disproven"] == []
+
+    def test_markdown_byte_identity_when_all_evaluated(self):
+        gates = _make_gates(G0=True, G1=True, G2=False, G3=False, G4=False)
+        md = generate_markdown_table(gates, None, None)
+        assert "INSUFFICIENT" not in md
+
+
 class TestCLIIntegration:
     def test_full_pipeline(self, tmp_path):
         gates = _make_gates(G0=True, G1=True, G2=False, G3=False, G4=False)
@@ -324,6 +483,46 @@ class TestCLIIntegration:
         )
         assert result.returncode == 0
         assert "Claim Level: C1" in result.stdout
+
+    def test_insufficient_gate_flows_through_cli(self, tmp_path):
+        # evaluate_paper_gates stamps evaluated=False when an input is missing;
+        # consolidate must carry that through as INSUFFICIENT, not FAIL.
+        gates = [
+            {"gate": "G0", "name": "Hygiene", "passed": True, "checks": []},
+            {"gate": "G1", "name": "Replicated Internal Efficiency", "passed": True, "checks": []},
+            {"gate": "G2", "name": "Memory Frontier Separation", "passed": True, "checks": []},
+            {"gate": "G3", "name": "External Quality Retention",
+             "passed": False, "evaluated": False, "checks": []},
+        ]
+        gate_data = {
+            "gates": gates,
+            "overall_passed": False,
+            "generated_at": "2026-05-25T00:00:00+00:00",
+        }
+        gate_path = tmp_path / "gate_report.json"
+        gate_path.write_text(json.dumps(gate_data))
+        out_dir = tmp_path / "output"
+
+        import subprocess
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "scripts/consolidate_paper_results.py",
+                "--gate-report", str(gate_path),
+                "--output-dir", str(out_dir),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "INSUFFICIENT" in result.stdout
+
+        report = json.loads((out_dir / "consolidated_report.json").read_text())
+        assert report["gate_summary"]["insufficient"] == 1
+        assert report["gate_summary"]["disproven"] == 0
+        assert report["claim_blockers"]["insufficient"] == ["G3"]
 
     def test_missing_gate_report_exits(self, tmp_path):
         import subprocess
