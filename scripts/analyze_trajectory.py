@@ -19,6 +19,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Allow running as a standalone CLI (``python scripts/analyze_trajectory.py``): a bare
+# script invocation puts ``scripts/`` — not the repo root — on sys.path, so make the
+# repo root importable so ``src.*`` resolves without a PYTHONPATH wrapper.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from src.tg_lora.trajectory import TrajectoryAnalyzer
 from src.training.trajectory_artifact_anomalies import \
     summarize_trajectory_artifact_anomalies

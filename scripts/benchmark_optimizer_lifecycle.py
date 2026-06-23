@@ -4,10 +4,17 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import sys
 import time
+from pathlib import Path
 
 import torch
 from omegaconf import DictConfig, OmegaConf
+
+# Allow running as a standalone CLI (``python scripts/benchmark_optimizer_lifecycle.py``): a
+# bare script invocation puts ``scripts/`` — not the repo root — on sys.path, so make the
+# repo root importable so ``src.*`` resolves without a PYTHONPATH wrapper.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.model.load_model import apply_lora, load_base_model
 from src.model.lora_utils import iter_lora_params

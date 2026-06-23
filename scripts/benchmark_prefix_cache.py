@@ -6,9 +6,15 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+# Allow running as a standalone CLI (``python scripts/benchmark_prefix_cache.py``): a bare
+# script invocation puts ``scripts/`` — not the repo root — on sys.path, so make the
+# repo root importable so ``src.*`` / ``scripts.*`` resolves without a PYTHONPATH wrapper.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.compare_runs import load_run
 

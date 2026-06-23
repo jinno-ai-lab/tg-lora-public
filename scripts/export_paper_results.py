@@ -16,9 +16,15 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from io import StringIO
 from pathlib import Path
 from typing import Any
+
+# Allow running as a standalone CLI (``python scripts/export_paper_results.py``): a bare
+# script invocation puts ``scripts/`` — not the repo root — on sys.path, so make the
+# repo root importable so ``src.*`` resolves without a PYTHONPATH wrapper.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.analysis.stats import analyze_multi_seed
 

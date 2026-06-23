@@ -16,6 +16,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# Allow running as a standalone CLI (``python scripts/diagnose.py``): a bare
+# script invocation puts ``scripts/`` — not the repo root — on sys.path, so make the
+# repo root importable so ``src.*`` resolves without a PYTHONPATH wrapper.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from src.utils.tensor_artifact import load_tensor_artifact
 
 
