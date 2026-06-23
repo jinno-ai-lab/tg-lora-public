@@ -559,46 +559,83 @@ def _check_g2(
         })
 
     # G2.3: Frontier separation from frontier_report.json
-    frontier_loaded = False
+    #
+    # The frontier report is G2's required input (_GATE_REQUIRED_INPUT["G2"])
+    # and carries the evidence for G2's headline claim — frontier separation
+    # (claim C2). When it is absent or unreadable that claim is *unmeasured*,
+    # not disproven — the same honesty contract G3/G4 honour (a missing/corrupt
+    # required input bails to evaluated=False so a not-yet-run experiment
+    # cannot read as a refuted claim). G2.1/G2.2 are still computed and reported
+    # for transparency, but the gate's verdict is INSUFFICIENT EVIDENCE until
+    # the frontier sweep lands. --strict still treats an un-evaluated gate as a
+    # failure.
+    frontier_state = "absent"  # absent | unreadable | loaded
+    frontier_payload: dict[str, Any] | None = None
+    read_error: Exception | None = None
     if frontier_report_path is not None:
         frp = Path(frontier_report_path)
         if frp.exists():
             try:
-                frontier = json.loads(frp.read_text())
-                frontier_loaded = True
-                detected = frontier.get("frontier_separation_detected", False)
-                boundary = frontier.get("frontier_boundary")
-                runs = frontier.get("runs", [])
-                frontier_runs = [r for r in runs if r.get("frontier_separation")]
-                if detected and frontier_runs:
-                    seq_lens = [r["seq_len"] for r in frontier_runs]
-                    checks.append({
-                        "check": "G2.3_frontier_separation",
-                        "pass": True,
-                        "detail": (
-                            f"Frontier detected at seq_len={boundary}. "
-                            f"Baseline OOM + TG completed at: {seq_lens}"
-                        ),
-                    })
-                else:
-                    checks.append({
-                        "check": "G2.3_frontier_separation",
-                        "pass": False,
-                        "detail": f"No frontier separation in sweep (boundary={boundary})",
-                    })
+                frontier_payload = json.loads(frp.read_text())
+                frontier_state = "loaded"
             except (json.JSONDecodeError, OSError) as exc:
-                checks.append({
-                    "check": "G2.3_frontier_separation",
-                    "pass": False,
-                    "detail": f"Failed to read frontier report: {exc}",
-                })
+                frontier_state = "unreadable"
+                read_error = exc
+        # path given but file missing -> stays "absent" (a missing required input)
 
-    if not frontier_loaded:
+    if frontier_state == "loaded":
+        detected = frontier_payload.get("frontier_separation_detected", False)
+        boundary = frontier_payload.get("frontier_boundary")
+        runs = frontier_payload.get("runs", [])
+        frontier_runs = [r for r in runs if r.get("frontier_separation")]
+        if detected and frontier_runs:
+            seq_lens = [r["seq_len"] for r in frontier_runs]
+            checks.append({
+                "check": "G2.3_frontier_separation",
+                "pass": True,
+                "detail": (
+                    f"Frontier detected at seq_len={boundary}. "
+                    f"Baseline OOM + TG completed at: {seq_lens}"
+                ),
+            })
+        else:
+            checks.append({
+                "check": "G2.3_frontier_separation",
+                "pass": False,
+                "detail": f"No frontier separation in sweep (boundary={boundary})",
+            })
+    elif frontier_state == "unreadable":
+        # present but unreadable: the claim was never measured, not disproven.
+        # Keep the read failure loud (a corrupt --frontier-report is named), but
+        # route to INSUFFICIENT — mirroring G3's corrupt-input handling (a418049).
+        checks.append({
+            "check": "G2.3_frontier_separation",
+            "pass": False,
+            "detail": f"Failed to read frontier report: {read_error}",
+        })
+        return {
+            "gate": "G2",
+            "name": "Memory Frontier Separation",
+            "passed": False,
+            "evaluated": False,
+            "insufficient_reason": (
+                f"frontier report present but unreadable ({read_error})"
+            ),
+            "checks": checks,
+        }
+    else:  # absent
         checks.append({
             "check": "G2.3_frontier_separation",
             "pass": False,
             "detail": "No frontier_report.json provided — run frontier sweep to evaluate",
         })
+        return {
+            "gate": "G2",
+            "name": "Memory Frontier Separation",
+            "passed": False,
+            "evaluated": False,
+            "checks": checks,
+        }
 
     passed = all(c["pass"] for c in checks)
     return {"gate": "G2", "name": "Memory Frontier Separation", "passed": passed, "checks": checks}

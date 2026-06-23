@@ -1650,5 +1650,6 @@ Phase 66 完了。残存する未完了タスク:
 - [TASK-0142: 論文 Claim Gate G1/G4 の既知制限を正式記録 — gate 評価器に known-limitation を発火させ、具体 next action + owner で追跡可能にする](TASK-0142.md)
 - [TASK-0143: §5.2 誠実性契約の休眠を可視化 — analyzer が pilot proxy に黙示フォールバックしたとき DORMANT 警告を発し TASK-0141 への所有を付与する](TASK-0143.md)
 - [TASK-0144: 論文 Gate 評価器に INSUFFICIENT EVIDENCE 第3状態を導入 — 入力欠落 bail を FAIL（反証）と区別し、generic owner の G1/G4 task 誤帰属を修正](TASK-0144.md)
+- [TASK-0149: G2 frontier-separation gate の INSUFFICIENT-EVIDENCE 契約閉包 — `_check_g2` が frontier report 欠損/破損時に disproven FAIL になっていた（G3/G4 は既に履行中・TASK-0144/a418049 の G2 残存 outlier）](TASK-0149.md)
 
 <!-- spine:references:end -->

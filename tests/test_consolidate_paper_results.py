@@ -321,6 +321,26 @@ class TestInsufficientEvidenceHonesty:
         assert blockers["insufficient"] == ["G3"]
         assert blockers["disproven"] == []
 
+    def test_claim_blockers_g2_insufficient_blocks_c2_not_disproven(self):
+        # G1 + G3 pass -> C1 reached; the top claim C2 (frontier separation) needs
+        # G2. An un-run frontier sweep makes G2 INSUFFICIENT, so C2 must be blocked
+        # by an UNMEASURED G2, never a disproven one — a not-yet-run revolutionary
+        # claim cannot read as refuted. This is the C2-analog of the G3/C1 case
+        # above and the consolidate-side proof of the _check_g2 fix: once
+        # _check_g2 emits evaluated=False, a real no-frontier gate_report.json
+        # flows here verbatim and the top claim reports honestly.
+        gates = [
+            self._gate("G0", "Hygiene", passed=True),
+            self._gate("G1", "Efficiency", passed=True),
+            self._gate("G2", "Frontier", passed=False, evaluated=False),  # un-run sweep
+            self._gate("G3", "Quality", passed=True),
+        ]
+        blockers = claim_blockers(gates)
+        assert blockers["achieved"] == "C1"
+        assert blockers["next"] == "C2"
+        assert blockers["insufficient"] == ["G2"]
+        assert blockers["disproven"] == []
+
     def test_claim_blockers_disproven_not_insufficient(self):
         gates = [
             self._gate("G0", "Hygiene", passed=True),
