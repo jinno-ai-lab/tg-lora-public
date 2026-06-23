@@ -139,6 +139,90 @@ class TestG1Efficiency:
         assert not result["passed"]
 
 
+class TestG1bQualityStatisticalSupport:
+    """G1.4b: the quality-retention claim must be statistically supported.
+
+    G1.4 trusts the aggregate *mean* of best-valid-loss. G1.4b re-checks the
+    same relative degradation with a per-seed paired CI (GOAL §7: every metric
+    needs significance, not a bare mean), mirroring the §6.3 honesty contract.
+    """
+
+    @staticmethod
+    def _check(result, prefix):
+        return next(c for c in result["checks"] if c["check"].startswith(prefix))
+
+    def test_g14b_passes_when_quality_retained(self):
+        from scripts.evaluate_paper_gates import _check_g1
+        summary = _make_summary(tg_loss=[2.5, 2.5, 2.5], bl_loss=[2.5, 2.5, 2.5])
+        result = _check_g1(summary, quality_tolerance=0.01)
+        g14b = self._check(result, "G1.4b")
+        assert g14b["pass"]
+        assert "CI95" in g14b["detail"]
+        assert "paired_t" in g14b["detail"]  # n>=2 -> paired t-test reported
+
+    def test_g14b_catches_high_variance_mean_misses(self):
+        """The asymmetry G1.4b exists to catch: mean within tolerance but the
+        CI upper bound crosses it (high variance across seeds). G1.4 (mean)
+        passes; G1.4b (CI upper) fails -> G1 fails."""
+        from scripts.evaluate_paper_gates import _check_g1
+        summary = _make_summary(
+            tg_eff=[4.0, 5.0, 3.5],
+            bl_eff=[2.0, 2.0, 2.0],   # G1.1/G1.3 pass
+            tg_loss=[2.5, 2.5, 2.7],  # 1 of 3 seeds degrades 8%
+            bl_loss=[2.5, 2.5, 2.5],
+        )
+        result = _check_g1(summary, quality_tolerance=0.05)
+        g14 = self._check(result, "G1.4_quality")   # mean ~2.7% < 5% -> passes
+        g14b = self._check(result, "G1.4b")          # CI upper > 5% -> fails
+        assert g14["pass"]
+        assert not g14b["pass"]
+        assert not result["passed"]
+
+    def test_g14b_flags_thin_evidence_below_min_seeds(self):
+        from scripts.evaluate_paper_gates import _check_g1
+        summary = _make_summary(seeds=[42, 43], tg_loss=[2.5, 2.5], bl_loss=[2.5, 2.5])
+        result = _check_g1(summary, quality_tolerance=0.01)
+        g14b = self._check(result, "G1.4b")
+        assert g14b["pass"]
+        assert "THIN_EVIDENCE" in g14b["detail"]
+
+    def test_g14b_fails_when_no_loss_pairs(self):
+        from scripts.evaluate_paper_gates import _check_g1
+        result = _check_g1({"per_seed": [], "aggregate": {}})
+        g14b = self._check(result, "G1.4b")
+        assert not g14b["pass"]
+        assert "Missing per-seed loss pairs" in g14b["detail"]
+
+
+class TestQualityStatisticalEnrichment:
+    def test_enrichment_includes_quality_t_test_and_ci(self):
+        from scripts.evaluate_paper_gates import _enrich_with_statistics
+        summary = _make_summary(tg_loss=[2.5, 2.6, 2.5], bl_loss=[2.5, 2.5, 2.5])
+        enrichment = _enrich_with_statistics(summary)
+        assert "paired_t_test_quality" in enrichment
+        qt = enrichment["paired_t_test_quality"]
+        assert {"t_statistic", "p_value", "significant_005"} <= set(qt)
+        qci = enrichment["quality_degradation_ci"]
+        assert qci["n"] == 3
+        assert qci["mean"] > 0  # TG loss is on average worse than baseline
+        assert qci["ci_upper"] >= qci["mean"]
+
+    def test_enrichment_omits_quality_when_losses_missing(self):
+        from scripts.evaluate_paper_gates import _enrich_with_statistics
+        summary = {
+            "per_seed": [
+                {"warm_tg_loss_red_per_wall_minute": 4.0,
+                 "warm_baseline_loss_red_per_wall_minute": 2.0},
+                {"warm_tg_loss_red_per_wall_minute": 4.0,
+                 "warm_baseline_loss_red_per_wall_minute": 2.0},
+            ],
+            "aggregate": {},
+        }
+        enrichment = _enrich_with_statistics(summary)
+        assert "paired_t_test_quality" not in enrichment
+        assert "quality_degradation_ci" not in enrichment
+
+
 class TestG2Memory:
     def test_passes_with_major_memory_reduction(self):
         from scripts.evaluate_paper_gates import _check_g2

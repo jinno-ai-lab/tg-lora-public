@@ -29,7 +29,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
-from src.analysis.stats import analyze_multi_seed, paired_t_test
+from src.analysis.stats import analyze_multi_seed, confidence_interval, paired_t_test
 
 
 def _load_summary(path: str | Path) -> dict[str, Any]:
@@ -102,6 +102,13 @@ _GATE_REQUIRED_INPUT: dict[str, str] = {
     "G4": "--cold-summary and --no-cache-summary "
     "(cold-vs-warm / cache-on-vs-off ablation)",
 }
+
+# Minimum seeds before the G1.4b quality-degradation CI is trusted as evidence.
+# Mirrors freeze_cost §6.3's MIN_SAMPLE_FOR_CONFIDENCE_BAND: a single mean hides
+# variance, and two reproductions of a median is thin evidence. Below this the
+# check flags THIN_EVIDENCE rather than silently trusting a bare point estimate
+# (GOAL §7: every metric needs a null surrogate + significance, not a mean).
+MIN_SEEDS_FOR_QUALITY_CI: int = 3
 
 
 def _g1_known_limitation(failed: list[str]) -> dict[str, Any]:
@@ -352,8 +359,8 @@ def _check_g1(
     bl_eff = [r.get("warm_baseline_loss_red_per_wall_minute") for r in per_seed]
     tg_bp = [r.get("warm_tg_backward_passes") for r in per_seed]
     bl_bp = [r.get("warm_baseline_backward_passes") for r in per_seed]
-    [r.get("warm_tg_best_valid_loss") for r in per_seed]
-    [r.get("warm_baseline_best_valid_loss") for r in per_seed]
+    tg_loss = [r.get("warm_tg_best_valid_loss") for r in per_seed]
+    bl_loss = [r.get("warm_baseline_best_valid_loss") for r in per_seed]
 
     # G1.1: All seeds TG efficiency > baseline
     g11_pass = True
@@ -421,6 +428,52 @@ def _check_g1(
             "check": f"G1.4_quality_degradation < {quality_tolerance*100:.0f}%",
             "pass": False,
             "detail": "Missing loss means",
+        })
+
+    # G1.4b: the quality claim is statistically supported (GOAL §7 鉄則).
+    # G1.4 trusts the aggregate *mean* of best-valid-loss; this re-checks the
+    # same relative degradation with a per-seed paired confidence interval, so a
+    # result whose mean sits inside tolerance but whose CI upper bound crosses it
+    # (high variance / few seeds) is not silently trusted. The efficiency axis
+    # (G1.1/G1.3) already gets a paired_t_test in the enrichment; quality must
+    # get the same honesty (freeze_cost §6.3: "two reproductions of a median is
+    # thin evidence").
+    quality_pairs = [
+        (b, t)
+        for b, t in zip(bl_loss, tg_loss)
+        if b is not None and t is not None and b > 0
+    ]
+    if quality_pairs:
+        degradations = [(t - b) / b for b, t in quality_pairs]
+        d_mean, d_lower, d_upper = confidence_interval(degradations)
+        g14b_pass = d_upper <= quality_tolerance
+        n_pairs = len(quality_pairs)
+        detail_parts = [
+            f"n={n_pairs} paired seeds",
+            f"rel_degradation mean={d_mean * 100:.2f}% "
+            f"[CI95 {d_lower * 100:.2f}%, {d_upper * 100:.2f}%]",
+            f"tolerance={quality_tolerance * 100:.0f}%",
+            f"CI_upper {'<=' if g14b_pass else '>'} tolerance",
+        ]
+        if n_pairs >= 2:
+            bl_paired = [b for b, _ in quality_pairs]
+            tg_paired = [t for _, t in quality_pairs]
+            t_stat, p_val = paired_t_test(bl_paired, tg_paired)
+            detail_parts.append(f"paired_t(tg-bl) t={t_stat:.3f} p={p_val:.4f}")
+        if n_pairs < MIN_SEEDS_FOR_QUALITY_CI:
+            detail_parts.append(
+                f"THIN_EVIDENCE (n<{MIN_SEEDS_FOR_QUALITY_CI}; CI unreliable)"
+            )
+        checks.append({
+            "check": f"G1.4b_quality_degradation_statistically_supported < {quality_tolerance*100:.0f}%",
+            "pass": g14b_pass,
+            "detail": "; ".join(detail_parts),
+        })
+    else:
+        checks.append({
+            "check": f"G1.4b_quality_degradation_statistically_supported < {quality_tolerance*100:.0f}%",
+            "pass": False,
+            "detail": "Missing per-seed loss pairs for the degradation CI",
         })
 
     passed = all(c["pass"] for c in checks)
@@ -924,6 +977,35 @@ def _enrich_with_statistics(summary: dict[str, Any]) -> dict[str, Any]:
             "significant_005": p_val < 0.05,
         }
 
+    # Quality counterpart (GOAL §7): the efficiency axis above gets a paired
+    # t-test; the valid-loss axis must too, so a quality-retention claim is not
+    # trusted on a bare mean. CI is on per-seed paired relative degradation.
+    tg_loss = [r.get("warm_tg_best_valid_loss") for r in per_seed_list]
+    bl_loss = [r.get("warm_baseline_best_valid_loss") for r in per_seed_list]
+    quality_pairs = [
+        (b, t)
+        for b, t in zip(bl_loss, tg_loss)
+        if b is not None and t is not None and b > 0
+    ]
+    if quality_pairs:
+        degradations = [(t - b) / b for b, t in quality_pairs]
+        d_mean, d_lower, d_upper = confidence_interval(degradations)
+        enrichment["quality_degradation_ci"] = {
+            "n": len(quality_pairs),
+            "mean": d_mean,
+            "ci_lower": d_lower,
+            "ci_upper": d_upper,
+        }
+        if len(quality_pairs) >= 2:
+            bl_paired = [b for b, _ in quality_pairs]
+            tg_paired = [t for _, t in quality_pairs]
+            qt, qp = paired_t_test(bl_paired, tg_paired)
+            enrichment["paired_t_test_quality"] = {
+                "t_statistic": qt,
+                "p_value": qp,
+                "significant_005": qp < 0.05,
+            }
+
     return enrichment
 
 
@@ -1019,6 +1101,13 @@ def main() -> None:
             pt = stats_enrichment["paired_t_test_efficiency"]
             sig = "YES" if pt["significant_005"] else "NO"
             print(f"TG vs BL efficiency: t={pt['t_statistic']:.3f}, p={pt['p_value']:.4f} (significant@0.05: {sig})")
+        if "paired_t_test_quality" in stats_enrichment:
+            qt = stats_enrichment["paired_t_test_quality"]
+            qsig = "YES" if qt["significant_005"] else "NO"
+            print(f"TG vs BL quality (valid-loss): t={qt['t_statistic']:.3f}, p={qt['p_value']:.4f} (significant@0.05: {qsig})")
+        qci = stats_enrichment.get("quality_degradation_ci")
+        if qci:
+            print(f"  quality rel-degradation CI95: {qci['mean'] * 100:.2f}% [{qci['ci_lower'] * 100:.2f}%, {qci['ci_upper'] * 100:.2f}%] (n={qci['n']})")
         ci_metrics = stats_enrichment.get("metric_ci", {})
         if ci_metrics:
             print("\n95% Confidence Intervals:")
