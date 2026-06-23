@@ -29,6 +29,12 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
+# Allow running as a standalone CLI (``python scripts/evaluate_paper_gates.py``):
+# a bare script invocation puts ``scripts/`` — not the repo root — on sys.path, so
+# make the repo root importable so ``src.*`` resolves without a PYTHONPATH wrapper.
+# The Makefile ``paper-memory-evaluate-gates`` target invokes us without one.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from src.analysis.stats import analyze_multi_seed, confidence_interval, paired_t_test
 
 
