@@ -7,6 +7,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Allow running as a standalone CLI (``python scripts/lookup_batch_plan.py``): a bare
+# script invocation puts ``scripts/`` — not the repo root — on sys.path, so make the
+# repo root importable so ``src.*`` resolves without a PYTHONPATH wrapper.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from src.training.deterministic_batch_plan import (
     load_deterministic_batch_plan_manifest, resolve_record_for_sample_key,
     resolve_records_for_batch_key)

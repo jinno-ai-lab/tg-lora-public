@@ -11,8 +11,14 @@ import gc
 import json
 import sys
 import time
+from pathlib import Path
 
 import torch
+
+# Allow running as a standalone CLI (``python scripts/benchmark_velocity_ops.py``): a
+# bare script invocation puts ``scripts/`` — not the repo root — on sys.path, so make
+# the repo root importable so ``src.*`` resolves without a PYTHONPATH wrapper.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.tg_lora.extrapolator import cap_update
 from src.tg_lora.velocity import Velocity

@@ -17,6 +17,11 @@ from typing import Any
 
 import orjson
 
+# Allow running as a standalone CLI (``python scripts/compare_runs.py``): a bare script
+# invocation puts ``scripts/`` — not the repo root — on sys.path, so make the repo root
+# importable so ``src.*`` resolves without a PYTHONPATH wrapper.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from src.training.trajectory_artifact_anomalies import \
     summarize_trajectory_artifact_anomalies
 from src.utils.mlflow_logger import MLflowLogger

@@ -11,8 +11,14 @@ Usage:
 
 import argparse
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
+
+# Allow running as a standalone CLI (``python scripts/inspect_model.py``): a bare script
+# invocation puts ``scripts/`` — not the repo root — on sys.path, so make the repo root
+# importable so ``src.*`` resolves without a PYTHONPATH wrapper.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.utils.logging import setup_logging
 
