@@ -2,7 +2,7 @@
        smoke smoke-tg smoke-bl \
        train-baseline train-tg-lora train-tg-lora-optreuse train-tg-lora-prefix \
        eval eval-lora eval-downstream eval-downstream-mlx eval-llm-jp-eval-mlx eval-mlx eval-base eval-35b-base eval-35b-ckpt \
-       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize \
+       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize freeze-replay \
 
 	compare compare-prefix compare-prefix-cold compare-prefix-warm compare-prefix-coldwarm compare-report paper-memory paper-memory-dry-run paper-memory-one-shot paper-memory-compare-modes paper-memory-all-modes paper-memory-evaluate-gates paper-memory-external-eval paper-memory-frontier-sweep paper-memory-cache-ablation cosine-n-ablation cosine-n-ablation-dry-run cosine-n-skip-ablation cosine-n-skip-ablation-dry-run precompute-prefix-cache ablation sweep accel-sweep \
 	bench-optimizer bench-prefix-cache bench-prefix-cache-one-shot analyze-prefix-break-even bench-velocity-ops bench-velocity-ops-ci bench-velocity-ops-save-baseline \
@@ -822,4 +822,18 @@ FREEZE_ORDER_SENSITIVITY_FLAGS ?= --device auto
 
 freeze-order-sensitivity: ## Order-resolution diagnostic: can the proxy resolve freeze order? (auto CUDA)
 	$(PYTHON_VENV) -m scripts.run_freeze_order_sensitivity $(FREEZE_ORDER_SENSITIVITY_FLAGS)
+
+# Re-judge recorded valid_loss samples through the §4 judge with NO GPU and NO
+# model — the Category-C step reduced to a concrete, executable command. Reads
+# the JSON schema `run_freeze_validloss_ci --json` writes (and the same schema a
+# future 9B target run deposits), so a committed recording is verifiable
+# anywhere and a target-scale sample file drops straight in: the proxy_scale
+# flag in the file upgrades the verdict's scale label with no code change. The
+# default re-judges the committed proxy recording and asserts it still replays
+# to its recorded TIES (override FREEZE_REPLAY_FLAGS for another file / verdict).
+# Needs only numpy (NOT torch/GPU): PYTHON_VENV=/path/to/numpy-python make freeze-replay
+FREEZE_REPLAY_FLAGS ?= tests/fixtures/freeze_validloss_generalize_proxy.json --expected TIES
+
+freeze-replay: ## Re-judge recorded valid_loss samples through the §4 judge (no GPU); asserts the recording still replays to its verdict
+	$(PYTHON_VENV) -m scripts.replay_freeze_validloss_ci $(FREEZE_REPLAY_FLAGS)
 
