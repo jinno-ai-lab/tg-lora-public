@@ -810,3 +810,16 @@ freeze-validloss-ci-heterogeneous: ## Positive control: heterogeneous (per-layer
 freeze-validloss-ci-generalize: ## Conclusive-TIES run: held-out generalization task, auto CUDA
 	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci $(FREEZE_VALIDLOSS_CI_FLAGS) --task generalize
 
+# The apparatus order-resolution diagnostic. Variance-decomposes the proxy's
+# final valid_loss into a Var(order) signal (distinct freeze orders at a fixed
+# seed) vs a Var(seed) noise floor (a fixed order across seeds) and reports their
+# ratio — does the §4 verdict apparatus resolve freeze order at proxy scale?
+# The proxy finding is ratio=0.000 (order is unresolvable: the boundary local
+# loss does not couple to the held-out task metric), which makes the verdict TIES
+# a genuine null and target-scale proven necessary. Auto-selects CUDA.
+# Needs a torch-enabled interpreter: PYTHON_VENV=/path/to/torch-python make ...
+FREEZE_ORDER_SENSITIVITY_FLAGS ?= --device auto
+
+freeze-order-sensitivity: ## Order-resolution diagnostic: can the proxy resolve freeze order? (auto CUDA)
+	$(PYTHON_VENV) -m scripts.run_freeze_order_sensitivity $(FREEZE_ORDER_SENSITIVITY_FLAGS)
+
