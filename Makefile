@@ -2,7 +2,7 @@
        smoke smoke-tg smoke-bl \
        train-baseline train-tg-lora train-tg-lora-optreuse train-tg-lora-prefix \
        eval eval-lora eval-downstream eval-downstream-mlx eval-llm-jp-eval-mlx eval-mlx eval-base eval-35b-base eval-35b-ckpt \
-       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci \
+       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize \
 
 	compare compare-prefix compare-prefix-cold compare-prefix-warm compare-prefix-coldwarm compare-report paper-memory paper-memory-dry-run paper-memory-one-shot paper-memory-compare-modes paper-memory-all-modes paper-memory-evaluate-gates paper-memory-external-eval paper-memory-frontier-sweep paper-memory-cache-ablation cosine-n-ablation cosine-n-ablation-dry-run cosine-n-skip-ablation cosine-n-skip-ablation-dry-run precompute-prefix-cache ablation sweep accel-sweep \
 	bench-optimizer bench-prefix-cache bench-prefix-cache-one-shot analyze-prefix-break-even bench-velocity-ops bench-velocity-ops-ci bench-velocity-ops-save-baseline \
@@ -803,4 +803,10 @@ FREEZE_VALIDLOSS_CI_FLAGS ?= --device auto
 
 freeze-validloss-ci: ## GOAL §4 real valid_loss-axis significance run (proxy-scale; auto CUDA)
 	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci $(FREEZE_VALIDLOSS_CI_FLAGS)
+
+freeze-validloss-ci-heterogeneous: ## Positive control: heterogeneous (per-layer rank) stack, auto CUDA
+	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci $(FREEZE_VALIDLOSS_CI_FLAGS) --architecture heterogeneous
+
+freeze-validloss-ci-generalize: ## Conclusive-TIES run: held-out generalization task, auto CUDA
+	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci $(FREEZE_VALIDLOSS_CI_FLAGS) --task generalize
 

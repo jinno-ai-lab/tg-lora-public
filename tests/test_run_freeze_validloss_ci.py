@@ -201,3 +201,165 @@ class TestHonestProxyScaleLabeling:
         assert parsed["verdict"] in {SURPASSES, TIES, UNDERSHOOTS}
         assert len(parsed["candidate_losses"]) == _TINY["n_candidate"]
         assert len(parsed["surrogate_losses"]) == _TINY["n_surrogate"]
+
+
+# ---------------------------------------------------------------------------
+# Heterogeneous positive control + generalize conclusive-TIES task
+# (the two apparatus-validation axes added to the Category-C attack)
+# ---------------------------------------------------------------------------
+
+
+class TestHeterogeneousRanks:
+    def test_geometric_schedule_rises_toward_output(self):
+        from scripts.run_freeze_validloss_ci import heterogeneous_ranks, HIDDEN
+
+        r = heterogeneous_ranks(6, HIDDEN)
+        # Strictly rising toward the output side (more adapter capacity near the
+        # output) — the faithful proxy of GOAL §1.5/§8 non-uniform per-layer cost.
+        assert r == (1, 2, 4, 7, 13, 24)
+        assert all(r[i] < r[i + 1] for i in range(len(r) - 1))
+
+    def test_single_layer_collapses_to_full_rank(self):
+        from scripts.run_freeze_validloss_ci import heterogeneous_ranks, HIDDEN
+
+        assert heterogeneous_ranks(1, HIDDEN) == (HIDDEN,)
+
+
+class TestRunCIHeterogeneousAndGeneralize:
+    def test_heterogeneous_records_per_layer_ranks_not_uniform(self):
+        from scripts.run_freeze_validloss_ci import (
+            HETEROGENEOUS,
+            HOMOGENEOUS,
+            HIDDEN,
+            run_ci,
+        )
+
+        het = run_ci(
+            device=_DEVICE, architecture=HETEROGENEOUS, num_layers=6, **_TINY
+        )
+        hom = run_ci(
+            device=_DEVICE, architecture=HOMOGENEOUS, num_layers=6, **_TINY
+        )
+        # Heterogeneous deposits the geometric per-layer rank schedule; the
+        # homogeneous default records the full HIDDEN rank on every layer.
+        assert het["architecture"] == HETEROGENEOUS
+        assert het["ranks"] == [1, 2, 4, 7, 13, 24]
+        assert hom["architecture"] == HOMOGENEOUS
+        assert hom["ranks"] == [HIDDEN] * 6
+        # Both deposit real samples and a valid verdict on either stack.
+        for r in (het, hom):
+            assert len(r["candidate_losses"]) == _TINY["n_candidate"]
+            assert len(r["surrogate_losses"]) == _TINY["n_surrogate"]
+            assert r["ci"].significance_verdict in {SURPASSES, TIES, UNDERSHOOTS}
+
+    def test_generalize_task_is_labeled_and_deposits_real_samples(self):
+        from scripts.run_freeze_validloss_ci import TASK_GENERALIZE, run_ci
+
+        r = run_ci(device=_DEVICE, task=TASK_GENERALIZE, num_layers=6, **_TINY)
+        assert r["task"] == TASK_GENERALIZE
+        samples = r["candidate_losses"] + r["surrogate_losses"]
+        assert all(v == pytest.approx(v) for v in samples)  # all finite
+
+    def test_json_carries_architecture_ranks_and_task(self):
+        from scripts.run_freeze_validloss_ci import (
+            HETEROGENEOUS,
+            TASK_GENERALIZE,
+            result_to_json,
+            run_ci,
+        )
+
+        r = run_ci(
+            device=_DEVICE,
+            architecture=HETEROGENEOUS,
+            task=TASK_GENERALIZE,
+            num_layers=6,
+            **_TINY,
+        )
+        payload = result_to_json(r)
+        assert payload["architecture"] == HETEROGENEOUS
+        assert payload["ranks"] == [1, 2, 4, 7, 13, 24]
+        assert payload["task"] == TASK_GENERALIZE
+
+    def test_cli_exposes_new_flags(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "scripts.run_freeze_validloss_ci", "--help"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "heterogeneous" in result.stdout
+        assert "generalize" in result.stdout
+
+
+class TestTeacherConfidence:
+    """The generalization target must be a *confident* function, not noise.
+
+    A near-uniform teacher (softmax entropy ~= log(VOCAB)) has a near-random
+    argmax, so its labels are unlearnable noise and any verdict is the trivial
+    "student couldn't learn" kind. The calibrated teacher must sit well below
+    uniform — the apparatus-validation invariant that makes a generalize-task
+    TIES conclusive rather than vacuous.
+    """
+
+    def test_teacher_entropy_is_well_below_uniform(self):
+        import torch
+        import torch.nn.functional as F
+
+        from scripts.run_freeze_validloss_ci import (
+            HIDDEN,
+            NUM_LAYERS,
+            VOCAB,
+            _frozen_teacher,
+            make_generalize_task,
+        )
+
+        teacher = _frozen_teacher(NUM_LAYERS, HIDDEN, "cpu")
+        train, _ = make_generalize_task(0, teacher=teacher)
+        logits = teacher(
+            input_ids=train[0]["input_ids"],
+            attention_mask=train[0]["attention_mask"],
+        ).logits
+        p = F.softmax(logits, dim=-1)
+        entropy = (-(p * torch.log(p + 1e-9)).sum(-1).mean()).item()
+        uniform = float(torch.log(torch.tensor(float(VOCAB))))
+        # Confident with margin: the calibration lands near ~1.1 nats vs ~3.47
+        # uniform; assert < 2.0 so the invariant is robust to float drift.
+        assert entropy < 2.0, (
+            f"teacher too uniform: entropy={entropy:.3f} vs uniform={uniform:.3f}"
+        )
+
+    def test_teacher_is_frozen_and_in_eval_mode(self):
+        from scripts.run_freeze_validloss_ci import HIDDEN, NUM_LAYERS, _frozen_teacher
+
+        teacher = _frozen_teacher(NUM_LAYERS, HIDDEN, "cpu")
+        assert teacher.training is False
+        assert all(not p.requires_grad for p in teacher.parameters())
+
+
+class TestGeneralizeArmLearns:
+    """The conclusive-TIES precondition: the student LEARNS the held-out task.
+
+    At the full budget the student reaches held-out valid_loss well below the
+    uniform ~3.47 — it generalizes the teacher's function, not memorizes. That
+    is what makes a generalize-task TIES conclusive: the model demonstrably
+    learned, yet order still did not help. A full CI is a 10-arm run; one arm
+    is enough to prove the learnability invariant and stays fast.
+    """
+
+    def test_single_generalize_arm_generalizes_below_uniform(self):
+        from scripts.run_freeze_validloss_ci import arm_valid_loss, output_first_order
+
+        v = arm_valid_loss(
+            output_first_order(6),
+            seed=0,
+            device=_DEVICE,
+            num_layers=6,
+            total=60,
+            warmup=45,
+            depth=3,
+            task="generalize",
+        )
+        assert v == pytest.approx(v)  # finite
+        # Well below uniform: the student generalizes the teacher's function,
+        # the precondition for a conclusive (not trivial) TIES verdict.
+        assert v < 3.0, f"generalize arm did not learn: held-out valid_loss={v}"
