@@ -183,6 +183,76 @@ def format_honesty_contract_line(status: dict) -> str:
     )
 
 
+def comparison_honesty_status(
+    baseline_status: dict | None, guard_status: dict | None
+) -> dict | None:
+    """Combine the per-run §5.2 honesty states into an A/B-comparison verdict.
+
+    The §5.2 quality/speed gate is an A/B comparison: L* (the best quality loss)
+    is read from the baseline (A) run and the stop-point quality loss from the
+    guard (B) run — both from the same full-eval-vs-pilot field. A run is DORMANT
+    whenever its records carry no ``loss_valid_full`` (every run predating the
+    TASK-0141 producer wiring, until regenerated on GPU), which silently puts
+    that side's loss on the pilot proxy. The comparison is therefore ACTIVE only
+    when BOTH supplied sides are ACTIVE — a single dormant side contaminates the
+    time-to-quality comparison exactly as much as both. ``dormant_sides`` names
+    precisely which side(s) are dormant (``"A"`` baseline / ``"B"`` guard) so the
+    diagnostic can attribute the contamination, and the verdict self-clears the
+    instant every named side is regenerated. Returns ``None`` only when neither
+    status was supplied, leaving such callers byte-identical to the behavior
+    before any honesty diagnostic existed.
+    """
+    if baseline_status is None and guard_status is None:
+        return None
+    sides = {"A": baseline_status, "B": guard_status}
+    dormant_sides = [
+        label
+        for label, status in sides.items()
+        if status is not None and status.get("state") != "active"
+    ]
+    return {
+        "state": "active" if not dormant_sides else "dormant",
+        "dormant_sides": dormant_sides,
+        "baseline": baseline_status,
+        "guard": guard_status,
+    }
+
+
+def format_comparison_honesty_line(combined: dict) -> str:
+    """User-visible A/B honesty diagnostic for the gate report.
+
+    DORMANT → a prominent ⚠ warning naming the dormant side(s) (A=baseline /
+    B=guard), stating that side's quality loss is on the pilot proxy — not the
+    design-mandated full-eval loss — so the §5.2 A/B time-to-quality comparison
+    is contaminated, and naming the unblocker. ACTIVE → a quiet confirmation
+    that both sides compute their loss from the full-eval column. Mirrors
+    :func:`format_honesty_contract_line` but over the full comparison, because a
+    contaminated B-side stop is exactly as dishonest as a contaminated A-side L*
+    and must be equally loud rather than hide behind a byte-identical fallback.
+    """
+    if combined.get("state") == "active":
+        b = combined.get("baseline") or {}
+        g = combined.get("guard") or {}
+        coverage = []
+        if b:
+            coverage.append(f"A {b.get('full_eval_records', 0)}/{b.get('step_records', 0)}")
+        if g:
+            coverage.append(f"B {g.get('full_eval_records', 0)}/{g.get('step_records', 0)}")
+        cov = f" ({'; '.join(coverage)})" if coverage else ""
+        return (
+            f"Honesty contract ACTIVE on both A and B{cov} — §5.2 comparison "
+            f"(L* and the stop-point loss) computed from the full-eval loss."
+        )
+    sides = " and ".join(combined.get("dormant_sides", [])) or "A/B"
+    return (
+        f"⚠ Honesty contract DORMANT on {sides}: that side's quality loss is on "
+        f"the pilot proxy (loss_valid), NOT the design-mandated full-eval loss — "
+        f"the §5.2 A/B time-to-quality comparison is contaminated. The trainer "
+        f"producer is wired ({_HONESTY_DORMANT_UNBLOCKER}) but these run files "
+        f"predate it — regenerate the dormant side(s) on GPU to activate."
+    )
+
+
 def extract_freeze_schedule(records: list[dict]) -> dict[int, dict]:
     """Extract per-cycle freeze block info.
 
@@ -532,6 +602,7 @@ def write_gate_decision(
     baseline_full_losses: list[float] | None = None,
     baseline_full_cycles: list[int] | None = None,
     honesty_status: dict | None = None,
+    guard_honesty_status: dict | None = None,
 ) -> None:
     lines: list[str] = []
     lines.append("Gate Decision — Guard Experiment (§5.2)")
@@ -580,14 +651,19 @@ def write_gate_decision(
             f"  L* = {l_star:.4f}   G* = {g_star if g_star is not None else 'N/A'}"
         )
 
-    # §5.2 honesty visibility: qualify the L* line above with whether it was
-    # computed from the honest full-eval loss (ACTIVE) or the silent pilot-proxy
-    # fallback (DORMANT). The trainer producer is wired (TASK-0141) but run files
-    # that predate it carry no loss_valid_full, so they are DORMANT — this line
-    # makes that contamination visible in the persisted artifact rather than
-    # reading as a working fix.
-    if honesty_status is not None:
-        lines.append("  " + format_honesty_contract_line(honesty_status))
+    # §5.2 honesty visibility: the gate is an A/B comparison — L* from the
+    # baseline (A) run and the stop-point loss from the guard (B) run, both read
+    # from the same full-eval-vs-pilot field. It is contaminated when EITHER run
+    # is DORMANT: a dormant baseline puts L* on the pilot proxy, and a dormant
+    # guard puts the stop-point loss there. The trainer producer is wired
+    # (TASK-0141) but run files that predate it carry no loss_valid_full, so the
+    # combined diagnostic makes the contamination visible on both sides rather
+    # than only the baseline (the silent guard-side gap the single-status path
+    # left). A caller supplying only the baseline status keeps byte-identical
+    # output, since a lone side drives the verdict on its own.
+    combined = comparison_honesty_status(honesty_status, guard_honesty_status)
+    if combined is not None:
+        lines.append("  " + format_comparison_honesty_line(combined))
 
     # Quality gate (§5.2): gold >= G* reached within the loss trigger margin
     quality_pass = stop_cycle is not None
@@ -714,13 +790,19 @@ def main():
     (_, baseline_full_losses, baseline_full_cycles) = extract_loss_and_time(
         baseline_records, full_eval_only=True
     )
-    # §5.2 honesty visibility: a run whose records carry no loss_valid_full
-    # (every run file predating the TASK-0141 producer wiring, until regenerated
-    # on GPU) leaves L* silently falling back to the pilot proxy below. Surface
-    # that dormancy on stdout AND in gate_decision.txt so a contaminated A/B
-    # comparison can never hide behind a byte-identical fallback that looks fixed.
+    # §5.2 honesty visibility: the A/B comparison is contaminated when EITHER
+    # run is DORMANT — a dormant guard (B) run puts the stop-point loss on the
+    # pilot proxy just as a dormant baseline (A) run puts L* there. Surface both
+    # sides (not just the baseline) on stdout AND in gate_decision.txt so a
+    # contaminated comparison can never hide behind a byte-identical fallback
+    # that looks fixed.
     baseline_honesty = honesty_contract_status(baseline_records)
-    print(format_honesty_contract_line(baseline_honesty))
+    guard_honesty = honesty_contract_status(guard_records)
+    print(
+        format_comparison_honesty_line(
+            comparison_honesty_status(baseline_honesty, guard_honesty)
+        )
+    )
     guard_times, guard_losses, _ = extract_loss_and_time(guard_records)
 
     baseline_gold = extract_gold(baseline_records)
@@ -773,6 +855,7 @@ def main():
         baseline_full_losses,
         baseline_full_cycles,
         honesty_status=baseline_honesty,
+        guard_honesty_status=guard_honesty,
     )
 
     write_metrics_csv(

@@ -35,8 +35,10 @@ from scripts.analyze_dynfreeze_experiment import (
     LOSS_VALID_FULL_KEY,
     _proxy_speed_gate_section,
     baseline_targets,
+    comparison_honesty_status,
     extract_gold,
     extract_loss_and_time,
+    format_comparison_honesty_line,
     format_honesty_contract_line,
     guard_stop_point,
     honesty_contract_status,
@@ -1291,3 +1293,157 @@ class TestSupplySideHonestyNonInert:
             )
         # No orphan emissions either: one producer call per real full-eval site.
         assert len(emit_sites) == len(eval_sites) == 5
+
+
+class TestComparisonHonestyBothSides:
+    """The §5.2 gate is an A/B comparison, so its honesty contract is only as
+    honest as its DORMANT side.
+
+    L* (the best quality loss) is read from the baseline (A) run and the
+    stop-point quality loss from the guard (B) run — both from the same
+    full-eval-vs-pilot field. The single-run diagnostic (TASK-0143) surfaced a
+    DORMANT *baseline*, but a DORMANT *guard* run silently puts the B-side stop
+    on the pilot proxy, contaminating the time-to-quality comparison with no
+    warning — the same "code looks fixed but inert" state on the other half of
+    the comparison. These corrupt-input tests pin that the combined diagnostic is
+    DORMANT when EITHER side is dormant, names the offending side, and that the
+    warning now surfaces a dormant guard side in the persisted
+    ``gate_decision.txt``.
+    """
+
+    def test_dormant_when_guard_dormant_even_if_baseline_active(self, tmp_path):
+        # The gap: baseline (A) regenerated on GPU is ACTIVE, but the guard (B)
+        # run still predates the producer → DORMANT. The single-status path would
+        # have printed "ACTIVE" and shipped a contaminated time-to-quality
+        # comparison silently. The combined diagnostic must report DORMANT and
+        # name the B side.
+        active = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "baseline",
+            [{"cycle": 0, "loss_valid": 1.2, "loss_valid_full": 1.3, "gold_combined": 0.5}],
+        )
+        dormant = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "guard",
+            [{"cycle": 0, "loss_valid": 1.2, "gold_combined": 0.6}],
+        )
+        a = honesty_contract_status(active)
+        b = honesty_contract_status(dormant)
+        assert a["state"] == "active"
+        assert b["state"] == "dormant"
+
+        combined = comparison_honesty_status(a, b)
+        assert combined["state"] == "dormant"
+        assert combined["dormant_sides"] == ["B"]
+
+        line = format_comparison_honesty_line(combined)
+        assert "DORMANT on B" in line
+        assert "TASK-0141" in line
+        assert "pilot proxy" in line
+
+    def test_dormant_when_baseline_dormant_even_if_guard_active(self, tmp_path):
+        # Symmetric corrupt-input inversion: the contamination is attributed to
+        # the A side when the baseline is the dormant one.
+        dormant = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "baseline",
+            [{"cycle": 0, "loss_valid": 1.2, "gold_combined": 0.5}],
+        )
+        active = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "guard",
+            [{"cycle": 0, "loss_valid": 1.1, "loss_valid_full": 1.15, "gold_combined": 0.6}],
+        )
+        combined = comparison_honesty_status(
+            honesty_contract_status(dormant), honesty_contract_status(active)
+        )
+        assert combined["state"] == "dormant"
+        assert combined["dormant_sides"] == ["A"]
+        assert "DORMANT on A" in format_comparison_honesty_line(combined)
+
+    def test_active_only_when_both_sides_active(self, tmp_path):
+        active_a = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "baseline",
+            [{"cycle": 0, "loss_valid": 1.2, "loss_valid_full": 1.3, "gold_combined": 0.5}],
+        )
+        active_b = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "guard",
+            [{"cycle": 0, "loss_valid": 1.1, "loss_valid_full": 1.15, "gold_combined": 0.6}],
+        )
+        combined = comparison_honesty_status(
+            honesty_contract_status(active_a), honesty_contract_status(active_b)
+        )
+        assert combined["state"] == "active"
+        assert combined["dormant_sides"] == []
+        line = format_comparison_honesty_line(combined)
+        assert "ACTIVE" in line
+        assert "DORMANT" not in line
+        assert "TASK-0141" not in line
+
+    def test_dormant_names_both_sides_when_both_dormant(self, tmp_path):
+        dormant_a = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "baseline",
+            [{"cycle": 0, "loss_valid": 1.2, "gold_combined": 0.5}],
+        )
+        dormant_b = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "guard",
+            [{"cycle": 0, "loss_valid": 1.1, "gold_combined": 0.6}],
+        )
+        combined = comparison_honesty_status(
+            honesty_contract_status(dormant_a), honesty_contract_status(dormant_b)
+        )
+        assert combined["state"] == "dormant"
+        assert combined["dormant_sides"] == ["A", "B"]
+        assert "on A and B" in format_comparison_honesty_line(combined)
+
+    def test_none_when_neither_supplied_and_lone_side_drives_verdict(self):
+        # Byte-identical fallback: no status at all → no diagnostic; a single
+        # supplied side still drives the verdict on its own (so the existing
+        # baseline-only callers/tests are unchanged).
+        assert comparison_honesty_status(None, None) is None
+        only_active = comparison_honesty_status(
+            {"state": "active", "step_records": 1, "full_eval_records": 1}, None
+        )
+        assert only_active["state"] == "active"
+        assert only_active["dormant_sides"] == []
+        only_dormant = comparison_honesty_status(
+            None, {"state": "dormant", "step_records": 2, "full_eval_records": 0}
+        )
+        assert only_dormant["state"] == "dormant"
+        assert only_dormant["dormant_sides"] == ["B"]
+
+    def test_guard_dormancy_warning_persists_in_gate_decision_file(self, tmp_path):
+        # The actual gap closure: a dormant GUARD (B) side must now surface in the
+        # persisted gate_decision.txt even when the baseline (A) side is ACTIVE.
+        # Before, only the baseline status was reported, so a dormant guard
+        # contaminated the time-to-quality comparison silently.
+        guard_records = TestFullEvalLossHonestyE2E._write_run_records(
+            tmp_path / "guard",
+            [{"cycle": 0, "loss_valid": 1.2, "gold_combined": 0.6}],
+        )
+        active = {"state": "active", "step_records": 1, "full_eval_records": 1}
+        dormant = honesty_contract_status(guard_records)
+        assert dormant["state"] == "dormant"
+
+        out = tmp_path / "gate_decision.txt"
+        write_gate_decision(
+            baseline_dir=tmp_path / "baseline",
+            guard_dir=tmp_path / "guard",
+            baseline_losses=[1.3],
+            baseline_cycles=[0],
+            baseline_times=[10.0],
+            baseline_gold=[
+                {"cycle": 0, "elapsed": 10.0, "loss": 1.3, "gold_combined": 0.5}
+            ],
+            guard_losses=[1.2],
+            guard_times=[8.0],
+            guard_gold=extract_gold(guard_records),
+            schedule={},
+            layer_indices=[24, 25],
+            target_width=4096,
+            freeze_level=2,
+            output_path=out,
+            baseline_full_losses=[1.3],
+            baseline_full_cycles=[0],
+            honesty_status=active,  # A side honest
+            guard_honesty_status=dormant,  # B side dormant → must warn
+        )
+        text = out.read_text()
+        assert "DORMANT on B" in text
+        assert "TASK-0141" in text
