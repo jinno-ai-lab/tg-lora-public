@@ -15,8 +15,11 @@ import logging
 import random
 from pathlib import Path
 
-from src.data.filter_dataset import filter_records
-
+# NOTE: ``src.data.filter_dataset`` lives in the private data pipeline that is
+# stripped from this public mirror. Importing it at module scope makes even
+# ``--help`` fail here; it is imported lazily inside ``prepare_dataset`` so the
+# argparse ``--help`` path works with only the stdlib (mirrors the existing lazy
+# ``load_tokenizer`` import in ``_load_audit_tokenizer``).
 logger = logging.getLogger("tg-lora")
 
 CHAT_TEMPLATE = """<|im_start|>user
@@ -149,6 +152,8 @@ def prepare_dataset(
     train_on_prompt: bool = False,
 ) -> dict[str, object] | None:
     """Prepare train/valid/test splits from raw data."""
+    from src.data.filter_dataset import filter_records
+
     raw_records = load_raw(source_path)
     logger.info(f"Loaded {len(raw_records)} raw records from {source_path}")
 
