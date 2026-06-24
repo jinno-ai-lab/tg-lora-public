@@ -2,7 +2,7 @@
        smoke smoke-tg smoke-bl \
        train-baseline train-tg-lora train-tg-lora-optreuse train-tg-lora-prefix \
        eval eval-lora eval-downstream eval-downstream-mlx eval-llm-jp-eval-mlx eval-mlx eval-base eval-35b-base eval-35b-ckpt \
-       ingest-evidence check-evidence run-paper-experiment \
+       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci \
 
 	compare compare-prefix compare-prefix-cold compare-prefix-warm compare-prefix-coldwarm compare-report paper-memory paper-memory-dry-run paper-memory-one-shot paper-memory-compare-modes paper-memory-all-modes paper-memory-evaluate-gates paper-memory-external-eval paper-memory-frontier-sweep paper-memory-cache-ablation cosine-n-ablation cosine-n-ablation-dry-run cosine-n-skip-ablation cosine-n-skip-ablation-dry-run precompute-prefix-cache ablation sweep accel-sweep \
 	bench-optimizer bench-prefix-cache bench-prefix-cache-one-shot analyze-prefix-break-even bench-velocity-ops bench-velocity-ops-ci bench-velocity-ops-save-baseline \
@@ -789,3 +789,18 @@ check-evidence: ## Validate paper_evidence size and check for binary files and m
 	else \
 		echo "[OK] All evidence directories have version_metadata.json."; \
 	fi
+
+# ── Progressive Freezing research tooling (Category-C attack) ────────────────
+#
+# The GOAL §4 valid_loss-axis significance verdict, from a REAL run. Trains the
+# progressive-freeze trio on a small learnable proxy for an output-first
+# candidate vs random-order surrogates across seeds and feeds the resulting real
+# valid_loss samples through surrogate_valid_loss_ci() — the first significance
+# verdict grounded in numbers from an actual run (proxy-scale; target run swaps
+# the data source through the same function). Auto-selects CUDA when available.
+# Needs a torch-enabled interpreter: PYTHON_VENV=/path/to/torch-python make ...
+FREEZE_VALIDLOSS_CI_FLAGS ?= --device auto
+
+freeze-validloss-ci: ## GOAL §4 real valid_loss-axis significance run (proxy-scale; auto CUDA)
+	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci $(FREEZE_VALIDLOSS_CI_FLAGS)
+
