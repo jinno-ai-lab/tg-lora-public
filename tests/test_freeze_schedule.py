@@ -20,6 +20,7 @@ from src.tg_lora.freeze_schedule import (
     VALID_POLICIES,
     FreezeSchedule,
     FreezeScheduleConfig,
+    random_freeze_order,
 )
 
 # A representative output-side active layer set (Qwen-style 32-layer model,
@@ -433,3 +434,67 @@ class TestValidation:
             "convergence_order",
             "compromise",
         }
+
+
+class TestRandomFreezeOrder:
+    """GOAL §4 surrogate-null baseline: a reproducible random freeze order.
+
+    The random-order freeze is the null any real schedule must beat (GOAL §4 /
+    design Phase 2 control-(ii)). It must be (a) a true permutation of the
+    active set, (b) reproducible from a seed, and (c) local to the call so the
+    global RNG — and other tests — cannot perturb it. It must also flow through
+    the standard ``convergence_order`` planner path unchanged, so the
+    candidate-vs-surrogate comparison is apples-to-apples (no separate branch).
+    """
+
+    def test_is_a_permutation_of_the_active_set(self):
+        order = random_freeze_order(ACTIVE, seed=0)
+        assert sorted(order) == sorted(ACTIVE)
+        assert len(order) == len(ACTIVE)
+
+    def test_same_seed_is_reproducible(self):
+        # GOAL §4 "各条件は複数シードで回す" requires the surrogate to be
+        # reproducible from its seed across runs and parallel workers.
+        assert random_freeze_order(ACTIVE, seed=42) == random_freeze_order(
+            ACTIVE, seed=42
+        )
+
+    def test_different_seed_drives_a_different_order(self):
+        # If the seed had no effect, reproducibility would be vacuous. Across 8
+        # layers P(two seeds collide) = 1/8! ≈ 2.5e-5, so this never flakes.
+        a = random_freeze_order(ACTIVE, seed=1)
+        b = random_freeze_order(ACTIVE, seed=2)
+        assert sorted(a) == sorted(ACTIVE)
+        assert sorted(b) == sorted(ACTIVE)
+        assert a != b
+
+    def test_does_not_touch_the_global_rng(self):
+        import random as _random
+
+        _random.seed(123)
+        before = _random.random()
+        random_freeze_order(ACTIVE, seed=999)  # must use a local RNG
+        _random.seed(123)
+        after = _random.random()
+        assert before == after
+
+    def test_feeds_the_convergence_order_planner_path(self):
+        # The GOAL §4 surrogate must reuse the identical planner/accountant path
+        # as a real schedule (design §5.3) — no separate random branch.
+        order = random_freeze_order(ACTIVE, seed=7)
+        cfg = FreezeScheduleConfig(
+            active_layer_indices=ACTIVE,
+            num_epochs=20,
+            max_depth=3,
+            start_epoch=2,
+            spacing=1,
+            policy="convergence_order",
+            convergence_order=order,
+        )
+        sched = FreezeSchedule.plan(cfg)
+        assert sched.realized_depth == 3
+        # The first 3 layers in the random order freeze, at start_epoch + rank.
+        assert set(sched.frozen_at_epoch) == set(order[:3])
+        assert sched.frozen_at_epoch[order[0]] == 2
+        assert sched.frozen_at_epoch[order[1]] == 3
+        assert sched.frozen_at_epoch[order[2]] == 4

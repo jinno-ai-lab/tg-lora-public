@@ -39,9 +39,59 @@ All three are pure-Python and model-free; estimating per-layer stability
 
 from __future__ import annotations
 
+import random
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 VALID_POLICIES: tuple[str, ...] = ("output_first", "convergence_order", "compromise")
+
+
+def random_freeze_order(
+    active_layer_indices: Iterable[int],
+    seed: int,
+) -> tuple[int, ...]:
+    """Reproducible random freeze order — the GOAL §4 surrogate-null baseline.
+
+    GOAL §4 / §3.1 Phase 2 control-(ii) require a **random-order freeze** as the
+    null baseline any real schedule (``output_first`` / ``convergence_order`` /
+    ``compromise``) must beat before its FLOPs reduction or quality retention is
+    claimed ("ランダム順フリーズ対照を超えた削減・性能だけを有効と認定"). The
+    surrogate must be **reproducible** across the multi-seed sweeps GOAL §4
+    demands ("各条件は複数シードで回す"), so this seeds a *local*
+    :class:`random.Random` rather than the global RNG: identical
+    ``(layers, seed)`` always yield the same permutation, independent of import
+    order, parallel workers, or other tests shaking global state.
+
+    The returned permutation feeds
+    :class:`FreezeScheduleConfig` under ``policy="convergence_order"`` — that
+    policy takes any caller-supplied order verbatim (see :func:`_resolve_order`),
+    so a shuffled order flows through the *identical* planner / accountant /
+    frontier code path as a real schedule. No separate random branch exists
+    (design §5.3), which is exactly what makes the candidate-vs-surrogate
+    comparison apples-to-apples. This module documented that idiom but provided
+    no reproducible generator for it; this function closes that gap.
+
+    Parameters
+    ----------
+    active_layer_indices:
+        Candidate layers eligible for freezing. Input order is irrelevant (the
+        call shuffles them). Duplicates are not deduplicated here — pass a unique
+        set, as :class:`FreezeScheduleConfig` rejects duplicates with a clear
+        error anyway.
+    seed:
+        Integer seed for the local RNG. Fix it to reproduce one surrogate across
+        runs and across seeds of the Phase 2 sweep.
+
+    Returns
+    -------
+    tuple[int, ...]
+        A shuffled permutation of the input layers — the random-order freeze
+        sequence, ready for ``FreezeScheduleConfig(convergence_order=...)``.
+    """
+    rng = random.Random(seed)
+    order = list(active_layer_indices)
+    rng.shuffle(order)
+    return tuple(order)
 
 
 @dataclass(frozen=True)
