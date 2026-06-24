@@ -560,6 +560,9 @@ test-trajectory: ## Run Phase 59-61 trajectory/advisor tests
 test-cli-help: ## Verify all Python CLI scripts respond to --help
 	$(PYTHON_VENV) -m pytest tests/test_cli_help_smoke.py -v
 
+check-spine: ## Verify spec/doc spine-anchor integrity (no provenance drift)
+	$(PYTHON_VENV) scripts/check_spine_anchors.py
+
 lint: ## Run linting
 	$(PYTHON_VENV) -m ruff check src/ tests/ scripts/
 	$(PYTHON_VENV) -m ruff format --check src/ tests/ scripts/
@@ -730,6 +733,7 @@ sync-to-cuda: ## Rsync MLX runs from Mac to CUDA host. Usage: make sync-to-cuda 
 ci: ## Run full CI pipeline (lint + test + script import check)
 	$(PYTHON_VENV) -m ruff check src/ tests/ scripts/ mlx/
 	$(PYTHON_VENV) -m ruff format --check src/ tests/ scripts/ mlx/
+	$(PYTHON_VENV) scripts/check_spine_anchors.py
 	$(PYTHON_VENV) -m pytest tests/ mlx/tests/ -q
 	@$(PYTHON_VENV) -m pytest tests/ -k "accel" -q --tb=short
 	@$(PYTHON_VENV) -c "import scripts.diagnose; import scripts.recover; print('scripts import OK')" 2>/dev/null || \

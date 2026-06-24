@@ -70,6 +70,7 @@ ARGPARSE_SCRIPTS = [
     "scripts/benchmark_optimizer_lifecycle.py",
     "scripts/benchmark_prefix_cache.py",
     "scripts/benchmark_velocity_ops.py",
+    "scripts/check_spine_anchors.py",
     "scripts/compare_experiment_configs.py",
     "scripts/compare_paper_memory_modes.py",
     "scripts/compare_runs.py",
