@@ -291,3 +291,81 @@ def _resolve_order(config: FreezeScheduleConfig) -> tuple[int, ...]:
         return tuple(config.convergence_order)
     # output_first and compromise both descend from the output side.
     return tuple(sorted(config.active_layer_indices, reverse=True))
+
+
+@dataclass(frozen=True)
+class ScheduleProcedure:
+    """GOAL §3.1 Phase 4 / §4 step 5 — the *portable* freeze 手順 (procedure).
+
+    Phase 4 verifies that the optimal schedule found in Phase 2/3 is *portable*:
+    the same procedure — which policy, how deep, when freezes start, how they
+    space out — applied to a different condition (LR / data / r / seed, which
+    manifest as a different trainable ``active_layer_indices`` set) must still
+    resolve without breaking. GOAL §3.1 Phase 4 is explicit that what is reused
+    is the **手順** ("いつ何層固めるかという手順"), *not* the specific cached
+    activations ("target xin の使い回し" is explicitly out of scope) — the
+    procedure is predicted to be more robust to condition drift than concrete
+    activations.
+
+    This dataclass factors the layer-set-independent parameters out of
+    :class:`FreezeScheduleConfig` so one procedure can be re-bound
+    (:meth:`bind`) to many conditions. That is the primitive Phase 4's "apply
+    the optimal schedule to different conditions" needs, expressed in pure
+    Python so portability is checkable *before* a GPU run (the valid_loss axis
+    of Phase 4 stays Category-C/GPU; the *手順*-resolution axis is Category-A).
+
+    The condition-specific inputs that :class:`FreezeScheduleConfig` takes
+    directly (``convergence_order`` from each run's stability analysis,
+    ``stability_epoch`` for the compromise policy) are deliberately **not**
+    part of the portable procedure — they are re-supplied per condition at
+    :meth:`bind` time. Only policy / depth / timing carry over.
+    """
+
+    policy: str
+    max_depth: int
+    start_epoch: int
+    spacing: int = 1
+
+    def __post_init__(self) -> None:
+        if self.policy not in VALID_POLICIES:
+            raise ValueError(
+                f"policy must be one of {VALID_POLICIES}, got {self.policy!r}"
+            )
+        if self.spacing < 1:
+            raise ValueError(f"spacing must be >= 1, got {self.spacing}")
+        if self.max_depth < 0:
+            raise ValueError(f"max_depth must be >= 0, got {self.max_depth}")
+        if self.start_epoch < 0:
+            raise ValueError(f"start_epoch must be >= 0, got {self.start_epoch}")
+
+    def bind(
+        self,
+        active_layer_indices: list[int],
+        num_epochs: int,
+        *,
+        convergence_order: tuple[int, ...] | None = None,
+        stability_epoch: dict[int, int] | None = None,
+    ) -> FreezeScheduleConfig:
+        """Re-bind this portable procedure to a concrete condition.
+
+        The procedure's policy / depth / timing are reused verbatim; only the
+        condition-specific layer set (and run length) change. ``convergence_order``
+        / ``stability_epoch`` are *per-condition* regime outputs (design §5.3
+        derives them from each run's stability analysis), so Phase 4 re-supplies
+        them here — the *procedure* (policy/depth/timing) is what carries over.
+        They default to ``None``: a procedure under ``convergence_order`` that
+        is bound without a fresh ``convergence_order`` raises a clear
+        :class:`ValueError` from :class:`FreezeScheduleConfig` (the caller must
+        re-derive the order for the new condition), which is exactly the
+        "degrades safely, never crashes silently" portability guarantee.
+        """
+        return FreezeScheduleConfig(
+            active_layer_indices=active_layer_indices,
+            num_epochs=num_epochs,
+            max_depth=self.max_depth,
+            start_epoch=self.start_epoch,
+            spacing=self.spacing,
+            policy=self.policy,
+            convergence_order=convergence_order,
+            stability_epoch=stability_epoch,
+        )
