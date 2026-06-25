@@ -837,3 +837,19 @@ FREEZE_REPLAY_FLAGS ?= tests/fixtures/freeze_validloss_generalize_proxy.json --e
 freeze-replay: ## Re-judge recorded valid_loss samples through the §4 judge (no GPU); asserts the recording still replays to its verdict
 	$(PYTHON_VENV) -m scripts.replay_freeze_validloss_ci $(FREEZE_REPLAY_FLAGS)
 
+# Re-derive the recorded order-sensitivity decomposition (Var(order)/Var(seed))
+# from stored per-arm samples with NO GPU, NO model, and NO torch — the other
+# half of the proxy evidence, given the same GPU-free-replay treatment as
+# freeze-replay. The verdict replay pins the recorded TIES; this pins the
+# recorded ratio=0.000 — the result that converts "target-scale is assumed
+# necessary" into "proven necessary". Reads the JSON schema
+# `run_freeze_order_sensitivity --json` writes (and the same schema a future 9B
+# target run deposits), so a committed recording is verifiable anywhere. The
+# default re-judges the committed proxy recording and asserts it still replays
+# to its recorded not_resolvable (override FREEZE_ORDER_REPLAY_FLAGS for another
+# file / outcome). Needs only the stdlib (NOT torch/GPU/numpy).
+FREEZE_ORDER_REPLAY_FLAGS ?= tests/fixtures/freeze_order_sensitivity_proxy.json --expected not_resolvable
+
+freeze-order-sensitivity-replay: ## Re-derive the recorded order-sensitivity decomposition (no GPU/torch); asserts the recording still replays to its outcome
+	$(PYTHON_VENV) -m scripts.replay_freeze_order_sensitivity $(FREEZE_ORDER_REPLAY_FLAGS)
+
