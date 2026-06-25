@@ -157,6 +157,38 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 > deferring the actual research result while accumulating orthogonal CPU scaffolding"）。
 > 代わりに Category-C（GPU）ブロックを直接叩く — **本イテレーションでそれを実行した**。
 
+> **【2026-06-26 追記・訓練ループ本体の正確性バグ修正へ旋回】** AI-Hub feedback (2026-06-26) が
+> 再び「proxy 証拠の足場追加は停止（valid_loss verdict と order-sensitivity ratio=0.000 は
+> 二重ロック済）・症状でなく根本原因を直せ・実際の training run へ旋回せよ」を指示。ただし
+> feedback の具体的根本原因提案（make-run auto-commit での `references:` ブロック振動・
+> `helix/orchestrator/gates.py` spine-audit 配線）は **AI Hub 自身のインフラ**を指し、本 mirror には
+> `_doc_spine.yml`・`helix/`・`check_spine_manifest.py` が存在せずここでは実行不能（feedback の
+> 名指しインフラは AI-Hub 側＝[[ai-hub-feedback-infra-vs-this-repo]] の既知パターン）。ゆえに
+> 「実際の training run への旋回」を実行可能な形で解釈し、**訓練ループ本体の潜伏 NameError バグ
+> 2 件**を発見・修正した（足場ではなく製品挙動・MS-PF 系とは独立の正確性軸）:
+> 1. **fault checkpoint が dynfreeze 状態を黙って喪失** — `_save_fault_checkpoint` がスコープに
+>    `dynfreeze` を持たないまま `dynfreeze.state_dict()` を参照（`NameError`）。広い `except` に
+>    飲まれて `training_state.pt` が OOM/CUDA fault 時に**黙って書かれず**、fault-resume が
+>    cycle/velocity/delta_tracker/controller/dynfreeze の全状態を失う。`dynfreeze_enabled: true` の
+>    実 config（`9b_tg_lora_m10_dynfreeze.yaml` 等）に潜在。並行の正常 periodic save（同関数の外・
+>    dynfreeze は正しくスコープにある）だけが正しく、**fault 側のみの欠陥**だった。
+>    → `dynfreeze` をパラメータで明示スレッドし、唯一の呼び出し site（`finally` block）で渡す。
+> 2. **progressive freeze 有効化で即 crash** — `ProgressiveFreezeController` を使用（≈L1200）するのが、
+>    唯一の import（無関係の `enable_psa` block 内の遅延 import・L1434）より前 → 有効化した瞬間に
+>    `NameError`。活性研究機能（MS-PF1）を有効にできない状態だった。`progressive_freeze_enabled: true`
+>    の config が無く・単体 test が controller を直接構築するため潜在化していた。
+>    → 両 controller（`ProgressiveFreezeController`/`DynamicFreezeController`）を module top に hoist
+>    （循環 import なし・両 module とも `src.training` を import しないことを確認済）し、遅延 import
+>    2 件を削除。これで F821/F401 の lint 族（5 F821 + 1 F401）も一括解消。
+> **検証**: `ruff --select F821 src/training/train_tg_lora.py` = **0**（修正前 5 件）。新規
+> `tests/test_train_tg_lora_static_guards.py` が F821 ゼロを CI 強制（train_tg_lora は L16 の src.data
+> 依存で本 mirror では import 不可のため、ruff を file path に走らせ **import を回避** = src.data
+> block の ~130 pre-existing fail に触らない）。dynfreeze_state の serialize 往復は既に
+> `tests/test_checkpoint.py` が cover。**`tests/test_fault_recovery.py` の OOM/resume 諸試験は本 fix で
+> private repo（src.data あり）では red→green に反転する**（本 mirror では src.data block で
+> pre-existing fail のまま・stash 比較で非回帰を確認: 修正前後とも同一 7 fail）。`ruff check` は
+> 8→2 error へ（残り F841@L2296 + E741@L3717 は従来からの無関係負債・非回帰）。
+
 ### Category-A vs Category-C 台帳（quantification）
 
 - **Category-A helpers 残数: 0**（MS-PF2 4/4・MS-PF3 2/2・MS-PF4 1/1 = 計 **7/7 完了**）:

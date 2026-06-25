@@ -29,6 +29,7 @@ from src.tg_lora.activation_cache import (
 )
 from src.tg_lora.cycle_state import CycleState
 from src.tg_lora.delta_tracker import DeltaTracker
+from src.tg_lora.dynamic_freeze import DynamicFreezeController
 from src.tg_lora.extrapolator import (
     ExtrapolationStats,
     ZerothOrderStepStats,
@@ -57,6 +58,7 @@ from src.tg_lora.prefix_feature_cache import (
     save_prefix_feature_dataset,
 )
 from src.tg_lora.prefix_runtime_offload import offload_prefix_runtime_to_cpu
+from src.tg_lora.progressive_freeze import ProgressiveFreezeController
 from src.tg_lora.random_walk_controller import RandomWalkController
 from src.tg_lora.rollback_manager import RollbackManager
 from src.tg_lora.velocity import Velocity, beta_from_window
@@ -703,8 +705,15 @@ def _save_fault_checkpoint(
     run_dir: Path,
     train_batch_position: int,
     accepted_valid_history: list[float],
+    dynfreeze: DynamicFreezeController | None,
 ) -> None:
-    """Save model + full training state on fault (OOM / CUDA error)."""
+    """Save model + full training state on fault (OOM / CUDA error).
+
+    ``dynfreeze`` is the reversible-freeze controller (``None`` when the Guard
+    experiment is disabled). It must be threaded in explicitly — the controller
+    lives in the caller's (``train_tg_lora``) scope and is unreachable from
+    module globals — so the fault checkpoint records its state for resume.
+    """
     try:
         oom_dir = run_dir / "oom_checkpoint"
         save_checkpoint(model, tokenizer, oom_dir)
@@ -1212,7 +1221,6 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     # Dynamic reversible freeze controller (Guard experiment)
     dynfreeze: DynamicFreezeController | None = None
     if bool(tg_cfg.get("dynfreeze_enabled", False)):
-        from src.tg_lora.dynamic_freeze import DynamicFreezeController
         dynfreeze = DynamicFreezeController(
             tau=float(tg_cfg.get("dynfreeze_tau", 0.015)),
             window=int(tg_cfg.get("dynfreeze_window", 5)),
@@ -1431,7 +1439,6 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     psa_regime_reset_enabled = True
     if bool(tg_cfg.get("enable_psa", False)):
         from src.tg_lora.psa import PSAPrior, amplify_gradients_psa, summarize_by_layer_type
-        from src.tg_lora.progressive_freeze import ProgressiveFreezeController
         from src.tg_lora.regime import RegimeDetector
         psa_regime_reset_enabled = bool(tg_cfg.get("psa_regime_reset_enabled", True))
         psa_prior = PSAPrior(
@@ -4007,6 +4014,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 run_dir,
                 train_batch_position,
                 accepted_valid_history,
+                dynfreeze,
             )
 
     pbar.close()
