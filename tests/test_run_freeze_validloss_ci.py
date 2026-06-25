@@ -404,3 +404,65 @@ class TestGeneralizeArmLearns:
         # Well below uniform: the student generalizes the teacher's function,
         # the precondition for a conclusive (not trivial) TIES verdict.
         assert v < 3.0, f"generalize arm did not learn: held-out valid_loss={v}"
+
+
+# ---------------------------------------------------------------------------
+# Apparatus drift sentinel — guard the committed GPU fixture's reproducibility
+# ---------------------------------------------------------------------------
+
+
+class TestApparatusDriftSentinel:
+    """Pin the apparatus's deterministic output so silent drift fails CI.
+
+    The committed Category-C GPU recording
+    (``tests/fixtures/freeze_validloss_generalize_proxy.json``) is only checked
+    for *faithfulness* — that its frozen floats replay to the verdict it records
+    (``tests/test_replay_freeze_validloss_ci.py::TestFixtureFaithfulness``). That
+    test passes even if the apparatus rots, because the floats in the file never
+    change. What no CI check guarded is that the documented regeneration command
+    (``make freeze-validloss-ci-generalize``) still reproduces that recording —
+    verified manually to reproduce **bit-for-bit** on the RTX 3060 (2026-06-26:
+    verdict TIES, every mean / CI bound / loss identical to the fixture), but
+    that was an assertion, not an enforced contract.
+
+    This sentinel closes that gap the cheap way. The apparatus is bit-deterministic
+    (``test_run_ci_is_reproducible_by_base_seed`` proves exact within-session
+    reproducibility), so pinning its tiny-budget CPU ``generalize`` output makes
+    any drift in the student-affecting constants/logic the GPU run depends on
+    (``TEACHER_BASE_STD`` / ``TEACHER_SEED`` / ``LR`` / ``make_generalize_task`` /
+    ``arm_valid_loss``) fail CI — mutation-verified: nudging each of those three
+    constants moves the pinned floats. A failure here means the GPU fixture is now
+    stale: regenerate it (``make freeze-validloss-ci-generalize``) and re-pin
+    these golden values — re-validating the evidence chain rather than letting
+    it rot silently.
+
+    Scope is honest about what it does NOT catch. A constant whose effect is
+    argmax-invariant on the student leaves the loss — and this sentinel — unmoved.
+    ``TEACHER_HEAD_SCALE`` is one: it sharpens the teacher's softmax (lowering its
+    entropy, the invariant ``TestTeacherConfidence`` pins) but does not change the
+    argmax *labels* the student trains on, so the student's loss is identical
+    across its values. The sentinel therefore guards the training-affecting
+    constants; the calibration-affecting ones are covered by the teacher-entropy
+    test. It is a drift sentinel, NOT a research claim: the tiny budget barely learns
+    (valid_loss ~3.1 vs uniform ~3.47) and is chosen for speed; only the
+    *stability* of the output across commits is asserted, not the value as a
+    §4 result.
+    """
+
+    # Golden output of run_ci(generalize, tiny CPU budget), captured from a real
+    # deterministic run. Every RNG is locally seeded, so this is bit-stable on a
+    # fixed torch/CPU — exactly the determinism the GPU recording relies on.
+    _GOLDEN_CANDIDATE = (3.1415646076202393, 2.9830827713012695, 3.1431686878204346)
+    _GOLDEN_SURROGATE = (3.3331193923950195, 2.9940176010131836, 3.2981650829315186)
+
+    def test_generalize_tiny_output_is_pinned(self):
+        from scripts.run_freeze_validloss_ci import TASK_GENERALIZE, run_ci
+
+        r = run_ci(device=_DEVICE, task=TASK_GENERALIZE, num_layers=6, **_TINY)
+        # Exact equality: the apparatus is bit-deterministic (the reproducibility
+        # test asserts a == b within a session), so any change in the pinned
+        # constants/logic moves these floats and fails the sentinel — flagging
+        # that the GPU fixture must be regenerated.
+        assert tuple(r["candidate_losses"]) == self._GOLDEN_CANDIDATE
+        assert tuple(r["surrogate_losses"]) == self._GOLDEN_SURROGATE
+        assert r["ci"].significance_verdict == TIES
