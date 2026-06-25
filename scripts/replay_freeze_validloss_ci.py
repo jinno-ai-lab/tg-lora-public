@@ -23,6 +23,18 @@ CPU scaffolding. Two roles:
    source. ``proxy_scale`` is read from the file and surfaced in the report, so
    a reader always sees which scale a replayed verdict is from.
 
+   **The synthetic-provenance guard.** A recording may carry ``synthetic: true``
+   to mark its floats as hand-authored plumbing (a constructed separation that
+   exercises this branch), not a measurement. Such a recording is still judged —
+   the verdict is faithfully recomputed from the stored floats — but it is never
+   *presented* as a citable §4 result: the rendered note withholds the "this
+   verdict IS the §4 target-scale result" claim a genuine 9B recording earns and
+   instead says plainly "synthetic — do not cite". This converts the feedback's
+   "every committed verdict is still proxy-scale and must not be cited as a §4
+   target-scale result" warning from prose into a code-enforced contract, so a
+   ``proxy_scale: false`` plumbing fixture can never be mistaken for a real 9B
+   run. A genuine recording omits ``synthetic`` (or sets it ``false``).
+
 The replay re-runs *only* :func:`src.tg_lora.freeze_surrogate_ci.surrogate_valid_loss_ci`
 — pure numpy over the stored floats, so it is deterministic and device-free.
 It does not retrain, does not import torch, and does not assume a label: it
@@ -74,8 +86,8 @@ def load_samples(path: str | Path) -> dict[str, Any]:
     writes with ``--json --output`` (and any future target-scale run that
     deposits samples in the same schema). The two sample lists the judge needs
     are required and must be non-empty; every other field (``verdict``,
-    ``base_seed``, ``proxy_scale``, ``task``, ...) is optional provenance the
-    report surfaces when present.
+    ``base_seed``, ``proxy_scale``, ``synthetic``, ``task``, ...) is optional
+    provenance the report surfaces when present.
     """
     p = Path(path)
     with p.open() as fh:
@@ -122,14 +134,22 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
     under the deterministic bootstrap, a mismatch is a warning that the file was
     edited inconsistently. The scale line makes ``proxy_scale`` visible so a
     reader never cites a proxy verdict as target-scale (or vice versa).
+
+    ``synthetic`` (read from the recording, default ``False``) is the
+    provenance guard: a hand-authored plumbing recording is judged but never
+    presented as a citable §4 result — its note withholds the "this verdict IS
+    the §4 target-scale result" claim a genuine recording earns, enforcing the
+    feedback's "do not cite as a target-scale result" warning in the rendered
+    output rather than relying on prose alone.
     """
     proxy_scale = bool(data.get("proxy_scale", True))
+    synthetic = bool(data.get("synthetic", False))
     scale = "PROXY" if proxy_scale else "TARGET"
     recorded = data.get("verdict")
     lines = [
         "freeze_replay — GOAL §4 judge on recorded samples (no GPU)",
         f"  source: {path}",
-        f"  scale: {scale}_SCALE  (proxy_scale={proxy_scale})  "
+        f"  scale: {scale}_SCALE  (proxy_scale={proxy_scale}, synthetic={synthetic})  "
         f"task={data.get('task', '?')}  architecture={data.get('architecture', '?')}",
         "",
         format_surrogate_valid_loss_ci(ci),
@@ -145,7 +165,20 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
                 f"  faithfulness: WARNING replayed {ci.significance_verdict} "
                 f"!= recorded {recorded}"
             )
-    if proxy_scale:
+    # Scale-honesty note. ``synthetic`` takes precedence over both PROXY and
+    # TARGET: a plumbing recording's floats are not a measurement, so the
+    # verdict — though faithfully recomputed — is never citable as a §4 result
+    # at any scale. A genuine recording reaches the PROXY/TARGET branches.
+    if synthetic:
+        lines.append(
+            "  note: SYNTHETIC — the stored floats are hand-authored plumbing "
+            f"(a constructed separation), not a {scale.lower()}-scale run. The "
+            "verdict is faithfully recomputed from those floats but is "
+            f"*synthetic* {scale.lower()}-scale evidence; do not cite it as a "
+            "§4 result at any scale. A genuine run overwrites this file with "
+            "real floats in the same schema and this note drops."
+        )
+    elif proxy_scale:
         lines.append(
             "  note: PROXY_SCALE — samples are from a 24-hidden proxy run, not "
             "the 9B target. The verdict is faithful to the recorded run but is "
@@ -171,6 +204,7 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         ),
         "source": str(path),
         "proxy_scale": bool(data.get("proxy_scale", True)),
+        "synthetic": bool(data.get("synthetic", False)),
         "candidate_mean": ci.candidate_mean,
         "surrogate_mean": ci.surrogate_mean,
         "point_improvement": ci.point_improvement,

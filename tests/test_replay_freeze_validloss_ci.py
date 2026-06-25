@@ -21,10 +21,15 @@ torch. The suite guards:
   the recorded Category-C dataset.
 * **Scale honesty + CLI assertion** — ``proxy_scale`` is surfaced from the
   file; ``--expected`` exits 0 on a match and 2 on a mismatch.
-* **The target-scale drop-in** — a committed ``proxy_scale: false`` plumbing
-  fixture upgrades the replayed verdict to the TARGET_SCALE label + note with no
-  code change (the MS-PF2 Cat-C contract); the proxy and target recordings are
-  distinguished by the file's ``proxy_scale`` flag alone.
+* **The target-scale drop-in + synthetic-provenance guard** — a committed
+  ``proxy_scale: false`` plumbing fixture flips the replayed verdict's scale
+  label to TARGET with no code change (the MS-PF2 Cat-C contract); the proxy and
+  target recordings are distinguished by the file's ``proxy_scale`` flag alone.
+  The fixture also carries ``synthetic: true``, so the replay withholds the
+  citable "this verdict IS the §4 target-scale result" claim a genuine 9B run
+  earns and warns instead — enforcing in code that synthetic plumbing is never
+  cited as a real measurement. The genuine claim is covered on a constructed
+  ``synthetic: false`` recording (the shape a real 9B run deposits).
 """
 
 from __future__ import annotations
@@ -139,12 +144,13 @@ class TestLoadSamples:
 # ---------------------------------------------------------------------------
 
 
-def _data(candidate, surrogate, *, base_seed=0, proxy_scale=True):
+def _data(candidate, surrogate, *, base_seed=0, proxy_scale=True, synthetic=False):
     return {
         "candidate_losses": list(candidate),
         "surrogate_losses": list(surrogate),
         "base_seed": base_seed,
         "proxy_scale": proxy_scale,
+        "synthetic": synthetic,
     }
 
 
@@ -248,66 +254,116 @@ class TestScaleAndCLI:
 
 
 class TestTargetScaleDropIn:
-    """The MS-PF2 Cat-C drop-in: a ``proxy_scale: false`` sample file upgrades
-    the replayed verdict to the target-scale §4 result with NO code change.
+    """The MS-PF2 Cat-C drop-in: a ``proxy_scale: false`` sample file flips the
+    replayed verdict to the TARGET scale label with NO code change — but a
+    *synthetic* plumbing recording is never presentable as a citable §4 result.
 
-    The committed plumbing fixture (synthetic floats, ``proxy_scale: false``) is
-    the first recording that exercises the TARGET_SCALE branch of the replay
-    judge — the path the real proxy fixture (``proxy_scale: true``) never touches.
-    The label must flip PROXY -> TARGET, the note must say "this verdict IS the §4
-    target-scale result", the JSON must carry ``proxy_scale=false``, and the stored
-    floats must faithfully re-earn their recorded SURPASSES verdict. Together with
-    ``TestTargetScaleParam`` (the generator sets ``proxy_scale`` rather than
-    hardcoding it), this closes the "same schema, no code change" contract that had
-    been asserted by docstrings and PURPOSE but never demonstrated.
+    The committed plumbing fixture (synthetic floats, ``proxy_scale: false``,
+    ``synthetic: true``) is the first recording that exercises the TARGET branch
+    of the replay scale label — the path the real proxy fixture
+    (``proxy_scale: true``) never touches. The scale label must flip PROXY ->
+    TARGET and the stored floats must faithfully re-earn their recorded SURPASSES
+    verdict; but because the floats are tagged ``synthetic: true``, the rendered
+    note withholds the "this verdict IS the §4 target-scale result" claim a
+    genuine 9B recording would earn and instead warns "do not cite". This is the
+    feedback's "every committed verdict is still proxy-scale and must not be cited
+    as a §4 target-scale result" guard, enforced in the rendered output rather
+    than left to the fixture's prose. The genuine target-scale note — the one a
+    real 9B run produces — is covered on a constructed ``synthetic: false``
+    recording below. Together with ``TestTargetScaleParam`` (the generator sets
+    ``proxy_scale`` rather than hardcoding it), this closes the "same schema, no
+    code change" contract that had been asserted by docstrings and PURPOSE but
+    never demonstrated — now with a machine-readable barrier between plumbing and
+    measurement.
     """
 
-    def test_target_fixture_is_target_scale(self):
+    def test_target_fixture_is_target_scale_and_synthetic(self):
         data = load_samples(FIXTURE_TARGET)
         assert data["proxy_scale"] is False
+        assert data["synthetic"] is True
 
-    def test_replay_surfaces_target_scale_label_and_note(self):
+    def test_synthetic_recording_withholds_citable_target_claim(self):
+        # The scale line still flips to TARGET (proxy_scale=False), but the
+        # synthetic tag withholds the citable "this verdict IS the §4
+        # target-scale result" claim and emits a SYNTHETIC do-not-cite note.
         data = load_samples(FIXTURE_TARGET)
         text = format_replay(FIXTURE_TARGET, data, replay_samples(data))
-        # The proxy label is replaced by the target-scale label + note; the
-        # scale line shows proxy_scale=False.
-        assert "TARGET_SCALE" in text
-        assert "this verdict IS" in text
+        assert "TARGET_SCALE" in text  # scale line shows the TARGET label
         assert "proxy_scale=False" in text
+        assert "synthetic=True" in text
+        assert "SYNTHETIC" in text  # the do-not-cite note fires
+        assert "this verdict IS" not in text  # citable claim withheld
         assert "PROXY_SCALE" not in text
+
+    def test_genuine_target_scale_renders_citable_note(self):
+        # The note a REAL 9B run earns: proxy_scale=False with genuine (non-
+        # synthetic) floats -> "this verdict IS the §4 target-scale result".
+        # This is the branch the committed plumbing fixture (synthetic) cannot
+        # reach; it is tested here on a constructed genuine recording — the exact
+        # shape a 9B run deposits — so the genuine claim is covered without the
+        # private src.data pipeline.
+        data = _data([1.0] * 4, [2.0] * 4, proxy_scale=False)  # synthetic=False
+        text = format_replay("<genuine-9b>", data, replay_samples(data))
+        assert "TARGET_SCALE" in text
+        assert "this verdict IS" in text  # the citable claim a real run earns
+        assert "PROXY_SCALE" not in text
+        assert "SYNTHETIC" not in text  # no synthetic warning on genuine floats
 
     def test_target_fixture_replays_to_recorded_surpasses(self):
         # A clear separation (candidate ~1.0 << surrogate ~2.0) -> CI entirely
-        # above 0 -> SURPASSES, non-thin. The TARGET_SCALE path is not a stub:
-        # it actually judges the stored floats.
+        # above 0 -> SURPASSES, non-thin. The TARGET path is not a stub:
+        # it actually judges the stored floats (synthetic provenance does not
+        # change the verdict — only whether it may be cited).
         data = load_samples(FIXTURE_TARGET)
         ci = replay_samples(data)
         assert ci.significance_verdict == SURPASSES == data["verdict"]
         assert not ci.is_thin_evidence
 
-    def test_replay_to_json_carries_proxy_scale_false(self):
+    def test_replay_to_json_carries_proxy_scale_false_and_synthetic_true(self):
         data = load_samples(FIXTURE_TARGET)
         out = replay_to_json(FIXTURE_TARGET, data, replay_samples(data))
         assert out["proxy_scale"] is False
+        assert out["synthetic"] is True  # machine-readable provenance
         assert out["recorded_verdict"] == SURPASSES
         assert out["replayed_verdict"] == SURPASSES
         assert out["faithful"] is True
 
     def test_expected_surpasses_on_target_fixture_exits_zero(self):
+        # Synthetic provenance does not block verdict assertion: the plumbing
+        # floats still faithfully replay to SURPASSES, which is the point.
         assert main([str(FIXTURE_TARGET), "--expected", SURPASSES]) == 0
 
-    def test_json_output_carries_proxy_scale_false(self, capsys):
+    def test_json_output_carries_proxy_scale_false_and_synthetic(self, capsys):
         rc = main([str(FIXTURE_TARGET), "--json"])
         captured = capsys.readouterr()
         assert rc == 0
         payload = json.loads(captured.out)
         assert payload["proxy_scale"] is False
+        assert payload["synthetic"] is True
         assert payload["replayed_verdict"] == SURPASSES
+
+    def test_real_proxy_fixture_replays_as_genuine(self):
+        # The committed real-GPU recording carries no synthetic field, so the
+        # replay treats it as genuine (synthetic defaults False) — the honest
+        # inverse of the plumbing fixture's synthetic=True.
+        data = load_samples(FIXTURE)
+        out = replay_to_json(FIXTURE, data, replay_samples(data))
+        assert out["synthetic"] is False
+        assert out["proxy_scale"] is True
+
+    def test_synthetic_defaults_false_when_absent(self, tmp_path):
+        # A recording with no synthetic field is genuine by default.
+        f = tmp_path / "genuine.json"
+        f.write_text(json.dumps(_data([1.0] * 4, [2.0] * 4)))  # no synthetic key
+        out = replay_to_json(f, load_samples(f), replay_samples(load_samples(f)))
+        assert out["synthetic"] is False
 
     def test_proxy_and_target_labels_are_distinguishable(self):
         # The core drop-in switch: the same judge, two recordings that differ
         # only in proxy_scale -> two different scale labels. The label upgrade
-        # is driven by the file's proxy_scale flag, not by code.
+        # is driven by the file's proxy_scale flag, not by code (the TARGET
+        # label shows in the scale line even though the plumbing fixture's note
+        # is the SYNTHETIC guard rather than the citable claim).
         proxy_text = format_replay(
             FIXTURE, load_samples(FIXTURE), replay_samples(load_samples(FIXTURE))
         )
