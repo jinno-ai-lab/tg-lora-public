@@ -218,6 +218,17 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
    （`proxy_scale=false, synthetic=false`）で cover 済み（private `src.data` 不要）。これは足場ヘルパー
    ではなく evidence-integrity 保護。**残る外部依存は private `src.data` pipeline 単体**（合成→本物 9B
    への置換のみで研究結果となる）。
+8. **引用ゲートを machine-readable JSON パスにも適用（本イテレーション）** — feedback #1 の引用制約
+   （proxy/synthetic verdict は §4 target-scale 結果として引用不可）は #7 で **human-readable**
+   （`format_replay` の prose note）でのみ強制されていた。**machine-readable**（`replay_to_json` /
+   `result_to_json`）には引用ゲートが無く、下流 consumer が `proxy_scale`/`synthetic` の2生フラグから引用
+   可否を推論しなければならなかった。これを単一 boolean `citable_as_target_scale` で閉じた:
+   consumer 側 `(not proxy_scale) and (not synthetic)`・generator 側 `not proxy_scale`（synthetic path 無し）。
+   3型（genuine→True / proxy→False / synthetic plumbing→False・target-scale label でも非引用可能）+
+   「machine boolean == human prose（"this verdict IS" の有無）」cross-check test で prose と機械ゲートの
+   不整合を自動検知。実 committed proxy fixture が `citable_as_target_scale=False` になることを CLI `--json`
+   で確認済み。前2イテレーションと同一 integrity 軸（prose→機械契約）の延長・足場ではなく evidence-integrity
+   保護。**残る外部依存は private `src.data` pipeline 単体**（不変）。
 
 ### 次候補（足場追加ではない）
 

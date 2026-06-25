@@ -747,6 +747,15 @@ def result_to_json(result: dict) -> dict:
         "ranks": result["ranks"],
         "task": result["task"],
         "proxy_scale": result["proxy_scale"],
+        # Machine-readable citation gate (GOAL §4): a recording this generator
+        # produces is citable as a §4 target-scale result iff it was produced at
+        # target scale. The generator has no ``synthetic`` path — every recording
+        # it writes is a real measurement — so the gate is ``not proxy_scale``
+        # here; the replay judge re-derives the stricter ``(not proxy_scale) and
+        # (not synthetic)`` for hand-authored fixtures. A genuine 9B run
+        # (``proxy_scale=False``) therefore carries
+        # ``citable_as_target_scale=True`` from inception.
+        "citable_as_target_scale": not result["proxy_scale"],
     }
 
 

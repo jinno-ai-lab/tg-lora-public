@@ -374,3 +374,69 @@ class TestTargetScaleDropIn:
         )
         assert "PROXY_SCALE" in proxy_text and "TARGET_SCALE" not in proxy_text
         assert "TARGET_SCALE" in target_text and "PROXY_SCALE" not in target_text
+
+
+# ---------------------------------------------------------------------------
+# Machine-readable citation gate (citable_as_target_scale)
+# ---------------------------------------------------------------------------
+
+
+class TestMachineCitationGate:
+    """The citability contract on the machine-readable (JSON) path.
+
+    The previous iteration gated the citable "this verdict IS the §4
+    target-scale result" claim on the *human-readable* output (withheld for any
+    proxy or synthetic recording). ``citable_as_target_scale`` mirrors that prose
+    rule into a single boolean on the JSON path, so a downstream consumer does
+    not have to infer citability from the raw ``proxy_scale`` / ``synthetic``
+    flags — the feedback's "must not be cited as a §4 target-scale result"
+    warning, enforced as a field rather than prose. These tests pin the gate for
+    every recording type and prove it can never drift from the human claim.
+    """
+
+    def test_genuine_target_scale_recording_is_citable(self):
+        # The one recording shape a real 9B run deposits: proxy_scale=False,
+        # genuine floats (no synthetic). It alone earns the citation gate.
+        data = _data([1.0] * 4, [2.0] * 4, proxy_scale=False)  # synthetic=False
+        out = replay_to_json("<genuine-9b>", data, replay_samples(data))
+        assert out["citable_as_target_scale"] is True
+
+    def test_committed_proxy_recording_is_not_citable(self):
+        # The real-GPU proxy recording (proxy_scale=True) must never be citable
+        # as a target-scale result — the core feedback constraint.
+        data = load_samples(FIXTURE)
+        out = replay_to_json(FIXTURE, data, replay_samples(data))
+        assert out["proxy_scale"] is True
+        assert out["citable_as_target_scale"] is False
+
+    def test_synthetic_plumbing_is_not_citable_even_at_target_scale(self):
+        # The drop-in plumbing fixture flips the scale label to TARGET
+        # (proxy_scale=False) but its floats are synthetic — so the scale IS
+        # target-scale yet the verdict is NOT citable. This is the exact shape
+        # that could fool a consumer reading proxy_scale alone; the gate refuses
+        # it via the synthetic flag.
+        data = load_samples(FIXTURE_TARGET)
+        out = replay_to_json(FIXTURE_TARGET, data, replay_samples(data))
+        assert out["proxy_scale"] is False       # scale label IS target...
+        assert out["synthetic"] is True
+        assert out["citable_as_target_scale"] is False  # ...but not citable
+
+    def test_machine_gate_matches_human_prose_across_all_recordings(self):
+        # The boolean is provably consistent with the prose claim: it is True
+        # exactly when the human-readable note grants the "this verdict IS the §4
+        # target-scale result" claim. Any future edit to one path without the
+        # other fails here.
+        cases = [
+            ("<genuine-9b>", _data([1.0] * 4, [2.0] * 4, proxy_scale=False)),
+            (str(FIXTURE), load_samples(FIXTURE)),
+            (str(FIXTURE_TARGET), load_samples(FIXTURE_TARGET)),
+        ]
+        for label, data in cases:
+            ci = replay_samples(data)
+            machine = replay_to_json(label, data, ci)["citable_as_target_scale"]
+            human_grants_claim = "this verdict IS" in format_replay(label, data, ci)
+            assert machine is human_grants_claim, (
+                f"{label}: machine citable_as_target_scale={machine} but "
+                f"human prose grants the citable claim={human_grants_claim}"
+            )
+

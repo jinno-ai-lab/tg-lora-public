@@ -35,6 +35,13 @@ CPU scaffolding. Two roles:
    ``proxy_scale: false`` plumbing fixture can never be mistaken for a real 9B
    run. A genuine recording omits ``synthetic`` (or sets it ``false``).
 
+   The same rule is also surfaced as a machine-readable
+   ``citable_as_target_scale`` boolean in :func:`replay_to_json` (``True`` only
+   for a genuine target-scale recording) so a downstream consumer does not have
+   to infer citability from the raw ``proxy_scale`` / ``synthetic`` flags — the
+   rendered claim and the machine gate enforce the same contract and cannot
+   drift apart.
+
 The replay re-runs *only* :func:`src.tg_lora.freeze_surrogate_ci.surrogate_valid_loss_ci`
 — pure numpy over the stored floats, so it is deterministic and device-free.
 It does not retrain, does not import torch, and does not assume a label: it
@@ -194,7 +201,15 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
 
 
 def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLossCI) -> dict[str, Any]:
-    """Machine-readable replay: the judge output plus the file's provenance."""
+    """Machine-readable replay: the judge output plus the file's provenance.
+
+    ``citable_as_target_scale`` is the single boolean a downstream consumer
+    checks before citing a recording's verdict as a §4 target-scale result —
+    ``True`` only for a genuine target-scale recording
+    (``proxy_scale=False`` and not ``synthetic``). It mirrors the prose rule
+    :func:`format_replay` renders, so the human-readable claim and the machine
+    gate can never drift apart.
+    """
     return {
         "replayed_verdict": ci.significance_verdict,
         "recorded_verdict": data.get("verdict"),
@@ -205,6 +220,18 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         "source": str(path),
         "proxy_scale": bool(data.get("proxy_scale", True)),
         "synthetic": bool(data.get("synthetic", False)),
+        # Machine-readable citation gate (GOAL §4): this recording's verdict MAY
+        # be cited as a §4 target-scale result only when it is BOTH target-scale
+        # AND genuine — the exact prose rule ``format_replay`` renders (a proxy or
+        # synthetic recording withholds the "this verdict IS the §4 target-scale
+        # result" claim). Surfacing it as one boolean closes the contract on the
+        # machine path too, so a consumer does not infer citability from two raw
+        # flags: this is the feedback's "must not be cited as a §4 target-scale
+        # result" warning enforced as a field, not prose.
+        "citable_as_target_scale": (
+            not bool(data.get("proxy_scale", True))
+            and not bool(data.get("synthetic", False))
+        ),
         "candidate_mean": ci.candidate_mean,
         "surrogate_mean": ci.surrogate_mean,
         "point_improvement": ci.point_improvement,

@@ -232,6 +232,24 @@ class TestTargetScaleParam:
         r = run_ci(device=_DEVICE, num_layers=6, **_TINY)
         assert r["proxy_scale"] is True
 
+    def test_citable_gate_false_on_proxy_true_on_target(self):
+        # The generator stamps the machine citation gate at inception: a proxy
+        # run (the default) is NOT citable as a §4 target-scale result; a
+        # proxy_scale=False run (the shape a 9B run deposits) IS. The generator
+        # has no synthetic path, so the gate is simply not proxy_scale here —
+        # the replay judge re-derives the stricter rule for synthetic fixtures.
+        from scripts.run_freeze_validloss_ci import run_ci, result_to_json
+
+        proxy = result_to_json(run_ci(device=_DEVICE, num_layers=6, **_TINY))
+        assert proxy["proxy_scale"] is True
+        assert proxy["citable_as_target_scale"] is False
+
+        target = result_to_json(
+            run_ci(device=_DEVICE, num_layers=6, proxy_scale=False, **_TINY)
+        )
+        assert target["proxy_scale"] is False
+        assert target["citable_as_target_scale"] is True
+
     def test_report_renders_target_scale_note_when_false(self):
         from scripts.run_freeze_validloss_ci import format_report, run_ci
 
