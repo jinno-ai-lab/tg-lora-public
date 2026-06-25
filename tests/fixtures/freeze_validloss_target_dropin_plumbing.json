@@ -1,0 +1,56 @@
+{
+  "verdict": "SURPASSES",
+  "passes": true,
+  "significant_surpasses": true,
+  "is_material": true,
+  "is_thin_evidence": false,
+  "candidate_mean": 1.0,
+  "surrogate_mean": 2.0,
+  "point_improvement": 1.0,
+  "lower": 0.9100000000000001,
+  "upper": 1.0899999999999999,
+  "confidence": 0.95,
+  "n_bootstrap": 10000,
+  "candidate_losses": [
+    1.0,
+    1.1,
+    0.9,
+    1.05,
+    0.95
+  ],
+  "surrogate_losses": [
+    2.0,
+    2.1,
+    1.9,
+    2.05,
+    1.95
+  ],
+  "candidate_order": [
+    5,
+    4,
+    3,
+    2,
+    1,
+    0
+  ],
+  "device": "cuda",
+  "total": 60,
+  "warmup": 45,
+  "depth": 3,
+  "n_candidate": 5,
+  "n_surrogate": 5,
+  "base_seed": 0,
+  "num_layers": 6,
+  "architecture": "heterogeneous",
+  "ranks": [
+    1,
+    2,
+    4,
+    7,
+    13,
+    24
+  ],
+  "task": "generalize",
+  "proxy_scale": false,
+  "source": "TARGET-SCALE DROP-IN PLUMBING VALIDATION — synthetic floats (NOT a real 9B measurement). The candidate/surrogate losses are chosen only for a clear separation that replays to SURPASSES, so the verdict and CI bounds above are recomputed faithfully from those losses. This file exists to prove scripts/replay_freeze_valid_loss_ci upgrades a proxy_scale=false recording to the TARGET_SCALE label with no code change (the MS-PF2 Cat-C contract) — the branch the real proxy fixture (proxy_scale=true) never exercises. Do NOT cite these numbers as a 9B result; the real target-scale run will overwrite this file with genuine 9B floats in the same schema."
+}

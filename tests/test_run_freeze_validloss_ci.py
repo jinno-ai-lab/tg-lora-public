@@ -203,6 +203,47 @@ class TestHonestProxyScaleLabeling:
         assert len(parsed["surrogate_losses"]) == _TINY["n_surrogate"]
 
 
+class TestTargetScaleParam:
+    """``run_ci`` carries a caller-supplied ``proxy_scale`` — not a hardcoded True.
+
+    The MS-PF2 Cat-C contract is that a target-scale source deposits samples in
+    the *same* schema and the scale label carries through with no code change, so
+    the scale must be a value the caller sets, not a magic ``True`` baked into the
+    result dict. The default stays proxy (byte-identical to the recorded
+    fixtures); ``proxy_scale=False`` threads through to the result, the JSON, and
+    the report's TARGET_SCALE note. This is the generator half of the drop-in
+    path the replay-side suite validates on a committed ``proxy_scale: false``
+    fixture.
+    """
+
+    def test_proxy_scale_false_threads_to_result_and_json(self):
+        from scripts.run_freeze_validloss_ci import run_ci, result_to_json
+
+        r = run_ci(device=_DEVICE, num_layers=6, proxy_scale=False, **_TINY)
+        assert r["proxy_scale"] is False
+        payload = result_to_json(r)
+        assert payload["proxy_scale"] is False
+
+    def test_proxy_scale_default_is_true_byte_identical(self):
+        from scripts.run_freeze_validloss_ci import run_ci
+
+        # Default stays proxy-scale — the recorded fixtures (proxy_scale=True)
+        # are unchanged, so nothing already committed regresses.
+        r = run_ci(device=_DEVICE, num_layers=6, **_TINY)
+        assert r["proxy_scale"] is True
+
+    def test_report_renders_target_scale_note_when_false(self):
+        from scripts.run_freeze_validloss_ci import format_report, run_ci
+
+        r = run_ci(device=_DEVICE, num_layers=6, proxy_scale=False, **_TINY)
+        text = format_report(r)
+        # The proxy caveat is replaced by the target-scale note; the header line
+        # reports proxy_scale=False.
+        assert "proxy_scale=False" in text
+        assert "TARGET_SCALE" in text
+        assert "PROXY_SCALE" not in text
+
+
 # ---------------------------------------------------------------------------
 # Heterogeneous positive control + generalize conclusive-TIES task
 # (the two apparatus-validation axes added to the Category-C attack)

@@ -513,6 +513,7 @@ def run_ci(
     num_layers: int = NUM_LAYERS,
     architecture: str = HOMOGENEOUS,
     task: str = TASK_MEMORIZE,
+    proxy_scale: bool = True,
 ) -> dict:
     """Run the candidate + surrogate arms and return the §4 significance verdict.
 
@@ -537,6 +538,16 @@ def run_ci(
     order CAN matter). The contrast between the two tasks is itself the
     apparatus diagnosis: a detectable verdict under ``generalize`` that is TIES
     under ``memorize`` is the positive-control signature.
+
+    ``proxy_scale`` is the GOAL §7 scale-honesty label carried on the result
+    (default ``True`` — this harness is the 24-hidden proxy, not the 9B target).
+    It is a caller-supplied value, not a hardcoded ``True``: a target-scale
+    source that deposits samples in this same schema passes
+    ``proxy_scale=False`` and the label carries through to the JSON and the
+    report with no code change — that is the "same function, no code change"
+    contract ``scripts/replay_freeze_validloss_ci`` relies on to upgrade a
+    recording to the target-scale §4 result. This harness keeps the default
+    (proxy) so the recorded fixtures stay byte-identical.
     """
     if architecture not in ARCHITECTURES:
         raise ValueError(
@@ -583,11 +594,13 @@ def run_ci(
         "architecture": architecture,
         "ranks": reported_ranks,
         "task": task,
-        # Proxy-scale honesty (GOAL §7): HIDDEN=24 / 6 layers is not the 9B
-        # target, so the verdict is proxy-scale. A target run deposits its own
-        # samples through the same function and the label upgrades with no code
-        # change — this flag is what a reader checks before citing the verdict.
-        "proxy_scale": True,
+        # Scale honesty (GOAL §7). The default asserts proxy-scale: HIDDEN=24 /
+        # 6 layers is not the 9B target. ``proxy_scale`` is the caller-supplied
+        # label (not a hardcoded True) so a target-scale source that deposits
+        # samples in this same schema can carry ``proxy_scale=False`` through to
+        # the JSON/report with no code change — the contract the replay judge
+        # upgrades on. This flag is what a reader checks before citing the verdict.
+        "proxy_scale": proxy_scale,
     }
 
 
@@ -693,6 +706,13 @@ def format_report(result: dict) -> str:
             "target-scale run deposits its own samples through the same "
             "surrogate_valid_loss_ci() and upgrades this label; do not cite "
             "this verdict as a target-scale §4 result."
+        )
+    else:
+        lines.append(
+            "  note: TARGET_SCALE — the recording is tagged target-scale "
+            "(proxy_scale=False); this verdict is recorded at target scale. "
+            "Dropping the sample file into replay_freeze_valid_loss_ci() "
+            "surfaces the target-scale §4 result with no code change."
         )
     return "\n".join(lines)
 
