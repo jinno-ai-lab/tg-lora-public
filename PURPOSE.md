@@ -152,6 +152,22 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-06-26 追記・LAWA best_lawa_loss headline の resume state-loss を修正】** resume-state-loss 軸の
+> **5 件目**（dynfreeze / best_full_eval / warmup / lawa-window に続く）。直前の `0eb6fdb`（LAWA
+> スナップショット窓 `lawa_state` の永続化）が**自身のバグ記述で `best_lawa_loss` も inf にリセットされると
+> 明記していたのに、窓だけを直して tracker は未修復のまま残していた文書化された半fix**を閉じた。
+> `best_lawa_loss` は GOAL §3.3 必須ベースライン LAWA 比較（`evaluate_with_lawa`）の run-wide 最小値で
+> run summary JSON の headline。`train_tg_lora` module-local で `inf` 初期化・resume で復元されず、fault/
+> periodic resume 後は inf 再始動して run-end headline が post-resume-only の最小値になっていた。
+> → `best_full_eval_loss`（`73201a4`）と**同一パターン**: `TrainingState.best_lawa_loss` field +
+> save/load（legacy 旧 checkpoint は inf 既定で clean load・headline は post-resume から再計算 = pre-fix 挙動・
+> 偽の低値ではない）+ fault-save param thread + periodic save + resume 復元（plain float なので averager 構築
+> 不要・`lawa_state` 窓の復元とは別 site）。**検証**: `tests/test_checkpoint.py` **17 passed**
+> （+best_lawa_loss 往復 / +legacy-load-clean）、`test_train_tg_lora_static_guards.py` green（F821=0）、
+> `test_weight_averaging.py` passed（LAWA 隣接・非接触）、`test_cli_help_smoke.py` 37 passed / 3 xfailed、
+> ruff 0 新規（既存 F841/E741 2 件は非回帰・不変）。これで resume-state-loss 軸は **5/5**（dynfreeze・
+> best_full_eval・warmup・lawa-window・best_lawa_loss）。9B 実 run は引き続き private `src.data` で block・不変。
+
 > **【2026-06-26 追記・LAWA weight-averaging window の resume state-loss を修正】** resume-state-loss 軸の
 > **4 件目**（`119e815` dynfreeze / `73201a4` best_full_eval / `02711e6` warmup と同軸）。LAWA は
 > **GOAL §3.3 の必須ベースライン**（P2 公平比較ゲート）かつ実 prod path（`configs/jsonex_lawa.yaml`
