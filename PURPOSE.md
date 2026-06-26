@@ -152,6 +152,22 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-06-27 追記・linearity-budget target-step set の resume state-loss を修正】** resume-state-loss 軸の
+> **6 件目**（dynfreeze / best_full_eval / warmup / lawa-window / best_lawa_loss / **triggered_target_steps**）。
+> `_check_and_save_linearity_budget_checkpoint` が各 target step（250/500/.../1500）を
+> `target not in triggered_target_steps` ガードで**1 回限り**発火させる（mandatory full eval +
+> `checkpoint-{target}` save + step-aligned `is_step_aligned_full_eval` record + vs-baseline 比較）が、
+> `triggered_target_steps` は `TrainingState` に無く resume で空 set に戻り、post-resume 初 cycle が
+> **既超過 target を全て再発火**していた（冗長 full eval + `checkpoint-{target}` 再 save + **重複
+> `aligned_target` record** で linearity-budget vs-baseline 比較 dataset を破壊＝downstream の step-keyed
+> reader が post-resume 値を二重計上 / pre-resume 値を上書き）。→ 既存パターンで
+> `TrainingState.triggered_target_steps`（`list[int] | None`・legacy-safe・`accepted_valid_history` と同型・
+> sorted 永続化）を追加し、`_save_fault_checkpoint`（param + docstring）・periodic save build・fault call site・
+> resume 復元（list→set）で対称化。**検証**: `test_checkpoint.py` **18 passed**（+round-trip +legacy-load）、
+> static-guards **F821=0**、`test_cli_help_smoke.py` **37p/3xf**、`test_weight_averaging.py` **28 passed**
+> （LAWA 隣接・TrainingState 構築）、`test_fault_recovery.py` **7f/15p == HEAD**（src.data block・stash 比較で
+> 非回帰）。これで resume-state-loss 軸は **6/6**。9B 実 run は引き続き private `src.data` で block・不変。
+
 > **【2026-06-26 追記・LAWA best_lawa_loss headline の resume state-loss を修正】** resume-state-loss 軸の
 > **5 件目**（dynfreeze / best_full_eval / warmup / lawa-window に続く）。直前の `0eb6fdb`（LAWA
 > スナップショット窓 `lawa_state` の永続化）が**自身のバグ記述で `best_lawa_loss` も inf にリセットされると
