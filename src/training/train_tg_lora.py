@@ -708,6 +708,8 @@ def _save_fault_checkpoint(
     dynfreeze: DynamicFreezeController | None,
     best_full_eval_loss: float,
     best_full_eval_perplexity: float | None,
+    warmup_released: bool,
+    warmup_cos_consecutive: int,
 ) -> None:
     """Save model + full training state on fault (OOM / CUDA error).
 
@@ -721,6 +723,12 @@ def _save_fault_checkpoint(
     ``best_model/`` save, so the fault checkpoint must record them or resume
     sees them as ``inf``/``None`` and clobbers the genuine best on the first
     post-fault full eval.
+
+    ``warmup_released`` / ``warmup_cos_consecutive`` likewise: they are the
+    caller-scoped two-phase gate state. A fault checkpoint taken mid-production
+    must record ``warmup_released=True`` or resume drops back into the pilot-only
+    warmup phase and re-disables convergence/acceleration adaptation and
+    extrapolation until the gate re-fires.
     """
     try:
         oom_dir = run_dir / "oom_checkpoint"
@@ -743,6 +751,8 @@ def _save_fault_checkpoint(
             dynfreeze_state=dynfreeze.state_dict() if dynfreeze is not None else None,
             best_full_eval_loss=best_full_eval_loss,
             best_full_eval_perplexity=best_full_eval_perplexity,
+            warmup_released=warmup_released,
+            warmup_cos_consecutive=warmup_cos_consecutive,
         )
         save_training_state(ts, run_dir / "training_state.pt")
     except Exception as exc:
@@ -1304,6 +1314,12 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
         # first full eval after resume unconditionally overwrites "best_model/".
         best_full_eval_loss = ts.best_full_eval_loss
         best_full_eval_perplexity = ts.best_full_eval_perplexity
+        # Restore the warmup phase so a checkpoint taken mid-production does not
+        # silently drop back into the pilot-only warmup phase on resume — which
+        # would re-disable convergence/acceleration adaptation and extrapolation
+        # until the gate re-fires. Mirrors the best_full_eval_* restore above.
+        warmup_released = ts.warmup_released
+        warmup_cos_consecutive = ts.warmup_cos_consecutive
 
     mlflow_cfg = cfg.logging.get("mlflow", {})
     batch_plan_manifest_path = run_dir / "batch_plan_manifest.json"
@@ -3962,6 +3978,8 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                     dynfreeze_state=dynfreeze.state_dict() if dynfreeze is not None else None,
                     best_full_eval_loss=best_full_eval_loss,
                     best_full_eval_perplexity=best_full_eval_perplexity,
+                    warmup_released=warmup_released,
+                    warmup_cos_consecutive=warmup_cos_consecutive,
                 )
                 # Bound on-disk checkpoint growth (M10.3 disk-death guard): the
                 # save -> training-state -> artifact -> prune sequence lives in
@@ -4034,6 +4052,8 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 dynfreeze,
                 best_full_eval_loss,
                 best_full_eval_perplexity,
+                warmup_released,
+                warmup_cos_consecutive,
             )
 
     pbar.close()

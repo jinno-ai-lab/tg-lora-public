@@ -147,6 +147,10 @@ class TestTrainingStateRoundtrip:
             accepted_valid_history=[2.9, 2.5, 2.1],
             best_full_eval_loss=1.83,
             best_full_eval_perplexity=6.23,
+            # Mid-production checkpoint: warmup already released, with a nonzero
+            # consecutive-cosine count carried over from the release moment.
+            warmup_released=True,
+            warmup_cos_consecutive=3,
         )
 
     def test_roundtrip_preserves_values(self, tmp_path):
@@ -164,6 +168,10 @@ class TestTrainingStateRoundtrip:
         # gate compares against the genuine pre-fault best, not inf.
         assert loaded.best_full_eval_loss == 1.83
         assert loaded.best_full_eval_perplexity == 6.23
+        # Warmup phase must survive resume so a mid-production checkpoint does
+        # not silently drop back into the pilot-only warmup phase.
+        assert loaded.warmup_released is True
+        assert loaded.warmup_cos_consecutive == 3
         assert loaded.controller_state.K == 3
         assert loaded.controller_state.alpha == 0.3
         assert loaded.velocity._state is not None
@@ -195,6 +203,26 @@ class TestTrainingStateRoundtrip:
         loaded = load_training_state(path)
         assert loaded.best_full_eval_loss == float("inf")
         assert loaded.best_full_eval_perplexity is None
+
+    def test_legacy_checkpoint_without_warmup_phase_loads_clean(self, tmp_path):
+        """A pre-fix checkpoint omits ``warmup_released``/``warmup_cos_consecutive``;
+        load must not break and must read as the safe 'not yet released' defaults
+        (False/0). False is the only sane legacy reading: a True default would
+        skip warmup on a checkpoint that was genuinely warming up, while False
+        merely re-runs a brief warmup on an old mid-production checkpoint —
+        backward-compatible with the pre-fix behavior."""
+        state = self._make_state()
+        path = tmp_path / "legacy.pt"
+        save_training_state(state, path)
+        # Strip both keys to simulate a pre-fix checkpoint blob.
+        blob = torch.load(path, weights_only=False)
+        blob.pop("warmup_released", None)
+        blob.pop("warmup_cos_consecutive", None)
+        torch.save(blob, path)
+
+        loaded = load_training_state(path)
+        assert loaded.warmup_released is False
+        assert loaded.warmup_cos_consecutive == 0
 
 
 class TestDynFreezeStateRoundtrip:

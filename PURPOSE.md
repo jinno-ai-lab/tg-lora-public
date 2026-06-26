@@ -152,6 +152,25 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-06-26 追記・warmup 2-phase gate の resume state-loss を修正】** resume-state-loss 軸の
+> **3 件目**（`119e815` dynfreeze / `73201a4` best_full_eval と同クラス・同ファイルの兄弟）。
+> `warmup_released`/`warmup_cos_consecutive` は `train_tg_lora` の module-local 2-phase gate 状態で、
+> False の間は pilot-only で `adapt_to_convergence`/`adapt_to_acceleration`/外挿を全バイパスする。
+> **mainline config**（`9b_tg_lora.yaml`・`9b_tg_lora_m9.yaml`・`jsonex_*`・`measure_accum*` 全て
+> `warmup_release_count: 1` / `warmup_release_cos: 0.1`）で実経路。かつ**単調でない**——M9 subspace-accept
+> path（L3517）が意図的に `warmup_released=False` に戻して再ウォームアップするため、checkpoint は
+> **どちらの相**を捕捉し得る。`TrainingState` に**永続化されず resume で False/0 に戻る**ため、
+> 本番期（mid-production）の checkpoint から resume すると**黙ってウォームアップ相へ逆戻り**し、
+> 収束/加速度適応と外挿を gate 再発火まで再無効化していた。→ 両 field を `TrainingState` に追加
+> （既定 False/0 で旧 checkpoint と後方互換）し、save/load 往復 + resume 復元 + fault-save
+> （`_save_fault_checkpoint` param thread = `dynfreeze`/`best_full_eval` と同一パターン・periodic save
+> site も含む）で対称化。**検証**: `tests/test_checkpoint.py` **15 passed**（mid-production checkpoint
+> の往復 assert + 旧 checkpoint が False/0 に落ちる legacy-load test 追加）。`ruff --select F821
+> src/training/train_tg_lora.py` = **0**（static-guards canary green）。`tests/test_fault_recovery.py`
+> の 7 fail は HEAD と**完全同一**（src.data block の pre-existing・`ModuleNotFoundError` で非回帰確認）。
+> これで resume-state-loss 軸は **3/3**（dynfreeze・best_full_eval・warmup）。本 axis は「実際の
+> training run への旋回」の実行可能形（9B は private `src.data` で block のまま・不変）。
+
 > **【2026-06-26 追記・fault-resume の best_model 無条件上書きバグを修正】** 直前の
 > `119e815`（訓練ループ潜伏 NameError 2 件）と**同クラス・同ファイルの兄弟バグ**を発見・修正
 > （足場ではなく製品挙動の正確性軸を継続）。`best_full_eval_loss`/`best_full_eval_perplexity`

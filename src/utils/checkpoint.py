@@ -433,6 +433,19 @@ class TrainingState:
     # state-loss on fault-resume, sibling to the fixed ``dynfreeze_state`` gap.
     best_full_eval_loss: float = float("inf")
     best_full_eval_perplexity: float | None = None
+    # Warmup phase (two-phase gate). ``warmup_released`` flips True once the
+    # cosine-predicted consistency holds for ``warmup_release_count`` consecutive
+    # cycles; while False the loop runs pilot-only and bypasses
+    # adapt_to_convergence / adapt_to_acceleration / extrapolation. It is NOT
+    # monotonic: the M9 subspace-accept path intentionally resets it to False
+    # mid-run to re-accumulate direction, so a checkpoint can legitimately catch
+    # it in *either* phase. Must survive resume: without it a checkpoint taken
+    # mid-production loads as warmup_released=False and the resumed run silently
+    # drops back into the warmup phase — re-disabling convergence/acceleration
+    # adaptation and extrapolation until the gate re-fires. Sibling resume
+    # state-loss to the fixed ``best_full_eval_*`` / ``dynfreeze_state`` gaps.
+    warmup_released: bool = False
+    warmup_cos_consecutive: int = 0
 
 
 @dataclass
@@ -536,6 +549,8 @@ def save_training_state(state: TrainingState, path: Path) -> None:
         "accepted_valid_history": state.accepted_valid_history,
         "best_full_eval_loss": state.best_full_eval_loss,
         "best_full_eval_perplexity": state.best_full_eval_perplexity,
+        "warmup_released": state.warmup_released,
+        "warmup_cos_consecutive": state.warmup_cos_consecutive,
         "dynfreeze_state": (
             {
                 "frozen_layer_indices": state.dynfreeze_state.frozen_layer_indices,
@@ -641,5 +656,13 @@ def load_training_state(path: Path) -> TrainingState:
         # checkpoint that predates the field (mirrors the dynfreeze legacy path).
         best_full_eval_loss=blob.get("best_full_eval_loss", float("inf")),
         best_full_eval_perplexity=blob.get("best_full_eval_perplexity"),
+        # Absent on pre-fix checkpoints → not-yet-released warmup (False/0), the
+        # only sane reading of a checkpoint that predates the fields: a True
+        # default would skip warmup on a checkpoint that was genuinely warming
+        # up, while False merely re-runs a brief warmup on an old mid-production
+        # checkpoint — backward-compatible with the pre-fix behavior. Mirrors the
+        # best_full_eval_* / dynfreeze legacy tolerance.
+        warmup_released=blob.get("warmup_released", False),
+        warmup_cos_consecutive=blob.get("warmup_cos_consecutive", 0),
         dynfreeze_state=dynfreeze_state,
     )
