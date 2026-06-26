@@ -152,6 +152,30 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-06-27 追記・PSA subspace-prior の resume state-loss を修正（resume-state-loss 軸を mainline 8 件から PSA route まで拡張）】**
+> resume-state-loss 軸の **9 件目**（mainline 8 件: dynfreeze / best_full_eval / warmup / lawa-window / best_lawa_loss /
+> triggered_target_steps / act_regime_state / efficiency_accounting に続き、**PSA route** の `psa_prior`）。
+> GOAL §1.5 / §3.3 PSA（Prior-based Subspace Amplification）の `PSAPrior` は run-wide 累積（per-step `_delta_history` ring buffer +
+> 抽出済み PC1 `priors`（= production `amplify_gradients` を駆動）+ L2-reg blend anchor `_prev_priors` + 非有界 `_prior_cosines` 安定度系列 +
+> `should_update` timing）を**全て `train_tg_lora` module scope に置き** fault/periodic resume のたびに**空再構築**していた → resume 後は
+> 2 delta 再蓄積 + 次 `extract_priors` 発火まで gradient amplification が**黙って off**になり、residual run が短いと run-end
+> `layer_delta_analysis`（GOAL §4 rank-1 dominance・`history_count >= 2` gate）が**丸ごと欠落**していた。
+> **重要な誠実性注記**: `enable_psa` は本 mirror の**全 config で `false`**（PSA は Phase 1-5 の移行済み route・現行は Phase 6 Progressive Freezing）。
+> ゆえにこれは **dormant route の硬化**であり mainline 挙動は不変（非破壊）——が、PSA は「baseline と比較済み」（GOAL §1.5）の実科学出力経路なので、
+> その run-end summary が resume で黙って腐るのは GOAL §7「測定せず結論しない」違反として本 axis の対象。
+> → LAWA（`0eb6fdb`）/ act_regime（`2994fcd`）と**同一パターン**: (a) `PSAPrior.state_dict()`/`load_state_dict()` 追加（tensor は save 時 CPU 化・
+> `None`/partial-dict 許容 load・`_delta_history` deque maxlen 再構築・`gain_map` は derived なので**非永続化**＝`compute_gain_map` で再計算）、
+> (b) `TrainingState.psa_state: dict | None`（legacy-safe 既定 None）+ `save_training_state` 記述 + `load_training_state` 復元（`blob.get` 既定 None）、
+> (c) `from src.tg_lora.psa import PSAPrior` を module top へ巻き上げ（`ActivationFingerprintTracker` hoist と同根拠・`_save_fault_checkpoint` 型注釈の
+> `UnboundLocalError`/ruff F821 回避）+ 遅延 import を縮約、(d) `_save_fault_checkpoint`（param + docstring + fault-save 構築 site）・periodic save 構築 site・
+> call site（`psa_prior=psa_prior` keyword・位置引数後キーワードの SyntaxError 回避）・resume 復元 block（`psa_prior` 構築直後・act_regime 復元と同 guard）で対称化。
+> **検証**: `ruff --select F821` = **0**（train_tg_lora.py / psa.py / checkpoint.py）、`tests/test_psa.py` **52 passed**
+> （+7 `TestPSAPriorStateRoundtrip`: 往復 / amplification-direction 不変 / `None` no-op / partial-dict 許容 / `gain_map` 非永続・再計算 /
+> window maxlen 再構築 / CPU tensor 復元）、`tests/test_checkpoint.py` **21 passed**（+`psa_state` 往復 + legacy-load-clean）、
+> `tests/test_train_tg_lora_static_guards.py` green、`tests/test_cli_help_smoke.py` **37p/3xf**、
+> `tests/test_fault_recovery.py` **7f/15p == HEAD**（src.data import-block・stash 比較で非回帰）。
+> これで resume-state-loss 軸は **mainline 8/8 + PSA-route 1 = 9/9**。9B 実 run は引き続き private `src.data` で block・不変。
+
 > **【2026-06-27 追記・GOAL §5/P3 efficiency-accounting counter block の resume state-loss を修正】** resume-state-loss 軸の
 > **8 件目**（dynfreeze / best_full_eval / warmup / lawa-window / best_lawa_loss / triggered_target_steps / act_regime_state / **efficiency_accounting**）。
 > `train_tg_lora` の **21 個**の run-wide 効率会計カウンタ（`activation_cache_*_count` / `pilot|post_validation_forward_count`
