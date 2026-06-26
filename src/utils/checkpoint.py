@@ -504,6 +504,22 @@ class TrainingState:
     # a pre-fix checkpoint (every counter resumes at its zero/empty init, the
     # pre-fix behavior — no fabricated data).
     efficiency_accounting: dict | None = None
+    # PSA (Prior-based Subspace Amplification, GOAL §1.5 / §3.3 baseline route)
+    # subspace-prior run-wide state — the serialized ``PSAPrior.state_dict()``
+    # (per-step incremental ``_delta_history`` ring buffer + extracted PC1
+    # ``priors`` that drive production gradient amplification + the L2-reg
+    # ``_prev_priors`` anchor + the unbounded ``_prior_cosines`` stability series
+    # + the ``should_update`` timing). Must survive resume: without it a
+    # fault/periodic resume rebuilds ``psa_prior`` empty, amplification is
+    # silently off until 2 deltas re-accumulate and the next extract fires, and
+    # the run-end ``layer_delta_analysis`` (gated on ``history_count >= 2``) is
+    # omitted entirely if the residual run is short — a silent resume-state-loss
+    # sibling to the fixed LAWA (``lawa_state``) / act-regime
+    # (``act_regime_state``) / efficiency-accounting gaps. ``None`` = PSA
+    # disabled (``enable_psa: false`` — currently every config in this mirror)
+    # or a pre-fix checkpoint (the prior rebuilds empty, the pre-fix behavior —
+    # no fabricated priors).
+    psa_state: dict | None = None
 
 
 @dataclass
@@ -631,6 +647,7 @@ def save_training_state(state: TrainingState, path: Path) -> None:
         "triggered_target_steps": state.triggered_target_steps,
         "act_regime_state": state.act_regime_state,
         "efficiency_accounting": state.efficiency_accounting,
+        "psa_state": state.psa_state,
         "dynfreeze_state": (
             {
                 "frozen_layer_indices": state.dynfreeze_state.frozen_layer_indices,
@@ -772,5 +789,11 @@ def load_training_state(path: Path) -> TrainingState:
         # behavior — no fabricated tallies). Mirrors the lawa_state /
         # act_regime_state / triggered_target_steps legacy paths.
         efficiency_accounting=blob.get("efficiency_accounting"),
+        # Absent on pre-fix checkpoints / ``enable_psa: false`` runs → None, the
+        # only sane reading of a checkpoint that predates the field or predates
+        # PSA: the resume path treats a missing prior as 'start fresh' (the
+        # pre-fix behavior, no fabricated priors). Mirrors the act_regime_state /
+        # efficiency_accounting / lawa_state legacy paths.
+        psa_state=blob.get("psa_state"),
         dynfreeze_state=dynfreeze_state,
     )

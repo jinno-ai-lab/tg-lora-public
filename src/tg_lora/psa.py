@@ -150,6 +150,72 @@ class PSAPrior:
         self._prev_priors.clear()
         self._prior_cosines.clear()
 
+    def state_dict(self) -> dict:
+        """Serialize the run-wide PSA accumulation for checkpoint resume.
+
+        Mirrors ``LAWAAverager.state_dict()`` /
+        ``ActivationFingerprintTracker.state_dict()``. The resume-persistent
+        surface is the accumulated subspace-prior state — the per-step
+        incremental ``_delta_history`` ring buffer (which feeds
+        :meth:`extract_priors` AND the run-end ``layer_delta_analysis`` /
+        GOAL §4 rank-1-dominance summary), the extracted PC1 ``priors`` (which
+        drive :meth:`amplify_gradients` in the production path), ``_prev_priors``
+        (the L2-reg blend anchor for the next extract), the unbounded
+        ``_prior_cosines`` stability series, and ``_last_update_step`` (the
+        :meth:`should_update` timing) — NOT the config (re-supplied in
+        ``__init__``) or ``gain_map`` (recomputed every ``update_interval``
+        cycles by :meth:`compute_gain_map`). Without persisting this a
+        fault/periodic resume rebuilds ``psa_prior`` empty: amplification is
+        silently off until 2 deltas re-accumulate and the next extract fires,
+        and the run-end ``layer_delta_analysis`` (gated on ``history_count >=
+        2``) is omitted entirely if the residual run is short — a silent
+        resume-state-loss sibling to the fixed LAWA / act-regime / dynfreeze /
+        efficiency-accounting gaps. Tensors move to CPU at snapshot time for
+        checkpoint portability and move back to device at use-site
+        (``extract_priors`` runs on CPU; ``amplify_gradients`` does
+        ``v.to(g.device)``), so the unit-normalized PC1 directions round-trip
+        unchanged.
+        """
+        return {
+            "delta_history": [
+                {k: v.cpu() for k, v in d.items()} for d in self._delta_history
+            ],
+            "priors": {k: v.cpu() for k, v in self.priors.items()},
+            "prev_priors": {k: v.cpu() for k, v in self._prev_priors.items()},
+            "prior_cosines": {k: list(v) for k, v in self._prior_cosines.items()},
+            "last_update_step": self._last_update_step,
+        }
+
+    def load_state_dict(self, state: dict | None) -> None:
+        """Restore run-wide PSA accumulation from a checkpoint.
+
+        Inverse of :meth:`state_dict`. Tolerant of a partial / legacy dict and
+        of ``None``: a missing key leaves the constructed default, so a pre-fix
+        checkpoint (or a checkpoint from an ``enable_psa: false`` run) loads
+        cleanly as a fresh prior. The ``_delta_history`` ring buffer is rebuilt
+        with the constructed ``maxlen`` so a history larger than the checkpoint's
+        ``history_length`` is trimmed the same way a live run would have trimmed
+        it, and a smaller checkpoint history fills a larger window without
+        padding.
+        """
+        if not state:
+            return
+        if "delta_history" in state:
+            self._delta_history = deque(
+                [{k: v for k, v in d.items()} for d in state["delta_history"]],
+                maxlen=self.history_length,
+            )
+        if "priors" in state:
+            self.priors = dict(state["priors"])
+        if "prev_priors" in state:
+            self._prev_priors = dict(state["prev_priors"])
+        if "prior_cosines" in state:
+            self._prior_cosines = {
+                k: list(v) for k, v in state["prior_cosines"].items()
+            }
+        if "last_update_step" in state:
+            self._last_update_step = int(state["last_update_step"])
+
     def amplify_gradients(
         self,
         model: torch.nn.Module,

@@ -107,6 +107,31 @@ def _efficiency_accounting_sample() -> dict:
     }
 
 
+def _psa_state_sample() -> dict:
+    """A representative ``PSAPrior.state_dict()`` with a populated subspace-prior
+    surface, so the checkpoint round-trip exercises the resume-persistent PSA
+    state (per-step ``_delta_history`` ring buffer + extracted PC1 ``priors`` that
+    drive amplification + ``_prev_priors`` blend anchor + ``_prior_cosines``
+    stability series + ``_last_update_step``). These must survive resume or the
+    run-end ``layer_delta_analysis`` (GOAL §4) is omitted on a short residual run
+    and amplification is silently off until priors re-accumulate (sibling
+    resume-state-loss axis to ``act_regime_state`` / ``efficiency_accounting``)."""
+    return {
+        "delta_history": [
+            {"layers.0.lora_A.default.weight": torch.randn(2, 16)},
+            {"layers.0.lora_A.default.weight": torch.randn(2, 16)},
+        ],
+        "priors": {"layers.0.lora_A.default.weight": _unit(torch.randn(32))},
+        "prev_priors": {"layers.0.lora_A.default.weight": _unit(torch.randn(32))},
+        "prior_cosines": {"layers.0.lora_A.default.weight": [0.91, 0.88]},
+        "last_update_step": 10,
+    }
+
+
+def _unit(v: torch.Tensor) -> torch.Tensor:
+    return v / (v.norm() + 1e-12)
+
+
 class TestSaveCheckpointNormal:
     def test_creates_directory(self, tmp_path):
         model, tokenizer = _mock_model_and_tokenizer(tmp_path, file_count=2)
@@ -237,6 +262,12 @@ class TestTrainingStateRoundtrip:
             # so resume does not rebuild them at zero and the run-end cost report
             # reflects the full run, not post-resume only (sibling resume-state-loss).
             efficiency_accounting=_efficiency_accounting_sample(),
+            # Mid-production PSA subspace-prior accumulation (GOAL §1.5 / §3.3):
+            # the prior has recorded 2 deltas and extracted priors once so resume
+            # does not rebuild it empty (amplification silently off + the run-end
+            # layer_delta_analysis omitted on a short residual run). Sibling
+            # resume-state-loss axis.
+            psa_state=_psa_state_sample(),
         )
 
     def test_roundtrip_preserves_values(self, tmp_path):
@@ -291,6 +322,22 @@ class TestTrainingStateRoundtrip:
         # the full run, not post-resume only. Round-trips as a plain dict.
         assert loaded.efficiency_accounting is not None
         assert loaded.efficiency_accounting == _efficiency_accounting_sample()
+        # PSA subspace-prior accumulation (GOAL §1.5 / §3.3) must survive resume
+        # so the run-end layer_delta_analysis (GOAL §4) is not omitted on a short
+        # residual run and amplification is not silently off. Tensors round-trip
+        # exactly; compare against the saved state (the sample is random).
+        assert loaded.psa_state is not None
+        assert loaded.psa_state["last_update_step"] == 10
+        assert loaded.psa_state["prior_cosines"] == state.psa_state["prior_cosines"]
+        _lora_name = "layers.0.lora_A.default.weight"
+        assert torch.equal(
+            loaded.psa_state["priors"][_lora_name],
+            state.psa_state["priors"][_lora_name],
+        )
+        assert torch.equal(
+            loaded.psa_state["delta_history"][1][_lora_name],
+            state.psa_state["delta_history"][1][_lora_name],
+        )
         assert loaded.controller_state.K == 3
         assert loaded.controller_state.alpha == 0.3
         assert loaded.velocity._state is not None
@@ -434,6 +481,25 @@ class TestTrainingStateRoundtrip:
 
         loaded = load_training_state(path)
         assert loaded.efficiency_accounting is None
+
+    def test_legacy_checkpoint_without_psa_state_loads_clean(self, tmp_path):
+        """A pre-fix checkpoint omits ``psa_state``; load must not break and must
+        read as the safe 'no prior' default (None). None is the only sane legacy
+        reading: the resume path treats a missing prior as 'start fresh' (the
+        pre-fix behavior, no fabricated priors), not a fabricated non-empty one.
+        Also covers an ``enable_psa: false`` run, which never serialized the
+        prior. Mirrors the ``act_regime_state`` / ``efficiency_accounting`` /
+        ``lawa_state`` legacy tolerance."""
+        state = self._make_state()
+        path = tmp_path / "legacy.pt"
+        save_training_state(state, path)
+        # Strip the key to simulate a pre-fix checkpoint blob.
+        blob = torch.load(path, weights_only=False)
+        blob.pop("psa_state", None)
+        torch.save(blob, path)
+
+        loaded = load_training_state(path)
+        assert loaded.psa_state is None
     """The §4 release-cooldown map (``released_at``) must survive a real
     ``save_training_state``→``load_training_state`` round-trip.
 

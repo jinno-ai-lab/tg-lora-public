@@ -32,6 +32,7 @@ from src.tg_lora.delta_tracker import DeltaTracker
 from src.tg_lora.activation_regime import ActivationFingerprintTracker
 from src.tg_lora.dynamic_freeze import DynamicFreezeController
 from src.tg_lora.weight_averaging import LAWAAverager
+from src.tg_lora.psa import PSAPrior
 from src.tg_lora.extrapolator import (
     ExtrapolationStats,
     ZerothOrderStepStats,
@@ -767,6 +768,7 @@ def _save_fault_checkpoint(
     triggered_target_steps: set[int] | list[int] | None,
     act_regime_tracker: ActivationFingerprintTracker | None,
     efficiency_accounting: dict | None,
+    psa_prior: PSAPrior | None,
 ) -> None:
     """Save model + full training state on fault (OOM / CUDA error).
 
@@ -828,6 +830,16 @@ def _save_fault_checkpoint(
     cycles — a silent resume-state-loss sibling to the fixed LAWA / act-regime
     gaps. Mirrors the accepted_valid_history threading (a caller-scoped mutable
     collection). ``None`` when no counters accumulated.
+
+    ``psa_prior`` likewise: it is the GOAL §1.5 / §3.3 PSA subspace-prior object
+    (``None`` when ``enable_psa: false``). A fault checkpoint must record its
+    run-wide accumulation (per-step ``_delta_history`` + extracted PC1
+    ``priors`` that drive amplification + ``_prev_priors`` + the
+    ``_prior_cosines`` series + the ``should_update`` timing) or resume rebuilds
+    it empty, amplification is silently off until the next extract, and the
+    run-end ``layer_delta_analysis`` (GOAL §4) is omitted on a short residual
+    run — a silent resume-state-loss sibling to the fixed act-regime / LAWA /
+    efficiency-accounting gaps. Mirrors the act_regime_tracker threading.
     """
     try:
         oom_dir = run_dir / "oom_checkpoint"
@@ -863,6 +875,7 @@ def _save_fault_checkpoint(
                 else None
             ),
             efficiency_accounting=efficiency_accounting,
+            psa_state=psa_prior.state_dict() if psa_prior is not None else None,
         )
         save_training_state(ts, run_dir / "training_state.pt")
     except Exception as exc:
@@ -1592,7 +1605,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     regime_detector = None
     psa_regime_reset_enabled = True
     if bool(tg_cfg.get("enable_psa", False)):
-        from src.tg_lora.psa import PSAPrior, amplify_gradients_psa, summarize_by_layer_type
+        from src.tg_lora.psa import amplify_gradients_psa, summarize_by_layer_type
         from src.tg_lora.regime import RegimeDetector
         psa_regime_reset_enabled = bool(tg_cfg.get("psa_regime_reset_enabled", True))
         psa_prior = PSAPrior(
@@ -1613,6 +1626,30 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
             psa_prior.gain, psa_prior.history_length,
             psa_prior.update_interval, psa_prior.warmup_steps, psa_prior.l2_reg,
             psa_regime_reset_enabled,
+        )
+
+    # Restore the PSA subspace-prior accumulation on resume. Placed here (after
+    # the prior is constructed) rather than in the resume block above because
+    # ``psa_prior`` is built just above — restoring there would hit
+    # UnboundLocalError. ``restored_training_state`` is the None-when-not-
+    # resuming handle. Without this restore a checkpoint taken after the prior
+    # accumulated deltas / extracted priors loads an empty prior: amplification
+    # is silently off until 2 deltas re-accumulate and the next extract fires,
+    # and the run-end ``layer_delta_analysis`` (gated on ``history_count >= 2``)
+    # is omitted if the residual run is short. Mirrors the LAWA / act-regime /
+    # dynfreeze restores; guarded so PSA-disabled runs and pre-fix checkpoints
+    # (None) are untouched.
+    if (
+        psa_prior is not None
+        and restored_training_state is not None
+        and restored_training_state.psa_state is not None
+    ):
+        psa_prior.load_state_dict(restored_training_state.psa_state)
+        logger.info(
+            "PSA prior restored: deltas=%d priors=%d last_update_step=%d",
+            psa_prior.history_count,
+            len(psa_prior.priors),
+            psa_prior._last_update_step,
         )
 
     # Activation-fingerprint regime inventory (GOAL §4 step 1)
@@ -4245,6 +4282,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                         else None
                     ),
                     efficiency_accounting=_snapshot_efficiency_accounting(locals()),
+                    psa_state=psa_prior.state_dict() if psa_prior is not None else None,
                 )
                 # Bound on-disk checkpoint growth (M10.3 disk-death guard): the
                 # save -> training-state -> artifact -> prune sequence lives in
@@ -4324,6 +4362,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 triggered_target_steps,
                 act_regime_tracker,
                 efficiency_accounting=_snapshot_efficiency_accounting(locals()),
+                psa_prior=psa_prior,
             )
 
     pbar.close()

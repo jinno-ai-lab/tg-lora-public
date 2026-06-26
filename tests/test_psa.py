@@ -741,3 +741,169 @@ class TestLayerTypeGain:
         }
         name = next(n for n in self.names if n not in typed)
         assert self.gm[name] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint resume (state_dict / load_state_dict) — GOAL §1.5/§3.3 resume-state-loss axis
+# ---------------------------------------------------------------------------
+
+class TestPSAPriorStateRoundtrip:
+    """The prior's run-wide accumulation must survive checkpoint resume or the
+    run-end ``layer_delta_analysis`` (GOAL §4) is omitted on a short residual run
+    and production amplification is silently off until priors re-accumulate — a
+    resume-state-loss sibling to the fixed LAWA / act-regime / dynfreeze surfaces.
+    These tests pin ``state_dict()`` / ``load_state_dict()`` directly, independent
+    of the TrainingState layer."""
+
+    def _populate_via_real_path(self, prior, model, n_steps=5):
+        """Drive the real record_delta → extract_priors → mark_updated path so the
+        resume-persistent surface (history + priors + _prev_priors + _prior_cosines
+        + _last_update_step) accumulates exactly as in a live run."""
+        dominant = {}
+        for name, p in model.named_parameters():
+            if "lora_A" in name or "lora_B" in name:
+                d = torch.randn_like(p)
+                dominant[name] = d / d.norm()
+        history = _make_delta_history(model, n_steps=n_steps, dominant_dir=dominant)
+        for delta in history:
+            prior.record_delta(delta)
+        prior.extract_priors()
+        prior.mark_updated(7)  # first extract: no _prev_priors yet → no cosines
+        # Second batch so _prior_cosines (cos between consecutive priors) populates.
+        for delta in _make_delta_history(model, n_steps=n_steps, dominant_dir=dominant):
+            prior.record_delta(delta)
+        prior.extract_priors()
+        prior.mark_updated(10)
+        return prior
+
+    def test_roundtrip_preserves_all_run_wide_state(self):
+        """Serialize a populated prior, load into a fresh one, and verify every
+        resume-persistent field is identical."""
+        model = _make_simple_model(n_layers=2, hidden=16, rank=2)
+        src = PSAPrior(history_length=8, gain=0.5, l2_reg=0.01)
+        self._populate_via_real_path(src, model)
+
+        dst = PSAPrior(history_length=8, gain=0.5, l2_reg=0.01)
+        dst.load_state_dict(src.state_dict())
+
+        # History feeds extract_priors + the run-end layer_delta_analysis.
+        assert dst.history_count == src.history_count
+        for ds, ss in zip(dst._delta_history, src._delta_history):
+            assert set(ds.keys()) == set(ss.keys())
+            for k in ss:
+                assert torch.allclose(ds[k], ss[k])
+        # Priors drive production amplification; must round-trip bit-for-bit on CPU.
+        assert set(dst.priors.keys()) == set(src.priors.keys())
+        for k in src.priors:
+            assert torch.allclose(dst.priors[k], src.priors[k])
+            assert abs(dst.priors[k].norm().item() - 1.0) < 1e-6
+        # L2-reg blend anchor + stability series + update timing.
+        assert set(dst._prev_priors.keys()) == set(src._prev_priors.keys())
+        for k in src._prev_priors:
+            assert torch.allclose(dst._prev_priors[k], src._prev_priors[k])
+        assert dst._prior_cosines == src._prior_cosines
+        assert dst._last_update_step == src._last_update_step == 10
+
+    def test_roundtrip_preserves_amplification_direction(self):
+        """Loaded priors must produce the SAME per-tensor amplification direction
+        as the live prior (proves state_dict captures real usable priors, not
+        zeros) — the production-path invariant."""
+        model = _make_simple_model(n_layers=2, hidden=16, rank=2)
+        src = PSAPrior(history_length=6, gain=0.5)
+        self._populate_via_real_path(src, model)
+
+        dst = PSAPrior(history_length=6, gain=0.5)
+        dst.load_state_dict(src.state_dict())
+
+        # Set identical grads on two fresh models; amplification must project onto
+        # the same prior direction, so the amplified grads agree.
+        m1 = _make_simple_model(n_layers=2, hidden=16, rank=2)
+        m2 = _make_simple_model(n_layers=2, hidden=16, rank=2)
+        torch.manual_seed(0)
+        for p in m1.parameters():
+            p.grad = torch.randn_like(p)
+        for (n2, p2), (n1, p1) in zip(m2.named_parameters(), m1.named_parameters()):
+            assert n2 == n1
+            p2.grad = p1.grad.clone()
+
+        src.amplify_gradients(m1)
+        dst.amplify_gradients(m2)
+        for (n2, p2), (n1, p1) in zip(m2.named_parameters(), m1.named_parameters()):
+            assert n2 == n1
+            assert torch.allclose(p1.grad, p2.grad), f"amplified grad mismatch for {n1}"
+
+    def test_load_none_is_noop(self):
+        """``load_state_dict(None)`` must leave a fresh prior empty — covers a
+        legacy blob and an ``enable_psa: false`` resume."""
+        prior = PSAPrior(history_length=5)
+        prior.load_state_dict(None)
+        assert prior.history_count == 0
+        assert prior.priors == {}
+        assert prior._prev_priors == {}
+        assert prior._prior_cosines == {}
+        assert prior._last_update_step == -1
+
+    def test_load_partial_dict_tolerates_missing_keys(self):
+        """A legacy/partial blob with only some keys must load the present keys
+        and leave the rest at their constructed defaults."""
+        prior = PSAPrior(history_length=5)
+        prior.load_state_dict({"last_update_step": 42})
+        assert prior._last_update_step == 42
+        # Unset keys keep defaults.
+        assert prior.history_count == 0
+        assert prior.priors == {}
+
+    def test_gain_map_is_not_persisted_but_recomputed(self):
+        """``gain_map`` is derived (recomputed every update_interval cycles by
+        compute_gain_map), so it must NOT appear in state_dict and a loaded prior
+        recomputes it from its restored priors — not from a stale persisted copy."""
+        model = _make_simple_model(n_layers=1, hidden=8, rank=2)
+        src = PSAPrior(history_length=4, gain=0.5)
+        self._populate_via_real_path(src, model)
+        # compute_gain_map fills src.gain_map, but state_dict must omit it.
+        src_gm = src.compute_gain_map(model)
+        blob = src.state_dict()
+        assert "gain_map" not in blob
+
+        dst = PSAPrior(history_length=4, gain=0.5)
+        dst.load_state_dict(blob)
+        # Loaded prior has priors but an empty gain_map until recomputed.
+        assert dst.gain_map == {}
+        assert dst.compute_gain_map(model) == src_gm
+
+    def test_history_window_rebuilt_with_constructed_maxlen(self):
+        """The _delta_history ring buffer is rebuilt with the destination's
+        ``history_length`` so a history larger than the checkpoint's is trimmed the
+        same way a live run would have trimmed it (mirrors the act-regime window
+        rebuild)."""
+        src = PSAPrior(history_length=8)
+        for _ in range(6):
+            src.record_delta({"a": torch.randn(4)})
+        blob = src.state_dict()
+
+        dst_small = PSAPrior(history_length=3)
+        dst_small.load_state_dict(blob)
+        assert dst_small.history_count == 3  # trimmed to the smaller window
+
+        dst_large = PSAPrior(history_length=12)
+        dst_large.load_state_dict(blob)
+        assert dst_large.history_count == 6  # not padded
+
+    def test_restored_tensors_are_on_cpu(self):
+        """Tensors are snapshotted to CPU for checkpoint portability; after load
+        they sit on CPU and amplify_gradients (which does ``v.to(g.device)``)
+        still operates correctly — the unit-normalized directions are device-
+        independent."""
+        model = _make_simple_model(n_layers=1, hidden=8, rank=2)
+        src = PSAPrior(history_length=4, gain=0.5)
+        self._populate_via_real_path(src, model)
+        blob = src.state_dict()
+        # Snapshot moved everything to CPU.
+        for d in blob["delta_history"]:
+            assert all(torch.is_tensor(v) and v.device.type == "cpu" for v in d.values())
+        assert all(v.device.type == "cpu" for v in blob["priors"].values())
+
+        dst = PSAPrior(history_length=4, gain=0.5)
+        dst.load_state_dict(blob)
+        for v in dst.priors.values():
+            assert v.device.type == "cpu"
