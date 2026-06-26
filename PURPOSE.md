@@ -193,6 +193,24 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 > 全件 revert → tree clean → `test_resume_state_integration` + `test_fault_recovery` + `test_checkpoint` + `test_psa` + `test_activation_regime` = **126 passed**。
 > これで resume-state-loss 軸は**孤立 round-trip に加え実 loop 一括復元も証明**（9/9 不変・強化）。9B 実 run は引き続き private `src.data` で block・不変。
 
+> **【2026-06-27 追記・integration fault-resume test を全 9 site に拡張 + fault seam を `run_cycle` へ移行（dynfreeze site の mutation 証明を閉鎖）】**
+> 上記（`c3d7f8f`）の integration test は run-feedback が例示した **5 site**（best_lawa_loss / triggered_target_steps / act_regime_state /
+> efficiency_accounting / psa_state）のみを end-to-end で証明し、残り **4 site**（dynfreeze_state / best_full_eval_loss+perplexity /
+> warmup_released+cos_consecutive / lawa_state window）は孤立 round-trip のみだった。→ 同 test を**全 9 site** に拡張:
+> `_populate_dynfreeze_state` / `_populate_lawa_state` fixture 追加・`_build_saved_state`（9 site populated）と `_make_resume_state_config`（dynfreeze+LAWA ON）へ組込み・
+> `DynamicFreezeController` / `LAWAAverager` の capturing factory 追加・sanity block と 4 site 分 assertion 追加。
+> **fault seam の移行（本改訂の要）**: 元 seam は pilot の `forward_backward`（`train_tg_lora.py:2112`）だが、これは `dynfreeze_all_frozen` の pilot-skip gate（L2075）**下流**にある。
+> dynfreeze 復元 line を破壊すると**新鮮な controller が初 cycle で全層凍結**（`run_cycle` が `block_size == len(_all_layers)` で True を返す・`dynamic_freeze.py:376`）→
+> pilot skip → fault **不発火** → loop が full-eval path（L3957 `tg_lora_cache_built=use_cache`）へ落ち、**該当 assertion に届く前に** `use_cache` 未代入の `UnboundLocalError` で異常終了していた
+> （= dynfreeze の mutation 証明が不正）。→ seam を**最初の再開 cycle action** である `dynfreeze.run_cycle`（L1999・復元 block 直後・cycle body が何も mutate する前）に移行し、
+> `patch.object(DynamicFreezeController, "run_cycle", side_effect=NumericalInstabilityError)` で注入。dynfreeze state に依存せず fault が確定発火 → 全 9 site の assertion が mutation 時にも到達可能。
+> **mutation 証明（全 9 site・各復元 line を個別破壊 → 該当 assertion で正確 fail）**: dynfreeze→`:592` / best_full_eval→`:611` / warmup→`:621` / lawa→`:632`（新 4 site）+
+> best_lawa_loss→`:562` / triggered_target_steps→`:568` / psa→`:533` / act_regime→`:548` / efficiency→`:585`（既 5 site・seam 移行後も再証明・green）。全件 revert → tree clean。
+> **発見した latent bug（非破壊・別件・未 fix）**: `use_cache` は `if not dynfreeze_all_frozen:`（L2292）内でのみ代入され、all-frozen 時の full-eval path（L2497/2967/3957）で**未代入参照**となる
+> `UnboundLocalError` が潜在。dynfreeze は dormant Guard 実験（本 mirror 全 config で無効）なので本番非発火だが、別途硬化すべき latent crash として記録（本 axis scope 外・今回は fix せず）。
+> **検証**: `tests/test_resume_state_integration.py` **1 passed**（9 site green）・full resume-state suite（8 file）= **192 passed, 3 xfailed**・
+> `tests/test_fault_recovery.py` **7f/15p == HEAD**（src.data import-block・src/ 未変更で非回帰）。これで resume-state-loss 軸は**全 9 site が孤立 round-trip + 実 loop 一括復元の双方で証明済み**（9/9 完結・強化）。9B 実 run は引き続き private `src.data` で block・不変。
+
 > **【2026-06-27 追記・GOAL §5/P3 efficiency-accounting counter block の resume state-loss を修正】** resume-state-loss 軸の
 > **8 件目**（dynfreeze / best_full_eval / warmup / lawa-window / best_lawa_loss / triggered_target_steps / act_regime_state / **efficiency_accounting**）。
 > `train_tg_lora` の **21 個**の run-wide 効率会計カウンタ（`activation_cache_*_count` / `pilot|post_validation_forward_count`

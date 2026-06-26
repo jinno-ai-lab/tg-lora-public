@@ -7,40 +7,47 @@ Closes the gap surfaced by the run-feedback review:
     actually invokes load_training_state and restores ALL persisted fields in
     concert inside the training loop."
 
-Each persisted run-wide accumulator — ``best_lawa_loss``,
+Each of the **nine** resume-state-loss sites — ``best_lawa_loss``,
 ``triggered_target_steps``, ``act_regime_state``, ``efficiency_accounting``,
-``psa_state`` — already has an ISOLATED round-trip test
+``psa_state`` (the five the run-feedback review named by example) **plus**
+``best_full_eval_loss``/``best_full_eval_perplexity``, ``warmup_released``/
+``warmup_cos_consecutive``, ``dynfreeze_state`` and the LAWA snapshot window
+``lawa_state`` — already has an ISOLATED round-trip test
 (``test_checkpoint.py`` for the ``TrainingState`` layer,
-``test_activation_regime.py`` / ``test_psa.py`` for the per-object
-``state_dict``/``load_state_dict`` pair). Those prove each object serializes and
-deserializes on its own. They do NOT prove that ``train_tg_lora(resume_path=...)``
-actually wires the loaded fields back into the in-loop objects — a deleted
-restore line, a swapped field, or an over-broad guard would slip past every
-isolated round-trip while silently dropping state on the 9B run's fault/periodic
-resume.
+``test_activation_regime.py`` / ``test_psa.py`` / ``test_weight_averaging.py``
+for the per-object ``state_dict``/``load_state_dict`` pair). Those prove each
+object serializes and deserializes on its own. They do NOT prove that
+``train_tg_lora(resume_path=...)`` actually wires the loaded fields back into
+the in-loop objects — a deleted restore line, a swapped field, or an over-broad
+guard would slip past every isolated round-trip while silently dropping state on
+the 9B run's fault/periodic resume. (The dynfreeze site is exactly the class
+that bit before: ``119e815`` fixed a ``NameError`` that left dynfreeze state out
+of the fault checkpoint — an isolated round-trip stayed green throughout.)
 
 This module runs the REAL resume path end to end — real
 ``save_training_state`` -> disk -> real ``load_training_state`` -> the real
-restore block -> real ``PSAPrior`` / ``ActivationFingerprintTracker``
-construction + ``load_state_dict`` — with all other heavy deps mocked. It
-populates ALL five fields, injects a numerical-instability fault on the first
-resumed cycle (so the loop's fault handler writes a checkpoint from the
-just-restored in-loop state, before any cycle body can mutate it), then asserts
-all five fields survived in concert through two independent seams:
+restore block -> real ``PSAPrior`` / ``ActivationFingerprintTracker`` /
+``DynamicFreezeController`` / ``LAWAAverager`` construction + ``load_state_dict``
+— with all other heavy deps mocked. It populates ALL nine sites, injects a
+numerical-instability fault on the first resumed cycle (so the loop's fault
+handler writes a checkpoint from the just-restored in-loop state, before any
+cycle body can mutate it), then asserts all nine sites survived in concert
+through two independent seams:
 
-  * object fields (``psa_state`` / ``act_regime_state``): capturing factories
-    that record the in-loop object's state the instant ``load_state_dict``
-    returns — the most direct proof that the restore call fired with the right
-    field and produced matching state;
+  * object fields (``psa_state`` / ``act_regime_state`` / ``dynfreeze_state`` /
+    ``lawa_state``): capturing factories that record the in-loop object's state
+    the instant ``load_state_dict`` returns — the most direct proof that the
+    restore call fired with the right field and produced matching state;
   * plain-local fields (``best_lawa_loss`` / ``triggered_target_steps`` /
-    ``efficiency_accounting``): the ``TrainingState`` the loop's OWN fault
-    handler hands to ``save_training_state``, which re-snapshots the in-loop
-    locals — proving they carried through the restore block into live variables.
+    ``efficiency_accounting`` / ``best_full_eval_loss`` / ``warmup_released``):
+    the ``TrainingState`` the loop's OWN fault handler hands to
+    ``save_training_state``, which re-snapshots the in-loop locals — proving they
+    carried through the restore block into live variables.
 """
 
 import sys
 import types
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -108,7 +115,9 @@ from src.tg_lora.activation_regime import (
     ActivationFingerprintTracker,
     ActivationRegime,
 )
+from src.tg_lora.dynamic_freeze import DynFreezeState, DynamicFreezeController
 from src.tg_lora.psa import PSAPrior
+from src.tg_lora.weight_averaging import LAWAAverager
 from src.training.trainer_loop import NumericalInstabilityError
 from src.utils.checkpoint import (
     TrainingState,
@@ -163,6 +172,46 @@ def _populate_act_regime_tracker() -> ActivationFingerprintTracker:
     return tracker
 
 
+def _populate_dynfreeze_state() -> DynFreezeState:
+    """A mid-run ``DynFreezeState``: layers {2, 3} frozen since cycle 7, with
+    layer 1 released at cycle 5 (mid-cooldown).
+
+    Mirrors a checkpoint taken mid-Guard run so the restored controller is
+    observably non-empty (frozen block + a release-cooldown map the §4
+    reversible-release path keys on).
+    """
+    return DynFreezeState(
+        frozen_layer_indices=[2, 3],
+        r_A_history={2: [0.12, 0.08], 3: [0.05, 0.04]},
+        frozen_since_cycle=7,
+        prev_A_fro={"layer.2.lora_A": 0.5, "layer.3.lora_A": 0.4},
+        median_A=0.3,
+        epsilon=1e-6,
+        released_at={1: 5},
+    )
+
+
+def _populate_lawa_state() -> dict:
+    """A populated LAWA snapshot window (GOAL §3.3): window_size 4, mid-run
+    cycle 5, two recorded snapshots.
+
+    ``window_size`` is intentionally 4 (the config constructs the averager at 5)
+    so the assertion can prove ``load_state_dict`` overwrote the constructed
+    default — not just that an averager exists. The buffer carries distinct
+    tensors so a swapped-field / empty-restore restore is unambiguous.
+    """
+    return {
+        "window_size": 4,
+        "start_cycle": 2,
+        "cycle": 5,
+        "recorded_count": 3,
+        "buffer": [
+            {"layer.0.lora_A": torch.zeros(2, 2), "layer.0.lora_B": torch.ones(2, 2)},
+            {"layer.0.lora_A": torch.ones(2, 2), "layer.0.lora_B": torch.zeros(2, 2)},
+        ],
+    }
+
+
 def _saved_efficiency_accounting() -> dict:
     """Non-zero run-wide efficiency counters (GOAL §5 / P3) with distinct
     values so a mismatch on any single counter is unambiguous."""
@@ -205,12 +254,32 @@ def _build_saved_state(tmp_path, expected):
     expected["triggered_target_steps"] = [250, 500]
     expected["efficiency_accounting"] = _saved_efficiency_accounting()
 
+    # The four sites the original 5-field capstone did not exercise end to end.
+    expected["best_full_eval_loss"] = 0.879
+    expected["best_full_eval_perplexity"] = 2.34
+    expected["warmup_released"] = True
+    expected["warmup_cos_consecutive"] = 3
+    expected["dynfreeze_state"] = _populate_dynfreeze_state()
+    expected["dynfreeze_frozen_layers"] = {2, 3}
+    expected["dynfreeze_frozen_since"] = 7
+    expected["dynfreeze_released_at"] = {1: 5}
+    expected["lawa_state"] = _populate_lawa_state()
+    expected["lawa_window_size"] = 4
+    expected["lawa_buffer_len"] = 2
+    expected["lawa_recorded_count"] = 3
+
     base = _make_training_state()  # cycle_offset=3, realistic legacy fields
     base.best_lawa_loss = expected["best_lawa_loss"]
     base.triggered_target_steps = list(expected["triggered_target_steps"])
     base.act_regime_state = expected["act_regime_state"]
     base.efficiency_accounting = expected["efficiency_accounting"]
     base.psa_state = expected["psa_state"]
+    base.best_full_eval_loss = expected["best_full_eval_loss"]
+    base.best_full_eval_perplexity = expected["best_full_eval_perplexity"]
+    base.warmup_released = expected["warmup_released"]
+    base.warmup_cos_consecutive = expected["warmup_cos_consecutive"]
+    base.dynfreeze_state = expected["dynfreeze_state"]
+    base.lawa_state = expected["lawa_state"]
 
     state_path = tmp_path / "training_state.pt"
     save_training_state(base, state_path)
@@ -317,8 +386,9 @@ def _capturing_save(real_save, sink: list):
 
 
 def _make_resume_state_config(tmp_path):
-    """Run-dir config with PSA + activation-regime ON so the in-loop prior /
-    tracker are built and their restore paths actually fire."""
+    """Run-dir config with PSA + activation-regime + dynfreeze + LAWA ON so the
+    in-loop prior / tracker / controller / averager are built and their restore
+    paths actually fire."""
     cfg = _make_run_dir_config(tmp_path)
     # OmegaConf merges these into the existing tg_lora block.
     from omegaconf import OmegaConf
@@ -335,6 +405,16 @@ def _make_resume_state_config(tmp_path):
                     "activation_regime_enabled": True,
                     "activation_regime_window": 10,
                     "activation_regime_min_history": 3,
+                    # Guard reversible-freeze controller — built so the in-loop
+                    # controller exists for the dynfreeze_state restore to fire.
+                    "dynfreeze_enabled": True,
+                    # LAWA mandatory baseline (GOAL §3.3) — built so the in-loop
+                    # averager exists for the lawa_state window restore to fire.
+                    # window_size 5 intentionally != the saved 4, so the
+                    # assertion proves load_state_dict overwrote the default.
+                    "enable_lawa": True,
+                    "lawa_window_size": 5,
+                    "lawa_start_cycle": 10,
                 }
             }
         ),
@@ -364,6 +444,12 @@ def _run_fault_resume(tmp_path, state_path):
             ActivationFingerprintTracker, "act_regime_tracker", captured_objs
         )
     )
+    deps["src.training.train_tg_lora.DynamicFreezeController"] = _capturing_factory(
+        DynamicFreezeController, "dynfreeze", captured_objs
+    )
+    deps["src.training.train_tg_lora.LAWAAverager"] = _capturing_factory(
+        LAWAAverager, "lawa_averager", captured_objs
+    )
 
     # Capture the fault-checkpoint TrainingState the loop's own handler writes.
     captured_saves: list = []
@@ -371,22 +457,28 @@ def _run_fault_resume(tmp_path, state_path):
         save_training_state, captured_saves
     )
 
-    # Fault on the first resumed cycle's pilot forward_backward — before the
-    # cycle body increments any efficiency counter, so the fault checkpoint
-    # snapshots the JUST-restored locals.
-    deps["src.training.train_tg_lora.forward_backward"] = MagicMock(
-        side_effect=NumericalInstabilityError("Loss is nan (non-finite)")
-    )
+    # Fault on the first resumed cycle's dynfreeze.run_cycle — the FIRST action
+    # after the restore block (train_tg_lora.py:1999), before any cycle body can
+    # mutate the restored locals. This seam is downstream-stable in a way the
+    # pilot's forward_backward is NOT: forward_backward only runs when the
+    # dynfreeze-gated pilot is not skipped, so a mutation that changes the
+    # controller's frozen block (e.g. disabling its restore, which lets the fresh
+    # controller freeze-all on cycle 1) would skip the pilot and prevent the
+    # fault from firing. Faulting at run_cycle makes the fault deterministic
+    # w.r.t. all nine restore sites, so each site's assertion is reachable when
+    # its restore line is mutated.
+    fault = NumericalInstabilityError("Loss is nan (non-finite)")
 
     # The loop ends a fault run by raising SystemExit(2) (train_tg_lora.py:4556).
     # ``_run_with_deps_resume`` does not swallow it (unlike ``_run_with_deps``),
     # so the fault path is observed here. Re-raise a non-fault exit code so a
     # clean finish (which would mean the fault never fired) is not masked.
-    try:
-        _run_with_deps_resume(cfg, deps, str(state_path))
-    except SystemExit as exc:
-        if exc.code not in (2,):
-            raise
+    with patch.object(DynamicFreezeController, "run_cycle", side_effect=fault):
+        try:
+            _run_with_deps_resume(cfg, deps, str(state_path))
+        except SystemExit as exc:
+            if exc.code not in (2,):
+                raise
     return captured_objs, captured_saves
 
 
@@ -396,14 +488,14 @@ def _run_fault_resume(tmp_path, state_path):
 
 
 class TestResumeStateIntegration:
-    """One integration-level fault-injection resume asserting ALL five
-    run-wide accumulators survive ``load_training_state`` -> restore block."""
+    """One integration-level fault-injection resume asserting ALL nine
+    resume-state-loss sites survive ``load_training_state`` -> restore block."""
 
     def test_all_run_wide_state_survives_fault_resume(self, tmp_path):
         expected: dict = {}
         state_path = _build_saved_state(tmp_path, expected)
 
-        # Sanity: the on-disk checkpoint round-trips all five fields.
+        # Sanity: the on-disk checkpoint round-trips ALL nine sites.
         loaded = load_training_state(state_path)
         assert loaded.cycle_offset == 3
         assert loaded.best_lawa_loss == expected["best_lawa_loss"]
@@ -411,6 +503,17 @@ class TestResumeStateIntegration:
         assert loaded.psa_state is not None
         assert loaded.act_regime_state is not None
         assert loaded.efficiency_accounting is not None
+        # The four sites the 5-field capstone omitted.
+        assert loaded.best_full_eval_loss == expected["best_full_eval_loss"]
+        assert (
+            loaded.best_full_eval_perplexity == expected["best_full_eval_perplexity"]
+        )
+        assert loaded.warmup_released is True
+        assert loaded.warmup_cos_consecutive == expected["warmup_cos_consecutive"]
+        assert loaded.dynfreeze_state is not None
+        assert sorted(loaded.dynfreeze_state.frozen_layer_indices) == [2, 3]
+        assert loaded.lawa_state is not None
+        assert loaded.lawa_state["window_size"] == expected["lawa_window_size"]
 
         captured_objs, captured_saves = _run_fault_resume(tmp_path, state_path)
 
@@ -483,3 +586,63 @@ class TestResumeStateIntegration:
                 f"efficiency counter '{key}' did not survive resume: "
                 f"expected {value!r}, got {restored_eff[key]!r}"
             )
+
+        # ---- dynfreeze_state (object, via load_state_dict) ----
+        restored_dynfreeze = captured_objs.get("dynfreeze")
+        assert restored_dynfreeze is not None, (
+            "dynfreeze.load_state_dict was never called on resume — the "
+            "reversible-freeze controller restore wiring is broken (or "
+            "dynfreeze was not enabled, so the controller was never built)"
+        )
+        assert restored_dynfreeze.frozen_layer_indices == expected[
+            "dynfreeze_frozen_layers"
+        ], "dynfreeze frozen block did not survive resume"
+        assert restored_dynfreeze._frozen_since_cycle == expected[
+            "dynfreeze_frozen_since"
+        ], "dynfreeze frozen_since_cycle did not survive resume"
+        assert restored_dynfreeze._released_at == expected[
+            "dynfreeze_released_at"
+        ], "dynfreeze release-cooldown map did not survive resume"
+        # The in-loop controller re-snapshotted by the loop's own save matches.
+        assert fault_ts.dynfreeze_state is not None
+        assert sorted(fault_ts.dynfreeze_state.frozen_layer_indices) == [2, 3]
+
+        # ---- best_full_eval_loss / perplexity (plain locals) ----
+        assert fault_ts.best_full_eval_loss == expected["best_full_eval_loss"], (
+            "best_full_eval_loss did not survive resume — the best-model "
+            "save-gate tracker restore wiring is broken (resumed at inf, so the "
+            "first post-resume full eval would clobber the genuine best_model)"
+        )
+        assert fault_ts.best_full_eval_perplexity == expected[
+            "best_full_eval_perplexity"
+        ], "best_full_eval_perplexity did not survive resume"
+
+        # ---- warmup_released / warmup_cos_consecutive (plain locals) ----
+        assert fault_ts.warmup_released is expected["warmup_released"], (
+            "warmup_released did not survive resume — the two-phase warmup gate "
+            "restore wiring is broken (resumed False, silently dropping a "
+            "mid-production checkpoint back into the pilot-only warmup phase)"
+        )
+        assert fault_ts.warmup_cos_consecutive == expected["warmup_cos_consecutive"], (
+            "warmup_cos_consecutive did not survive resume"
+        )
+
+        # ---- lawa_state window (object, via load_state_dict) ----
+        restored_lawa = captured_objs.get("lawa_averager")
+        assert restored_lawa is not None, (
+            "lawa_averager.load_state_dict was never called on resume — the "
+            "LAWA snapshot-window restore wiring is broken (or LAWA was not "
+            "enabled, so the averager was never built)"
+        )
+        assert restored_lawa.window_size == expected["lawa_window_size"], (
+            "LAWA window_size was not restored — the saved window must overwrite "
+            "the config-constructed default (proving load_state_dict fired)"
+        )
+        assert restored_lawa.count == expected["lawa_buffer_len"], (
+            "LAWA snapshot buffer did not survive resume"
+        )
+        assert restored_lawa._recorded_count == expected["lawa_recorded_count"], (
+            "LAWA recorded_count did not survive resume"
+        )
+        assert fault_ts.lawa_state is not None
+        assert len(fault_ts.lawa_state["buffer"]) == expected["lawa_buffer_len"]
