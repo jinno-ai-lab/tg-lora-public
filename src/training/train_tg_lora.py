@@ -769,6 +769,8 @@ def _save_fault_checkpoint(
     act_regime_tracker: ActivationFingerprintTracker | None,
     efficiency_accounting: dict | None,
     psa_prior: PSAPrior | None,
+    swap_cycle_vq: int | None,
+    swap_cycle_vf: int | None,
 ) -> None:
     """Save model + full training state on fault (OOM / CUDA error).
 
@@ -840,6 +842,18 @@ def _save_fault_checkpoint(
     run-end ``layer_delta_analysis`` (GOAL §4) is omitted on a short residual
     run — a silent resume-state-loss sibling to the fixed act-regime / LAWA /
     efficiency-accounting gaps. Mirrors the act_regime_tracker threading.
+
+    ``swap_cycle_vq`` / ``swap_cycle_vf`` likewise: they are the caller-scoped
+    cycles at which the ``valid_quick`` / ``valid_full`` loader was swapped to
+    the asynchronously-built cached dataset (GOAL §3.3 cache-ablation
+    apparatus), reported in the run-end summary as
+    ``async_cache_swap_cycle_valid_quick`` / ``async_cache_swap_cycle_valid_full``.
+    A fault checkpoint taken after a swap must record them or resume resets both
+    to ``None`` and the run-end summary silently drops both swap-cycle fields —
+    a silent resume-state-loss sibling to the fixed act-regime / efficiency /
+    LAWA gaps. ``None`` when async cache building is disabled (no current config
+    enables it) or the swap had not yet fired. Mirrors the best_full_eval_*
+    threading (caller-scoped plain scalars).
     """
     try:
         oom_dir = run_dir / "oom_checkpoint"
@@ -876,6 +890,8 @@ def _save_fault_checkpoint(
             ),
             efficiency_accounting=efficiency_accounting,
             psa_state=psa_prior.state_dict() if psa_prior is not None else None,
+            swap_cycle_vq=swap_cycle_vq,
+            swap_cycle_vf=swap_cycle_vf,
         )
         save_training_state(ts, run_dir / "training_state.pt")
     except Exception as exc:
@@ -1456,6 +1472,14 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
         # records corrupting the vs-baseline comparison dataset. The serialized
         # form is a list (or None on a pre-fix checkpoint); restore to a set.
         triggered_target_steps = set(ts.triggered_target_steps or [])
+        # Restore the async-cache-swap completion cycles so a resumed run-end
+        # summary still reports when valid_quick / valid_full were swapped to the
+        # cached dataset — without this a fault/periodic resume resets both to
+        # None (the caller init) and the async_cache_swap_cycle_valid_quick/full
+        # summary fields are silently dropped. Mirrors the best_* /
+        # triggered_target_steps restores (plain scalars, None-safe).
+        swap_cycle_vq = ts.swap_cycle_vq
+        swap_cycle_vf = ts.swap_cycle_vf
 
     mlflow_cfg = cfg.logging.get("mlflow", {})
     batch_plan_manifest_path = run_dir / "batch_plan_manifest.json"
@@ -4304,6 +4328,8 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                     ),
                     efficiency_accounting=_snapshot_efficiency_accounting(locals()),
                     psa_state=psa_prior.state_dict() if psa_prior is not None else None,
+                    swap_cycle_vq=swap_cycle_vq,
+                    swap_cycle_vf=swap_cycle_vf,
                 )
                 # Bound on-disk checkpoint growth (M10.3 disk-death guard): the
                 # save -> training-state -> artifact -> prune sequence lives in
@@ -4384,6 +4410,8 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 act_regime_tracker,
                 efficiency_accounting=_snapshot_efficiency_accounting(locals()),
                 psa_prior=psa_prior,
+                swap_cycle_vq=swap_cycle_vq,
+                swap_cycle_vf=swap_cycle_vf,
             )
 
     pbar.close()

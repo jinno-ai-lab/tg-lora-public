@@ -152,6 +152,23 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-06-27 追記・async-cache-swap 完了 cycle marker（swap_cycle_vq/vf）の resume state-loss を修正（resume-state-loss 軸を dormant async-cache-swap route まで拡張）】**
+> resume-state-loss 軸の **10 件目**（mainline 8 件 + PSA route 1 件に続き、**dormant async-cache-swap route** の完了 cycle marker）。
+> `swap_cycle_vq`/`swap_cycle_vf` は caller scope の plain scalar（caller init L999 `= None`）で、async cache builder が `valid_quick` / `valid_full` を
+> cached dataset に swap した cycle を記録（L1957/L1960 で `if async_builder is not None and not async_ready` gate 下で `= cycle` 代入）。run-end summary（L4566-4569）は
+> これらを読み `async_cache_swap_cycle_valid_quick`/`full` を出力するが、`TrainingState` にも resume 復元 block にも無く、fault/periodic resume のたびに
+> caller init `None` に**空再構築** → run-end summary が両 field を**黙って欠落**させていた。
+> **重要な誠実性注記**: async cache builder は本 mirror の**全 config で無効**（dormant route）。ゆえにこれは **dormant route の硬化**であり mainline 挙動は不変（非破壊）——が、
+> その run-end summary field が resume で黙って腐るのは GOAL §7「測定せず結論しない」違反として本 axis の対象（PSA/dynfreeze と同根拠）。
+> → best_lawa_loss / triggered_target_steps / best_full_eval と**同一パターン**（plain scalar・None-safe）: (a) `TrainingState.swap_cycle_vq/vf: int | None`
+> （legacy-safe 既定 None）+ `save_training_state` 記述 + `load_training_state` 復元（`blob.get` 既定 None）、(b) `_save_fault_checkpoint`
+> （L772 param + L846-850 docstring + L893 fault-save 構築 site）・L4331 periodic save 構築 site・L4413 call site（keyword 引数）・L1481 resume 復元 block で対称化。
+> **検証**: `ruff --select F821` = **0**（checkpoint.py / train_tg_lora.py / touched tests）、`tests/test_checkpoint.py` **22 passed**
+> （+`swap_cycle_vq/vf` 往復 + legacy-load-clean・両 key 欠落で None 復元）、`tests/test_resume_state_integration.py` を **9→10 site に拡張**
+> （`swap_cycle_vq=7`/`vf=9` を `_build_saved_state` で populate・fault-checkpoint 再 snapshot で検証・async builder が test config で `None` のため復元値が cycle body で不変）、
+> **mutation 証明**: L1481 復元行を `= None` に破壊すると当該 assertion のみ fail → revert で green（9 site と同基準）。これで resume-state-loss 軸は **10/10**
+> （dormant route 含む全 run-wide summary field が孤立 round-trip + 実 loop 一括復元の双方で証明済み）。9B 実 run は引き続き private `src.data` で block・不変。
+
 > **【2026-06-27 追記・PSA subspace-prior の resume state-loss を修正（resume-state-loss 軸を mainline 8 件から PSA route まで拡張）】**
 > resume-state-loss 軸の **9 件目**（mainline 8 件: dynfreeze / best_full_eval / warmup / lawa-window / best_lawa_loss /
 > triggered_target_steps / act_regime_state / efficiency_accounting に続き、**PSA route** の `psa_prior`）。

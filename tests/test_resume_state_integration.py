@@ -7,12 +7,13 @@ Closes the gap surfaced by the run-feedback review:
     actually invokes load_training_state and restores ALL persisted fields in
     concert inside the training loop."
 
-Each of the **nine** resume-state-loss sites — ``best_lawa_loss``,
+Each of the **ten** resume-state-loss sites — ``best_lawa_loss``,
 ``triggered_target_steps``, ``act_regime_state``, ``efficiency_accounting``,
 ``psa_state`` (the five the run-feedback review named by example) **plus**
 ``best_full_eval_loss``/``best_full_eval_perplexity``, ``warmup_released``/
-``warmup_cos_consecutive``, ``dynfreeze_state`` and the LAWA snapshot window
-``lawa_state`` — already has an ISOLATED round-trip test
+``warmup_cos_consecutive``, ``dynfreeze_state``, the LAWA snapshot window
+``lawa_state``, and the async-cache-swap completion markers
+``swap_cycle_vq``/``swap_cycle_vf`` — already has an ISOLATED round-trip test
 (``test_checkpoint.py`` for the ``TrainingState`` layer,
 ``test_activation_regime.py`` / ``test_psa.py`` / ``test_weight_averaging.py``
 for the per-object ``state_dict``/``load_state_dict`` pair). Those prove each
@@ -28,10 +29,10 @@ This module runs the REAL resume path end to end — real
 ``save_training_state`` -> disk -> real ``load_training_state`` -> the real
 restore block -> real ``PSAPrior`` / ``ActivationFingerprintTracker`` /
 ``DynamicFreezeController`` / ``LAWAAverager`` construction + ``load_state_dict``
-— with all other heavy deps mocked. It populates ALL nine sites, injects a
+— with all other heavy deps mocked. It populates ALL ten sites, injects a
 numerical-instability fault on the first resumed cycle (so the loop's fault
 handler writes a checkpoint from the just-restored in-loop state, before any
-cycle body can mutate it), then asserts all nine sites survived in concert
+cycle body can mutate it), then asserts all ten sites survived in concert
 through two independent seams:
 
   * object fields (``psa_state`` / ``act_regime_state`` / ``dynfreeze_state`` /
@@ -132,7 +133,7 @@ from tests.test_fault_recovery import (
 )
 
 # ---------------------------------------------------------------------------
-# Fixtures: a saved TrainingState with ALL five run-wide accumulators populated
+# Fixtures: a saved TrainingState with ALL ten resume-state sites populated
 # ---------------------------------------------------------------------------
 
 
@@ -231,10 +232,10 @@ def _saved_efficiency_accounting() -> dict:
 
 
 def _build_saved_state(tmp_path, expected):
-    """Build a realistic TrainingState (cycle_offset=3) carrying all 5 fields.
+    """Build a realistic TrainingState (cycle_offset=3) carrying all 10 sites.
 
     Reuses ``_make_training_state`` for the legacy fields, then attaches the
-    five run-wide accumulators and records the ground-truth values the test
+    ten resume-state sites and records the ground-truth values the test
     will assert against in ``expected``.
     """
     psa_prior = _populate_psa_prior()
@@ -268,6 +269,13 @@ def _build_saved_state(tmp_path, expected):
     expected["lawa_buffer_len"] = 2
     expected["lawa_recorded_count"] = 3
 
+    # The async-cache-swap completion markers (dormant feature, no config in the
+    # mirror enables the builder, so async_builder is None and the restored
+    # values pass through the resumed cycle untouched). Distinct values so a
+    # stale/buffered-value bug would be caught.
+    expected["swap_cycle_vq"] = 7
+    expected["swap_cycle_vf"] = 9
+
     base = _make_training_state()  # cycle_offset=3, realistic legacy fields
     base.best_lawa_loss = expected["best_lawa_loss"]
     base.triggered_target_steps = list(expected["triggered_target_steps"])
@@ -280,6 +288,8 @@ def _build_saved_state(tmp_path, expected):
     base.warmup_cos_consecutive = expected["warmup_cos_consecutive"]
     base.dynfreeze_state = expected["dynfreeze_state"]
     base.lawa_state = expected["lawa_state"]
+    base.swap_cycle_vq = expected["swap_cycle_vq"]
+    base.swap_cycle_vf = expected["swap_cycle_vf"]
 
     state_path = tmp_path / "training_state.pt"
     save_training_state(base, state_path)
@@ -465,7 +475,7 @@ def _run_fault_resume(tmp_path, state_path):
     # controller's frozen block (e.g. disabling its restore, which lets the fresh
     # controller freeze-all on cycle 1) would skip the pilot and prevent the
     # fault from firing. Faulting at run_cycle makes the fault deterministic
-    # w.r.t. all nine restore sites, so each site's assertion is reachable when
+    # w.r.t. all ten restore sites, so each site's assertion is reachable when
     # its restore line is mutated.
     fault = NumericalInstabilityError("Loss is nan (non-finite)")
 
@@ -488,14 +498,14 @@ def _run_fault_resume(tmp_path, state_path):
 
 
 class TestResumeStateIntegration:
-    """One integration-level fault-injection resume asserting ALL nine
+    """One integration-level fault-injection resume asserting ALL ten
     resume-state-loss sites survive ``load_training_state`` -> restore block."""
 
     def test_all_run_wide_state_survives_fault_resume(self, tmp_path):
         expected: dict = {}
         state_path = _build_saved_state(tmp_path, expected)
 
-        # Sanity: the on-disk checkpoint round-trips ALL nine sites.
+        # Sanity: the on-disk checkpoint round-trips ALL ten sites.
         loaded = load_training_state(state_path)
         assert loaded.cycle_offset == 3
         assert loaded.best_lawa_loss == expected["best_lawa_loss"]
@@ -616,6 +626,18 @@ class TestResumeStateIntegration:
         assert fault_ts.best_full_eval_perplexity == expected[
             "best_full_eval_perplexity"
         ], "best_full_eval_perplexity did not survive resume"
+
+        # ---- swap_cycle_vq / swap_cycle_vf (plain locals) ----
+        assert fault_ts.swap_cycle_vq == expected["swap_cycle_vq"], (
+            "swap_cycle_vq did not survive resume — the async-cache-swap "
+            "completion-cycle marker restore wiring is broken (resumed None, so "
+            "the run-end summary would silently drop "
+            "async_cache_swap_cycle_valid_quick after a fault/periodic resume)"
+        )
+        assert fault_ts.swap_cycle_vf == expected["swap_cycle_vf"], (
+            "swap_cycle_vf did not survive resume — the async-cache-swap "
+            "full-cycle marker restore wiring is broken (resumed None)"
+        )
 
         # ---- warmup_released / warmup_cos_consecutive (plain locals) ----
         assert fault_ts.warmup_released is expected["warmup_released"], (

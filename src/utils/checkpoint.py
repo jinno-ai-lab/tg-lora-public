@@ -520,6 +520,21 @@ class TrainingState:
     # or a pre-fix checkpoint (the prior rebuilds empty, the pre-fix behavior —
     # no fabricated priors).
     psa_state: dict | None = None
+    # Async prefix-cache swap completion cycles (GOAL §3.3 cache-ablation
+    # apparatus) — the caller-scoped cycle at which the ``valid_quick`` /
+    # ``valid_full`` loader was swapped to the asynchronously-built cached
+    # dataset (``async_builder.poll()`` succeeds mid-run), reported in the
+    # run-end summary as ``async_cache_swap_cycle_valid_quick`` /
+    # ``async_cache_swap_cycle_valid_full``. Must survive resume: without it a
+    # fault/periodic resume resets both to ``None`` (the caller init) and the
+    # run-end summary silently drops both swap-cycle fields — a silent
+    # resume-state-loss sibling to the fixed act-regime (``act_regime_state``)
+    # / efficiency-accounting / LAWA gaps. ``None`` = async cache building
+    # disabled (no current config enables it) or the swap had not yet fired, or
+    # a pre-fix checkpoint (the field stays ``None``, the pre-fix behavior — no
+    # fabricated cycle).
+    swap_cycle_vq: int | None = None
+    swap_cycle_vf: int | None = None
 
 
 @dataclass
@@ -648,6 +663,8 @@ def save_training_state(state: TrainingState, path: Path) -> None:
         "act_regime_state": state.act_regime_state,
         "efficiency_accounting": state.efficiency_accounting,
         "psa_state": state.psa_state,
+        "swap_cycle_vq": state.swap_cycle_vq,
+        "swap_cycle_vf": state.swap_cycle_vf,
         "dynfreeze_state": (
             {
                 "frozen_layer_indices": state.dynfreeze_state.frozen_layer_indices,
@@ -795,5 +812,12 @@ def load_training_state(path: Path) -> TrainingState:
         # pre-fix behavior, no fabricated priors). Mirrors the act_regime_state /
         # efficiency_accounting / lawa_state legacy paths.
         psa_state=blob.get("psa_state"),
+        # Absent on pre-fix checkpoints / async-cache-disabled runs → None, the
+        # only sane reading of a checkpoint that predates the field or predates
+        # a swap firing: the resume path treats a missing cycle as 'no swap yet'
+        # (the pre-fix behavior, no fabricated cycle). Mirrors the psa_state /
+        # act_regime_state legacy paths.
+        swap_cycle_vq=blob.get("swap_cycle_vq"),
+        swap_cycle_vf=blob.get("swap_cycle_vf"),
         dynfreeze_state=dynfreeze_state,
     )

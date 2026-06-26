@@ -268,6 +268,13 @@ class TestTrainingStateRoundtrip:
             # layer_delta_analysis omitted on a short residual run). Sibling
             # resume-state-loss axis.
             psa_state=_psa_state_sample(),
+            # Mid-run async-cache-swap state (GOAL §3.3 cache-ablation): both
+            # loaders were swapped to the cached dataset at cycle 4 so resume
+            # does not reset them to None and the run-end summary's
+            # async_cache_swap_cycle_valid_quick/full fields are not silently
+            # dropped (sibling resume-state-loss axis).
+            swap_cycle_vq=4,
+            swap_cycle_vf=4,
         )
 
     def test_roundtrip_preserves_values(self, tmp_path):
@@ -338,6 +345,12 @@ class TestTrainingStateRoundtrip:
             loaded.psa_state["delta_history"][1][_lora_name],
             state.psa_state["delta_history"][1][_lora_name],
         )
+        # Async-cache-swap completion cycles (GOAL §3.3) must survive resume so
+        # the run-end summary's async_cache_swap_cycle_valid_quick/full fields
+        # are not silently dropped after a fault/periodic resume. Round-trip as
+        # plain ints (caller-scoped scalars, None-safe).
+        assert loaded.swap_cycle_vq == 4
+        assert loaded.swap_cycle_vf == 4
         assert loaded.controller_state.K == 3
         assert loaded.controller_state.alpha == 0.3
         assert loaded.velocity._state is not None
@@ -500,6 +513,28 @@ class TestTrainingStateRoundtrip:
 
         loaded = load_training_state(path)
         assert loaded.psa_state is None
+
+    def test_legacy_checkpoint_without_swap_cycle_loads_clean(self, tmp_path):
+        """A pre-fix checkpoint omits ``swap_cycle_vq``/``swap_cycle_vf``; load
+        must not break and must read as the safe 'no swap yet' default (None).
+        None is the only sane legacy reading: the resume path treats a missing
+        cycle as 'the async cache swap had not fired' (the pre-fix behavior, no
+        fabricated cycle), and the run-end summary simply omits the
+        async_cache_swap_cycle_valid_quick/full fields. Also covers an
+        async-cache-disabled run, which never sets either cycle. Mirrors the
+        psa_state / act_regime_state legacy tolerance."""
+        state = self._make_state()
+        path = tmp_path / "legacy.pt"
+        save_training_state(state, path)
+        # Strip both keys to simulate a pre-fix checkpoint blob.
+        blob = torch.load(path, weights_only=False)
+        blob.pop("swap_cycle_vq", None)
+        blob.pop("swap_cycle_vf", None)
+        torch.save(blob, path)
+
+        loaded = load_training_state(path)
+        assert loaded.swap_cycle_vq is None
+        assert loaded.swap_cycle_vf is None
     """The §4 release-cooldown map (``released_at``) must survive a real
     ``save_training_state``→``load_training_state`` round-trip.
 
