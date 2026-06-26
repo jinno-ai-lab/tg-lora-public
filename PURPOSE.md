@@ -206,10 +206,23 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 > `patch.object(DynamicFreezeController, "run_cycle", side_effect=NumericalInstabilityError)` で注入。dynfreeze state に依存せず fault が確定発火 → 全 9 site の assertion が mutation 時にも到達可能。
 > **mutation 証明（全 9 site・各復元 line を個別破壊 → 該当 assertion で正確 fail）**: dynfreeze→`:592` / best_full_eval→`:611` / warmup→`:621` / lawa→`:632`（新 4 site）+
 > best_lawa_loss→`:562` / triggered_target_steps→`:568` / psa→`:533` / act_regime→`:548` / efficiency→`:585`（既 5 site・seam 移行後も再証明・green）。全件 revert → tree clean。
-> **発見した latent bug（非破壊・別件・未 fix）**: `use_cache` は `if not dynfreeze_all_frozen:`（L2292）内でのみ代入され、all-frozen 時の full-eval path（L2497/2967/3957）で**未代入参照**となる
-> `UnboundLocalError` が潜在。dynfreeze は dormant Guard 実験（本 mirror 全 config で無効）なので本番非発火だが、別途硬化すべき latent crash として記録（本 axis scope 外・今回は fix せず）。
+> **発見した latent bug（別件）**: `use_cache` 他 5 名は `if not dynfreeze_all_frozen:`（L2292）内でのみ代入され、all-frozen 時の full-eval path（L2497/2967/3957）で**未代入参照**となる
+> `UnboundLocalError` が潜在していた（dynfreeze は dormant Guard 実験・本 mirror 全 config で無効なので本番非発火）。→ **別途 fix 済み**（下記【2026-06-27 追記・all-frozen skip path の latent UnboundLocalError を修正】参照）。
 > **検証**: `tests/test_resume_state_integration.py` **1 passed**（9 site green）・full resume-state suite（8 file）= **192 passed, 3 xfailed**・
 > `tests/test_fault_recovery.py` **7f/15p == HEAD**（src.data import-block・src/ 未変更で非回帰）。これで resume-state-loss 軸は**全 9 site が孤立 round-trip + 実 loop 一括復元の双方で証明済み**（9/9 完結・強化）。9B 実 run は引き続き private `src.data` で block・不変。
+
+> **【2026-06-27 追記・all-frozen skip path の latent UnboundLocalError を修正（上記 latent bug の close）】** 上記 9-site integration test 拡張中に発見し「別途硬化すべき」と記録していた latent crash を今回 fix。
+> dynfreeze が全層凍結（`dynfreeze_all_frozen == True`）すると cycle は skip block（`train_tg_lora.py:2225`）から pilot/extrapolation/post-eval を飛ばし**そのまま metrics 記録へ fall-through** する設計だが、
+> skip block は**共有の最終 record_step（L3938）が読む 5 名**（`use_cache` / `cache_eligible` / `cache_hit` / `can_confident_skip` / `m9_cycle_stats`）も、**post-record_step tail の full-eval gate（L4162 `if is_full_eval_cycle:`）が読む `is_full_eval_cycle`** も初期化していなかった。
+> この 6 名は全てスキップ対象の `if not dynfreeze_all_frozen:` block（L2292-3919）内でのみ代入されるため、fall-through は**未代入参照の UnboundLocalError** を起こしていた（1 crash site: L3957 record_step の `use_cache` → fix 後は 2 crash site: L4162 の `is_full_eval_cycle` へ移動）。
+> = dynfreeze 有効化 run は**最後の層を凍結した瞬間**（実験が到達すべき終端状態）に crash していた。dynfreeze は本 mirror 全 config で無効（dormant Guard 実験）なので本番非発火だが、潜在 crash としては閉鎖すべき defect。
+> **fix**: skip block に 6 名の既定値を追加（`use_cache=False` / `cache_eligible=False` / `cache_hit=False` / `can_confident_skip=False` / `m9_cycle_stats={}` は record_step 引数に整合・`is_full_eval_cycle=False` は凍結 model 不変→冗長 full-eval を行わず・best_model/early-stop は最終訓練 cycle で既決定）。
+> skip block 自身の「metrics recording へ直接 skip」という intent にも整合（凍結 cycle は余計な full-eval/checkpoint を行わない）。
+> **回帰 test**: `tests/test_dynfreeze_all_frozen_path.py` — `tests/test_resume_state_integration.py` と同一の sys.modules shim（`src.data` + `src.model.load_model` raise-stub 化）で本物の loop を import し、
+> `DynamicFreezeController` を「毎 cycle 全層凍結」mock に差し替えて all-frozen path を**実コードで強制起動**。run 完了 + 全 record_step が `tg_lora_cache_built=False`（cache 非作業の意味的検証・単に例外未脱出でないことの証拠）+ mock controller 発火を assert。
+> **mutation 証明**: src 改変を `git stash` で revert（test file は untracked で保持）→ test が `UnboundLocalError`（`use_cache` 未代入）で **RED** → `stash pop` で復元 → **GREEN**。fix が無ければ再現する crash であることを確認。
+> **検証**: `tests/test_dynfreeze_all_frozen_path.py` **1 passed**・resume-state + fault-recovery + 新 test = **24 passed**（非回帰）・`ruff check --select F821 src/training/train_tg_lora.py` **All checks passed!**（0・新規未定義名なし）。
+> 9B 実 run は引き続き private `src.data` で block・不変。
 
 > **【2026-06-27 追記・GOAL §5/P3 efficiency-accounting counter block の resume state-loss を修正】** resume-state-loss 軸の
 > **8 件目**（dynfreeze / best_full_eval / warmup / lawa-window / best_lawa_loss / triggered_target_steps / act_regime_state / **efficiency_accounting**）。

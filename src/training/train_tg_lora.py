@@ -2272,6 +2272,27 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 future_work_record = None
                 pilot_validation_forwards_this_cycle = 0
                 post_validation_forwards_this_cycle = 0
+                # No cache/M9 work happened (pilot + extrapolation + post-eval all
+                # skipped): initialize the names the shared final record_step below
+                # references, mirroring the extrapolation block's defaults
+                # (cache_eligible/cache_hit/can_confident_skip/m9_cycle_stats at
+                # L2936-2941) plus use_cache. Without these the all-frozen
+                # fall-through raises UnboundLocalError on use_cache (then
+                # can_confident_skip / cache_eligible / cache_hit / m9_cycle_stats)
+                # the instant dynfreeze freezes the last layer — the terminal state
+                # the Guard experiment exists to reach.
+                use_cache = False
+                cache_eligible = False
+                cache_hit = False
+                can_confident_skip = False
+                m9_cycle_stats: dict = {}
+                # No training happened, so a frozen cycle must not run a redundant
+                # full eval on the unchanged model (and must initialize the gate:
+                # is_full_eval_cycle is otherwise set only inside the skipped
+                # if not dynfreeze_all_frozen block at L2478/2774/3862). The model
+                # is frozen at W0, so best_model / early-stop were already decided
+                # at the last trained cycle.
+                is_full_eval_cycle = False
                 # Skip directly to metrics recording
             else:
                 pilot_loss_avg, _pilot_metrics = _compute_pilot_average(
