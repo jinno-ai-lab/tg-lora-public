@@ -152,6 +152,21 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-06-27 追記・activation-fingerprint regime inventory の resume state-loss を修正】** resume-state-loss 軸の
+> **7 件目**（dynfreeze / best_full_eval / warmup / lawa-window / best_lawa_loss / triggered_target_steps / **act_regime_state**）。
+> GOAL §4 step 1 の `ActivationFingerprintTracker` は最終 decoder 層の forward hook で activation cosine 時系列を取り
+> 3 相分類（STABLE/TRANSITION/CHAOTIC）し、run-wide 状態（完全 cosine 系列 `_all_cosines`=GOAL §7 null baseline 入力・
+> per-regime `_counts`=regime_inventory/stable_fraction 駆動・分類窓 `_cosines`・現 `_regime`）を蓄積するが、これらは
+> **全て `TrainingState` に未永続化**で、蓄積後の fault/periodic resume が**空 tracker** を再構築していた → run-end summary の
+> `activation_regime_inventory` / `activation_regime_stable_fraction`（GOAL §4 step 1 の理論上限指標）が post-resume-only に化けていた。
+> tracker は `configs/9b_tg_lora_psa.yaml:140` の `activation_regime_enabled: true` で**実 config で有効化済み**（非デッド機能）。
+> → `LAWAAverager`（`0eb6fdb`）と**同一パターン**: (a) tracker に `state_dict()`/`load_state_dict()` 追加（run-wide 累積を plain dict
+> で往復・enum key は `.value` 文字列・transient な `_prev_act`/`_current_act` と hook は意図的に非永続化＝次 forward hook で run-start 同様に再 populate・`None`/partial-dict 許容で旧 checkpoint と disabled run は clean load）、(b) `TrainingState.act_regime_state`（`dict | None` 既定・legacy-safe）、(c) `save_training_state` 記述 + `load_training_state` 復元（`blob.get` 既定 None）、(d) `_save_fault_checkpoint`（param + docstring + call site）と periodic save の両 site で `act_regime_tracker.state_dict()` を is-not-None ガードで対称化、(e) resume 復元は tracker 構築+hook 直後に配置（`act_regime_tracker` は resume block **より後**で構築されるため同 block 内だと `UnboundLocalError` → `LAWAAverager` hoist と同根拠・`ActivationFingerprintTracker` import を `LAWAAverager` の巻き上げと並べて module top へ）。**検証**:
+> `tests/test_activation_regime.py` に `TestActivationRegimeStateRoundtrip`（+6: 実 step 経由の往復 / 直接注入の inventory 一致 /
+> `None` no-op / partial-dict 許容 / transient tensor 非永続の cold-start / window maxlen 再構築）、`tests/test_checkpoint.py`
+> **+round-trip +legacy-load-clean**、全体 **87 passed / 3 xfailed**、static-guards **F821=0**（旧 F841/E741 2 件は非回帰・不変）。
+> これで resume-state-loss 軸は **7/7**。9B 実 run は引き続き private `src.data` で block・不変。
+
 > **【2026-06-27 追記・linearity-budget target-step set の resume state-loss を修正】** resume-state-loss 軸の
 > **6 件目**（dynfreeze / best_full_eval / warmup / lawa-window / best_lawa_loss / **triggered_target_steps**）。
 > `_check_and_save_linearity_budget_checkpoint` が各 target step（250/500/.../1500）を
