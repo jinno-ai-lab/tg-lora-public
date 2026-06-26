@@ -712,6 +712,7 @@ def _save_fault_checkpoint(
     warmup_released: bool,
     warmup_cos_consecutive: int,
     lawa_averager: LAWAAverager | None,
+    best_lawa_loss: float,
 ) -> None:
     """Save model + full training state on fault (OOM / CUDA error).
 
@@ -739,6 +740,13 @@ def _save_fault_checkpoint(
     are silently skipped until ``start_cycle`` worth of new snapshots
     re-accumulate — the resumed headline baseline measured over a post-fault-only
     window.
+
+    ``best_lawa_loss`` likewise: it is the caller-scoped minimum of the LAWA
+    comparison loss (reported in the run summary). A fault checkpoint must record
+    it or resume resets it to ``inf`` and the run-end ``best_lawa_loss`` headline
+    reflects only post-resume cycles — the LAWA fault fix persisted the snapshot
+    ``lawa_state`` window but left this tracker un-persisted. Mirrors the
+    ``best_full_eval_loss`` threading.
     """
     try:
         oom_dir = run_dir / "oom_checkpoint"
@@ -764,6 +772,7 @@ def _save_fault_checkpoint(
             warmup_released=warmup_released,
             warmup_cos_consecutive=warmup_cos_consecutive,
             lawa_state=lawa_averager.state_dict() if lawa_averager is not None else None,
+            best_lawa_loss=best_lawa_loss,
         )
         save_training_state(ts, run_dir / "training_state.pt")
     except Exception as exc:
@@ -1331,6 +1340,12 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
         # until the gate re-fires. Mirrors the best_full_eval_* restore above.
         warmup_released = ts.warmup_released
         warmup_cos_consecutive = ts.warmup_cos_consecutive
+        # Restore the best-LAWA-loss headline tracker so the resumed run-end
+        # summary reflects the genuine run-wide minimum, not a post-resume-only
+        # inf-restarted value. A plain float (no dependency on the averager being
+        # built yet), so it restores here alongside the other best_* trackers —
+        # unlike the lawa_state window which restores after the averager is built.
+        best_lawa_loss = ts.best_lawa_loss
 
     mlflow_cfg = cfg.logging.get("mlflow", {})
     batch_plan_manifest_path = run_dir / "batch_plan_manifest.json"
@@ -4014,6 +4029,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                     warmup_released=warmup_released,
                     warmup_cos_consecutive=warmup_cos_consecutive,
                     lawa_state=lawa_averager.state_dict() if lawa_averager is not None else None,
+                    best_lawa_loss=best_lawa_loss,
                 )
                 # Bound on-disk checkpoint growth (M10.3 disk-death guard): the
                 # save -> training-state -> artifact -> prune sequence lives in
@@ -4089,6 +4105,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 warmup_released,
                 warmup_cos_consecutive,
                 lawa_averager,
+                best_lawa_loss,
             )
 
     pbar.close()

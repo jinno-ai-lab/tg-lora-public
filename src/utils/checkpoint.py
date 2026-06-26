@@ -456,6 +456,16 @@ class TrainingState:
     # window. Sibling resume-state-loss to the fixed dynfreeze / best_full_eval
     # / warmup gaps. ``None`` = LAWA disabled or a pre-fix checkpoint.
     lawa_state: dict | None = None
+    # Best LAWA loss observed across the run — the caller-scoped minimum of the
+    # GOAL §3.3 mandatory-baseline comparison (``evaluate_with_lawa``), reported
+    # in the run summary JSON. Sibling tracker to ``best_full_eval_loss``: the
+    # LAWA fault-resume fix (``0eb6fdb``) persisted the snapshot ``lawa_state``
+    # window but left ``best_lawa_loss`` un-persisted, so a fault/periodic resume
+    # reset it to ``inf`` and the post-resume ``best_lawa_loss`` headline
+    # reflected only post-resume cycles (the fix's own PURPOSE note flagged this
+    # as "best_lawa_loss も inf にリセット"). Must survive resume for a faithful
+    # run-end headline. Mirrors the ``best_full_eval_*`` legacy path.
+    best_lawa_loss: float = float("inf")
 
 
 @dataclass
@@ -576,6 +586,7 @@ def save_training_state(state: TrainingState, path: Path) -> None:
             if state.lawa_state is not None
             else None
         ),
+        "best_lawa_loss": state.best_lawa_loss,
         "dynfreeze_state": (
             {
                 "frozen_layer_indices": state.dynfreeze_state.frozen_layer_indices,
@@ -694,5 +705,10 @@ def load_training_state(path: Path) -> TrainingState:
         # window as 'start fresh' (the pre-fix behavior), not a fabricated
         # non-empty window. Mirrors the dynfreeze/best_full_eval legacy path.
         lawa_state=blob.get("lawa_state"),
+        # Absent on pre-fix checkpoints → inf, the only sane reading of a
+        # checkpoint that predates the field (the headline is recomputed from
+        # post-resume cycles, the pre-fix behavior — not a fabricated low).
+        # Mirrors the best_full_eval_* / lawa_state legacy paths.
+        best_lawa_loss=blob.get("best_lawa_loss", float("inf")),
         dynfreeze_state=dynfreeze_state,
     )

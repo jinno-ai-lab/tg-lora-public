@@ -171,6 +171,10 @@ class TestTrainingStateRoundtrip:
             # ``is_ready`` is True on resume and the LAWA comparison is NOT
             # silently skipped post-resume (sibling resume-state-loss axis).
             lawa_state=_lawa_state_sample(),
+            # Mid-production best-LAWA-loss headline (the run-wide minimum of the
+            # §3.3 mandatory-baseline comparison) so resume does not restart it at
+            # inf and report a post-resume-only headline (sibling resume-state-loss).
+            best_lawa_loss=1.17,
         )
 
     def test_roundtrip_preserves_values(self, tmp_path):
@@ -201,6 +205,9 @@ class TestTrainingStateRoundtrip:
         assert torch.equal(
             loaded.lawa_state["buffer"][1]["lora_A"], torch.tensor([0.4, 0.5])
         )
+        # Best-LAWA-loss headline must survive resume so the run-end summary
+        # reflects the genuine run-wide minimum, not an inf-restarted value.
+        assert loaded.best_lawa_loss == 1.17
         assert loaded.controller_state.K == 3
         assert loaded.controller_state.alpha == 0.3
         assert loaded.velocity._state is not None
@@ -268,6 +275,24 @@ class TestTrainingStateRoundtrip:
 
         loaded = load_training_state(path)
         assert loaded.lawa_state is None
+
+    def test_legacy_checkpoint_without_best_lawa_loss_loads_clean(self, tmp_path):
+        """A pre-fix checkpoint omits ``best_lawa_loss``; load must not break and
+        must read as the safe 'no prior best' default (inf). inf is the only sane
+        legacy reading: the first post-resume LAWA comparison establishes a new
+        run-wide minimum rather than comparing against a fabricated low — the
+        pre-fix behavior (headline recomputed from post-resume cycles). Mirrors
+        the ``best_full_eval_loss`` legacy tolerance."""
+        state = self._make_state()
+        path = tmp_path / "legacy.pt"
+        save_training_state(state, path)
+        # Strip the key to simulate a pre-fix checkpoint blob.
+        blob = torch.load(path, weights_only=False)
+        blob.pop("best_lawa_loss", None)
+        torch.save(blob, path)
+
+        loaded = load_training_state(path)
+        assert loaded.best_lawa_loss == float("inf")
 
 
 class TestDynFreezeStateRoundtrip:
