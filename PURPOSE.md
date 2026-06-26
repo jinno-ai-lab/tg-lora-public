@@ -176,6 +176,23 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 > `tests/test_fault_recovery.py` **7f/15p == HEAD**（src.data import-block・stash 比較で非回帰）。
 > これで resume-state-loss 軸は **mainline 8/8 + PSA-route 1 = 9/9**。9B 実 run は引き続き private `src.data` で block・不変。
 
+> **【2026-06-27 追記・resume-state-loss 軸に integration-level fault-resume test を追加（孤立 round-trip → 実 loop 一括復元の gap を閉鎖）】**
+> run-feedback 指摘: 9/9 は**オブジェクト毎の孤立 round-trip**で検証されており、「実際の fault-resume が loop 内で `load_training_state` を起動し、
+> **全フィールドを一括で**復元する」ことを証明する test がなかった。孤立 round-trip は**各オブジェクトの serialize/deserialize** を証明するが、復元 line の削除・
+> フィールド入れ替え・過剰に広い guard は全ての孤立 test を素通りさせ、9B run の fault/periodic resume で**黙って state 落ち**させる。
+> → `tests/test_resume_state_integration.py`（1 件の integration test）を追加。本 mirror では `train_tg_lora` の top-level import chain が
+> private `src.data` + 未 install の `peft`（経由 `src.model.load_model`）で un-importable なため、**test-only の `sys.modules` shim**
+> （`src.data.build_seed_dataset` + `src.model.load_model` の 4 name を raise-stub 化・`lora_utils` は依存無しなので実 import のまま）で loop を import 可能にし、
+> **本物の loop コード**を走らせる（shim は未 mock 呼出で大声で raise・src/ 変更ではなく・不在 dep を「fix した」とは一切主張しない誠実設計）。
+> 手順: 全 5 フィールド populated の `TrainingState` を disk に save → 実 `train_tg_lora(resume_path=...)` で resume → 最初の再開 cycle の pilot `forward_backward`
+> で `NumericalInstabilityError` を注入 → loop の fault handler が**復元直後の in-loop state** から fault checkpoint を書く → 2 seam で検証:
+> (1) **capturing factory**（PSAPrior / ActivationFingerprintTracker の `load_state_dict` 復帰直後に object を捕捉・`load_state_dict` が正しい field で発火した直接証拠）、
+> (2) **loop 自身の fault-checkpoint TrainingState**（`save_training_state` を wrap して捕捉・plain local の `best_lawa_loss` / `triggered_target_steps` /
+> `efficiency_accounting` が復元 block を経て live 変数へ運ばれた証拠）。**mutation 証明**: 5 復元 site を**個別に破壊**（best_lawa_loss→inf / triggered_target_steps→空 set /
+> psa `load_state_dict` 無効化 / act_regime 無効化 / efficiency guard `and False`）→ いずれも test が**該当 assertion で正確に fail**（over-broad guard case 含む）→
+> 全件 revert → tree clean → `test_resume_state_integration` + `test_fault_recovery` + `test_checkpoint` + `test_psa` + `test_activation_regime` = **126 passed**。
+> これで resume-state-loss 軸は**孤立 round-trip に加え実 loop 一括復元も証明**（9/9 不変・強化）。9B 実 run は引き続き private `src.data` で block・不変。
+
 > **【2026-06-27 追記・GOAL §5/P3 efficiency-accounting counter block の resume state-loss を修正】** resume-state-loss 軸の
 > **8 件目**（dynfreeze / best_full_eval / warmup / lawa-window / best_lawa_loss / triggered_target_steps / act_regime_state / **efficiency_accounting**）。
 > `train_tg_lora` の **21 個**の run-wide 効率会計カウンタ（`activation_cache_*_count` / `pilot|post_validation_forward_count`
