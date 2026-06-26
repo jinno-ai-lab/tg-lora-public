@@ -75,6 +75,37 @@ def _act_regime_state_sample() -> dict:
     }
 
 
+def _efficiency_accounting_sample() -> dict:
+    """A representative mid-run snapshot of the run-wide efficiency-accounting
+    counters (GOAL §5 / P3), exercising the mixed int / float / list / dict
+    counter types so the checkpoint round-trip exercises the full surface. These
+    must survive resume or the run-end cost report (validation_forwards_total,
+    cache hit-rate, subspace-ZO / alpha-line tallies, future-work projection
+    mean) reflects only post-resume cycles (sibling resume-state-loss axis)."""
+    return {
+        "activation_cache_build_count": 2,
+        "activation_cache_eligible_count": 40,
+        "activation_cache_hit_count": 28,
+        "activation_cache_miss_count": 12,
+        "pilot_validation_forward_count": 37,
+        "post_validation_forward_count": 19,
+        "post_extrapolation_eval_count": 14,
+        "post_extrapolation_eval_skipped_count": 5,
+        "post_extrapolation_eval_skip_reasons": {"below_threshold": 3, "no_velocity": 2},
+        "subspace_zo_attempted_steps_total": 8,
+        "subspace_zo_accepted_steps_total": 5,
+        "subspace_zo_rejected_steps_total": 3,
+        "subspace_zo_forward_count_total": 16,
+        "subspace_zo_dim1_steps_total": 6,
+        "subspace_zo_dim2_steps_total": 2,
+        "alpha_line_steps_total": 11,
+        "alpha_line_base_recompute_total": 11,
+        "alpha_line_v_update_wall_seconds_total": 0.42,
+        "alpha_line_alpha_wall_seconds_total": 1.17,
+        "future_work_projection_ratios": [0.31, 0.44, 0.52],
+        "future_work_internal_pair_count": 9,
+    }
+
 
 class TestSaveCheckpointNormal:
     def test_creates_directory(self, tmp_path):
@@ -200,6 +231,12 @@ class TestTrainingStateRoundtrip:
             # activation_regime_inventory / stable_fraction reflect the full run,
             # not post-resume only (sibling resume-state-loss axis).
             act_regime_state=_act_regime_state_sample(),
+            # Mid-run efficiency-accounting counters (GOAL §5 / P3): the run-wide
+            # tallies have accumulated (cache hit-rate, validation_forwards_total,
+            # subspace-ZO / alpha-line step counts, future-work projection ratios)
+            # so resume does not rebuild them at zero and the run-end cost report
+            # reflects the full run, not post-resume only (sibling resume-state-loss).
+            efficiency_accounting=_efficiency_accounting_sample(),
         )
 
     def test_roundtrip_preserves_values(self, tmp_path):
@@ -248,6 +285,12 @@ class TestTrainingStateRoundtrip:
         }
         assert loaded.act_regime_state["all_cosines"] == [0.97, 0.98, 0.96, 0.41, 0.97]
         assert loaded.act_regime_state["regime"] == "stable"
+        # Efficiency-accounting counters (GOAL §5 / P3) must survive resume so
+        # the run-end cost report (cache hit-rate, validation_forwards_total,
+        # subspace-ZO / alpha-line tallies, future-work projection mean) reflects
+        # the full run, not post-resume only. Round-trips as a plain dict.
+        assert loaded.efficiency_accounting is not None
+        assert loaded.efficiency_accounting == _efficiency_accounting_sample()
         assert loaded.controller_state.K == 3
         assert loaded.controller_state.alpha == 0.3
         assert loaded.velocity._state is not None
@@ -370,6 +413,27 @@ class TestTrainingStateRoundtrip:
 
         loaded = load_training_state(path)
         assert loaded.act_regime_state is None
+
+    def test_legacy_checkpoint_without_efficiency_accounting_loads_clean(
+        self, tmp_path
+    ):
+        """A pre-fix checkpoint omits ``efficiency_accounting``; load must not
+        break and must read as the safe 'all counters at zero/empty init'
+        default (None). None is the only sane legacy reading: the resume path
+        treats a missing accounting bag as 'start every counter fresh' (the
+        pre-fix behavior — no fabricated tallies), not a fabricated non-empty
+        bag. Mirrors the lawa_state / act_regime_state / triggered_target_steps
+        legacy tolerance."""
+        state = self._make_state()
+        path = tmp_path / "legacy.pt"
+        save_training_state(state, path)
+        # Strip the key to simulate a pre-fix checkpoint blob.
+        blob = torch.load(path, weights_only=False)
+        blob.pop("efficiency_accounting", None)
+        torch.save(blob, path)
+
+        loaded = load_training_state(path)
+        assert loaded.efficiency_accounting is None
     """The §4 release-cooldown map (``released_at``) must survive a real
     ``save_training_state``→``load_training_state`` round-trip.
 

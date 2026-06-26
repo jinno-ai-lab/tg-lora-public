@@ -491,6 +491,19 @@ class TrainingState:
     # best_full_eval gaps. ``None`` = activation-regime disabled
     # (``activation_regime_enabled: false``) or a pre-fix checkpoint.
     act_regime_state: dict | None = None
+    # Run-wide efficiency-accounting counters (GOAL §5 / P3 cost accounting) —
+    # a snapshot of the ``train_tg_lora`` caller-scoped tallies that accumulate
+    # across the whole run and feed the run-end summary (cache hit-rate,
+    # validation_forwards_total, post-extrapolation eval accounting, subspace-ZO
+    # / alpha-line step tallies, future-work projection ratios). Must survive
+    # resume: without it a fault/periodic resume rebuilds every counter at
+    # zero/empty and the run-end cost report reflects only post-resume cycles —
+    # a silent resume-state-loss sibling to the fixed LAWA (``lawa_state``) /
+    # act-regime (``act_regime_state``) / dynfreeze gaps. Plain dict so mixed
+    # int / float / list / dict counter types round-trip uniformly. ``None`` =
+    # a pre-fix checkpoint (every counter resumes at its zero/empty init, the
+    # pre-fix behavior — no fabricated data).
+    efficiency_accounting: dict | None = None
 
 
 @dataclass
@@ -617,6 +630,7 @@ def save_training_state(state: TrainingState, path: Path) -> None:
         # (already a list at construction — see ``accepted_valid_history``).
         "triggered_target_steps": state.triggered_target_steps,
         "act_regime_state": state.act_regime_state,
+        "efficiency_accounting": state.efficiency_accounting,
         "dynfreeze_state": (
             {
                 "frozen_layer_indices": state.dynfreeze_state.frozen_layer_indices,
@@ -752,5 +766,11 @@ def load_training_state(path: Path) -> TrainingState:
         # regime inventory as 'start empty' (the pre-fix behavior). Mirrors the
         # lawa_state / triggered_target_steps legacy paths.
         act_regime_state=blob.get("act_regime_state"),
+        # Absent on pre-fix checkpoints → None, the only sane reading of a
+        # checkpoint that predates the field: the resume path treats a missing
+        # accounting bag as 'all counters at zero/empty init' (the pre-fix
+        # behavior — no fabricated tallies). Mirrors the lawa_state /
+        # act_regime_state / triggered_target_steps legacy paths.
+        efficiency_accounting=blob.get("efficiency_accounting"),
         dynfreeze_state=dynfreeze_state,
     )

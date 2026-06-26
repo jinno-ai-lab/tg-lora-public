@@ -697,6 +697,56 @@ def build_training_summary(controller, cycle_state, delta_tracker) -> dict:
     return summary
 
 
+# Names of the run-wide efficiency-accounting counters (GOAL §5 / P3 cost
+# accounting) that accumulate across the whole ``train_tg_lora`` run and feed
+# the run-end summary. They live as plain function-local tallies, so a
+# fault/periodic resume that rebuilds them at zero silently corrupts the run-end
+# cost report (validation_forwards_total, cache hit-rate, subspace-ZO / alpha-
+# line tallies, future-work projection mean) — the resume-state-loss sibling to
+# dynfreeze / best_full_eval / warmup / LAWA / triggered-target / act-regime.
+# Snapshotted into ``TrainingState.efficiency_accounting`` and restored on
+# resume. Order-independent (a dict); single source of truth shared by the fault
+# and periodic save sites.
+_EFFICIENCY_ACCOUNTING_KEYS: tuple[str, ...] = (
+    "activation_cache_build_count",
+    "activation_cache_eligible_count",
+    "activation_cache_hit_count",
+    "activation_cache_miss_count",
+    "pilot_validation_forward_count",
+    "post_validation_forward_count",
+    "post_extrapolation_eval_count",
+    "post_extrapolation_eval_skipped_count",
+    "post_extrapolation_eval_skip_reasons",
+    "subspace_zo_attempted_steps_total",
+    "subspace_zo_accepted_steps_total",
+    "subspace_zo_rejected_steps_total",
+    "subspace_zo_forward_count_total",
+    "subspace_zo_dim1_steps_total",
+    "subspace_zo_dim2_steps_total",
+    "alpha_line_steps_total",
+    "alpha_line_base_recompute_total",
+    "alpha_line_v_update_wall_seconds_total",
+    "alpha_line_alpha_wall_seconds_total",
+    "future_work_projection_ratios",
+    "future_work_internal_pair_count",
+)
+
+
+def _snapshot_efficiency_accounting(
+    scope: dict[str, object],
+) -> dict[str, object]:
+    """Snapshot the run-wide efficiency-accounting counters from the caller's
+    local scope into a plain dict for ``TrainingState.efficiency_accounting``.
+
+    Only keys present in ``scope`` are captured, so a counter renamed out from
+    under ``_EFFICIENCY_ACCOUNTING_KEYS`` is silently omitted rather than written
+    as ``None`` (a ``None`` restore would break the live ``+= 1`` sites).
+    """
+    return {
+        key: scope[key] for key in _EFFICIENCY_ACCOUNTING_KEYS if key in scope
+    }
+
+
 def _save_fault_checkpoint(
     model: torch.nn.Module,
     tokenizer,
@@ -716,6 +766,7 @@ def _save_fault_checkpoint(
     best_lawa_loss: float,
     triggered_target_steps: set[int] | list[int] | None,
     act_regime_tracker: ActivationFingerprintTracker | None,
+    efficiency_accounting: dict | None,
 ) -> None:
     """Save model + full training state on fault (OOM / CUDA error).
 
@@ -768,6 +819,15 @@ def _save_fault_checkpoint(
     summary's regime fractions reflect only post-fault steps — a silent
     resume-state-loss sibling to the fixed LAWA window. ``None`` when the feature
     is disabled (``activation_regime_enabled: false``).
+
+    ``efficiency_accounting`` likewise: it is the caller-scoped snapshot of the
+    run-wide efficiency-accounting counters (GOAL §5 / P3). A fault checkpoint
+    must record it or resume rebuilds every counter at zero/empty and the
+    run-end cost report (cache hit-rate, validation_forwards_total, subspace-ZO
+    / alpha-line tallies, future-work projection mean) reflects only post-fault
+    cycles — a silent resume-state-loss sibling to the fixed LAWA / act-regime
+    gaps. Mirrors the accepted_valid_history threading (a caller-scoped mutable
+    collection). ``None`` when no counters accumulated.
     """
     try:
         oom_dir = run_dir / "oom_checkpoint"
@@ -802,6 +862,7 @@ def _save_fault_checkpoint(
                 if act_regime_tracker is not None
                 else None
             ),
+            efficiency_accounting=efficiency_accounting,
         )
         save_training_state(ts, run_dir / "training_state.pt")
     except Exception as exc:
@@ -1677,6 +1738,98 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     alpha_line_alpha_wall_seconds_total = 0.0
     future_work_projection_ratios: list[float] = []
     future_work_internal_pair_count = 0
+
+    # Restore the run-wide efficiency-accounting counters (GOAL §5 / P3) on
+    # resume. These locals accumulate across the whole run and feed the run-end
+    # summary; without this restore a fault/periodic resume rebuilds them at
+    # zero/empty and the cost report (validation_forwards_total, cache hit-rate,
+    # subspace-ZO / alpha-line tallies, future-work projection mean) reflects
+    # only post-resume cycles — a silent resume-state-loss sibling to the fixed
+    # LAWA (``lawa_state``) / act-regime (``act_regime_state``) / dynfreeze gaps.
+    # Each counter falls back to its zero/empty init when the restored blob
+    # omits it (pre-fix checkpoint / a counter that didn't exist yet), so a
+    # partial restore never fabricates data. Mirrors the act_regime / lawa
+    # restores; guarded so fresh runs and pre-fix checkpoints (None) are
+    # untouched.
+    if (
+        restored_training_state is not None
+        and restored_training_state.efficiency_accounting
+    ):
+        _eff = restored_training_state.efficiency_accounting
+        activation_cache_build_count = _eff.get(
+            "activation_cache_build_count", activation_cache_build_count
+        )
+        activation_cache_eligible_count = _eff.get(
+            "activation_cache_eligible_count", activation_cache_eligible_count
+        )
+        activation_cache_hit_count = _eff.get(
+            "activation_cache_hit_count", activation_cache_hit_count
+        )
+        activation_cache_miss_count = _eff.get(
+            "activation_cache_miss_count", activation_cache_miss_count
+        )
+        pilot_validation_forward_count = _eff.get(
+            "pilot_validation_forward_count", pilot_validation_forward_count
+        )
+        post_validation_forward_count = _eff.get(
+            "post_validation_forward_count", post_validation_forward_count
+        )
+        post_extrapolation_eval_count = _eff.get(
+            "post_extrapolation_eval_count", post_extrapolation_eval_count
+        )
+        post_extrapolation_eval_skipped_count = _eff.get(
+            "post_extrapolation_eval_skipped_count",
+            post_extrapolation_eval_skipped_count,
+        )
+        post_extrapolation_eval_skip_reasons = _eff.get(
+            "post_extrapolation_eval_skip_reasons",
+            post_extrapolation_eval_skip_reasons,
+        )
+        subspace_zo_attempted_steps_total = _eff.get(
+            "subspace_zo_attempted_steps_total", subspace_zo_attempted_steps_total
+        )
+        subspace_zo_accepted_steps_total = _eff.get(
+            "subspace_zo_accepted_steps_total", subspace_zo_accepted_steps_total
+        )
+        subspace_zo_rejected_steps_total = _eff.get(
+            "subspace_zo_rejected_steps_total", subspace_zo_rejected_steps_total
+        )
+        subspace_zo_forward_count_total = _eff.get(
+            "subspace_zo_forward_count_total", subspace_zo_forward_count_total
+        )
+        subspace_zo_dim1_steps_total = _eff.get(
+            "subspace_zo_dim1_steps_total", subspace_zo_dim1_steps_total
+        )
+        subspace_zo_dim2_steps_total = _eff.get(
+            "subspace_zo_dim2_steps_total", subspace_zo_dim2_steps_total
+        )
+        alpha_line_steps_total = _eff.get(
+            "alpha_line_steps_total", alpha_line_steps_total
+        )
+        alpha_line_base_recompute_total = _eff.get(
+            "alpha_line_base_recompute_total", alpha_line_base_recompute_total
+        )
+        alpha_line_v_update_wall_seconds_total = _eff.get(
+            "alpha_line_v_update_wall_seconds_total",
+            alpha_line_v_update_wall_seconds_total,
+        )
+        alpha_line_alpha_wall_seconds_total = _eff.get(
+            "alpha_line_alpha_wall_seconds_total",
+            alpha_line_alpha_wall_seconds_total,
+        )
+        future_work_projection_ratios = _eff.get(
+            "future_work_projection_ratios", future_work_projection_ratios
+        )
+        future_work_internal_pair_count = _eff.get(
+            "future_work_internal_pair_count", future_work_internal_pair_count
+        )
+        logger.info(
+            "Efficiency-accounting counters restored: %d keys "
+            "(validation_forwards_total=%d, post_extrap_eval=%d)",
+            len(_eff),
+            pilot_validation_forward_count + post_validation_forward_count,
+            post_extrapolation_eval_count,
+        )
 
     metrics.write_header(
         cfg,
@@ -4091,6 +4244,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                         if act_regime_tracker is not None
                         else None
                     ),
+                    efficiency_accounting=_snapshot_efficiency_accounting(locals()),
                 )
                 # Bound on-disk checkpoint growth (M10.3 disk-death guard): the
                 # save -> training-state -> artifact -> prune sequence lives in
@@ -4169,6 +4323,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 best_lawa_loss,
                 triggered_target_steps,
                 act_regime_tracker,
+                efficiency_accounting=_snapshot_efficiency_accounting(locals()),
             )
 
     pbar.close()

@@ -152,6 +152,24 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-06-27 追記・GOAL §5/P3 efficiency-accounting counter block の resume state-loss を修正】** resume-state-loss 軸の
+> **8 件目**（dynfreeze / best_full_eval / warmup / lawa-window / best_lawa_loss / triggered_target_steps / act_regime_state / **efficiency_accounting**）。
+> `train_tg_lora` の **21 個**の run-wide 効率会計カウンタ（`activation_cache_*_count` / `pilot|post_validation_forward_count`
+> / `post_extrapolation_eval_*` / `subspace_zo_*_total` / `alpha_line_*_total` / `future_work_projection_ratios` +
+> `future_work_internal_pair_count`）は mainline config の実経路で cycle 毎に蓄積し run-end summary の **GOAL §5 / P3
+> コスト会計ブロック**（`validation_forwards_total`・`activation_cache_hit_rate`・subspace-ZO/alpha-line tallies・
+> `projection_ratio_mean`）を駆るが、**全て `TrainingState` に未永続化**で蓄積後の fault/periodic resume が**ゼロ/空再構築**していた →
+> run-end コスト報告が post-resume-only に化けていた（削減率や forward 会計が resume 跨ぎで過小評価＝GOAL §7「測定せず結論しない」の誠実性違反）。
+> → 既存パターンで `TrainingState.efficiency_accounting: dict | None`（legacy-safe 既定 None・混在 int/float/list/dict 型を plain dict で往復）を追加し、
+> (a) `_EFFICIENCY_ACCOUNTING_KEYS` タプル（21 名・単一ソース）+ `_snapshot_efficiency_accounting(locals())` ヘルパで fault save と periodic save の**両 site** を DRY に対称化、
+> (b) `_save_fault_checkpoint`（param + docstring + TrainingState 構築）に thread、(c) `save_training_state` 記述 + `load_training_state` 復元（`blob.get` 既定 None）、
+> (d) resume 復元は counter init block（L1659-1679）直後に配置・各カウンタは `.get(key, 現 init)` で旧 checkpoint / 未存在カウンタは現 init に後退し**偽データを生成しない**・
+> act_regime / lawa の復元と同 guard（fresh run・None は非接触）。**検証**:
+> `tests/test_checkpoint.py` **20 passed**（+`efficiency_accounting` 往復 + legacy-load-clean）、`tests/test_train_tg_lora_static_guards.py`
+> green（**F821=0**）、`tests/test_cli_help_smoke.py` **37p/3xf**、`tests/test_fault_recovery.py` **7f/15p == HEAD**（src.data block・stash 比較で非回帰）、
+> ruff F821=0（既存 E741@L4004 は非回帰・不変）。
+> これで resume-state-loss 軸は **8/8**。9B 実 run は引き続き private `src.data` で block・不変。
+
 > **【2026-06-27 追記・activation-fingerprint regime inventory の resume state-loss を修正】** resume-state-loss 軸の
 > **7 件目**（dynfreeze / best_full_eval / warmup / lawa-window / best_lawa_loss / triggered_target_steps / **act_regime_state**）。
 > GOAL §4 step 1 の `ActivationFingerprintTracker` は最終 decoder 層の forward hook で activation cosine 時系列を取り
