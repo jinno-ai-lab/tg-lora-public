@@ -175,6 +175,11 @@ class TestTrainingStateRoundtrip:
             # §3.3 mandatory-baseline comparison) so resume does not restart it at
             # inf and report a post-resume-only headline (sibling resume-state-loss).
             best_lawa_loss=1.17,
+            # Mid-run linearity-budget state: two of the six target steps
+            # (250/500/.../1500) already fired, so resume does not re-fire them
+            # (redundant evals + duplicate is_step_aligned_full_eval records
+            # corrupting the vs-baseline comparison dataset). Sibling resume-state-loss.
+            triggered_target_steps=[250, 500],
         )
 
     def test_roundtrip_preserves_values(self, tmp_path):
@@ -208,6 +213,12 @@ class TestTrainingStateRoundtrip:
         # Best-LAWA-loss headline must survive resume so the run-end summary
         # reflects the genuine run-wide minimum, not an inf-restarted value.
         assert loaded.best_lawa_loss == 1.17
+        # Linearity-budget target-step set must survive resume so a resumed run
+        # does not re-fire already-crossed targets (redundant full evals +
+        # duplicate is_step_aligned_full_eval records corrupting the
+        # vs-baseline comparison dataset). Serialized sorted; round-trips as a
+        # list the trainer converts back to a set.
+        assert loaded.triggered_target_steps == [250, 500]
         assert loaded.controller_state.K == 3
         assert loaded.controller_state.alpha == 0.3
         assert loaded.velocity._state is not None
@@ -293,6 +304,25 @@ class TestTrainingStateRoundtrip:
 
         loaded = load_training_state(path)
         assert loaded.best_lawa_loss == float("inf")
+
+    def test_legacy_checkpoint_without_triggered_target_steps_loads_clean(self, tmp_path):
+        """A pre-fix checkpoint omits ``triggered_target_steps``; load must not
+        break and must read as the safe 'no target yet fired' default (None).
+        None is the only sane legacy reading: the resume path converts it to an
+        empty set, so the loop re-fires targets from the resumed equivalent-step
+        count (the pre-fix behavior) rather than fabricating an already-fired
+        set. Mirrors the ``accepted_valid_history`` / ``best_full_eval_*``
+        legacy tolerance."""
+        state = self._make_state()
+        path = tmp_path / "legacy.pt"
+        save_training_state(state, path)
+        # Strip the key to simulate a pre-fix checkpoint blob.
+        blob = torch.load(path, weights_only=False)
+        blob.pop("triggered_target_steps", None)
+        torch.save(blob, path)
+
+        loaded = load_training_state(path)
+        assert loaded.triggered_target_steps is None
 
 
 class TestDynFreezeStateRoundtrip:

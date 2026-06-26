@@ -713,6 +713,7 @@ def _save_fault_checkpoint(
     warmup_cos_consecutive: int,
     lawa_averager: LAWAAverager | None,
     best_lawa_loss: float,
+    triggered_target_steps: set[int] | list[int] | None,
 ) -> None:
     """Save model + full training state on fault (OOM / CUDA error).
 
@@ -747,6 +748,15 @@ def _save_fault_checkpoint(
     reflects only post-resume cycles — the LAWA fault fix persisted the snapshot
     ``lawa_state`` window but left this tracker un-persisted. Mirrors the
     ``best_full_eval_loss`` threading.
+
+    ``triggered_target_steps`` likewise: it is the caller-scoped set of
+    linearity-budget target steps (250/500/.../1500) already fired by
+    ``_check_and_save_linearity_budget_checkpoint``. A fault checkpoint must
+    record it or resume resets it to empty and the first post-resume cycle
+    re-fires every already-crossed target — redundant full evals, re-saved
+    ``checkpoint-{target}`` dirs, and duplicate ``is_step_aligned_full_eval``
+    records corrupting the linearity-budget vs-baseline comparison. Mirrors the
+    accepted_valid_history threading (a caller-scoped mutable collection).
     """
     try:
         oom_dir = run_dir / "oom_checkpoint"
@@ -773,6 +783,9 @@ def _save_fault_checkpoint(
             warmup_cos_consecutive=warmup_cos_consecutive,
             lawa_state=lawa_averager.state_dict() if lawa_averager is not None else None,
             best_lawa_loss=best_lawa_loss,
+            triggered_target_steps=sorted(triggered_target_steps)
+            if triggered_target_steps is not None
+            else None,
         )
         save_training_state(ts, run_dir / "training_state.pt")
     except Exception as exc:
@@ -1346,6 +1359,13 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
         # built yet), so it restores here alongside the other best_* trackers —
         # unlike the lawa_state window which restores after the averager is built.
         best_lawa_loss = ts.best_lawa_loss
+        # Restore the linearity-budget target-step set so a resumed run does not
+        # re-fire every already-crossed target (250/500/.../1500) on its first
+        # cycle — which would re-run redundant full evals, re-save
+        # checkpoint-{target} dirs, and emit duplicate is_step_aligned_full_eval
+        # records corrupting the vs-baseline comparison dataset. The serialized
+        # form is a list (or None on a pre-fix checkpoint); restore to a set.
+        triggered_target_steps = set(ts.triggered_target_steps or [])
 
     mlflow_cfg = cfg.logging.get("mlflow", {})
     batch_plan_manifest_path = run_dir / "batch_plan_manifest.json"
@@ -4030,6 +4050,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                     warmup_cos_consecutive=warmup_cos_consecutive,
                     lawa_state=lawa_averager.state_dict() if lawa_averager is not None else None,
                     best_lawa_loss=best_lawa_loss,
+                    triggered_target_steps=sorted(triggered_target_steps),
                 )
                 # Bound on-disk checkpoint growth (M10.3 disk-death guard): the
                 # save -> training-state -> artifact -> prune sequence lives in
@@ -4106,6 +4127,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 warmup_cos_consecutive,
                 lawa_averager,
                 best_lawa_loss,
+                triggered_target_steps,
             )
 
     pbar.close()

@@ -466,6 +466,21 @@ class TrainingState:
     # as "best_lawa_loss も inf にリセット"). Must survive resume for a faithful
     # run-end headline. Mirrors the ``best_full_eval_*`` legacy path.
     best_lawa_loss: float = float("inf")
+    # Linearity-budget target steps already fired (250/500/.../1500). The
+    # training loop's ``_check_and_save_linearity_budget_checkpoint`` fires a
+    # mandatory full eval + ``checkpoint-{target}`` save + a step-aligned
+    # ``is_step_aligned_full_eval`` record in ``run_metrics.jsonl`` exactly once
+    # per target, guarded by ``target not in triggered_target_steps``. Must
+    # survive resume: without it a fault/periodic resume resets the set to empty
+    # and the first post-resume cycle re-fires EVERY already-crossed target —
+    # redundant full evals, re-saved ``checkpoint-{target}`` dirs, and DUPLICATE
+    # ``aligned_target`` records corrupting the linearity-budget vs-baseline
+    # comparison dataset (a downstream reader keyed on ``step`` sees the
+    # post-resume value twice / the pre-resume value overwritten). Sibling
+    # resume-state-loss to the fixed dynfreeze / best_full_eval / warmup / lawa
+    # gaps. Modeled as a list (sorted at save) so the legacy path mirrors
+    # ``accepted_valid_history``; the trainer restores it to a ``set`` on resume.
+    triggered_target_steps: list[int] | None = None
 
 
 @dataclass
@@ -587,6 +602,10 @@ def save_training_state(state: TrainingState, path: Path) -> None:
             else None
         ),
         "best_lawa_loss": state.best_lawa_loss,
+        # Sorted so the serialized form is deterministic across save order;
+        # ``None`` on LAWA-disabled / pre-fix checkpoints. Passed through as-is
+        # (already a list at construction — see ``accepted_valid_history``).
+        "triggered_target_steps": state.triggered_target_steps,
         "dynfreeze_state": (
             {
                 "frozen_layer_indices": state.dynfreeze_state.frozen_layer_indices,
@@ -710,5 +729,12 @@ def load_training_state(path: Path) -> TrainingState:
         # post-resume cycles, the pre-fix behavior — not a fabricated low).
         # Mirrors the best_full_eval_* / lawa_state legacy paths.
         best_lawa_loss=blob.get("best_lawa_loss", float("inf")),
+        # Absent on pre-fix checkpoints → None, the only sane reading of a
+        # checkpoint that predates the field: the resume path treats a missing
+        # set as 'no target yet fired' and the loop re-fires from the resumed
+        # equivalent-step count (the pre-fix behavior). The trainer converts the
+        # list back to a set; ``None`` → empty set. Mirrors the
+        # accepted_valid_history / best_full_eval_* / best_lawa_loss legacy paths.
+        triggered_target_steps=blob.get("triggered_target_steps"),
         dynfreeze_state=dynfreeze_state,
     )
