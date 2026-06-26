@@ -1,6 +1,7 @@
 """Tests for activation-fingerprint cosine regime tracker."""
 
 import math
+from collections import deque
 
 import pytest
 import torch
@@ -300,3 +301,132 @@ class TestNullBaseline:
         assert result["stable_fraction_null_mean"] is not None
         assert result["stable_fraction_null_std"] is not None
         assert isinstance(result["stable_fraction_z"], float)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint resume (state_dict / load_state_dict) — GOAL §4 resume-state-loss axis
+# ---------------------------------------------------------------------------
+
+class TestActivationRegimeStateRoundtrip:
+    """The tracker's run-wide accumulation must survive checkpoint resume or the
+    run-end ``activation_regime_inventory`` / ``stable_fraction`` (GOAL §4) reflect
+    only post-resume steps — a resume-state-loss sibling to the fixed LAWA /
+    dynfreeze / best_full_eval surfaces. These tests pin ``state_dict()`` /
+    ``load_state_dict()`` directly, independent of the TrainingState layer."""
+
+    def test_roundtrip_preserves_inventory_and_counts(self):
+        """Serialize a populated tracker, load into a fresh one, and verify the
+        run-wide regime surface is identical."""
+        src = ActivationFingerprintTracker(window=10, min_history=3)
+        # Populate the resume-persistent surface directly (mirrors what a live
+        # run accumulates through step()).
+        src._all_cosines = [0.97, 0.98, 0.96, 0.41, 0.97]
+        src._cosines = deque([0.96, 0.41, 0.97], maxlen=src.window)
+        src._counts[ActivationRegime.STABLE] = 3
+        src._counts[ActivationRegime.TRANSITION] = 1
+        src._counts[ActivationRegime.CHAOTIC] = 1
+        src._regime = ActivationRegime.STABLE
+
+        dst = ActivationFingerprintTracker(window=10, min_history=3)
+        dst.load_state_dict(src.state_dict())
+
+        # Counts drive regime_inventory / stable_fraction.
+        assert dst._counts == src._counts
+        assert dst.regime_inventory == src.regime_inventory
+        assert dst.stable_fraction == src.stable_fraction
+        # Full cosine series drives the GOAL §7 null baseline at summary time.
+        assert dst._all_cosines == src._all_cosines
+        assert dst.summary()["all_cosines"] == src._all_cosines
+        assert dst.regime == src.regime
+
+    def test_roundtrip_after_real_steps(self):
+        """Populate via the real hook+step() path, serialize, reload into a fresh
+        tracker, and verify the loaded inventory matches the live run exactly
+        (proves state_dict captures real accumulated state, not zeros)."""
+        def run_live(tracker):
+            module = nn.Linear(8, 8)
+            tracker.register_hook(module)
+            # Steps 1-3: identical input → identical output → cosine ~1.0 (stable).
+            x_stable = torch.randn(1, 8)
+            for _ in range(3):
+                module(x_stable)
+                tracker.step()
+            # Step 4: a wildly different input → low cosine (chaotic/transition).
+            module(torch.randn(1, 8) * 50)
+            tracker.step()
+            tracker.remove_hooks()
+
+        src = ActivationFingerprintTracker(window=10, min_history=3)
+        run_live(src)
+        dst = ActivationFingerprintTracker(window=10, min_history=3)
+        dst.load_state_dict(src.state_dict())
+
+        assert dst._counts == src._counts
+        assert dst._all_cosines == src._all_cosines
+        assert dst.regime_inventory == src.regime_inventory
+
+    def test_load_none_is_noop(self):
+        """``load_state_dict(None)`` must leave a fresh tracker empty — covers a
+        legacy blob and an ``activation_regime_enabled: false`` resume."""
+        tracker = ActivationFingerprintTracker()
+        tracker.load_state_dict(None)
+        assert tracker._all_cosines == []
+        assert len(tracker._cosines) == 0
+        assert sum(tracker._counts.values()) == 0
+        assert tracker.regime == ActivationRegime.STABLE
+
+    def test_load_partial_dict_tolerates_missing_keys(self):
+        """A legacy/partial blob with only some keys must load the present keys
+        and leave the rest at their constructed defaults."""
+        tracker = ActivationFingerprintTracker()
+        tracker.load_state_dict(
+            {"counts": {"stable": 4, "transition": 0, "chaotic": 1}}
+        )
+        assert tracker._counts[ActivationRegime.STABLE] == 4
+        assert tracker._counts[ActivationRegime.CHAOTIC] == 1
+        # Unset keys keep defaults.
+        assert tracker._all_cosines == []
+        assert tracker.regime == ActivationRegime.STABLE
+
+    def test_resume_does_not_require_transient_tensors(self):
+        """Transient per-step activation tensors are NOT persisted; a resumed
+        tracker must operate from a cold start (no predecessor) just like the
+        run's first step — the next step() with a forward hook simply has no
+        cosine (the same cold-start as step 1), and must not crash."""
+        src = ActivationFingerprintTracker(window=10, min_history=3)
+        src._all_cosines = [0.97, 0.98]
+        src._cosines = deque([0.97, 0.98], maxlen=src.window)
+        src._counts[ActivationRegime.STABLE] = 2
+        src._prev_act = torch.randn(8)  # transient — must NOT be persisted
+
+        blob = src.state_dict()
+        dst = ActivationFingerprintTracker(window=10, min_history=3)
+        dst.load_state_dict(blob)
+        assert "prev_act" not in blob
+        assert dst._prev_act is None  # cold start, as at run start
+
+        module = nn.Linear(8, 8)
+        dst.register_hook(module)
+        module(torch.randn(1, 8))
+        regime = dst.step()  # cold start: no cosine, no crash
+        assert regime in set(ActivationRegime)
+        dst.remove_hooks()
+
+    def test_load_rebuilds_window_maxlen(self):
+        """The classification window is rebuilt with the tracker's constructed
+        ``maxlen``, so a checkpoint whose ``cosines`` exceed the live window is
+        trimmed the same way a live run would have trimmed it (not unbounded),
+        while the full series (needed for the §7 null baseline) is unbounded."""
+        blob = {
+            "all_cosines": [0.9, 0.91, 0.92, 0.93, 0.94],
+            "cosines": [0.9, 0.91, 0.92, 0.93, 0.94],
+            "counts": {"stable": 5, "transition": 0, "chaotic": 0},
+            "regime": "stable",
+        }
+        tracker = ActivationFingerprintTracker(window=3)
+        tracker.load_state_dict(blob)
+        # Sliding window trimmed to the constructed maxlen...
+        assert len(tracker._cosines) == 3
+        assert list(tracker._cosines) == [0.92, 0.93, 0.94]
+        # ...but the full series is unbounded.
+        assert tracker._all_cosines == [0.9, 0.91, 0.92, 0.93, 0.94]

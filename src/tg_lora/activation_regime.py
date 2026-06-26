@@ -172,6 +172,57 @@ class ActivationFingerprintTracker:
         self._counts = {r: 0 for r in ActivationRegime}
         self.remove_hooks()
 
+    def state_dict(self) -> dict:
+        """Serialize the run-wide regime state for checkpoint resume.
+
+        Mirrors ``LAWAAverager.state_dict()``. The resume-persistent surface is
+        the run-wide accumulation — the full cosine series (``_all_cosines``,
+        needed for the GOAL §7 null baseline at summary time), the per-regime
+        ``_counts`` (which drive ``regime_inventory`` / ``stable_fraction``), the
+        classification window (``_cosines``), and the current ``_regime`` — NOT
+        the transient per-step activation tensors (``_prev_act`` /
+        ``_current_act`` are repopulated by the next forward hook, as at run
+        start) or the registered hooks (re-registered on construction). Without
+        persisting this a fault/periodic resume rebuilds the tracker empty and
+        the run-end summary's ``activation_regime_inventory`` /
+        ``stable_fraction`` (GOAL §4) reflect only post-resume steps — a silent
+        resume-state-loss sibling to the fixed LAWA / dynfreeze / best_full_eval
+        gaps. Enum keys are serialized as their ``.value`` strings.
+        """
+        return {
+            "all_cosines": list(self._all_cosines),
+            "cosines": list(self._cosines),
+            "counts": {r.value: c for r, c in self._counts.items()},
+            "regime": self._regime.value,
+        }
+
+    def load_state_dict(self, state: dict | None) -> None:
+        """Restore run-wide regime state from a checkpoint.
+
+        Inverse of :meth:`state_dict`. Transient activation tensors and hooks
+        are left untouched (``None`` / re-registered); the next forward hook +
+        :meth:`step` repopulates them as at run start, so the first post-resume
+        step simply has no predecessor (the same cold-start as the run's first
+        step). Tolerant of a partial / legacy dict and of ``None``: a missing key
+        leaves the constructed default, so a pre-fix checkpoint (or a checkpoint
+        from an ``activation_regime_enabled: false`` run) loads cleanly as an
+        empty tracker. The classification window is rebuilt with the constructed
+        ``maxlen`` so a window larger than the checkpoint's is trimmed the same
+        way a live run would have trimmed it.
+        """
+        if not state:
+            return
+        if "all_cosines" in state:
+            self._all_cosines = list(state["all_cosines"])
+        if "cosines" in state:
+            self._cosines = deque(list(state["cosines"]), maxlen=self.window)
+        if "counts" in state:
+            self._counts = {
+                r: int(state["counts"].get(r.value, 0)) for r in ActivationRegime
+            }
+        if "regime" in state:
+            self._regime = ActivationRegime(state["regime"])
+
     def summary(self) -> dict:
         cosines = list(self._cosines)
         return {

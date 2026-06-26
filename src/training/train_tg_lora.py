@@ -29,6 +29,7 @@ from src.tg_lora.activation_cache import (
 )
 from src.tg_lora.cycle_state import CycleState
 from src.tg_lora.delta_tracker import DeltaTracker
+from src.tg_lora.activation_regime import ActivationFingerprintTracker
 from src.tg_lora.dynamic_freeze import DynamicFreezeController
 from src.tg_lora.weight_averaging import LAWAAverager
 from src.tg_lora.extrapolator import (
@@ -714,6 +715,7 @@ def _save_fault_checkpoint(
     lawa_averager: LAWAAverager | None,
     best_lawa_loss: float,
     triggered_target_steps: set[int] | list[int] | None,
+    act_regime_tracker: ActivationFingerprintTracker | None,
 ) -> None:
     """Save model + full training state on fault (OOM / CUDA error).
 
@@ -757,6 +759,15 @@ def _save_fault_checkpoint(
     ``checkpoint-{target}`` dirs, and duplicate ``is_step_aligned_full_eval``
     records corrupting the linearity-budget vs-baseline comparison. Mirrors the
     accepted_valid_history threading (a caller-scoped mutable collection).
+
+    ``act_regime_tracker`` likewise: it is the caller-scoped activation-fingerprint
+    regime inventory (GOAL §4 step 1), reported in the run-end summary as
+    ``activation_regime_inventory`` / ``stable_fraction`` and feeding the §7 null
+    baseline. A fault checkpoint taken after the tracker has accumulated steps
+    must serialize it (``state_dict()``) or resume rebuilds it empty and the
+    summary's regime fractions reflect only post-fault steps — a silent
+    resume-state-loss sibling to the fixed LAWA window. ``None`` when the feature
+    is disabled (``activation_regime_enabled: false``).
     """
     try:
         oom_dir = run_dir / "oom_checkpoint"
@@ -786,6 +797,11 @@ def _save_fault_checkpoint(
             triggered_target_steps=sorted(triggered_target_steps)
             if triggered_target_steps is not None
             else None,
+            act_regime_state=(
+                act_regime_tracker.state_dict()
+                if act_regime_tracker is not None
+                else None
+            ),
         )
         save_training_state(ts, run_dir / "training_state.pt")
     except Exception as exc:
@@ -1541,10 +1557,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     # Activation-fingerprint regime inventory (GOAL §4 step 1)
     act_regime_tracker = None
     if bool(tg_cfg.get("activation_regime_enabled", False)):
-        from src.tg_lora.activation_regime import (
-            ActivationFingerprintTracker,
-            compute_regime_null_baseline,
-        )
+        from src.tg_lora.activation_regime import compute_regime_null_baseline
         act_regime_tracker = ActivationFingerprintTracker(
             window=int(tg_cfg.get("activation_regime_window", 10)),
             stable_threshold=float(tg_cfg.get("activation_regime_stable_threshold", 0.95)),
@@ -1563,6 +1576,28 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
         else:
             logger.warning("Activation regime tracker: could not find decoder layers, disabling")
             act_regime_tracker = None
+
+    # Restore the activation-fingerprint regime inventory on resume. Placed here
+    # (after the tracker is constructed and hooked) rather than in the resume
+    # block above because ``act_regime_tracker`` is built just above — restoring
+    # there would hit UnboundLocalError. ``restored_training_state`` is the
+    # None-when-not-resuming handle. Without this restore a checkpoint taken
+    # after the tracker has accumulated steps loads an empty tracker and the
+    # run-end summary's ``activation_regime_inventory`` / ``stable_fraction``
+    # (GOAL §4) reflect only post-resume steps. Mirrors the LAWA / dynfreeze /
+    # best_full_eval restores; guarded so activation-regime-disabled runs and
+    # pre-fix checkpoints (None) are untouched.
+    if (
+        act_regime_tracker is not None
+        and restored_training_state is not None
+        and restored_training_state.act_regime_state is not None
+    ):
+        act_regime_tracker.load_state_dict(restored_training_state.act_regime_state)
+        logger.info(
+            "Activation regime restored: cosines=%d stable_fraction=%.3f",
+            len(act_regime_tracker._all_cosines),
+            act_regime_tracker.stable_fraction,
+        )
 
     # LAWA weight averaging baseline (GOAL §3.3)
     lawa_averager = None
@@ -4051,6 +4086,11 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                     lawa_state=lawa_averager.state_dict() if lawa_averager is not None else None,
                     best_lawa_loss=best_lawa_loss,
                     triggered_target_steps=sorted(triggered_target_steps),
+                    act_regime_state=(
+                        act_regime_tracker.state_dict()
+                        if act_regime_tracker is not None
+                        else None
+                    ),
                 )
                 # Bound on-disk checkpoint growth (M10.3 disk-death guard): the
                 # save -> training-state -> artifact -> prune sequence lives in
@@ -4128,6 +4168,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 lawa_averager,
                 best_lawa_loss,
                 triggered_target_steps,
+                act_regime_tracker,
             )
 
     pbar.close()

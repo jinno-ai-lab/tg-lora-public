@@ -61,6 +61,20 @@ def _lawa_state_sample() -> dict:
     }
 
 
+def _act_regime_state_sample() -> dict:
+    """A representative ``ActivationFingerprintTracker.state_dict()`` with a
+    populated regime inventory, so the checkpoint round-trip exercises the
+    resume-persistent regime surface. The GOAL §4 ``activation_regime_inventory``
+    / ``stable_fraction`` must survive resume or the run-end summary reflects
+    only post-resume steps (sibling resume-state-loss axis to ``lawa_state``)."""
+    return {
+        "all_cosines": [0.97, 0.98, 0.96, 0.41, 0.97],
+        "cosines": [0.96, 0.41, 0.97],
+        "counts": {"stable": 3, "transition": 1, "chaotic": 1},
+        "regime": "stable",
+    }
+
+
 
 class TestSaveCheckpointNormal:
     def test_creates_directory(self, tmp_path):
@@ -180,6 +194,12 @@ class TestTrainingStateRoundtrip:
             # (redundant evals + duplicate is_step_aligned_full_eval records
             # corrupting the vs-baseline comparison dataset). Sibling resume-state-loss.
             triggered_target_steps=[250, 500],
+            # Mid-production activation-regime inventory (GOAL §4): the tracker
+            # has classified 5 steps (3 stable / 1 transition / 1 chaotic) so
+            # resume does not rebuild it empty and the run-end summary's
+            # activation_regime_inventory / stable_fraction reflect the full run,
+            # not post-resume only (sibling resume-state-loss axis).
+            act_regime_state=_act_regime_state_sample(),
         )
 
     def test_roundtrip_preserves_values(self, tmp_path):
@@ -219,6 +239,15 @@ class TestTrainingStateRoundtrip:
         # vs-baseline comparison dataset). Serialized sorted; round-trips as a
         # list the trainer converts back to a set.
         assert loaded.triggered_target_steps == [250, 500]
+        # Activation-regime inventory (GOAL §4) must survive resume so the
+        # run-end summary's activation_regime_inventory / stable_fraction reflect
+        # the full run, not post-resume only. Round-trips as a plain dict.
+        assert loaded.act_regime_state is not None
+        assert loaded.act_regime_state["counts"] == {
+            "stable": 3, "transition": 1, "chaotic": 1
+        }
+        assert loaded.act_regime_state["all_cosines"] == [0.97, 0.98, 0.96, 0.41, 0.97]
+        assert loaded.act_regime_state["regime"] == "stable"
         assert loaded.controller_state.K == 3
         assert loaded.controller_state.alpha == 0.3
         assert loaded.velocity._state is not None
@@ -324,8 +353,23 @@ class TestTrainingStateRoundtrip:
         loaded = load_training_state(path)
         assert loaded.triggered_target_steps is None
 
+    def test_legacy_checkpoint_without_act_regime_state_loads_clean(self, tmp_path):
+        """A pre-fix checkpoint omits ``act_regime_state``; load must not break
+        and must read as the safe 'no prior inventory' default (None). None is the
+        only sane legacy reading: the resume path treats a missing inventory as
+        'start empty' (the pre-fix behavior), not a fabricated non-empty one.
+        Also covers an ``activation_regime_enabled: false`` run, which never
+        serialized the tracker. Mirrors the ``lawa_state`` legacy tolerance."""
+        state = self._make_state()
+        path = tmp_path / "legacy.pt"
+        save_training_state(state, path)
+        # Strip the key to simulate a pre-fix checkpoint blob.
+        blob = torch.load(path, weights_only=False)
+        blob.pop("act_regime_state", None)
+        torch.save(blob, path)
 
-class TestDynFreezeStateRoundtrip:
+        loaded = load_training_state(path)
+        assert loaded.act_regime_state is None
     """The §4 release-cooldown map (``released_at``) must survive a real
     ``save_training_state``→``load_training_state`` round-trip.
 

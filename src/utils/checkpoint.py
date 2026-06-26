@@ -481,6 +481,16 @@ class TrainingState:
     # gaps. Modeled as a list (sorted at save) so the legacy path mirrors
     # ``accepted_valid_history``; the trainer restores it to a ``set`` on resume.
     triggered_target_steps: list[int] | None = None
+    # Activation-fingerprint regime inventory (GOAL §4 step 1) run-wide state —
+    # the serialized ``ActivationFingerprintTracker.state_dict()`` (full cosine
+    # series + per-regime counts + classification window + current regime). Must
+    # survive resume: without it a fault/periodic resume rebuilds the tracker
+    # empty and the run-end summary's ``activation_regime_inventory`` /
+    # ``stable_fraction`` reflect only post-resume steps — a silent
+    # resume-state-loss sibling to the fixed LAWA (``lawa_state``) / dynfreeze /
+    # best_full_eval gaps. ``None`` = activation-regime disabled
+    # (``activation_regime_enabled: false``) or a pre-fix checkpoint.
+    act_regime_state: dict | None = None
 
 
 @dataclass
@@ -606,6 +616,7 @@ def save_training_state(state: TrainingState, path: Path) -> None:
         # ``None`` on LAWA-disabled / pre-fix checkpoints. Passed through as-is
         # (already a list at construction — see ``accepted_valid_history``).
         "triggered_target_steps": state.triggered_target_steps,
+        "act_regime_state": state.act_regime_state,
         "dynfreeze_state": (
             {
                 "frozen_layer_indices": state.dynfreeze_state.frozen_layer_indices,
@@ -736,5 +747,10 @@ def load_training_state(path: Path) -> TrainingState:
         # list back to a set; ``None`` → empty set. Mirrors the
         # accepted_valid_history / best_full_eval_* / best_lawa_loss legacy paths.
         triggered_target_steps=blob.get("triggered_target_steps"),
+        # Absent on pre-fix checkpoints → None, the only sane reading of a
+        # checkpoint that predates the field: the resume path treats a missing
+        # regime inventory as 'start empty' (the pre-fix behavior). Mirrors the
+        # lawa_state / triggered_target_steps legacy paths.
+        act_regime_state=blob.get("act_regime_state"),
         dynfreeze_state=dynfreeze_state,
     )
