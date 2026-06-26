@@ -46,6 +46,22 @@ def _mock_model_and_tokenizer(tmp_path, file_count=3, save_pretrained_side_effec
     return model, tokenizer
 
 
+def _lawa_state_sample() -> dict:
+    """A representative ``LAWAAverager.state_dict()`` with two snapshots, so the
+    checkpoint round-trip exercises the buffer-tensor path (not just scalars)."""
+    return {
+        "window_size": 3,
+        "start_cycle": 1,
+        "cycle": 2,
+        "recorded_count": 2,
+        "buffer": [
+            {"lora_A": torch.tensor([0.1, 0.2]), "lora_B": torch.tensor([0.3])},
+            {"lora_A": torch.tensor([0.4, 0.5]), "lora_B": torch.tensor([0.6])},
+        ],
+    }
+
+
+
 class TestSaveCheckpointNormal:
     def test_creates_directory(self, tmp_path):
         model, tokenizer = _mock_model_and_tokenizer(tmp_path, file_count=2)
@@ -151,6 +167,10 @@ class TestTrainingStateRoundtrip:
             # consecutive-cosine count carried over from the release moment.
             warmup_released=True,
             warmup_cos_consecutive=3,
+            # Mid-production LAWA window: two LoRA snapshots already recorded so
+            # ``is_ready`` is True on resume and the LAWA comparison is NOT
+            # silently skipped post-resume (sibling resume-state-loss axis).
+            lawa_state=_lawa_state_sample(),
         )
 
     def test_roundtrip_preserves_values(self, tmp_path):
@@ -172,6 +192,15 @@ class TestTrainingStateRoundtrip:
         # not silently drop back into the pilot-only warmup phase.
         assert loaded.warmup_released is True
         assert loaded.warmup_cos_consecutive == 3
+        # LAWA window must survive resume: the snapshot buffer tensors round-trip
+        # so a resumed averager is ``is_ready`` and does not silently skip the
+        # LAWA comparison / LAWA-averaged JSON eval.
+        assert loaded.lawa_state is not None
+        assert loaded.lawa_state["recorded_count"] == 2
+        assert len(loaded.lawa_state["buffer"]) == 2
+        assert torch.equal(
+            loaded.lawa_state["buffer"][1]["lora_A"], torch.tensor([0.4, 0.5])
+        )
         assert loaded.controller_state.K == 3
         assert loaded.controller_state.alpha == 0.3
         assert loaded.velocity._state is not None
@@ -223,6 +252,22 @@ class TestTrainingStateRoundtrip:
         loaded = load_training_state(path)
         assert loaded.warmup_released is False
         assert loaded.warmup_cos_consecutive == 0
+
+    def test_legacy_checkpoint_without_lawa_state_loads_clean(self, tmp_path):
+        """A pre-fix checkpoint omits ``lawa_state``; load must not break and
+        must read as the safe 'no prior window' default (None). None is the only
+        sane legacy reading: the resume path treats a missing window as 'start
+        fresh' (the pre-fix behavior), not a fabricated non-empty window."""
+        state = self._make_state()
+        path = tmp_path / "legacy.pt"
+        save_training_state(state, path)
+        # Strip the key to simulate a pre-fix checkpoint blob.
+        blob = torch.load(path, weights_only=False)
+        blob.pop("lawa_state", None)
+        torch.save(blob, path)
+
+        loaded = load_training_state(path)
+        assert loaded.lawa_state is None
 
 
 class TestDynFreezeStateRoundtrip:

@@ -99,6 +99,43 @@ class LAWAAverager:
         self._buffer.clear()
         self._recorded_count = 0
 
+    def state_dict(self) -> dict:
+        """Serialize the snapshot window + counters for checkpoint resume.
+
+        Mirrors the resume contract of velocity/delta_tracker: the weight
+        snapshots are caller-local state (the averager is constructed in
+        ``train_tg_lora``'s scope) and must survive resume. Without it a
+        fault-resume starts the window empty, ``is_ready`` is False, and the
+        LAWA comparison (plus LAWA-averaged JSON eval) are silently skipped
+        until ``start_cycle`` worth of new snapshots re-accumulate. LAWA is a
+        mandatory baseline (GOAL §3.3), so its window fidelity across resume is
+        load-bearing. Snapshots are already CPU-detached at ``record`` time, so
+        the checkpoint is device-agnostic.
+        """
+        return {
+            "window_size": self.window_size,
+            "start_cycle": self.start_cycle,
+            "cycle": self._cycle,
+            "recorded_count": self._recorded_count,
+            "buffer": [dict(snapshot) for snapshot in self._buffer],
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore from a serialized state produced by :meth:`state_dict`.
+
+        The deque is rebuilt with ``maxlen=window_size`` from the saved state so
+        a buffer recorded under a given window trims back to that window —
+        matching the live rolling-window contract.
+        """
+        self.window_size = int(state["window_size"])
+        self.start_cycle = int(state["start_cycle"])
+        self._buffer = deque(
+            (dict(snapshot) for snapshot in state.get("buffer", [])),
+            maxlen=self.window_size,
+        )
+        self._cycle = int(state.get("cycle", 0))
+        self._recorded_count = int(state.get("recorded_count", 0))
+
 
 @torch.no_grad()
 def evaluate_with_lawa(

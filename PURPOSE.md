@@ -152,6 +152,28 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-06-26 追記・LAWA weight-averaging window の resume state-loss を修正】** resume-state-loss 軸の
+> **4 件目**（`119e815` dynfreeze / `73201a4` best_full_eval / `02711e6` warmup と同軸）。LAWA は
+> **GOAL §3.3 の必須ベースライン**（P2 公平比較ゲート）かつ実 prod path（`configs/jsonex_lawa.yaml`
+> で `enable_lawa: true`）。`lawa_averager` のスナップショット窓は `train_tg_lora` の module-local 状態で
+> `record()` で蓄積されるが、**resume で空再構築**されていた → `is_ready` が False に落ち、LAWA 比較
+> （`evaluate_with_lawa`）と **LAWA 平均化 JSON eval**（`averaged_weights_context`）が `start_cycle`
+> 分の新スナップショット再蓄積まで**黙って skip** され、resume 後の見出し品質ベースラインが
+> fault 後のみの窓で測られていた（`best_lawa_loss` も inf にリセット）。→ (a) `LAWAAverager.state_dict()`
+> /`load_state_dict()`（CPU スナップショット buffer + counters・deque maxlen を load で再構築）、(b) `TrainingState`
+> に `lawa_state: dict | None` 追加（既定 None で旧 checkpoint と LAWA-disabled run は後方互換）、
+> (c) `_save_fault_checkpoint` + periodic save の両 site で `lawa_averager.state_dict()` を記録、
+> (d) resume で `restored_training_state` ガード下に復元（`lawa_averager` は resume block **より後**で
+> 構築されるため、同 block 内だと `UnboundLocalError` → 構築直後に配置・`119e815` の hoist と同様に
+> `LAWAAverager` import を module top に巻き上げ）。**検証**: `tests/test_weight_averaging.py` **28 passed**
+> （+5 `TestLAWAStateRoundtrip`：往復 / `is_ready` の resume 越え生存 / `average_snapshot` の byte 同一性 /
+> maxlen 窓 trim / 空 buffer 許容）、`tests/test_checkpoint.py` **16 passed**（+legacy-load clean / +`lawa_state`
+> 往復）、`test_train_tg_lora_static_guards.py` green（F821=0）、`test_cli_help_smoke.py` 37 passed / 3 xfailed、
+> `test_fault_recovery.py` 7 fail / 15 pass は stashed HEAD と**完全同一**（src.data import-block・非回帰）。
+> ruff 0 新規（既存 F841 `production_start_full_backward_passes` は write-only dead var と判明＝本 fix
+> の調査副産物・別 clean-up 対象・非回帰）。本 axis は「実際の training run への旋回」の実行可能形
+> （9B は private `src.data` で block のまま・不変）。
+
 > **【2026-06-26 追記・warmup 2-phase gate の resume state-loss を修正】** resume-state-loss 軸の
 > **3 件目**（`119e815` dynfreeze / `73201a4` best_full_eval と同クラス・同ファイルの兄弟）。
 > `warmup_released`/`warmup_cos_consecutive` は `train_tg_lora` の module-local 2-phase gate 状態で、

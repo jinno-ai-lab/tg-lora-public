@@ -384,3 +384,95 @@ class TestAveragedWeightsContext:
             assert torch.allclose(p.detach().cpu(), pre[n].cpu()), (
                 f"{n} not restored after exception in context"
             )
+
+
+# ---------------------------------------------------------------------------
+# LAWAAverager — state_dict / load_state_dict (resume persistence)
+#
+# GOAL §3.3: LAWA is a *mandatory* baseline. Its snapshot window is caller-local
+# state; without persistence a fault-resume starts the window empty, ``is_ready``
+# is False, and the LAWA comparison + LAWA-averaged JSON eval are silently
+# skipped until ``start_cycle`` worth of new snapshots re-accumulate. This is
+# the same resume-state-loss class as dynfreeze / best_full_eval / warmup.
+# ---------------------------------------------------------------------------
+
+
+class TestLAWAStateRoundtrip:
+    def test_state_dict_roundtrip_restores_buffer_and_counters(self):
+        model = _make_lora_model()
+        avg = LAWAAverager(window_size=4, start_cycle=1)
+        for c in range(3):
+            for p in model.parameters():
+                p.data += 1.0
+            avg.record(model, cycle=c)
+
+        state = avg.state_dict()
+        restored = LAWAAverager(window_size=4, start_cycle=1)
+        restored.load_state_dict(state)
+
+        assert restored.count == 3
+        assert restored.window_size == 4
+        assert restored.start_cycle == 1
+        assert restored._recorded_count == 3
+        assert restored._cycle == 2
+
+    def test_load_preserves_is_ready_gate(self):
+        """The resume-correctness core: a ready window stays ready after
+        round-trip. Without persistence a resumed averager is empty → not
+        ready → LAWA eval silently skipped."""
+        model = _make_lora_model()
+        avg = LAWAAverager(window_size=4, start_cycle=1)
+        avg.record(model, cycle=1)
+        for p in model.parameters():
+            p.data += 1.0
+        avg.record(model, cycle=2)
+        assert avg.is_ready
+
+        restored = LAWAAverager(window_size=4, start_cycle=1)
+        restored.load_state_dict(avg.state_dict())
+        assert restored.is_ready
+
+    def test_average_snapshot_byte_identical_after_roundtrip(self):
+        model = _make_lora_model()
+        avg = LAWAAverager(window_size=4)
+        for c in range(3):
+            for p in model.parameters():
+                p.data += 1.0
+            avg.record(model, cycle=c)
+        before = avg.average_snapshot()
+
+        restored = LAWAAverager(window_size=4)
+        restored.load_state_dict(avg.state_dict())
+        after = restored.average_snapshot()
+
+        assert before is not None and after is not None
+        assert set(before.keys()) == set(after.keys())
+        for k in before:
+            assert torch.equal(before[k], after[k]), f"{k} diverged after round-trip"
+
+    def test_load_reconstructs_maxlen_window(self):
+        """A window_size=3 deque must trim a 5-snapshot buffer back to 3 on
+        load, matching the live rolling-window contract."""
+        model = _make_lora_model()
+        avg = LAWAAverager(window_size=3)
+        for c in range(5):
+            for p in model.parameters():
+                p.data += 1.0
+            avg.record(model, cycle=c)
+        assert avg.count == 3  # deque already trimmed
+
+        restored = LAWAAverager(window_size=3)
+        restored.load_state_dict(avg.state_dict())
+        assert restored.count == 3
+
+    def test_empty_buffer_roundtrips_clean(self):
+        """A fresh (never-recorded) averager must round-trip to an empty,
+        not-ready averager — the resume baseline for a run that faulted before
+        the first snapshot."""
+        avg = LAWAAverager(window_size=3, start_cycle=2)
+        restored = LAWAAverager(window_size=3, start_cycle=2)
+        restored.load_state_dict(avg.state_dict())
+
+        assert restored.count == 0
+        assert restored._recorded_count == 0
+        assert not restored.is_ready

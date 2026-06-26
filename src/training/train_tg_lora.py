@@ -30,6 +30,7 @@ from src.tg_lora.activation_cache import (
 from src.tg_lora.cycle_state import CycleState
 from src.tg_lora.delta_tracker import DeltaTracker
 from src.tg_lora.dynamic_freeze import DynamicFreezeController
+from src.tg_lora.weight_averaging import LAWAAverager
 from src.tg_lora.extrapolator import (
     ExtrapolationStats,
     ZerothOrderStepStats,
@@ -710,6 +711,7 @@ def _save_fault_checkpoint(
     best_full_eval_perplexity: float | None,
     warmup_released: bool,
     warmup_cos_consecutive: int,
+    lawa_averager: LAWAAverager | None,
 ) -> None:
     """Save model + full training state on fault (OOM / CUDA error).
 
@@ -729,6 +731,14 @@ def _save_fault_checkpoint(
     must record ``warmup_released=True`` or resume drops back into the pilot-only
     warmup phase and re-disables convergence/acceleration adaptation and
     extrapolation until the gate re-fires.
+
+    ``lawa_averager`` likewise: it is the caller-scoped mandatory-baseline
+    (GOAL §3.3) weight-averaging window. A fault checkpoint taken after the
+    window has started recording must serialize it or resume rebuilds it empty,
+    ``is_ready`` is False, and the LAWA comparison plus LAWA-averaged JSON eval
+    are silently skipped until ``start_cycle`` worth of new snapshots
+    re-accumulate — the resumed headline baseline measured over a post-fault-only
+    window.
     """
     try:
         oom_dir = run_dir / "oom_checkpoint"
@@ -753,6 +763,7 @@ def _save_fault_checkpoint(
             best_full_eval_perplexity=best_full_eval_perplexity,
             warmup_released=warmup_released,
             warmup_cos_consecutive=warmup_cos_consecutive,
+            lawa_state=lawa_averager.state_dict() if lawa_averager is not None else None,
         )
         save_training_state(ts, run_dir / "training_state.pt")
     except Exception as exc:
@@ -1521,7 +1532,6 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     # LAWA weight averaging baseline (GOAL §3.3)
     lawa_averager = None
     if bool(tg_cfg.get("enable_lawa", False)):
-        from src.tg_lora.weight_averaging import LAWAAverager
         lawa_averager = LAWAAverager(
             window_size=int(tg_cfg.get("lawa_window_size", 5)),
             start_cycle=int(tg_cfg.get("lawa_start_cycle", 10)),
@@ -1529,6 +1539,29 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
         logger.info(
             "LAWA enabled: window=%d, start_cycle=%d",
             lawa_averager.window_size, lawa_averager.start_cycle,
+        )
+
+    # Restore the LAWA snapshot window on resume. Placed here (after the
+    # averager is constructed) rather than in the resume block above because
+    # ``lawa_averager`` is built below that block — restoring there would hit
+    # UnboundLocalError. ``restored_training_state`` is the None-when-not-
+    # resuming handle (the resume block sets it to the loaded TrainingState).
+    # Without this restore a checkpoint taken after the window started recording
+    # loads an empty averager: ``is_ready`` is False and the LAWA comparison +
+    # LAWA-averaged JSON eval are silently skipped until ``start_cycle`` worth of
+    # new snapshots re-accumulate. Mirrors the dynfreeze/best_full_eval/warmup
+    # restores; guarded so LAWA-disabled runs and pre-fix checkpoints (None) are
+    # untouched.
+    if (
+        lawa_averager is not None
+        and restored_training_state is not None
+        and restored_training_state.lawa_state is not None
+    ):
+        lawa_averager.load_state_dict(restored_training_state.lawa_state)
+        logger.info(
+            "LAWA window restored: snapshots=%d recorded_count=%d",
+            lawa_averager.count,
+            lawa_averager._recorded_count,
         )
 
     warmup_release_cos = float(tg_cfg.get("warmup_release_cos", 0.75))
@@ -3980,6 +4013,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                     best_full_eval_perplexity=best_full_eval_perplexity,
                     warmup_released=warmup_released,
                     warmup_cos_consecutive=warmup_cos_consecutive,
+                    lawa_state=lawa_averager.state_dict() if lawa_averager is not None else None,
                 )
                 # Bound on-disk checkpoint growth (M10.3 disk-death guard): the
                 # save -> training-state -> artifact -> prune sequence lives in
@@ -4054,6 +4088,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 best_full_eval_perplexity,
                 warmup_released,
                 warmup_cos_consecutive,
+                lawa_averager,
             )
 
     pbar.close()

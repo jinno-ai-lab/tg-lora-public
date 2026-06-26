@@ -446,6 +446,16 @@ class TrainingState:
     # state-loss to the fixed ``best_full_eval_*`` / ``dynfreeze_state`` gaps.
     warmup_released: bool = False
     warmup_cos_consecutive: int = 0
+    # LAWA (mandatory baseline, GOAL §3.3) snapshot window — the serialized
+    # ``LAWAAverager.state_dict()`` (window_size / start_cycle / counters + the
+    # CPU LoRA-snapshot buffer). Must survive resume: without it a fault-resume
+    # rebuilds the averager empty, ``is_ready`` is False, and the LAWA
+    # comparison plus LAWA-averaged JSON eval are silently skipped until
+    # ``start_cycle`` worth of new snapshots re-accumulate — the resumed
+    # headline-quality baseline measured over a different (post-fault-only)
+    # window. Sibling resume-state-loss to the fixed dynfreeze / best_full_eval
+    # / warmup gaps. ``None`` = LAWA disabled or a pre-fix checkpoint.
+    lawa_state: dict | None = None
 
 
 @dataclass
@@ -551,6 +561,21 @@ def save_training_state(state: TrainingState, path: Path) -> None:
         "best_full_eval_perplexity": state.best_full_eval_perplexity,
         "warmup_released": state.warmup_released,
         "warmup_cos_consecutive": state.warmup_cos_consecutive,
+        "lawa_state": (
+            # Deep-copy the snapshot buffer so the checkpoint is independent of
+            # the live averager's deque; tensors are already CPU at record time.
+            {
+                "window_size": state.lawa_state["window_size"],
+                "start_cycle": state.lawa_state["start_cycle"],
+                "cycle": state.lawa_state["cycle"],
+                "recorded_count": state.lawa_state["recorded_count"],
+                "buffer": [
+                    dict(snapshot) for snapshot in state.lawa_state["buffer"]
+                ],
+            }
+            if state.lawa_state is not None
+            else None
+        ),
         "dynfreeze_state": (
             {
                 "frozen_layer_indices": state.dynfreeze_state.frozen_layer_indices,
@@ -664,5 +689,10 @@ def load_training_state(path: Path) -> TrainingState:
         # best_full_eval_* / dynfreeze legacy tolerance.
         warmup_released=blob.get("warmup_released", False),
         warmup_cos_consecutive=blob.get("warmup_cos_consecutive", 0),
+        # Absent on pre-fix checkpoints → None, the only sane reading of a
+        # checkpoint that predates the field: the resume path treats a missing
+        # window as 'start fresh' (the pre-fix behavior), not a fabricated
+        # non-empty window. Mirrors the dynfreeze/best_full_eval legacy path.
+        lawa_state=blob.get("lawa_state"),
         dynfreeze_state=dynfreeze_state,
     )
