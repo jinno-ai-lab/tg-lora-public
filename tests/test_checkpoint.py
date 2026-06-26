@@ -145,6 +145,8 @@ class TestTrainingStateRoundtrip:
             cycle_offset=3,
             train_batch_position=17,
             accepted_valid_history=[2.9, 2.5, 2.1],
+            best_full_eval_loss=1.83,
+            best_full_eval_perplexity=6.23,
         )
 
     def test_roundtrip_preserves_values(self, tmp_path):
@@ -158,6 +160,10 @@ class TestTrainingStateRoundtrip:
         assert loaded.accepted_valid_history == [2.9, 2.5, 2.1]
         assert loaded.cycle_state.cycle == 5
         assert loaded.cycle_state.best_loss == 2.5
+        # Best-full-eval trackers must survive resume so the resumed save-best
+        # gate compares against the genuine pre-fault best, not inf.
+        assert loaded.best_full_eval_loss == 1.83
+        assert loaded.best_full_eval_perplexity == 6.23
         assert loaded.controller_state.K == 3
         assert loaded.controller_state.alpha == 0.3
         assert loaded.velocity._state is not None
@@ -172,6 +178,23 @@ class TestTrainingStateRoundtrip:
             == state.velocity.predicted_consistency()
         )
         assert loaded.delta_tracker.norm_history == state.delta_tracker.norm_history
+
+    def test_legacy_checkpoint_without_best_full_eval_loads_clean(self, tmp_path):
+        """A pre-fix checkpoint omits ``best_full_eval_loss``/``_perplexity``;
+        load must not break and must read as the safe 'no prior best' defaults
+        (inf/None) so the resumed save-best gate never sees a fabricated low."""
+        state = self._make_state()
+        path = tmp_path / "legacy.pt"
+        save_training_state(state, path)
+        # Strip both keys to simulate a pre-fix checkpoint blob.
+        blob = torch.load(path, weights_only=False)
+        blob.pop("best_full_eval_loss", None)
+        blob.pop("best_full_eval_perplexity", None)
+        torch.save(blob, path)
+
+        loaded = load_training_state(path)
+        assert loaded.best_full_eval_loss == float("inf")
+        assert loaded.best_full_eval_perplexity is None
 
 
 class TestDynFreezeStateRoundtrip:

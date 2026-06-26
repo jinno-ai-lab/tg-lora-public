@@ -424,6 +424,15 @@ class TrainingState:
     train_batch_position: int = 0
     accepted_valid_history: list[float] | None = None
     dynfreeze_state: DynFreezeState | None = None
+    # Best full-eval loss/perplexity seen so far — gates the run_dir/"best_model"
+    # save via a PLAIN improvement check, which is distinct from
+    # ``cycle_state.best_loss`` (that one carries the §5.3 ``min_delta`` margin
+    # and drives early-stopping). Must survive resume: without it the first
+    # post-resume full eval sees ``best_full_eval_loss=inf`` and unconditionally
+    # overwrites the genuinely-best pre-fault "best_model" artifact — a silent
+    # state-loss on fault-resume, sibling to the fixed ``dynfreeze_state`` gap.
+    best_full_eval_loss: float = float("inf")
+    best_full_eval_perplexity: float | None = None
 
 
 @dataclass
@@ -525,6 +534,8 @@ def save_training_state(state: TrainingState, path: Path) -> None:
         "adapter_checkpoint_dir": state.adapter_checkpoint_dir,
         "train_batch_position": state.train_batch_position,
         "accepted_valid_history": state.accepted_valid_history,
+        "best_full_eval_loss": state.best_full_eval_loss,
+        "best_full_eval_perplexity": state.best_full_eval_perplexity,
         "dynfreeze_state": (
             {
                 "frozen_layer_indices": state.dynfreeze_state.frozen_layer_indices,
@@ -626,5 +637,9 @@ def load_training_state(path: Path) -> TrainingState:
         adapter_checkpoint_dir=blob.get("adapter_checkpoint_dir"),
         train_batch_position=blob.get("train_batch_position", 0),
         accepted_valid_history=blob.get("accepted_valid_history"),
+        # Absent on pre-fix checkpoints → inf/None, the only sane reading of a
+        # checkpoint that predates the field (mirrors the dynfreeze legacy path).
+        best_full_eval_loss=blob.get("best_full_eval_loss", float("inf")),
+        best_full_eval_perplexity=blob.get("best_full_eval_perplexity"),
         dynfreeze_state=dynfreeze_state,
     )

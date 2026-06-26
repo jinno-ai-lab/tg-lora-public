@@ -152,6 +152,23 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-06-26 追記・fault-resume の best_model 無条件上書きバグを修正】** 直前の
+> `119e815`（訓練ループ潜伏 NameError 2 件）と**同クラス・同ファイルの兄弟バグ**を発見・修正
+> （足場ではなく製品挙動の正確性軸を継続）。`best_full_eval_loss`/`best_full_eval_perplexity`
+> は `train_tg_lora` の module-local tracker で `best_model/` 保存 gate（5 site）を駆るが、
+> `TrainingState` に**永続化されず resume で復元されない**ため、fault-resume 後の初回 full-eval
+> が `inf` と比較して**常に真**になり、真に最良だった fault 前の `best_model/` を**黙って上書き**
+> していた（`cycle_state.best_loss` とは §5.3 `min_delta` の有無で意味が異なり流用不可）。
+> → 両 field を `TrainingState` に追加（既定値 inf/None で旧 checkpoint と後方互換）し、
+> save/load 往復 + resume 復元 + fault-save（`_save_fault_checkpoint` へ param thread =
+> `dynfreeze` と同一パターン）で対称化。**検証**: `tests/test_checkpoint.py` 14 passed
+> （往復 assert + 旧 checkpoint が inf/None に落ちる legacy-load test 追加）。
+> `ruff --select F821 src/training/train_tg_lora.py` = **0**（thread 前に一時 F821×2 を
+> 導入したが param 化で解消・`test_train_tg_lora_static_guards.py` green）。
+> `tests/test_fault_recovery.py` の 7 fail は HEAD と**完全同一**（src.data block の
+> pre-existing・stash 比較で非回帰確認）。本 axis は「実際の training run への旋回」の
+> 実行可能形（9B は private `src.data` で block のまま）。
+
 > **方針転換（AI-Hub feedback 2026-06-25）**: Category-A（CPU-only 足場）は**枯竭**。
 > 次イテレーションで**足場ヘルパーをこれ以上追加しない**こと（収益逓減・"indefinitely
 > deferring the actual research result while accumulating orthogonal CPU scaffolding"）。

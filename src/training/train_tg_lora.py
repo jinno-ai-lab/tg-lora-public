@@ -706,6 +706,8 @@ def _save_fault_checkpoint(
     train_batch_position: int,
     accepted_valid_history: list[float],
     dynfreeze: DynamicFreezeController | None,
+    best_full_eval_loss: float,
+    best_full_eval_perplexity: float | None,
 ) -> None:
     """Save model + full training state on fault (OOM / CUDA error).
 
@@ -713,6 +715,12 @@ def _save_fault_checkpoint(
     experiment is disabled). It must be threaded in explicitly — the controller
     lives in the caller's (``train_tg_lora``) scope and is unreachable from
     module globals — so the fault checkpoint records its state for resume.
+
+    ``best_full_eval_loss`` / ``best_full_eval_perplexity`` use the same
+    threading rationale: they are caller-scoped trackers that gate the
+    ``best_model/`` save, so the fault checkpoint must record them or resume
+    sees them as ``inf``/``None`` and clobbers the genuine best on the first
+    post-fault full eval.
     """
     try:
         oom_dir = run_dir / "oom_checkpoint"
@@ -733,6 +741,8 @@ def _save_fault_checkpoint(
             train_batch_position=train_batch_position,
             accepted_valid_history=list(accepted_valid_history),
             dynfreeze_state=dynfreeze.state_dict() if dynfreeze is not None else None,
+            best_full_eval_loss=best_full_eval_loss,
+            best_full_eval_perplexity=best_full_eval_perplexity,
         )
         save_training_state(ts, run_dir / "training_state.pt")
     except Exception as exc:
@@ -1289,6 +1299,11 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 sorted(dynfreeze.frozen_layer_indices),
                 dynfreeze._frozen_since_cycle,
             )
+        # Restore the best-full-eval trackers so the post-resume save-best gate
+        # compares against the genuine pre-fault best, not inf — otherwise the
+        # first full eval after resume unconditionally overwrites "best_model/".
+        best_full_eval_loss = ts.best_full_eval_loss
+        best_full_eval_perplexity = ts.best_full_eval_perplexity
 
     mlflow_cfg = cfg.logging.get("mlflow", {})
     batch_plan_manifest_path = run_dir / "batch_plan_manifest.json"
@@ -3945,6 +3960,8 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                     train_batch_position=train_batch_position,
                     accepted_valid_history=list(accepted_valid_history),
                     dynfreeze_state=dynfreeze.state_dict() if dynfreeze is not None else None,
+                    best_full_eval_loss=best_full_eval_loss,
+                    best_full_eval_perplexity=best_full_eval_perplexity,
                 )
                 # Bound on-disk checkpoint growth (M10.3 disk-death guard): the
                 # save -> training-state -> artifact -> prune sequence lives in
@@ -4015,6 +4032,8 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 train_batch_position,
                 accepted_valid_history,
                 dynfreeze,
+                best_full_eval_loss,
+                best_full_eval_perplexity,
             )
 
     pbar.close()
