@@ -13,7 +13,7 @@ import math
 
 import torch
 
-from src.tg_lora.layer_type import LayerType, classify_layer_type
+from src.tg_lora.layer_type import classify_layer_type
 from src.tg_lora.psa import _power_iteration_pc1
 
 

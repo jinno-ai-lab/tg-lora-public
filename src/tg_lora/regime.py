@@ -114,7 +114,6 @@ class RegimeDetector:
             return Regime.STABLE
 
         recent = vels[-self.min_history:]
-        mean_v = sum(recent) / len(recent)
 
         # Plateau: recent velocities all near zero
         if all(abs(v) < self.plateau_eps for v in recent):

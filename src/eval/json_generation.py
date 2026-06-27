@@ -127,7 +127,7 @@ if __name__ == "__main__":
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     test_path = Path("data/jsonex_test.jsonl")
-    records = [json.loads(l) for l in open(test_path) if l.strip()]
+    records = [json.loads(line) for line in open(test_path) if line.strip()]
     model_id = os.environ.get("MODEL_ID")
     if not model_id:
         print("Set MODEL_ID to run generation; skipping (no model).")

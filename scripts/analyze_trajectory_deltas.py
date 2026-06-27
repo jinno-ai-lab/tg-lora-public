@@ -133,7 +133,7 @@ def compute_regime_inventory(
                 step_cosines.append(cos)
 
     if not step_cosines:
-        return {"n_steps": len(incregments)}
+        return {"n_steps": len(increments)}
 
     # Classify: cos > 0.5 = stable, 0.0-0.5 = plateau, < 0.0 = transition
     n_stable = sum(1 for c in step_cosines if c > 0.5)

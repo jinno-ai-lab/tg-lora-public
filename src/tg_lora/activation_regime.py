@@ -292,7 +292,6 @@ def compute_regime_null_baseline(
         }
 
     rng = random.Random(seed)
-    n = len(cosines)
 
     def _classify_series(series: list[float]) -> dict[str, float]:
         counts = {r: 0 for r in ActivationRegime}

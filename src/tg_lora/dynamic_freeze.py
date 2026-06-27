@@ -291,14 +291,14 @@ class DynamicFreezeController:
         self._frozen_block.extend(layers)
         self._frozen_block.sort(reverse=True)  # Maintain L31→L24 order
 
-        if layers and not any(l == min(self._frozen_block) for l in layers):
+        if layers and not any(layer == min(self._frozen_block) for layer in layers):
             pass  # Existing block, just extending
         else:
             self._frozen_since_cycle = cycle
 
         logger.info(
             "Guard: froze L%s (cycle %d, %d params, block=%s)",
-            ",".join(str(l) for l in layers), cycle, frozen_count, self._frozen_block,
+            ",".join(str(layer) for layer in layers), cycle, frozen_count, self._frozen_block,
         )
         return frozen_count
 
@@ -326,7 +326,7 @@ class DynamicFreezeController:
                         param.requires_grad = True
                         unfrozen_count += 1
 
-        self._frozen_block = [l for l in self._frozen_block if l not in release_set]
+        self._frozen_block = [layer for layer in self._frozen_block if layer not in release_set]
 
         if cycle is not None:
             # Block changed → the "held R cycles" counter for §4(a) stir resets,
@@ -341,7 +341,7 @@ class DynamicFreezeController:
         if unfrozen_count:
             logger.info(
                 "Guard: released L%s (block now=%s, %d params unfrozen)",
-                ",".join(str(l) for l in layers), self._frozen_block, unfrozen_count,
+                ",".join(str(layer) for layer in layers), self._frozen_block, unfrozen_count,
             )
         return unfrozen_count
 

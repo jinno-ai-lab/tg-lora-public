@@ -152,6 +152,42 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-06-27 追記・AI-Hub feedback 再送（同一 4 提案）の再確認 + scripts/ の実在する latent NameError 修正 + whole-`src/` lint-clean/CI-pin】**
+> AI-Hub feedback が前回と**同一の 4 提案**を再送。各々を本 mirror で再検証し、やはり全件
+> 実行不能/非適用（前回エントリと同一結論）: (1) 9B target-scale run → `src/data/` 不在で BLOCKED
+> （`train_tg_lora.py:16` `from src.data...`）・(2) §2.5 gate vs 9B corpus + claims.ndjson → 同 BLOCKED
+> （`claims.ndjson` は本 repo に存在せず）・(3) critique-loop/experiment-loop → AI Hub 自身の infra
+> （`grep -rni critique.?loop|experiment.?loop|revision_only` = 該当なし）・(4) MS-008=871 vs 866 →
+> `MS-008`/`871`/`866`/`system.?health` は本 repo 全文に存在せず（別 repo の PURPOSE）。9B lever は
+> 引き続き private `src.data` で block（不変）。feedback の「足場/ゲート硬化は停止・proxy 負対照は飽和」
+> にも合致するため、これらをこれ以上追加しない。
+>
+> 代わりに audit-integrity/hygiene 軸（feedback #4 の spirit「測定値に pin して整合させる」の継続）で、
+> **実在する latent defect を修正しつつ再発防止を CI 化**:
+> - **(a) scripts/analyze_trajectory_deltas.py の実在する latent `NameError` を修正**。[[public-mirror-preexisting-lint-debt]]
+>   memory は本件を「既知の scripts/ lint 債」と記録していたが、実際は **runtime NameError** だった:
+>   `compute_regime_inventory`（GOAL §4 step 2 regime inventory）の empty-`step_cosines` 早期 return（L136）が
+>   `len(incregments)` を読んでいた（param `increments` の typo・未定義名）。平ら/零ノルム軌道は全 cosine の
+>   `n1>1e-10 and n2>1e-10` guard を false にして `step_cosines` を空にするため、この経路に到達し
+>   `NameError` で crash していた（L123/L145 は正しく `increments`）。`increments` へ修正。
+>   **新規 `tests/test_analyze_trajectory_deltas.py`**（零ノルム経路の回帰 test + stable 軌道の happy-path）で固定。
+>   **mutation 証明**: typo を再注入すると零ノルム test が `NameError` で fail → revert で green。
+>   ※ scripts/ の他 F841（`prev_meta` 等）は dead-local であり NameError ではないため、既知債のまま残置。
+> - **(b) whole-`src/` tree を ruff-clean (0) 化 + CI-pin**（a4d7c26 の `train_tg_lora.py` 単体 pin を `src/` 全体へ拡張）。
+>   11 件を除去、全て振舞非変更: F401 ×2（`eval/eval_json_extraction.py` `sys`・`layer_delta_analysis.py` `LayerType`）・
+>   F841 ×3 dead local（`activation_regime.py` `n`・`regime.py` `mean_v`・`weight_averaging.py` `n` — いずれも計算-only で未読;
+>   trainer から除去したのと同 dead-state class）・E741 ×6（`dynamic_freeze.py` ×4 + `extrapolator.py` `l`→`loss` + `json_generation.py` `l`→`line`）。
+>   **新規 `tests/test_src_static_guards.py::test_src_tree_is_ruff_clean`**（subprocess `ruff check src/`==0）で CI 強制。
+>   **mutation 証明**: throwaway src file に非 underscore の unused local を置くと F841 で fail → 削除で green。
+>   scope は `src/` のみ（`scripts/`+`tests/` 債は高 churn/低優先で意図的に残置・`make lint` は同 2 slice で依然 red）。
+>
+> **検証**: `ruff check src/` = **All checks passed! (0)**・新規 2 test（3 passed）・`test_train_tg_lora_static_guards.py`
+> green・canary `tests/test_cli_help_smoke.py` **37p/3xf**（不変）・影響 module test（dynamic_freeze / activation_regime /
+> weight_averaging / layer_delta_analysis / extrapolator / regime / eval_modules / eval_loss / analyze_trajectory_deltas）
+> = **221 passed**（振舞非変更を確認）・`test_eval_downstream.py` の collection error は `ModuleNotFoundError: No module named 'peft'`
+> で**既知の pre-existing 欠損 dep**（stash で clean HEAD でも同一に fail = 非回帰）。memory
+> [[public-mirror-preexisting-lint-debt]] 更新済み（whole-`src/` clean/CI-pin 化 + `incregments` NameError 修正）。
+
 > **【2026-06-27 追記・AI-Hub feedback 4 提案の検証と lint-debt/audit-drift gap の close】**
 > AI-Hub feedback が前イテレーション（§4 verdict gate の負対照 provenance guard）を VALUABLE と判定し、
 > 4 件の focus を提案。各々を本 mirror で検証した結果:

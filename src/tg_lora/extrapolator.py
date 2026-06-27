@@ -1008,9 +1008,9 @@ def subspace_m9_fit_step(
         for name, p in params.items():
             delta_val = selected_N * a * w_traj * v0_dict[name].to(p.device) + b1 * u1_dict[name].to(p.device) + b2 * u2_dict[name].to(p.device)
             p.data.copy_(original_state[name].to(p.device) + delta_val)
-        l = loss_fn(batch)
+        loss = loss_fn(batch)
         restore_model()
-        return l
+        return loss
 
     # Fixed coefficients: FD fitting bypassed for diagnostic run.
     # Motivation: alpha std=4.46 noise in previous run made fitting harmful.

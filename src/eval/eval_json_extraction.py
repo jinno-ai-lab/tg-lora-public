@@ -172,7 +172,6 @@ def score_json_extraction(
 
 if __name__ == "__main__":
     # Self-test: gold completions should score perfectly
-    import sys
     from pathlib import Path
 
     data_dir = Path("data")

@@ -88,7 +88,6 @@ class LAWAAverager:
 
         keys = sorted(self._buffer[0].keys())
         avg: dict[str, torch.Tensor] = {}
-        n = len(self._buffer)
         for key in keys:
             stacked = torch.stack([buf[key] for buf in self._buffer])
             avg[key] = stacked.mean(dim=0)
