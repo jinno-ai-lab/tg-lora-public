@@ -277,11 +277,21 @@ class TestNegativeControlParam:
     def test_default_is_symmetric_not_negative_control(self):
         from scripts.run_freeze_validloss_ci import run_ci
 
-        # Default (candidate_total=None): candidate and surrogate share one
-        # budget, so nothing already committed regresses.
+        # Default (candidate_total=None, surrogate_total=None): candidate and
+        # surrogate share one budget, so nothing already committed regresses.
         r = run_ci(device=_DEVICE, num_layers=6, **_TINY)
         assert r["candidate_total"] == r["total"] == _TINY["total"]
+        assert r["surrogate_total"] == r["total"] == _TINY["total"]
         assert r["negative_control"] is False
+        assert r["negative_control_arm"] is None
+
+    def test_negative_control_arm_is_candidate_when_only_candidate_diverges(self):
+        # The arm field names the degraded arm: candidate-only divergence ⇒
+        # "candidate" (the DOWNWARD/UNDERSHOOTS direction).
+        from scripts.run_freeze_validloss_ci import run_ci
+
+        r = run_ci(device=_DEVICE, num_layers=6, candidate_total=2, **_TINY)
+        assert r["negative_control_arm"] == "candidate"
 
     def test_candidate_total_threads_through_to_result_and_json(self):
         from scripts.run_freeze_validloss_ci import run_ci, result_to_json
@@ -337,6 +347,101 @@ class TestNegativeControlParam:
         assert "NEGATIVE_CONTROL" in text
         assert "candidate_total=2" in text
         assert "NOT a §4 order result" in text
+
+
+class TestNegativeControlSurrogateParam:
+    """``surrogate_total`` — the SYMMETRIC negative-control lever.
+
+    ``candidate_total`` (the sibling class above) degrades the candidate and
+    fires the DOWNWARD real label (UNDERSHOOTS, commit 74fe474's recorded
+    fixture). But the gate's UPWARD label — SURPASSES — had only ever been
+    exercised on synthetic plumbing floats (``freeze_validloss_target_dropin_
+    plumbing.json``); no real measurement had ever shown the ``lower > 0.0``
+    branch fires on gradient-trained samples. ``surrogate_total`` closes that
+    symmetric gap: it degrades the SURROGATE on the same non-order lever
+    (training budget), so the candidate looks better by construction and the
+    gate fires a real SURPASSES. The result is tagged ``negative_control=True``
+    with ``negative_control_arm="surrogate"`` and the citation gate withholds
+    it — the generator half of the path the replay-side suite validates on the
+    committed ``freeze_validloss_negative_control_surrogate_proxy.json`` fixture.
+    """
+
+    def test_surrogate_total_threads_through_to_result_and_json(self):
+        from scripts.run_freeze_validloss_ci import run_ci, result_to_json
+
+        r = run_ci(device=_DEVICE, num_layers=6, surrogate_total=2, **_TINY)
+        assert r["surrogate_total"] == 2
+        assert r["total"] == _TINY["total"]
+        assert r["candidate_total"] == _TINY["total"]  # candidate stays symmetric
+        assert r["negative_control"] is True
+        assert r["negative_control_arm"] == "surrogate"
+        payload = result_to_json(r)
+        assert payload["surrogate_total"] == 2
+        assert payload["negative_control"] is True
+        assert payload["negative_control_arm"] == "surrogate"
+
+    def test_under_trained_surrogate_is_reliably_better(self):
+        # The lever works the other direction: an under-trained surrogate
+        # (2 epochs vs 15) lands at a HIGHER valid_loss than the fully-trained
+        # candidate — the real, non-order quality gap the gate reads as SURPASSES
+        # on the committed RTX 3060 fixture (candidate_mean=0.43 vs surrogate
+        # mean=1.67, CI entirely above zero).
+        from scripts.run_freeze_validloss_ci import run_ci
+
+        r = run_ci(device=_DEVICE, num_layers=6, surrogate_total=2, **_TINY)
+        cmean = sum(r["candidate_losses"]) / len(r["candidate_losses"])
+        smean = sum(r["surrogate_losses"]) / len(r["surrogate_losses"])
+        assert cmean < smean
+
+    def test_negative_control_withholds_citable_claim(self):
+        # The generator stamps the machine gate at inception: a surrogate-side
+        # negative control is never citable as a §4 result, even at target scale
+        # — the generator-side mirror of the replay judge's stricter rule, and
+        # the same withholding the candidate-side negative control gets.
+        from scripts.run_freeze_validloss_ci import run_ci, result_to_json
+
+        proxy_neg = result_to_json(
+            run_ci(device=_DEVICE, num_layers=6, surrogate_total=2, **_TINY)
+        )
+        assert proxy_neg["negative_control_arm"] == "surrogate"
+        assert proxy_neg["citable_as_target_scale"] is False
+
+        target_neg = result_to_json(
+            run_ci(
+                device=_DEVICE, num_layers=6, surrogate_total=2,
+                proxy_scale=False, **_TINY,
+            )
+        )
+        assert target_neg["proxy_scale"] is False
+        assert target_neg["negative_control_arm"] == "surrogate"
+        # Target-scale AND negative control ⇒ still NOT citable.
+        assert target_neg["citable_as_target_scale"] is False
+
+    def test_report_renders_surrogate_negative_control_note(self):
+        # The arm-aware note names the SURROGATE (not the candidate) so the gap's
+        # source is honest and the recorded SURPASSES cannot be misread as an
+        # output-first order advantage.
+        from scripts.run_freeze_validloss_ci import format_report, run_ci
+
+        r = run_ci(device=_DEVICE, num_layers=6, surrogate_total=2, **_TINY)
+        text = format_report(r)
+        assert "NEGATIVE_CONTROL" in text
+        assert "surrogate_total=2" in text
+        assert "candidate arm" not in text  # the candidate was NOT degraded
+        assert "NOT a §4 order result" in text
+
+    def test_both_arms_diverging_is_negative_control_both(self):
+        # Defensive: if both levers diverge, the arm is "both" and it is still a
+        # negative control (never citable). The committed fixtures use one lever;
+        # this guards the combined path is not a silent no-op.
+        from scripts.run_freeze_validloss_ci import run_ci
+
+        r = run_ci(
+            device=_DEVICE, num_layers=6,
+            candidate_total=2, surrogate_total=4, **_TINY,
+        )
+        assert r["negative_control"] is True
+        assert r["negative_control_arm"] == "both"
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +530,8 @@ class TestRunCIHeterogeneousAndGeneralize:
         assert result.returncode == 0
         assert "heterogeneous" in result.stdout
         assert "generalize" in result.stdout
+        assert "candidate-total" in result.stdout
+        assert "surrogate-total" in result.stdout  # the symmetric negative-control lever
 
 
 class TestTeacherConfidence:

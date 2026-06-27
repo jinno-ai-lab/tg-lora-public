@@ -819,6 +819,9 @@ freeze-validloss-ci-heterogeneous-generalize-thin: ## Single-cycle guard: n=2/ar
 freeze-validloss-ci-negative-control: ## Sensitivity negative control: under-trained candidate fires real UNDERSHOOTS (auto CUDA)
 	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci $(FREEZE_VALIDLOSS_CI_FLAGS) --candidate-total 2 --json --output tests/fixtures/freeze_validloss_negative_control_proxy.json
 
+freeze-validloss-ci-negative-control-surrogate: ## Symmetric sensitivity negative control: under-trained surrogate fires real SURPASSES (auto CUDA)
+	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci $(FREEZE_VALIDLOSS_CI_FLAGS) --surrogate-total 2 --json --output tests/fixtures/freeze_validloss_negative_control_surrogate_proxy.json
+
 # The apparatus order-resolution diagnostic. Variance-decomposes the proxy's
 # final valid_loss into a Var(order) signal (distinct freeze orders at a fixed
 # seed) vs a Var(seed) noise floor (a fixed order across seeds) and reports their

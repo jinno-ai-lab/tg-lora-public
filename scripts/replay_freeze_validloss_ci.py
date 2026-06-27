@@ -36,13 +36,18 @@ CPU scaffolding. Two roles:
    run. A genuine recording omits ``synthetic`` (or sets it ``false``).
 
    **The negative-control provenance guard.** A recording may carry
-   ``negative_control: true`` to mark its candidate arm as deliberately
-   degraded on a non-order lever (an asymmetric training budget). Such a
-   recording is a real measurement and is judged faithfully, but its verdict is
-   an apparatus-sensitivity probe (proof the gate fires a genuine non-TIES
-   label on a measured loss gap), never a §4 order result — an additive note
-   says so, and the ``citable_as_target_scale`` gate withholds the citation
-   claim for it just as it does for a synthetic recording.
+   ``negative_control: true`` to mark one of its arms as deliberately degraded
+   on a non-order lever (an asymmetric training budget, ``candidate_total`` or
+   ``surrogate_total``). Such a recording is a real measurement and is judged
+   faithfully, but its verdict is an apparatus-sensitivity probe (proof the
+   gate fires a genuine non-TIES label on a measured loss gap), never a §4
+   order result — an additive note names the degraded arm and says so, and the
+   ``citable_as_target_scale`` gate withholds the citation claim for it just as
+   it does for a synthetic recording. Degrading the candidate fires the
+   DOWNWARD label (UNDERSHOOTS); degrading the surrogate fires the UPWARD label
+   (SURPASSES) — the symmetric completion, the only real-label direction that
+   had never been recorded before this lever existed (the sole prior SURPASSES
+   is the synthetic plumbing fixture).
 
    The same rule is also surfaced as a machine-readable
    ``citable_as_target_scale`` boolean in :func:`replay_to_json` (``True`` only
@@ -142,6 +147,35 @@ def replay_samples(
     )
 
 
+def _resolve_negative_control_arm(data: dict[str, Any]) -> str | None:
+    """Which arm a negative-control recording degraded, or ``None``.
+
+    New recordings carry ``negative_control_arm`` directly. Legacy recordings
+    (the committed UNDERSHOOTS fixture predates the field) are resolved by
+    comparing each arm's recorded budget against ``total``: a budget that
+    diverged was deliberately degraded. Returns ``'candidate'`` / ``'surrogate'``
+    / ``'both'`` / ``None`` — so a surrogate-degraded recording (real SURPASSES)
+    names the surrogate, not the candidate, keeping the provenance honest.
+    """
+    arm = data.get("negative_control_arm")
+    if arm is not None:
+        return arm
+    total = data.get("total")
+    if total is None:
+        return None
+    cand = data.get("candidate_total", total)
+    surr = data.get("surrogate_total", total)
+    cand_div = cand != total
+    surr_div = surr != total
+    if cand_div and surr_div:
+        return "both"
+    if cand_div:
+        return "candidate"
+    if surr_div:
+        return "surrogate"
+    return None
+
+
 def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLossCI) -> str:
     """Human-readable replay block: scale, the §4 verdict, and faithfulness.
 
@@ -217,12 +251,17 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
         # NEGATIVE_CONTROL note below says why — keeping the prose claim and the
         # machine ``citable_as_target_scale`` gate from drifting apart.
         if negative_control:
+            arm = _resolve_negative_control_arm(data)
+            arm_clause = (
+                "the candidate arm was" if arm != "surrogate"
+                else "the surrogate arm was"
+            )
             lines.append(
                 "  note: TARGET_SCALE — samples are from a 9B run, so the "
-                "recording IS at target scale; however the candidate was a "
-                "negative control (deliberately degraded on a non-order lever), "
-                "so the verdict is a sensitivity probe recorded at target "
-                "scale, NOT a citable §4 order result."
+                "recording IS at target scale; however a negative control was "
+                f"applied ({arm_clause} deliberately degraded on a non-order "
+                "lever), so the verdict is a sensitivity probe recorded at "
+                "target scale, NOT a citable §4 order result."
             )
         else:
             lines.append(
@@ -231,20 +270,28 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
                 "target-scale by swapping the sample source, with no code change."
             )
     # Negative-control provenance (additive — a negative control IS a real
-    # measurement, just not of order). The candidate arm was deliberately
-    # degraded on a non-order lever (an asymmetric training budget), so the
-    # verdict — though faithfully recomputed from the stored floats — is an
-    # apparatus-sensitivity probe, never a §4 order result. Surfacing it as a
-    # note keeps a recorded UNDERSHOOTS from being misread as "the output-first
-    # order is worse than random" when the gap is from undertraining.
+    # measurement, just not of order). The degraded arm is named so the gap's
+    # source is honest: a candidate-degraded recording's gap is from
+    # undertraining the candidate (a recorded UNDERSHOOTS must not be misread
+    # as "the output-first order is worse than random"), while a surrogate-
+    # degraded recording's gap makes the candidate look better by construction
+    # (a recorded SURPASSES that is a sensitivity probe, not an order win). The
+    # verdict itself is recomputed from the stored floats; this note states only
+    # why it is never a §4 order result, never which label it earned.
     if negative_control:
+        arm = _resolve_negative_control_arm(data)
+        if arm == "surrogate":
+            arm_phrase = "the surrogate arm was deliberately degraded"
+        elif arm == "both":
+            arm_phrase = "both arms were deliberately degraded asymmetrically"
+        else:  # "candidate" (and the legacy default for pre-arm recordings)
+            arm_phrase = "the candidate arm was deliberately degraded"
         lines.append(
-            "  note: NEGATIVE_CONTROL — the candidate arm was deliberately "
-            "degraded (an asymmetric training budget, unrelated to freeze "
-            "order) to inject a real quality gap. The verdict is faithfully "
-            "recomputed from the stored floats but is an apparatus-sensitivity "
-            "probe, NOT a §4 order result; do not read it as evidence for or "
-            "against an output-first order advantage."
+            f"  note: NEGATIVE_CONTROL — {arm_phrase} (an asymmetric training "
+            "budget, unrelated to freeze order) to inject a real quality gap. "
+            "The verdict is faithfully recomputed from the stored floats but is "
+            "an apparatus-sensitivity probe, NOT a §4 order result; do not read "
+            "it as evidence for or against an output-first order advantage."
         )
     return "\n".join(lines)
 
@@ -270,6 +317,12 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         "proxy_scale": bool(data.get("proxy_scale", True)),
         "synthetic": bool(data.get("synthetic", False)),
         "negative_control": bool(data.get("negative_control", False)),
+        # Which arm a negative control degraded (resolved from
+        # ``negative_control_arm`` when present, else inferred from the arms'
+        # recorded budgets vs ``total``). Surfaced so a downstream consumer can
+        # tell a candidate-degraded (DOWNWARD) from a surrogate-degraded
+        # (UPWARD) sensitivity probe without re-deriving it from the budgets.
+        "negative_control_arm": _resolve_negative_control_arm(data),
         # Machine-readable citation gate (GOAL §4): this recording's verdict MAY
         # be cited as a §4 target-scale result only when it is target-scale AND
         # genuine AND not a negative control — the exact prose rule

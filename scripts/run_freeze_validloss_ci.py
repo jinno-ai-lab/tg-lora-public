@@ -515,6 +515,7 @@ def run_ci(
     task: str = TASK_MEMORIZE,
     proxy_scale: bool = True,
     candidate_total: int | None = None,
+    surrogate_total: int | None = None,
 ) -> dict:
     """Run the candidate + surrogate arms and return the §4 significance verdict.
 
@@ -550,17 +551,22 @@ def run_ci(
     recording to the target-scale §4 result. This harness keeps the default
     (proxy) so the recorded fixtures stay byte-identical.
 
-    ``candidate_total`` is the NEGATIVE-CONTROL lever (default ``None`` =
-    symmetric, the §4 order experiment unchanged). When set, the candidate arm
-    trains for that many epochs while the surrogate arms keep ``total`` — an
+    ``candidate_total`` / ``surrogate_total`` are the NEGATIVE-CONTROL levers
+    (default ``None`` = symmetric, the §4 order experiment unchanged). When set,
+    that arm trains for the given epochs while the other keeps ``total`` — an
     asymmetric budget deliberately UNRELATED to freeze order. It injects a real,
     reproducible quality gap so the verdict becomes an apparatus-sensitivity
-    probe: the gate emits a genuine non-TIES label (``UNDERSHOOTS``) on a
-    measured loss gap, proving the order-experiment TIES recordings are a true
-    null rather than a broken always-TIES pipeline (a property the
-    heterogeneous positive control could not show, since the proxy order-signal
-    is genuinely zero). The result is tagged ``negative_control=True`` so the
-    recorded verdict is never misread as a §4 order result.
+    probe: the gate emits a genuine non-TIES label on a measured loss gap,
+    proving the order-experiment TIES recordings are a true null rather than a
+    broken always-TIES pipeline (a property the heterogeneous positive control
+    could not show, since the proxy order-signal is genuinely zero). Degrading
+    the *candidate* (``candidate_total``) fires the DOWNWARD label
+    (``UNDERSHOOTS``); degrading the *surrogate* (``surrogate_total``) fires the
+    UPWARD label (``SURPASSES``) — the symmetric completion, the only real-label
+    direction that had never been recorded (the sole prior ``SURPASSES`` is the
+    synthetic plumbing fixture). The result is tagged ``negative_control=True``
+    (with ``negative_control_arm`` naming the degraded arm) so the recorded
+    verdict is never misread as a §4 order result.
     """
     if architecture not in ARCHITECTURES:
         raise ValueError(
@@ -572,15 +578,20 @@ def run_ci(
         None if architecture == HOMOGENEOUS
         else heterogeneous_ranks(num_layers, HIDDEN)
     )
-    # ``candidate_total`` is the NEGATIVE-CONTROL lever: when set, the candidate
-    # arm trains for fewer epochs than the surrogate (an asymmetric budget that
-    # is UNRELATED to freeze order). That injects a real, reproducible quality
-    # gap so the verdict becomes an apparatus-sensitivity probe — the gate fires
-    # a real non-TIES label (UNDERSHOOTS) on a genuine loss gap, proving the
-    # TIES-for-order recordings are a true null, not a broken always-TIES
-    # pipeline. Default None keeps candidate and surrogate symmetric (the §4
-    # order experiment, unchanged).
+    # ``candidate_total`` / ``surrogate_total`` are the NEGATIVE-CONTROL levers:
+    # when set, that arm trains for fewer epochs than the other (an asymmetric
+    # budget UNRELATED to freeze order). The injected quality gap makes the
+    # verdict an apparatus-sensitivity probe — the gate fires a real non-TIES
+    # label on a genuine loss gap, proving the TIES-for-order recordings are a
+    # true null, not a broken always-TIES pipeline. Degrading the *candidate*
+    # fires the DOWNWARD real label (UNDERSHOOTS, the committed
+    # ``freeze_validloss_negative_control_proxy.json``); degrading the
+    # *surrogate* fires the UPWARD real label (SURPASSES) — the only direction
+    # left that had never been recorded on a real measurement (the only prior
+    # SURPASSES is synthetic plumbing). Default None keeps both arms symmetric
+    # (the §4 order experiment, unchanged).
     cand_total = candidate_total if candidate_total is not None else total
+    surr_total = surrogate_total if surrogate_total is not None else total
     candidate_losses = [
         arm_valid_loss(
             output_first_order(num_layers), base_seed + i,
@@ -593,13 +604,31 @@ def run_ci(
         arm_valid_loss(
             random_freeze_order(range(num_layers), base_seed + 1000 + i),
             base_seed + 100 + i,
-            device=device, total=total, warmup=warmup, depth=depth, num_layers=num_layers,
+            device=device, total=surr_total, warmup=warmup, depth=depth, num_layers=num_layers,
             ranks=ranks, task=task,
         )
         for i in range(n_surrogate)
     ]
     ci = surrogate_valid_loss_ci(candidate_losses, surrogate_losses, seed=base_seed)
     reported_ranks = list(ranks) if ranks is not None else [HIDDEN] * num_layers
+    # NEGATIVE-CONTROL provenance. A negative control is ANY deliberate
+    # asymmetric training budget (a non-order lever): candidate-degraded fires
+    # UNDERSHOOTS, surrogate-degraded fires SURPASSES, both degraded fires
+    # whichever gap dominates. ``negative_control_arm`` records which arm(s)
+    # diverged from ``total`` so the provenance note is honest about the gap's
+    # source — the verdict is an apparatus-sensitivity probe, never a §4 order
+    # result, regardless of which arm was degraded or which label it earned.
+    cand_diverged = candidate_total is not None and candidate_total != total
+    surr_diverged = surrogate_total is not None and surrogate_total != total
+    if cand_diverged and surr_diverged:
+        negative_control_arm = "both"
+    elif cand_diverged:
+        negative_control_arm = "candidate"
+    elif surr_diverged:
+        negative_control_arm = "surrogate"
+    else:
+        negative_control_arm = None
+    negative_control = negative_control_arm is not None
     return {
         "ci": ci,
         "candidate_losses": candidate_losses,
@@ -623,17 +652,21 @@ def run_ci(
         # the JSON/report with no code change — the contract the replay judge
         # upgrades on. This flag is what a reader checks before citing the verdict.
         "proxy_scale": proxy_scale,
-        # The candidate arm's actual training budget: equal to ``total`` for the
-        # symmetric order experiment, or the reduced ``candidate_total`` for a
-        # negative-control run. Surfaced so the asymmetry that produced an
-        # UNDERSHOOTS is visible in the recording, not hidden.
+        # The arms' actual training budgets: equal to ``total`` for the
+        # symmetric order experiment, or the reduced ``candidate_total`` /
+        # ``surrogate_total`` for a negative-control run. Surfaced so the
+        # asymmetry that produced a non-TIES verdict is visible, not hidden.
         "candidate_total": cand_total,
-        # Provenance: a negative control deliberately degrades the candidate on
-        # a non-order lever (here, training budget). The recorded verdict is an
-        # apparatus-sensitivity probe, NOT a §4 order result — this flag carries
-        # that contract through to the JSON/report so the gate's verdict is
-        # never misread as evidence for or against an output-first order.
-        "negative_control": candidate_total is not None and candidate_total != total,
+        "surrogate_total": surr_total,
+        # Provenance: a negative control deliberately degrades one or both arms
+        # on a non-order lever (here, training budget). The recorded verdict is
+        # an apparatus-sensitivity probe, NOT a §4 order result — these fields
+        # carry that contract through to the JSON/report so the gate's verdict
+        # is never misread as evidence for or against an output-first order.
+        # ``negative_control_arm`` names which arm was degraded ("candidate" ⇒
+        # DOWNWARD/UNDERSHOOTS, "surrogate" ⇒ UPWARD/SURPASSES, "both", or None).
+        "negative_control": negative_control,
+        "negative_control_arm": negative_control_arm,
     }
 
 
@@ -694,7 +727,22 @@ def build_parser() -> argparse.ArgumentParser:
             "quality gap UNRELATED to freeze order, so the verdict becomes an "
             "apparatus-sensitivity probe (the gate fires a genuine non-TIES "
             "label on a measured loss gap) rather than a §4 order result. "
+            "Degrading the candidate fires the DOWNWARD label (UNDERSHOOTS). "
             "Default None = symmetric (the order experiment, unchanged)."
+        ),
+    )
+    p.add_argument(
+        "--surrogate-total", type=int, default=None,
+        help=(
+            "NEGATIVE-CONTROL lever (symmetric to --candidate-total): train the "
+            "SURROGATE arms for this many epochs instead of --total. The "
+            "asymmetric budget injects a real quality gap UNRELATED to freeze "
+            "order, so the verdict becomes an apparatus-sensitivity probe "
+            "(the gate fires a genuine non-TIES label on a measured loss gap) "
+            "rather than a §4 order result. Degrading the surrogate fires the "
+            "UPWARD label (SURPASSES) — the symmetric completion of "
+            "--candidate-total, and the only real-label direction that had "
+            "never been recorded. Default None = symmetric."
         ),
     )
     return p
@@ -744,16 +792,37 @@ def format_report(result: dict) -> str:
             "asymmetry sat below the n=5 bootstrap floor."
         )
     if result["negative_control"]:
+        # Arm-aware: the degraded arm is named so the gap's source is honest
+        # (candidate-degraded ⇒ DOWNWARD/UNDERSHOOTS, surrogate-degraded ⇒
+        # UPWARD/SURPASSES). The verdict label itself is recomputed by the CI
+        # and shown above — this note states only WHY it is not a §4 order
+        # result, never which label it earned.
+        arm = result["negative_control_arm"]
+        total = result["total"]
+        if arm == "candidate":
+            arm_phrase = (
+                "the candidate arm was deliberately under-trained "
+                f"(candidate_total={result['candidate_total']} vs total={total})"
+            )
+        elif arm == "surrogate":
+            arm_phrase = (
+                "the surrogate arm was deliberately under-trained "
+                f"(surrogate_total={result['surrogate_total']} vs total={total})"
+            )
+        else:  # "both"
+            arm_phrase = (
+                "both arms were deliberately under-trained asymmetrically "
+                f"(candidate_total={result['candidate_total']}, "
+                f"surrogate_total={result['surrogate_total']} vs total={total})"
+            )
         lines.append(
-            "  note: NEGATIVE_CONTROL — the candidate arm was deliberately "
-            f"under-trained (candidate_total={result['candidate_total']} vs "
-            f"surrogate total={result['total']}) to inject a real quality gap "
-            "UNRELATED to freeze order. The verdict is an apparatus-"
-            "sensitivity probe (the gate fires a genuine non-TIES label on a "
-            "measured loss gap, proving the order-experiment TIES recordings "
-            "are a true null, not a broken always-TIES pipeline); it is NOT a "
-            "§4 order result — do not read it as evidence for or against an "
-            "output-first order advantage."
+            f"  note: NEGATIVE_CONTROL — {arm_phrase} to inject a real "
+            "quality gap UNRELATED to freeze order. The verdict is an "
+            "apparatus-sensitivity probe (the gate fires a genuine non-TIES "
+            "label on a measured loss gap, proving the order-experiment TIES "
+            "recordings are a true null, not a broken always-TIES pipeline); "
+            "it is NOT a §4 order result — do not read it as evidence for or "
+            "against an output-first order advantage."
         )
     if result["proxy_scale"]:
         lines.append(
@@ -804,7 +873,9 @@ def result_to_json(result: dict) -> dict:
         "task": result["task"],
         "proxy_scale": result["proxy_scale"],
         "candidate_total": result["candidate_total"],
+        "surrogate_total": result["surrogate_total"],
         "negative_control": result["negative_control"],
+        "negative_control_arm": result["negative_control_arm"],
         # Machine-readable citation gate (GOAL §4): a recording this generator
         # produces is citable as a §4 target-scale result iff it was produced at
         # target scale AND is not a negative control. The generator has no
@@ -837,6 +908,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         architecture=args.architecture,
         task=args.task,
         candidate_total=args.candidate_total,
+        surrogate_total=args.surrogate_total,
     )
     payload = json.dumps(result_to_json(result), indent=2) if args.json else format_report(result)
     print(payload)

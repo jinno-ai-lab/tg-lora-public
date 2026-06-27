@@ -126,6 +126,27 @@ FIXTURE_NEGCTRL = (
     / "freeze_validloss_negative_control_proxy.json"
 )
 
+# The committed real-GPU recording that exercises the THIRD verdict label's
+# UPWARD direction on a real measurement: SURPASSES. Every committed recording
+# is TIES (the proxy order-signal is genuinely zero), the only non-TIES real
+# recording was the DOWNWARD UNDERSHOOTS (FIXTURE_NEGCTRL, candidate-degraded),
+# and the only SURPASSES was a synthetic plumbing fixture — so the gate's
+# ``lower > 0.0`` branch had never fired on gradient-trained samples. This
+# SYMMETRIC negative control closes that gap: the SURROGATE arm is deliberately
+# under-trained (surrogate_total=2 vs candidate total=60) — the same asymmetric
+# non-order lever as FIXTURE_NEGCTRL, applied to the other arm — so the
+# candidate looks better by construction and the gate fires a real SURPASSES
+# (CI entirely above zero). It is the first real ``passes=True`` recording too
+# (significant AND material), proving the UPWARD win path on a measurement, not
+# hand-authored floats. It is a sensitivity probe, never a §4 order result — the
+# ``negative_control`` provenance with ``negative_control_arm="surrogate"``
+# enforces that. Regenerate with ``make freeze-validloss-ci-negative-control-surrogate``.
+FIXTURE_NEGCTRL_SURROGATE = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "freeze_validloss_negative_control_surrogate_proxy.json"
+)
+
 
 # ---------------------------------------------------------------------------
 # Import health + --help
@@ -529,6 +550,117 @@ class TestNegativeControlUndershoots:
 
 
 # ---------------------------------------------------------------------------
+# The symmetric negative control (real SURPASSES): the upward real label,
+# finally recorded on a real artifact
+# ---------------------------------------------------------------------------
+
+
+class TestNegativeControlSurpasses:
+    """The ``SURPASSES`` verdict recorded on a real GPU artifact.
+
+    The symmetric completion of ``TestNegativeControlUndershoots``. That class
+    proved the gate fires the DOWNWARD real label (UNDERSHOOTS) by degrading the
+    candidate; this proves the UPWARD real label (SURPASSES) by degrading the
+    surrogate on the SAME non-order lever. Until this fixture, the gate's
+    ``lower > 0.0`` branch had only ever fired on hand-authored synthetic floats
+    (FIXTURE_TARGET) — so the apparatus had never demonstrated it resolves a
+    genuine IMPROVEMENT, only a genuine degradation. A SURPASSES-only-on-
+    synthetic gate could not distinguish "the candidate never truly wins at
+    proxy scale" (the honest null) from "the SURPASSES branch is silently
+    broken". This recording closes that gap: the under-trained surrogate
+    (``surrogate_total=2`` vs candidate ``total=60``) is reliably worse, so the
+    gate fires a real SURPASSES (CI entirely above zero) — and, as a bonus, the
+    first real ``passes=True`` (significant AND material). It is a sensitivity
+    probe, never a §4 order result — the ``negative_control_arm="surrogate"``
+    provenance enforces that, and the note names the surrogate, not the
+    candidate.
+    """
+
+    def test_fixture_is_the_surrogate_negative_control(self):
+        # The recording carries the provenance that makes it a sensitivity probe
+        # of the UPWARD direction: surrogate was under-trained (total=2 vs 60).
+        data = load_samples(FIXTURE_NEGCTRL_SURROGATE)
+        assert data["negative_control"] is True
+        assert data["negative_control_arm"] == "surrogate"
+        assert data["surrogate_total"] == 2
+        assert data["total"] == 60
+        assert data["surrogate_total"] != data["total"]
+        assert data["candidate_total"] == data["total"]  # candidate symmetric
+
+    def test_real_surpasses_fires_on_real_recording(self):
+        # The upward verdict label, emitted on a real artifact: replay recomputes
+        # SURPASSES from the stored floats (CI entirely above zero), matching the
+        # verdict recorded at run time — the gate fires the UPWARD non-TIES label
+        # on a measured signal, so the SURPASSES branch is proven on real samples,
+        # not only the synthetic plumbing fixture.
+        data = load_samples(FIXTURE_NEGCTRL_SURROGATE)
+        ci = replay_samples(data)
+        assert ci.significance_verdict == SURPASSES == data["verdict"]
+        assert ci.lower > 0.0  # CI entirely above zero ⇒ SURPASSES
+        assert ci.n_candidate == 5 and ci.n_surrogate == 5
+
+    def test_first_real_passes_true_recording(self):
+        # The TIES recordings have passes=False (not significant); the UNDERSHOOTS
+        # negative control has passes=False; only the synthetic plumbing fixture
+        # had passes=True. This is the first REAL recording clearing the §4 bar
+        # (significant AND material) — proving the win path on a measurement.
+        data = load_samples(FIXTURE_NEGCTRL_SURROGATE)
+        ci = replay_samples(data)
+        assert ci.passes is True
+        assert ci.significant_surpasses is True
+        assert ci.is_material is True
+
+    def test_gap_is_from_surrogate_undertraining_not_order(self):
+        # The SURPASSES is earned by the under-trained surrogate being reliably
+        # WORSE (higher valid_loss), not by a strong candidate: candidate_mean
+        # sits far below surrogate_mean, the injected non-order quality gap.
+        data = load_samples(FIXTURE_NEGCTRL_SURROGATE)
+        ci = replay_samples(data)
+        assert ci.candidate_mean < ci.surrogate_mean
+        assert ci.point_improvement > 0.0
+
+    def test_surrogate_negative_control_is_not_thin(self):
+        # n=5/arm is above MIN_SAMPLE_FOR_BOOTSTRAP: the SURPASSES is a real
+        # significance call, not a thin-evidence caveat.
+        assert not replay_samples(load_samples(FIXTURE_NEGCTRL_SURROGATE)).is_thin_evidence
+
+    def test_surrogate_negative_control_note_names_surrogate(self):
+        # The arm-aware provenance surfaces in the human report so a recorded
+        # SURPASSES cannot be misread as "the output-first order beats random" —
+        # the note names the SURROGATE as the degraded arm, not the candidate.
+        data = load_samples(FIXTURE_NEGCTRL_SURROGATE)
+        text = format_replay(FIXTURE_NEGCTRL_SURROGATE, data, replay_samples(data))
+        assert "NEGATIVE_CONTROL" in text
+        assert "surrogate arm was deliberately degraded" in text
+        assert "candidate arm was deliberately degraded" not in text
+        assert "NOT a §4 order result" in text
+        assert "do not read it as evidence" in text
+        assert "negative_control=True" in text
+
+    def test_surrogate_negative_control_withholds_citable_claim(self):
+        # A surrogate-side negative-control verdict is never citable as a §4
+        # result, even though it is a real (non-synthetic, proxy-scale)
+        # measurement — the gate refuses it via the negative_control flag,
+        # mirroring the candidate-side and synthetic guards.
+        data = load_samples(FIXTURE_NEGCTRL_SURROGATE)
+        out = replay_to_json(FIXTURE_NEGCTRL_SURROGATE, data, replay_samples(data))
+        assert out["negative_control"] is True
+        assert out["negative_control_arm"] == "surrogate"
+        assert out["synthetic"] is False
+        assert out["citable_as_target_scale"] is False
+
+    def test_expected_surpasses_exits_zero(self):
+        # The recording is pinned to SURPASSES: the --expected gate passes, so a
+        # drift in the recorded floats (or the judge) fails loudly on this leg.
+        assert main([str(FIXTURE_NEGCTRL_SURROGATE), "--expected", SURPASSES]) == 0
+
+    def test_expected_ties_exits_nonzero(self):
+        # Asserting the wrong verdict (TIES) on the SURPASSES recording exits
+        # nonzero — the --expected gate distinguishes SURPASSES from TIES.
+        assert main([str(FIXTURE_NEGCTRL_SURROGATE), "--expected", TIES]) == 2
+
+
+# ---------------------------------------------------------------------------
 # Scale honesty + CLI assertion
 # ---------------------------------------------------------------------------
 
@@ -754,6 +886,12 @@ class TestMachineCitationGate:
             ("<negctrl-target>", _data(
                 [2.0] * 4, [1.0] * 4, proxy_scale=False, negative_control=True)),
             (str(FIXTURE_NEGCTRL), load_samples(FIXTURE_NEGCTRL)),
+            # The symmetric negative control: a real SURPASSES from a degraded
+            # surrogate. It is a genuine measurement and significant, yet still
+            # NOT citable — the negative_control flag withholds the claim on both
+            # arms, and the prose grants none. This is the case that could fool a
+            # consumer reading the SURPASSES verdict alone.
+            (str(FIXTURE_NEGCTRL_SURROGATE), load_samples(FIXTURE_NEGCTRL_SURROGATE)),
         ]
         for label, data in cases:
             ci = replay_samples(data)
