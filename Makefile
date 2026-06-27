@@ -813,6 +813,9 @@ freeze-validloss-ci-generalize: ## Conclusive-TIES run: held-out generalization 
 freeze-validloss-ci-heterogeneous-generalize: ## Discriminating positive control: heterogeneous stack x generalize task (auto CUDA)
 	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci $(FREEZE_VALIDLOSS_CI_FLAGS) --architecture heterogeneous --task generalize
 
+freeze-validloss-ci-heterogeneous-generalize-thin: ## Single-cycle guard: n=2/arm thin run on the discriminating leg (auto CUDA)
+	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci $(FREEZE_VALIDLOSS_CI_FLAGS) --architecture heterogeneous --task generalize --n-candidate 2 --n-surrogate 2
+
 # The apparatus order-resolution diagnostic. Variance-decomposes the proxy's
 # final valid_loss into a Var(order) signal (distinct freeze orders at a fixed
 # seed) vs a Var(seed) noise floor (a fixed order across seeds) and reports their

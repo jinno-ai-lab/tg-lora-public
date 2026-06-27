@@ -90,6 +90,23 @@ FIXTURE_HETEROGEN = (
     / "freeze_validloss_heterogeneous_generalize_proxy.json"
 )
 
+# The committed real-GPU recording that exercises the SINGLE-CYCLE guard the two
+# fixtures above only assert the *inverse* of: a thin arm (n=2/arm, below
+# MIN_SAMPLE_FOR_BOOTSTRAP) on the same discriminating heterogeneous x generalize
+# leg, where the candidate *appears* to win (a material point lead) but the gate
+# refuses the significance call and flags it THIN_EVIDENCE instead — the one
+# false-confidence guard (zero-median→TIES and baseline-less→unverified are
+# already recorded) whose honest label had never been emitted on a real artifact.
+# The n=2 losses are the deterministic first two seeds of FIXTURE_HETEROGEN
+# (same base_seed), so this recording is a faithful thin truncation of the
+# discriminating leg, not a different experiment. Regenerate with
+# ``make freeze-validloss-ci-heterogeneous-generalize-thin``.
+FIXTURE_THIN = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "freeze_validloss_heterogeneous_generalize_thin_proxy.json"
+)
+
 
 # ---------------------------------------------------------------------------
 # Import health + --help
@@ -294,6 +311,113 @@ class TestHeterogeneousGeneralizePositiveControl:
         # The recording is pinned to TIES: a replay gate asserting TIES passes,
         # so a future drift in the recorded floats (or the judge) fails loudly.
         assert main([str(FIXTURE_HETEROGEN), "--expected", TIES]) == 0
+
+
+# ---------------------------------------------------------------------------
+# The single-cycle guard, run end-to-end on a real (thin) artifact
+# ---------------------------------------------------------------------------
+
+
+class TestThinEvidenceGuardFires:
+    """The false-confidence guard the loop's feedback named ("single-cycle"),
+    run end-to-end on a real GPU artifact and locked by no-GPU replay.
+
+    The hardened §4 verdict gate carries three false-confidence guards. Two were
+    already recorded on real artifacts: the *zero-median* guard (a CI straddling
+    zero honestly reads TIES — pinned by ``TestFixtureFaithfulness`` and
+    ``TestHeterogeneousGeneralizePositiveControl``) and the *baseline-less* guard
+    (``valid_loss_unverified=True`` until a GPU run deposits a quality number —
+    pinned by the structural-gate suite). The *single-cycle* guard — an arm below
+    ``MIN_SAMPLE_FOR_BOOTSTRAP`` cannot anchor a significance statement, so the
+    verdict is flagged ``is_thin_evidence`` and the audit says "do not read as
+    confirmed" — had only ever been asserted in its *inverse* (every committed
+    recording is n=5/arm, ``not is_thin_evidence``). This class records that guard
+    actually *firing* on a real thin run: the discriminating heterogeneous x
+    generalize leg truncated to n=2/arm, where the candidate's point lead looks
+    material yet the gate refuses the significance win and surfaces the
+    THIN_EVIDENCE caveat rather than dressing a 2-seed anecdote up as a call.
+    """
+
+    def test_fixture_is_the_thin_discriminating_leg(self):
+        # Provenance pins this as the same heterogeneous x generalize leg as
+        # FIXTURE_HETEROGEN, but truncated to a thin n=2/arm sample — the exact
+        # shape a researcher running too few seeds deposits.
+        data = load_samples(FIXTURE_THIN)
+        assert data["architecture"] == "heterogeneous"
+        assert data["task"] == "generalize"
+        assert len(data["candidate_losses"]) == 2
+        assert len(data["surrogate_losses"]) == 2
+
+    def test_thin_arm_is_the_first_two_seeds_of_the_n5_recording(self):
+        # The n=2 run is a faithful thin truncation of the committed n=5
+        # discriminating fixture (same base_seed → same per-seed init/data draw),
+        # not a different experiment. This is what makes it a clean record of the
+        # *guard* rather than a new result: the same leg, deliberately starved.
+        thin = load_samples(FIXTURE_THIN)
+        full = load_samples(FIXTURE_HETEROGEN)
+        assert thin["candidate_losses"] == full["candidate_losses"][:2]
+        assert thin["surrogate_losses"] == full["surrogate_losses"][:2]
+
+    def test_single_cycle_guard_fires_on_real_thin_recording(self):
+        # The guard the feedback asked whether it actually emits: a real thin arm
+        # (n=2 < MIN_SAMPLE_FOR_BOOTSTRAP=3) flips is_thin_evidence True. The
+        # recorded flag is not painted on — the replay re-derives it from the
+        # stored float counts.
+        data = load_samples(FIXTURE_THIN)
+        ci = replay_samples(data)
+        assert ci.is_thin_evidence
+        assert ci.n_candidate == 2
+        assert ci.n_surrogate == 2
+        assert ci.is_thin_evidence is data["is_thin_evidence"]
+
+    def test_thin_lead_is_refused_a_significance_win(self):
+        # The false-confidence trap: the candidate *looks* materially better
+        # (a positive point lead above the material margin) on a thin sample, yet
+        # the wide thin-sample CI straddles zero so the verdict is TIES — never
+        # SURPASSES, never passes — the guard doing exactly what it exists for.
+        data = load_samples(FIXTURE_THIN)
+        ci = replay_samples(data)
+        assert ci.point_improvement > 0.0       # candidate appears better...
+        assert ci.is_material                    # ...and the lead clears margin...
+        assert ci.significance_verdict == TIES   # ...but it is NOT a significance win
+        assert not ci.significant_surpasses
+        assert not ci.passes
+        assert ci.lower < 0.0 < ci.upper         # the CI straddles zero → honest TIES
+
+    def test_replay_reproduces_recorded_ties_faithfully(self):
+        # The gate, re-run on the real stored floats with no GPU, emits the
+        # verdict the recording stored — the floats earn the label under the
+        # deterministic bootstrap; it is not painted on.
+        data = load_samples(FIXTURE_THIN)
+        ci = replay_samples(data)
+        assert ci.significance_verdict == data["verdict"] == TIES
+        assert ci.point_improvement == pytest.approx(data["point_improvement"])
+        assert ci.lower == pytest.approx(data["lower"])
+        assert ci.upper == pytest.approx(data["upper"])
+
+    def test_thin_evidence_note_is_emitted_not_hidden(self):
+        # The honesty is in the rendered output, not just the boolean: the audit
+        # says plainly the thin verdict must not be read as confirmed, so a
+        # 2-seed anecdote can never masquerade as a settled §4 call.
+        data = load_samples(FIXTURE_THIN)
+        text = format_replay(FIXTURE_THIN, data, replay_samples(data))
+        assert "THIN_EVIDENCE" in text
+        assert "do not read this verdict as confirmed" in text
+
+    def test_thin_recording_is_still_proxy_scale_and_not_citable(self):
+        # Thin evidence does not relax the scale-honesty gate: a genuine proxy
+        # recording is still not citable as a target-scale §4 result.
+        data = load_samples(FIXTURE_THIN)
+        out = replay_to_json(FIXTURE_THIN, data, replay_samples(data))
+        assert out["proxy_scale"] is True
+        assert out["synthetic"] is False  # genuine run
+        assert out["citable_as_target_scale"] is False
+        assert out["faithful"] is True
+
+    def test_expected_ties_exits_zero(self):
+        # The thin recording is pinned to TIES: asserting TIES passes, so a drift
+        # in the recorded floats (or the judge) fails loudly even on the thin leg.
+        assert main([str(FIXTURE_THIN), "--expected", TIES]) == 0
 
 
 # ---------------------------------------------------------------------------
