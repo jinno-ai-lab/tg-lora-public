@@ -152,6 +152,53 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-06-27 追記・AI-Hub feedback 4 提案の検証と lint-debt/audit-drift gap の close】**
+> AI-Hub feedback が前イテレーション（§4 verdict gate の負対照 provenance guard）を VALUABLE と判定し、
+> 4 件の focus を提案。各々を本 mirror で検証した結果:
+> - **(1) 9B target-scale run（heterogeneous×generalize leg）** → **BLOCKED**: `src/data/` が不在で
+>   `train_tg_lora.py:16` が `from src.data.build_seed_dataset import load_dataset` し、verdict runner
+>   （`run_freeze_validloss_ci.py`）は `TEACHER_*` 定数の合成 proxy。private `src.data` pipeline 単体が
+>   唯一の外部依存（不変・MS-PF2 分類 C）。
+> - **(2) §2.5 verdict gate vs 9B corpus + claims.ndjson 記録** → 同 BLOCKED（src.data）。
+>   ※ `claims.ndjson` は本 repo に存在せず（`docs/paper/tmlr_claims_alignment.md` 等の paper-claims doc のみ）。
+> - **(3) critique-loop (revision_only) vs experiment-loop の end-to-end artifact** → **AI Hub 自身の infra**
+>   （`grep -rni critique.?loop|experiment.?loop|revision_only` = 該当なし・`scripts/run_ablation_cache_isolation.sh`
+>   の無関係 `# Main experiment loop` コメントのみ）= [[ai-hub-feedback-infra-vs-this-repo]] 既知パターン。
+> - **(4) PURPOSE.md の MS-008=871 vs system-health=866 計数の不一致** → **該当なし**: `MS-008`/`871`/`866`/
+>   `system.?health` は本 repo 全文に存在せず（grep 確認）= AI Hub 側の別 repo PURPOSE を指す。本 repo の
+>   監査計数（canary 37p/3xf 等）は実測と一致（drift なし）。
+> → **4 件とも本 mirror では実行不能/非適用**。9B lever は引き続き src.data で block（不変）。
+> feedback の「足場/ゲート硬化は停止（収益逓減）・proxy 負対照は飽和」という指導にも合致し、これらを追加しない。
+>
+> 代わりに feedback **#4 の spirit（"audit source-of-truth を測定値に pin して整合させる"）** を本 repo に適用:
+> 監査文書（PURPOSE.md + [[public-mirror-preexisting-lint-debt]]）が長らく主張していた
+> 「`src/training/train_tg_lora.py` に **2 件**の pre-existing ruff error（F841 `production_start_full_backward_passes` + E741）」が
+> **実測と矛盾して drift** していた — 実測は **1 件**（E741@L4086 のみ）。F841 は ruff に**検出されなくなっていた**:
+> `train_tg_lora()` が `_snapshot_efficiency_accounting(locals())` で `locals()` を呼ぶため pyflakes が
+> 関数内の全 local を「使用済みの可能性」と見做して F841 を抑制（=apparatus が盲点）。ゆえに「2 errors」という
+> 監査主張は prose のまま陳腐化していた（GOAL §7「測定せず結論しない」違反の小さな実例）。
+>
+> **本イテレーションでこの gap を close**（足場ではなく監査整合性の硬化）:
+> - **(a) 死変数 `production_start_full_backward_passes` を削除**（init L1406 + shadow-block 代入 + warmup-release 代入の 3 site）。
+>   memory が「別 clean-up 対象」と明記していた TODO。**provably write-only**: 代入 3 site・読者ゼロ・
+>   `_EFFICIENCY_ACCOUNTING_KEYS`（21 名 allowlist）外・文字列 key 参照なし・`globals()`/`vars()`/`dir()` 呼出なし。
+>   reader が存在しないので**振舞非変更**（GOAL §7 诚实性: 削除=誤データ生成ではなく死状態の除去）。
+> - **(b) E741@L4086 を fix**: dynfreeze guard record の `",".join(str(l) for l in dynfreeze.frozen_block)` の
+>   ambiguous `l` → `layer` に純 rename。→ `ruff check src/training/train_tg_lora.py` = **All checks passed! (0)**.
+> - **(c) 新 CI guard `tests/test_train_tg_lora_static_guards.py::test_training_entry_point_is_ruff_clean`**:
+>   F821 のみならず**全 rule の ruff check = 0** を CI 強制（`_run_ruff` helper で既存 F821 test を DRY 化）。
+>   「0 errors」が prose ではなく test invariant になり、監査 drift が再発したら CI が捕る
+>   （apparatus-drift sentinel `TestApparatusDriftSentinel` と同パターン）。**mutation 証明**: E741 を含む file で
+>   ruff が nonzero を返すことを確認 → この guard は pre-fix 状態を検知したはず（no-op ではない）。
+>
+> **検証**: `tests/test_train_tg_lora_static_guards.py` **2 passed**（既存 F821 + 新 full-clean）・
+> canary `tests/test_cli_help_smoke.py` **37p/3xf**（不変）・`tests/test_checkpoint.py` +
+> `test_resume_state_integration.py` + `test_dynfreeze_all_frozen_path.py` = **24 passed**（死変数削除の
+> 振舞非変更を確認）・`py_compile` OK・`ruff check` train_tg_lora.py = **0**。
+> memory [[public-mirror-preexisting-lint-debt]] 更新済み（train_tg_lora.py = lint-clean/CI-pinned）。
+> **9B 実 run は引き続き private `src.data` で block・不変**。残る真の研究結果 lever は src.data 利用可能次第の
+> 9B target-scale verdict のみ（導線は具体コマンドに縮約済み・`proxy_scale` flag で昇格・コード変更不要）。
+
 > **【2026-06-27 追記・async-cache-swap 完了 cycle marker（swap_cycle_vq/vf）の resume state-loss を修正（resume-state-loss 軸を dormant async-cache-swap route まで拡張）】**
 > resume-state-loss 軸の **10 件目**（mainline 8 件 + PSA route 1 件に続き、**dormant async-cache-swap route** の完了 cycle marker）。
 > `swap_cycle_vq`/`swap_cycle_vf` は caller scope の plain scalar（caller init L999 `= None`）で、async cache builder が `valid_quick` / `valid_full` を

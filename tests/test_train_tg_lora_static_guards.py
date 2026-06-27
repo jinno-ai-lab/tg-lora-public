@@ -55,21 +55,55 @@ def test_training_entry_point_has_no_undefined_names() -> None:
     enable NameError: if either fix regresses, the offending name reappears as
     F821 and this assertion fails.
     """
-    ruff = shutil.which("ruff")
-    if ruff is None:
+    if shutil.which("ruff") is None:
         pytest.skip("ruff not on PATH; cannot enforce the F821 guard statically")
 
     assert TARGET.is_file(), f"training entry point not found at {TARGET}"
 
-    proc = subprocess.run(
-        [ruff, "check", "--select", "F821", str(TARGET)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    proc = _run_ruff(TARGET, select="F821")
     assert proc.returncode == 0, (
         "src/training/train_tg_lora.py must contain zero undefined-name (F821) "
         "defects — a non-zero count signals a regression of the dynfreeze "
         "fault-checkpoint NameError or the progressive-freeze enable NameError. "
         "ruff output:\n" + (proc.stdout + proc.stderr).strip()
+    )
+
+
+def _run_ruff(target: Path, select: str | None) -> subprocess.CompletedProcess[str]:
+    ruff = shutil.which("ruff")
+    cmd = [ruff, "check"]
+    if select is not None:
+        cmd += ["--select", select]
+    cmd.append(str(target))
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+
+def test_training_entry_point_is_ruff_clean() -> None:
+    """``train_tg_lora.py`` must be ``ruff``-clean (zero findings, all rules).
+
+    The F821 guard above pins the two historical ``NameError`` defects. This
+    guard pins the *whole* file's cleanliness — every rule, not just F821 — so
+    the audit's standing claim that the main training entry point is lint-clean
+    (it was long described as carrying "2 pre-existing errors (F841 + E741)"
+    that had in fact drifted to a single E741, with the F841 a write-only local
+    pyflakes could no longer see once ``train_tg_lora`` started calling
+    ``locals()``) is enforced by the test suite rather than by prose. A future
+    regression — an ambiguous-name comprehension variable, an unused import, a
+    re-introduced dead local — fails CI here instead of silently restating a
+    stale lint count in PURPOSE.md.
+
+    Like the F821 guard this runs ``ruff`` on the file path (the module's
+    line-1 ``src.data`` import is unimportable in this public mirror) and skips
+    when ``ruff`` is absent.
+    """
+    if shutil.which("ruff") is None:
+        pytest.skip("ruff not on PATH; cannot enforce the cleanliness guard")
+
+    assert TARGET.is_file(), f"training entry point not found at {TARGET}"
+    proc = _run_ruff(TARGET, select=None)
+    assert proc.returncode == 0, (
+        "src/training/train_tg_lora.py must be ruff-clean (zero findings across "
+        "all rules) — a non-zero count regresses the lint-clean invariant and "
+        "makes the audit's standing claim false. ruff output:\n"
+        + (proc.stdout + proc.stderr).strip()
     )

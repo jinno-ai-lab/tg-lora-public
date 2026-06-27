@@ -1403,7 +1403,6 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     best_lawa_loss = float("inf")
     warmup_released = False
     warmup_cos_consecutive = 0
-    production_start_full_backward_passes = 0
     restored_training_state: TrainingState | None = None
 
     # Resume from a previously saved training state if requested.
@@ -2649,7 +2648,6 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 if shadow_enabled:
                     if not warmup_released:
                         warmup_released = True
-                        production_start_full_backward_passes = cycle_state.full_backward_passes
                         logger.info("Shadow mode: warmup bypassed at cycle %d", cycle)
                     selected_N = 1
                     proposal.N = 1
@@ -2662,9 +2660,6 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                         warmup_cos_consecutive = 0
                     if warmup_cos_consecutive >= warmup_release_count:
                         warmup_released = True
-                        production_start_full_backward_passes = (
-                            cycle_state.full_backward_passes
-                        )
                         logger.info(
                             "Warmup released at cycle %d: cos=%.4f consecutive=%d",
                             cycle,
@@ -4083,7 +4078,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 **_measurement_results_record,
                 **({f"guard_{k}": v for k, v in {
                     "block_size": dynfreeze.block_size,
-                    "block_layers": ",".join(str(l) for l in dynfreeze.frozen_block),
+                    "block_layers": ",".join(str(layer) for layer in dynfreeze.frozen_block),
                     **{f"r_A_L{li}": h[-1] for li, h in dynfreeze._r_A_history.items() if h},
                 }.items()} if dynfreeze is not None else {}),
                 **({f"gold_{k}": v for k, v in gold_scores.items()} if gold_scores else {}),
