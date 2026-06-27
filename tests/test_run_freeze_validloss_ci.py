@@ -262,6 +262,83 @@ class TestTargetScaleParam:
         assert "PROXY_SCALE" not in text
 
 
+class TestNegativeControlParam:
+    """``candidate_total`` — the negative-control lever on the generator side.
+
+    The default (None) keeps candidate and surrogate symmetric (the §4 order
+    experiment, byte-identical to the recorded fixtures). Setting it trains the
+    candidate for fewer epochs — an asymmetric budget UNRELATED to freeze order —
+    so the verdict becomes a sensitivity probe. The result is tagged
+    ``negative_control=True`` and the citation gate withholds it, the generator
+    half of the path the replay-side suite validates on the committed
+    ``freeze_validloss_negative_control_proxy.json`` fixture.
+    """
+
+    def test_default_is_symmetric_not_negative_control(self):
+        from scripts.run_freeze_validloss_ci import run_ci
+
+        # Default (candidate_total=None): candidate and surrogate share one
+        # budget, so nothing already committed regresses.
+        r = run_ci(device=_DEVICE, num_layers=6, **_TINY)
+        assert r["candidate_total"] == r["total"] == _TINY["total"]
+        assert r["negative_control"] is False
+
+    def test_candidate_total_threads_through_to_result_and_json(self):
+        from scripts.run_freeze_validloss_ci import run_ci, result_to_json
+
+        r = run_ci(device=_DEVICE, num_layers=6, candidate_total=2, **_TINY)
+        assert r["candidate_total"] == 2
+        assert r["total"] == _TINY["total"]
+        assert r["negative_control"] is True
+        payload = result_to_json(r)
+        assert payload["candidate_total"] == 2
+        assert payload["negative_control"] is True
+
+    def test_under_trained_candidate_is_reliably_worse(self):
+        # The lever works: an under-trained candidate (2 epochs vs 15) lands at a
+        # higher valid_loss than the fully-trained surrogate — the real, non-order
+        # quality gap the negative control injects (and the gate reads as
+        # UNDERSHOOTS on the committed RTX 3060 fixture).
+        from scripts.run_freeze_validloss_ci import run_ci
+
+        r = run_ci(device=_DEVICE, num_layers=6, candidate_total=2, **_TINY)
+        cmean = sum(r["candidate_losses"]) / len(r["candidate_losses"])
+        smean = sum(r["surrogate_losses"]) / len(r["surrogate_losses"])
+        assert cmean > smean
+
+    def test_negative_control_withholds_citable_claim(self):
+        # The generator stamps the machine gate at inception: a negative-control
+        # run is never citable as a §4 result, even at target scale — the
+        # generator-side mirror of the replay judge's stricter rule.
+        from scripts.run_freeze_validloss_ci import run_ci, result_to_json
+
+        proxy_neg = result_to_json(
+            run_ci(device=_DEVICE, num_layers=6, candidate_total=2, **_TINY)
+        )
+        assert proxy_neg["negative_control"] is True
+        assert proxy_neg["citable_as_target_scale"] is False
+
+        target_neg = result_to_json(
+            run_ci(
+                device=_DEVICE, num_layers=6, candidate_total=2,
+                proxy_scale=False, **_TINY,
+            )
+        )
+        assert target_neg["proxy_scale"] is False
+        assert target_neg["negative_control"] is True
+        # Target-scale AND negative control ⇒ still NOT citable.
+        assert target_neg["citable_as_target_scale"] is False
+
+    def test_report_renders_negative_control_note(self):
+        from scripts.run_freeze_validloss_ci import format_report, run_ci
+
+        r = run_ci(device=_DEVICE, num_layers=6, candidate_total=2, **_TINY)
+        text = format_report(r)
+        assert "NEGATIVE_CONTROL" in text
+        assert "candidate_total=2" in text
+        assert "NOT a §4 order result" in text
+
+
 # ---------------------------------------------------------------------------
 # Heterogeneous positive control + generalize conclusive-TIES task
 # (the two apparatus-validation axes added to the Category-C attack)

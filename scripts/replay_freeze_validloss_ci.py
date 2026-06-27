@@ -35,6 +35,15 @@ CPU scaffolding. Two roles:
    ``proxy_scale: false`` plumbing fixture can never be mistaken for a real 9B
    run. A genuine recording omits ``synthetic`` (or sets it ``false``).
 
+   **The negative-control provenance guard.** A recording may carry
+   ``negative_control: true`` to mark its candidate arm as deliberately
+   degraded on a non-order lever (an asymmetric training budget). Such a
+   recording is a real measurement and is judged faithfully, but its verdict is
+   an apparatus-sensitivity probe (proof the gate fires a genuine non-TIES
+   label on a measured loss gap), never a §4 order result — an additive note
+   says so, and the ``citable_as_target_scale`` gate withholds the citation
+   claim for it just as it does for a synthetic recording.
+
    The same rule is also surfaced as a machine-readable
    ``citable_as_target_scale`` boolean in :func:`replay_to_json` (``True`` only
    for a genuine target-scale recording) so a downstream consumer does not have
@@ -148,15 +157,24 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
     the §4 target-scale result" claim a genuine recording earns, enforcing the
     feedback's "do not cite as a target-scale result" warning in the rendered
     output rather than relying on prose alone.
+
+    ``negative_control`` (default ``False``) is the apparatus-provenance guard:
+    a recording whose candidate arm was deliberately degraded on a non-order
+    lever (an asymmetric training budget). Such a recording IS a real
+    measurement and is judged faithfully, but its verdict is a sensitivity
+    probe, not a §4 order result — an additive note says so plainly, keeping a
+    recorded UNDERSHOOTS from being misread as an order disadvantage.
     """
     proxy_scale = bool(data.get("proxy_scale", True))
     synthetic = bool(data.get("synthetic", False))
+    negative_control = bool(data.get("negative_control", False))
     scale = "PROXY" if proxy_scale else "TARGET"
     recorded = data.get("verdict")
     lines = [
         "freeze_replay — GOAL §4 judge on recorded samples (no GPU)",
         f"  source: {path}",
-        f"  scale: {scale}_SCALE  (proxy_scale={proxy_scale}, synthetic={synthetic})  "
+        f"  scale: {scale}_SCALE  (proxy_scale={proxy_scale}, "
+        f"synthetic={synthetic}, negative_control={negative_control})  "
         f"task={data.get('task', '?')}  architecture={data.get('architecture', '?')}",
         "",
         format_surrogate_valid_loss_ci(ci),
@@ -192,10 +210,41 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
             "a proxy-scale §4 result; do not cite it as target-scale."
         )
     else:
+        # Target-scale. A genuine target-scale recording grants the citable
+        # claim; a negative-control recording does NOT (its verdict is a
+        # sensitivity probe, never a §4 order result), so the "this verdict IS
+        # the §4 target-scale result" claim is withheld and the additive
+        # NEGATIVE_CONTROL note below says why — keeping the prose claim and the
+        # machine ``citable_as_target_scale`` gate from drifting apart.
+        if negative_control:
+            lines.append(
+                "  note: TARGET_SCALE — samples are from a 9B run, so the "
+                "recording IS at target scale; however the candidate was a "
+                "negative control (deliberately degraded on a non-order lever), "
+                "so the verdict is a sensitivity probe recorded at target "
+                "scale, NOT a citable §4 order result."
+            )
+        else:
+            lines.append(
+                "  note: TARGET_SCALE — samples are from a 9B run; this verdict "
+                "IS the §4 target-scale result. The proxy verdict upgrades to "
+                "target-scale by swapping the sample source, with no code change."
+            )
+    # Negative-control provenance (additive — a negative control IS a real
+    # measurement, just not of order). The candidate arm was deliberately
+    # degraded on a non-order lever (an asymmetric training budget), so the
+    # verdict — though faithfully recomputed from the stored floats — is an
+    # apparatus-sensitivity probe, never a §4 order result. Surfacing it as a
+    # note keeps a recorded UNDERSHOOTS from being misread as "the output-first
+    # order is worse than random" when the gap is from undertraining.
+    if negative_control:
         lines.append(
-            "  note: TARGET_SCALE — samples are from a 9B run; this verdict IS "
-            "the §4 target-scale result. The proxy verdict upgrades to "
-            "target-scale by swapping the sample source, with no code change."
+            "  note: NEGATIVE_CONTROL — the candidate arm was deliberately "
+            "degraded (an asymmetric training budget, unrelated to freeze "
+            "order) to inject a real quality gap. The verdict is faithfully "
+            "recomputed from the stored floats but is an apparatus-sensitivity "
+            "probe, NOT a §4 order result; do not read it as evidence for or "
+            "against an output-first order advantage."
         )
     return "\n".join(lines)
 
@@ -220,17 +269,20 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         "source": str(path),
         "proxy_scale": bool(data.get("proxy_scale", True)),
         "synthetic": bool(data.get("synthetic", False)),
+        "negative_control": bool(data.get("negative_control", False)),
         # Machine-readable citation gate (GOAL §4): this recording's verdict MAY
-        # be cited as a §4 target-scale result only when it is BOTH target-scale
-        # AND genuine — the exact prose rule ``format_replay`` renders (a proxy or
-        # synthetic recording withholds the "this verdict IS the §4 target-scale
-        # result" claim). Surfacing it as one boolean closes the contract on the
-        # machine path too, so a consumer does not infer citability from two raw
-        # flags: this is the feedback's "must not be cited as a §4 target-scale
-        # result" warning enforced as a field, not prose.
+        # be cited as a §4 target-scale result only when it is target-scale AND
+        # genuine AND not a negative control — the exact prose rule
+        # ``format_replay`` renders (a proxy, synthetic, or negative-control
+        # recording withholds the "this verdict IS the §4 target-scale result"
+        # claim). Surfacing it as one boolean closes the contract on the machine
+        # path too, so a consumer does not infer citability from raw flags: this
+        # is the feedback's "must not be cited as a §4 target-scale result"
+        # warning enforced as a field, not prose.
         "citable_as_target_scale": (
             not bool(data.get("proxy_scale", True))
             and not bool(data.get("synthetic", False))
+            and not bool(data.get("negative_control", False))
         ),
         "candidate_mean": ci.candidate_mean,
         "surrogate_mean": ci.surrogate_mean,

@@ -43,7 +43,7 @@ from pathlib import Path
 import pytest
 
 from src.tg_lora.freeze_surrogate_ci import surrogate_valid_loss_ci
-from src.tg_lora.freeze_surrogate_gate import SURPASSES, TIES
+from src.tg_lora.freeze_surrogate_gate import SURPASSES, TIES, UNDERSHOOTS
 
 from scripts.replay_freeze_validloss_ci import (
     format_replay,
@@ -105,6 +105,25 @@ FIXTURE_THIN = (
     Path(__file__).resolve().parent
     / "fixtures"
     / "freeze_validloss_heterogeneous_generalize_thin_proxy.json"
+)
+
+# The committed real-GPU recording that exercises the THIRD verdict label the
+# recordings above never emit: UNDERSHOOTS. Every committed recording is TIES
+# (the proxy order-signal is genuinely zero, so TIES is a true null — that is
+# the research conclusion), and the only SURPASSES is a synthetic plumbing
+# fixture. So no real recording had ever shown the gate CAN fire a non-TIES
+# verdict on a measured signal. This negative control closes that gap: the
+# candidate arm is deliberately under-trained (candidate_total=2 vs surrogate
+# total=60) — an asymmetric budget UNRELATED to freeze order — so the candidate
+# is reliably worse and the gate fires a real UNDERSHOOTS (CI entirely below
+# zero). It is a sensitivity probe (proof the TIES recordings are a genuine
+# null, not a broken always-TIES pipeline), tagged negative_control=True so the
+# verdict is never misread as a §4 order result. Regenerate with
+# ``make freeze-validloss-ci-negative-control``.
+FIXTURE_NEGCTRL = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "freeze_validloss_negative_control_proxy.json"
 )
 
 
@@ -177,13 +196,15 @@ class TestLoadSamples:
 # ---------------------------------------------------------------------------
 
 
-def _data(candidate, surrogate, *, base_seed=0, proxy_scale=True, synthetic=False):
+def _data(candidate, surrogate, *, base_seed=0, proxy_scale=True, synthetic=False,
+          negative_control=False):
     return {
         "candidate_losses": list(candidate),
         "surrogate_losses": list(surrogate),
         "base_seed": base_seed,
         "proxy_scale": proxy_scale,
         "synthetic": synthetic,
+        "negative_control": negative_control,
     }
 
 
@@ -421,6 +442,93 @@ class TestThinEvidenceGuardFires:
 
 
 # ---------------------------------------------------------------------------
+# The negative control (real UNDERSHOOTS): the third verdict label, finally
+# recorded on a real artifact
+# ---------------------------------------------------------------------------
+
+
+class TestNegativeControlUndershoots:
+    """The ``UNDERSHOOTS`` verdict recorded on a real GPU artifact.
+
+    Every other committed recording is ``TIES`` (the proxy order-signal is
+    genuinely zero, so ``TIES`` is a true null — the research conclusion), and
+    the only ``SURPASSES`` is a synthetic plumbing fixture. So no real recording
+    had ever shown the gate CAN fire a non-TIES verdict on a measured signal.
+    This negative control closes that gap: a deliberately under-trained
+    candidate (``candidate_total=2`` vs surrogate ``total=60`` — an asymmetric
+    budget UNRELATED to freeze order) is reliably worse, so the gate fires a
+    real ``UNDERSHOOTS`` (CI entirely below zero). It is a sensitivity probe,
+    not a §4 order result — the ``negative_control`` provenance enforces that.
+    """
+
+    def test_fixture_is_the_negative_control(self):
+        # The recording carries the provenance that makes it a sensitivity probe,
+        # not an order result: candidate was under-trained (total=2 vs 60).
+        data = load_samples(FIXTURE_NEGCTRL)
+        assert data["negative_control"] is True
+        assert data["candidate_total"] == 2
+        assert data["total"] == 60
+        assert data["candidate_total"] != data["total"]
+
+    def test_real_undershoots_fires_on_real_recording(self):
+        # The third verdict label, emitted on a real artifact: replay recomputes
+        # UNDERSHOOTS from the stored floats (CI entirely below zero), matching
+        # the verdict recorded at run time — the gate fires non-TIES on a
+        # measured signal, so the order-experiment TIES recordings are a genuine
+        # null, not a broken always-TIES pipeline.
+        data = load_samples(FIXTURE_NEGCTRL)
+        ci = replay_samples(data)
+        assert ci.significance_verdict == UNDERSHOOTS == data["verdict"]
+        assert ci.upper < 0.0  # CI entirely below zero ⇒ UNDERSHOOTS
+        assert ci.n_candidate == 5 and ci.n_surrogate == 5
+
+    def test_gap_is_from_undertraining_not_order(self):
+        # The UNDERSHOOTS is earned by the under-trained candidate being reliably
+        # WORSE (higher valid_loss), not by a low surrogate: candidate_mean sits
+        # far above surrogate_mean, the injected non-order quality gap.
+        data = load_samples(FIXTURE_NEGCTRL)
+        ci = replay_samples(data)
+        assert ci.candidate_mean > ci.surrogate_mean
+        assert ci.point_improvement < 0.0
+
+    def test_negative_control_is_not_thin(self):
+        # n=5/arm is above MIN_SAMPLE_FOR_BOOTSTRAP: the UNDERSHOOTS is a real
+        # significance call, not a thin-evidence caveat (distinct from FIXTURE_THIN).
+        assert not replay_samples(load_samples(FIXTURE_NEGCTRL)).is_thin_evidence
+
+    def test_negative_control_note_is_emitted_not_hidden(self):
+        # The provenance surfaces in the human report so a recorded UNDERSHOOTS
+        # cannot be misread as "the output-first order is worse than random".
+        data = load_samples(FIXTURE_NEGCTRL)
+        text = format_replay(FIXTURE_NEGCTRL, data, replay_samples(data))
+        assert "NEGATIVE_CONTROL" in text
+        assert "NOT a §4 order result" in text
+        assert "do not read it as evidence" in text
+        # The scale line also carries the flag for a reader scanning it.
+        assert "negative_control=True" in text
+
+    def test_negative_control_withholds_citable_claim(self):
+        # A negative-control verdict is never citable as a §4 result, even though
+        # it is a real (non-synthetic, proxy-scale) measurement — the gate refuses
+        # it via the negative_control flag, mirroring the synthetic guard.
+        data = load_samples(FIXTURE_NEGCTRL)
+        out = replay_to_json(FIXTURE_NEGCTRL, data, replay_samples(data))
+        assert out["negative_control"] is True
+        assert out["synthetic"] is False
+        assert out["citable_as_target_scale"] is False
+
+    def test_expected_undershoots_exits_zero(self):
+        # The recording is pinned to UNDERSHOOTS: the --expected gate passes, so a
+        # drift in the recorded floats (or the judge) fails loudly on this leg.
+        assert main([str(FIXTURE_NEGCTRL), "--expected", UNDERSHOOTS]) == 0
+
+    def test_expected_ties_exits_nonzero(self):
+        # Asserting the wrong verdict (TIES) on the UNDERSHOOTS recording exits
+        # nonzero — the --expected gate distinguishes UNDERSHOOTS from TIES.
+        assert main([str(FIXTURE_NEGCTRL), "--expected", TIES]) == 2
+
+
+# ---------------------------------------------------------------------------
 # Scale honesty + CLI assertion
 # ---------------------------------------------------------------------------
 
@@ -640,6 +748,12 @@ class TestMachineCitationGate:
             ("<genuine-9b>", _data([1.0] * 4, [2.0] * 4, proxy_scale=False)),
             (str(FIXTURE), load_samples(FIXTURE)),
             (str(FIXTURE_TARGET), load_samples(FIXTURE_TARGET)),
+            # A negative-control recording at target scale: real floats, target
+            # scale, but a sensitivity probe — not citable, and the prose grants
+            # no claim (the NEGATIVE_CONTROL note replaces the TARGET_SCALE claim).
+            ("<negctrl-target>", _data(
+                [2.0] * 4, [1.0] * 4, proxy_scale=False, negative_control=True)),
+            (str(FIXTURE_NEGCTRL), load_samples(FIXTURE_NEGCTRL)),
         ]
         for label, data in cases:
             ci = replay_samples(data)

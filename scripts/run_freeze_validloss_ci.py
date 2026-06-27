@@ -514,6 +514,7 @@ def run_ci(
     architecture: str = HOMOGENEOUS,
     task: str = TASK_MEMORIZE,
     proxy_scale: bool = True,
+    candidate_total: int | None = None,
 ) -> dict:
     """Run the candidate + surrogate arms and return the §4 significance verdict.
 
@@ -548,6 +549,18 @@ def run_ci(
     contract ``scripts/replay_freeze_validloss_ci`` relies on to upgrade a
     recording to the target-scale §4 result. This harness keeps the default
     (proxy) so the recorded fixtures stay byte-identical.
+
+    ``candidate_total`` is the NEGATIVE-CONTROL lever (default ``None`` =
+    symmetric, the §4 order experiment unchanged). When set, the candidate arm
+    trains for that many epochs while the surrogate arms keep ``total`` — an
+    asymmetric budget deliberately UNRELATED to freeze order. It injects a real,
+    reproducible quality gap so the verdict becomes an apparatus-sensitivity
+    probe: the gate emits a genuine non-TIES label (``UNDERSHOOTS``) on a
+    measured loss gap, proving the order-experiment TIES recordings are a true
+    null rather than a broken always-TIES pipeline (a property the
+    heterogeneous positive control could not show, since the proxy order-signal
+    is genuinely zero). The result is tagged ``negative_control=True`` so the
+    recorded verdict is never misread as a §4 order result.
     """
     if architecture not in ARCHITECTURES:
         raise ValueError(
@@ -559,10 +572,19 @@ def run_ci(
         None if architecture == HOMOGENEOUS
         else heterogeneous_ranks(num_layers, HIDDEN)
     )
+    # ``candidate_total`` is the NEGATIVE-CONTROL lever: when set, the candidate
+    # arm trains for fewer epochs than the surrogate (an asymmetric budget that
+    # is UNRELATED to freeze order). That injects a real, reproducible quality
+    # gap so the verdict becomes an apparatus-sensitivity probe — the gate fires
+    # a real non-TIES label (UNDERSHOOTS) on a genuine loss gap, proving the
+    # TIES-for-order recordings are a true null, not a broken always-TIES
+    # pipeline. Default None keeps candidate and surrogate symmetric (the §4
+    # order experiment, unchanged).
+    cand_total = candidate_total if candidate_total is not None else total
     candidate_losses = [
         arm_valid_loss(
             output_first_order(num_layers), base_seed + i,
-            device=device, total=total, warmup=warmup, depth=depth, num_layers=num_layers,
+            device=device, total=cand_total, warmup=warmup, depth=depth, num_layers=num_layers,
             ranks=ranks, task=task,
         )
         for i in range(n_candidate)
@@ -601,6 +623,17 @@ def run_ci(
         # the JSON/report with no code change — the contract the replay judge
         # upgrades on. This flag is what a reader checks before citing the verdict.
         "proxy_scale": proxy_scale,
+        # The candidate arm's actual training budget: equal to ``total`` for the
+        # symmetric order experiment, or the reduced ``candidate_total`` for a
+        # negative-control run. Surfaced so the asymmetry that produced an
+        # UNDERSHOOTS is visible in the recording, not hidden.
+        "candidate_total": cand_total,
+        # Provenance: a negative control deliberately degrades the candidate on
+        # a non-order lever (here, training budget). The recorded verdict is an
+        # apparatus-sensitivity probe, NOT a §4 order result — this flag carries
+        # that contract through to the JSON/report so the gate's verdict is
+        # never misread as evidence for or against an output-first order.
+        "negative_control": candidate_total is not None and candidate_total != total,
     }
 
 
@@ -653,6 +686,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--json", action="store_true", help="emit JSON evidence to stdout.")
     p.add_argument("--output", default=None, help="write the report/JSON to this path too.")
+    p.add_argument(
+        "--candidate-total", type=int, default=None,
+        help=(
+            "NEGATIVE-CONTROL lever: train the candidate arm for this many "
+            "epochs instead of --total. The asymmetric budget injects a real "
+            "quality gap UNRELATED to freeze order, so the verdict becomes an "
+            "apparatus-sensitivity probe (the gate fires a genuine non-TIES "
+            "label on a measured loss gap) rather than a §4 order result. "
+            "Default None = symmetric (the order experiment, unchanged)."
+        ),
+    )
     return p
 
 
@@ -698,6 +742,18 @@ def format_report(result: dict) -> str:
             "homogeneous TIES of 9170b46 is a genuine 'no effect', not a "
             "broken always-TIES pipeline); a TIES here means the injected "
             "asymmetry sat below the n=5 bootstrap floor."
+        )
+    if result["negative_control"]:
+        lines.append(
+            "  note: NEGATIVE_CONTROL — the candidate arm was deliberately "
+            f"under-trained (candidate_total={result['candidate_total']} vs "
+            f"surrogate total={result['total']}) to inject a real quality gap "
+            "UNRELATED to freeze order. The verdict is an apparatus-"
+            "sensitivity probe (the gate fires a genuine non-TIES label on a "
+            "measured loss gap, proving the order-experiment TIES recordings "
+            "are a true null, not a broken always-TIES pipeline); it is NOT a "
+            "§4 order result — do not read it as evidence for or against an "
+            "output-first order advantage."
         )
     if result["proxy_scale"]:
         lines.append(
@@ -747,15 +803,22 @@ def result_to_json(result: dict) -> dict:
         "ranks": result["ranks"],
         "task": result["task"],
         "proxy_scale": result["proxy_scale"],
+        "candidate_total": result["candidate_total"],
+        "negative_control": result["negative_control"],
         # Machine-readable citation gate (GOAL §4): a recording this generator
         # produces is citable as a §4 target-scale result iff it was produced at
-        # target scale. The generator has no ``synthetic`` path — every recording
-        # it writes is a real measurement — so the gate is ``not proxy_scale``
-        # here; the replay judge re-derives the stricter ``(not proxy_scale) and
-        # (not synthetic)`` for hand-authored fixtures. A genuine 9B run
+        # target scale AND is not a negative control. The generator has no
+        # ``synthetic`` path — every recording it writes is a real measurement —
+        # so the gate is ``not proxy_scale`` here; the replay judge re-derives
+        # the stricter ``(not proxy_scale) and (not synthetic) and (not
+        # negative_control)`` for hand-authored fixtures. A genuine 9B run
         # (``proxy_scale=False``) therefore carries
-        # ``citable_as_target_scale=True`` from inception.
-        "citable_as_target_scale": not result["proxy_scale"],
+        # ``citable_as_target_scale=True`` from inception; a negative-control
+        # run never does, because its verdict is a sensitivity probe, not an
+        # order result.
+        "citable_as_target_scale": (
+            not result["proxy_scale"] and not result["negative_control"]
+        ),
     }
 
 
@@ -773,6 +836,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         num_layers=args.num_layers,
         architecture=args.architecture,
         task=args.task,
+        candidate_total=args.candidate_total,
     )
     payload = json.dumps(result_to_json(result), indent=2) if args.json else format_report(result)
     print(payload)
