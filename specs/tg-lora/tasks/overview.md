@@ -10,12 +10,12 @@
 <!-- spine:anchor:end -->
 
 **作成日**: 2026-05-21
-**最終更新**: 2026-05-25（Phase 64 parse_warnings E2E検証）
+**最終更新**: 2026-06-28（TASK-0152: 9B target-scale 決定検証 recipe — Tier-1 turnkey 計測 + §4 verdict gate 拡張 gap）
 **プロジェクト期間**: 2026-05-21 - 2026-06-19（24日）
 **推定工数**: 262.0時間（Phase 1-38: 170.0h + Phase 40-42: 8.5h + Phase 43: 4.0h + Phase 44-47: 13.5h + Phase 48: 3.0h + Phase 49: 3.0h + Phase 50: 5.0h + Phase 51: 12.0h + Phase 52: 2.0h + Phase 53: 0.5h + Phase 54: 2.0h + Phase 55: 2.5h + Phase 56: 3.0h + Phase 57: 7.0h + Phase 58: 4.0h + Phase 59: 3.0h + Phase 60: 3.0h + Phase 61: 3.0h + Phase 62: 8.0h + Phase 63: 2.5h + Phase 64: 1.5h）
 **総タスク数**: 133件（131件完了 + 1件Phase 43 GPU依存 + 1件Phase 64 完了）
 **要件数**: 259件（REQ-001~217 + REQ-218~231 Phase 56追加 + REQ-232~236 Phase 59追加 + REQ-237~240 Phase 60追加 + REQ-241~250 Phase 57-58追加 + REQ-251~258 Phase 61追加 + REQ-037a 比較スクリプト警告パターン統一）
-**次回タスク番号**: TASK-0130
+**次回タスク番号**: TASK-0153
 
 ## 関連文書
 
@@ -1652,5 +1652,6 @@ Phase 66 完了。残存する未完了タスク:
 - [TASK-0144: 論文 Gate 評価器に INSUFFICIENT EVIDENCE 第3状態を導入 — 入力欠落 bail を FAIL（反証）と区別し、generic owner の G1/G4 task 誤帰属を修正](TASK-0144.md)
 - [TASK-0149: G2 frontier-separation gate の INSUFFICIENT-EVIDENCE 契約閉包 — `_check_g2` が frontier report 欠損/破損時に disproven FAIL になっていた（G3/G4 は既に履行中・TASK-0144/a418049 の G2 残存 outlier）](TASK-0149.md)
 - [TASK-0150: §5.2 誠実性契約の guard(B) 側閉包 — A/B 比較の休眠可視化が baseline(A) 側のみで、dormant な guard run が time-to-quality 比較を黙示汚染していた](TASK-0150.md)
+- [TASK-0152: 9B target-scale 決定検証 recipe — Tier-1 turnkey 計測（9b candidate vs baseline・GOAL 究極目標）+ §4 verdict gate 拡張 gap（heterogeneous×generalize の surrogate arm 移植）。blocker は fundamental でなく runnable（upstream src.data + cached Qwen3.5-9B + RTX 3060 全て present・本 iter 検証）](TASK-0152.md)
 
 <!-- spine:references:end -->

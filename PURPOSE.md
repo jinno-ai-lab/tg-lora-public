@@ -152,6 +152,48 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-06-28 追記・AI-Hub feedback 第3回再送の検証 + 「BLOCKED」→「runnable」への再定式化 + 実測 test 計数 pin + TASK-0152 recipe 化】**
+> AI-Hub feedback が**同一 4 提案を第3回**再送。各々を本 mirror で再検証:
+> - **(1) 9B target-scale run / (2) §2.5 gate vs 9B corpus + claims.ndjson** → これまで通り
+>   `src/data/` 不在が *public-mirror 内の* blocker だが、**本 iter で blocker が fundamental でないことを証明**:
+>   決定的 lever は **runnable** である。根拠（全て本 iter で grep/実行確認）:
+>   (a) private pipeline は同機の upstream `/home/jinno/tg-lora/src/data/`（`build_seed_dataset.py:218 load_dataset`）に present;
+>   (b) 対象モデル `Qwen/Qwen3.5-9B`（GOAL §0 Track A）が `~/.cache/huggingface/hub/` に 19G で cached;
+>   (c) 学習データ `data/{train,valid_quick,valid_full,gold_test}.jsonl` が upstream に present;
+>   (d) `torch.cuda.is_available()=True`（RTX 3060, torch 2.1.1+cu121）。`claims.ndjson` は upstream `.concept/`
+>   の concept-invariant ledger（実験 verdict 用ではない）で public には不在 → 判定は既存 deposit 契約で代替。
+> - **(3) critique-loop/experiment-loop** → 引き続き AI Hub 自身の infra（`grep = 該当なし`）= [[ai-hub-feedback-infra-vs-this-repo]]。
+> - **(4) MS-008=871 vs system-health=866** → 引き続き**本 repo 全文に存在せず**（別 repo の PURPOSE）。
+>   → **本 iter は feedback #4 の spirit「監査計数を実測に pin」を、本 repo の *実* 計数で履行**:
+>   全 test suite（`/home/jinno/.pyenv/shims/python -m pytest --continue-on-collection-errors`）=
+>   **3469 passed / 17 failed / 5 skipped / 3 xfailed / 21 errors**（213s）。**17 failed 全件**を分類した結果、
+>   全て `src/data/` 不在（4 schema-rejection test は subprocess が `from src.data...` で import crash して
+>   validation 実行前に落ちる）+ 宣言済み dev dep 未 install（peft/datasets/hypothesis/mlx）= **修正可能な
+>   code defect は一件もない**（feedback が想定する 871/866 のような計数矛盾も本 repo には存在しない）。
+>
+> **やったこと（public-mirror scope に留まる）**: blocker を越境せず、**発見を turnkey で検証済みの recipe に変換**:
+> - **`specs/tg-lora/tasks/TASK-0152.md` 新設**: 9B target-scale 決定検証を 2 tier で定式化。
+>   **Tier-1（turnkey NOW）**: 9b candidate（`9b_tg_lora.yaml`=output_first progressive freeze）vs 9b baseline（full backprop）
+>   の best_valid_loss を multi-seed で比較 → `proxy_scale=False` で deposit → `replay_freeze_validloss_ci` が判定。
+>   GOAL §0 究極目標（品質保持×コスト削減・Phase 0/1）に決定的。全コマンド本 iter 検証済み。
+>   **Tier-2（feedback の §4 verdict gate 通り・upstream 拡張必要）**: heterogeneous×generalize での
+>   candidate vs surrogate(random-order) は turnkey でない — upstream `train_tg_lora.py` は prod-path 1本のみで、
+>   (a) random-order surrogate 掃引 (b) heterogeneous per-layer rank (c) generalize held-out verdict arm は
+>   public の合成-runner（`run_freeze_validloss_ci.py`）にしか存在しない（grep 確認）。これらの実 9B 移植が本研究の eng gap。
+> - **deposit 契約の test green を再確認**: `tests/test_replay_freeze_validloss_ci.py:852` が
+>   `proxy_scale=False`+非 synthetic → `citable_as_target_scale=True` を主張（:860/:872 は False）= 誤引用 gate 機能中。
+>
+> **本 iter の越境判断**: upstream pipeline を実行して 9B 数値を生成・public に deposit することは
+> public/private 境界を越え、かつ public repo に科学的 claim を刻む取り消し困難な行為であるため、
+> **明示的な合意を得るまで実行せず**、代わりに「実行すれば即決定的」な recipe（TASK-0152）として結晶化した。
+> 次の一手は合意後の Tier-1 実行（GPU 予算 ~数時間）+ Tier-2 拡張の TDD 化。`[[ai-hub-feedback-infra-vs-this-repo]]`。
+>
+> **検証**: `ls /home/jinno/tg-lora/src/data/` = present・`load_dataset`@build_seed_dataset.py:218・
+> `du -sh ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B` = 19G・`data/*.jsonl` present・
+> `python -c "import torch;print(torch.cuda.is_available())"` = True・`grep heterogeneous|surrogate|random.?order
+> upstream train_tg_lora.py` = 該当なし・`pytest test_replay_freeze_validloss_ci.py -k thin` = 1 passed・
+> 全 suite = 3469p/17f/21e/3xf（17f 全件 src.data/dep 由来・fixable defect 0）。
+
 > **【2026-06-27 追記・AI-Hub feedback 再送（同一 4 提案）の再確認 + scripts/ の実在する latent NameError 修正 + whole-`src/` lint-clean/CI-pin】**
 > AI-Hub feedback が前回と**同一の 4 提案**を再送。各々を本 mirror で再検証し、やはり全件
 > 実行不能/非適用（前回エントリと同一結論）: (1) 9B target-scale run → `src/data/` 不在で BLOCKED
