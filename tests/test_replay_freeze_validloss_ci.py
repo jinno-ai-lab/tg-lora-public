@@ -74,6 +74,22 @@ FIXTURE_TARGET = (
     / "freeze_validloss_target_dropin_plumbing.json"
 )
 
+# The committed real-GPU recording for the DISCRIMINATING positive control:
+# ``--architecture heterogeneous --task generalize`` on the RTX 3060 — the one
+# regime where freeze order structurally CAN matter (per-layer rank rising toward
+# the output, GOAL §1.5/§8 non-uniform per-layer cost) on a task order can move
+# (held-out generalization). Every other leg (homogeneous, or the memorize task)
+# is a TIES where order is structurally irrelevant or the task is unlearned; this
+# leg's TIES is therefore the strongest proxy-scale evidence the apparatus cannot
+# resolve order even where it should — consistent with the ratio=0.000
+# order-sensitivity diagnostic, and the reason target-scale is proven necessary.
+# Regenerate with ``make freeze-validloss-ci-heterogeneous-generalize``.
+FIXTURE_HETEROGEN = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "freeze_validloss_heterogeneous_generalize_proxy.json"
+)
+
 
 # ---------------------------------------------------------------------------
 # Import health + --help
@@ -208,6 +224,76 @@ class TestFixtureFaithfulness:
         # thin-evidence caveat — the recorded TIES is a real significance call.
         ci = replay_samples(load_samples(FIXTURE))
         assert not ci.is_thin_evidence
+
+
+# ---------------------------------------------------------------------------
+# The discriminating positive control (heterogeneous x generalize), run for real
+# ---------------------------------------------------------------------------
+
+
+class TestHeterogeneousGeneralizePositiveControl:
+    """The leg where a §4 order win was most reachable, run end-to-end on a real
+    GPU and locked by no-GPU replay.
+
+    ``run_freeze_validloss_ci`` is the hardened §4 verdict gate: a bootstrap CI
+    on the candidate-vs-surrogate valid_loss difference, graduated to
+    SURPASSES/TIES/UNDERSHOOTS, with the false-confidence guards the loop's
+    feedback asked whether they actually fire — thin-evidence (an arm below
+    ``MIN_SAMPLE_FOR_BOOTSTRAP`` cannot anchor a significance call), materiality
+    (a lead below the margin is not a win), and the proxy/target citation gate.
+    This class runs that gate, through the no-GPU replay, on the *real* recording
+    that settles the question a homogeneous or memorize TIES cannot: the only
+    regime where order structurally CAN matter.
+
+    The committed fixture is a genuine RTX 3060 ``--architecture heterogeneous
+    --task generalize`` run (per-layer rank ``[1, 2, 4, 7, 13, 24]`` rising
+    toward the output, held-out teacher-student task). On that stack a non-TIES
+    verdict would be the evidence the apparatus is sensitive to order; the replay
+    records what the gate actually emits on this real artifact and pins that the
+    hardened guards surface honestly rather than dressing a proxy-scale tie up as
+    a citable §4 win.
+    """
+
+    def test_fixture_is_the_discriminating_positive_control(self):
+        # Provenance pins this as the heterogeneous x generalize leg — distinct
+        # from FIXTURE (homogeneous generalize), whose TIES is the trivial one
+        # (order structurally irrelevant on a uniform stack).
+        data = load_samples(FIXTURE_HETEROGEN)
+        assert data["architecture"] == "heterogeneous"
+        assert data["task"] == "generalize"
+        # Per-layer rank is non-uniform and rises toward the output — the GOAL
+        # §1.5/§8 asymmetry that lets order matter (a uniform stack could not).
+        assert len(set(data["ranks"])) > 1
+        assert data["ranks"] == sorted(data["ranks"])
+
+    def test_replay_reproduces_recorded_ties_faithfully(self):
+        # The gate, re-run on the real stored floats with no GPU, emits the
+        # verdict the recording stored — the floats earn the label under the
+        # deterministic bootstrap; it is not painted on.
+        data = load_samples(FIXTURE_HETEROGEN)
+        ci = replay_samples(data)
+        assert ci.significance_verdict == data["verdict"] == TIES
+        assert ci.point_improvement == pytest.approx(data["point_improvement"])
+        # An honest TIES: the CI straddles zero, so the lead is not significant.
+        assert ci.lower < 0.0 < ci.upper
+
+    def test_hardened_guards_surface_not_false_confidence(self):
+        # The false-confidence guards the loop hardened the gate against, pinned
+        # on the real recording: n=5/arm is non-thin, and a genuine proxy
+        # recording is never citable as a target-scale §4 result.
+        data = load_samples(FIXTURE_HETEROGEN)
+        ci = replay_samples(data)
+        assert not ci.is_thin_evidence  # n=5 >= MIN_SAMPLE_FOR_BOOTSTRAP
+        out = replay_to_json(FIXTURE_HETEROGEN, data, ci)
+        assert out["proxy_scale"] is True
+        assert out["synthetic"] is False  # genuine run, not plumbing
+        assert out["citable_as_target_scale"] is False
+        assert out["faithful"] is True
+
+    def test_expected_ties_exits_zero(self):
+        # The recording is pinned to TIES: a replay gate asserting TIES passes,
+        # so a future drift in the recorded floats (or the judge) fails loudly.
+        assert main([str(FIXTURE_HETEROGEN), "--expected", TIES]) == 0
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,56 @@
+{
+  "verdict": "TIES",
+  "passes": false,
+  "significant_surpasses": false,
+  "is_material": true,
+  "is_thin_evidence": false,
+  "candidate_mean": 2.5691880702972414,
+  "surrogate_mean": 2.606846046447754,
+  "point_improvement": 0.037657976150512695,
+  "lower": -0.13685730099678,
+  "upper": 0.20852448105812088,
+  "confidence": 0.95,
+  "n_bootstrap": 10000,
+  "candidate_losses": [
+    2.6942012310028076,
+    2.3439528942108154,
+    2.559264659881592,
+    2.5961623191833496,
+    2.6523592472076416
+  ],
+  "surrogate_losses": [
+    2.786588430404663,
+    2.474616050720215,
+    2.7470765113830566,
+    2.3779022693634033,
+    2.6480469703674316
+  ],
+  "candidate_order": [
+    5,
+    4,
+    3,
+    2,
+    1,
+    0
+  ],
+  "device": "cuda",
+  "total": 60,
+  "warmup": 45,
+  "depth": 3,
+  "n_candidate": 5,
+  "n_surrogate": 5,
+  "base_seed": 0,
+  "num_layers": 6,
+  "architecture": "heterogeneous",
+  "ranks": [
+    1,
+    2,
+    4,
+    7,
+    13,
+    24
+  ],
+  "task": "generalize",
+  "proxy_scale": true,
+  "citable_as_target_scale": false
+}
