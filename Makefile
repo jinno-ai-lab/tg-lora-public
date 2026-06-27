@@ -849,6 +849,18 @@ FREEZE_REPLAY_FLAGS ?= tests/fixtures/freeze_validloss_generalize_proxy.json --e
 freeze-replay: ## Re-judge recorded valid_loss samples through the §4 judge (no GPU); asserts the recording still replays to its verdict
 	$(PYTHON_VENV) -m scripts.replay_freeze_validloss_ci $(FREEZE_REPLAY_FLAGS)
 
+# Turnkey for recipe TASK-0152 Tier-1 step 3: form a §4 verdict-gate deposit from
+# real upstream run_metrics.jsonl (candidate = output_first progressive-freeze vs
+# surrogate = full-backprop baseline, multi-seed) so best_valid_loss is read
+# straight from the artifact — not hand-transcribed (a P0 reproducibility hazard).
+# Default prints --help; override FREEZE_FORM_DEPOSIT_FLAGS with the real
+# --candidate/--surrogate/--model/--device/--output, then `make freeze-replay`
+# the emitted file to judge it GPU-free.
+FREEZE_FORM_DEPOSIT_FLAGS ?= --help
+
+freeze-form-deposit: ## Form a §4 verdict-gate deposit from real upstream run_metrics.jsonl (TASK-0152 Tier-1 step 3; override FREEZE_FORM_DEPOSIT_FLAGS)
+	$(PYTHON_VENV) -m scripts.form_freeze_validloss_deposit $(FREEZE_FORM_DEPOSIT_FLAGS)
+
 # Re-derive the recorded order-sensitivity decomposition (Var(order)/Var(seed))
 # from stored per-arm samples with NO GPU, NO model, and NO torch — the other
 # half of the proxy evidence, given the same GPU-free-replay treatment as

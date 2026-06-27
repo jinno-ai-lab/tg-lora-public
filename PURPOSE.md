@@ -152,6 +152,28 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-06-28 追記・Tier-1 deposit 形成の turnkey 化（feat）— 9B lever の分類 C→A 変換】**
+> AI-Hub feedback 第4回。提案 (3) critique/experiment-loop・(4) 871/866 計数は**本 iter でも**
+> `grep -rni critique.?loop|experiment.?loop = 該当なし`・`MS-008/871/866 = 本 repo 全文に存在せず`
+> で**引き続き別 repo の PURPOSE への誤送**（[[ai-hub-feedback-infra-vs-this-repo]]）。決定的 lever は
+> 引き続き (1)/(2) の **9B target-scale run**。本 iter で判明: real 9B *Progressive Freezing* 数値は
+> **既存 upstream run には存在しない**（`runs/` 138 件の `run_metrics.jsonl` は m9/m10 velocity・dynfreeze 系で
+> `progressive_freeze_enabled: true` な config は 0 件）。よって real PF verdict には新規 multi-seed 9B
+> campaign が必要（~4-6h GPU + public/private 境界合意）。**この iter は越境・campaign 実行を行わず**、
+> executor の分類 C→A 変換ルールに従い lever を**コードで前進**させた:
+> - **`scripts/form_freeze_validloss_deposit.py`（feat）+ `tests/test_form_freeze_validloss_deposit.py`（6 test）新設**:
+>   recipe TASK-0152 Tier-1 step3「deposit JSON の成形」を**手書き転写 → 1 コマンド**に変換。upstream
+>   `run_metrics.jsonl` の `run_footer.best_valid_loss`（footer 無しは min `loss_valid` step）を直接読み、
+>   `proxy_scale=false`/`synthetic=false`/`negative_control=false`・各 run_id/seed/step の provenance 付きで
+>   `replay_freeze_validloss_ci` へ直結する deposit を生成。**手書き転写は P0 再現性 hazard**（1 float の誤記が
+>   bootstrap verdict を暗黙に腐らせる）であり、本 CLI はそれを「artifact 直読 + 監査可能 provenance」で除去する。
+> - **form→judge chain の test green**: 形成した deposit が `citable_as_target_scale=True` gate を開くこと
+>   （`test_deposit_replays_as_citable_target_scale`）+ `make freeze-form-deposit` target + 105 passed/3 xfailed 非回帰。
+> - **verdict の現状（誠実）**: 9B target-scale の §4 verdict 自体は**依然 pending**（real multi-seed PF campaign 待ち）。
+>   ただし「real 9B 数値 → verdict」の経路は**完全 turnkey かつ real-number 対応 test 済み**になり、
+>   campaign が数値を出せば `form` → `replay --json` の 2 コマンドで決定的判定が出る。
+> 次の一手は（合意後）Tier-1 multi-seed 9B PF campaign 実行 → 本 CLI で deposit → `replay` で §4 verdict 記録。
+
 > **【2026-06-28 追記・AI-Hub feedback 第3回再送の検証 + 「BLOCKED」→「runnable」への再定式化 + 実測 test 計数 pin + TASK-0152 recipe 化】**
 > AI-Hub feedback が**同一 4 提案を第3回**再送。各々を本 mirror で再検証:
 > - **(1) 9B target-scale run / (2) §2.5 gate vs 9B corpus + claims.ndjson** → これまで通り
