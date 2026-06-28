@@ -131,6 +131,37 @@ def test_extract_falls_back_to_min_step_when_no_footer(tmp_path: Path) -> None:
     assert prov["best_valid_loss_source"] == "min_loss_valid_step"
 
 
+def test_extract_falls_back_when_footer_best_is_null(tmp_path: Path) -> None:
+    # An interrupted run writes a footer with best_valid_loss: null (best_loss
+    # never updated) but still carries per-step loss_valid lines. Extract must
+    # fall back to the step minimum rather than crash on float(None).
+    p = tmp_path / "killed.jsonl"
+    lines = [
+        json.dumps(
+            {
+                "type": "run_header",
+                "run_id": "killed_base",
+                "model_name": "Qwen/Qwen3.5-9B",
+                "seed": 42,
+            }
+        ),
+        # per-step loss_valid present (min = 1.06 at index 1)
+        json.dumps({"type": "step", "step": 8, "loss_valid": 1.30}),
+        json.dumps({"type": "step", "step": 16, "loss_valid": 1.06}),
+        json.dumps({"type": "step", "step": 24, "loss_valid": 1.18}),
+        # footer exists but best_valid_loss is null (never updated before kill)
+        json.dumps(
+            {"type": "run_footer", "best_valid_loss": None, "best_valid_step": 0}
+        ),
+    ]
+    p.write_text("\n".join(lines) + "\n")
+    value, prov = extract_best_valid_loss(p)
+    assert value == pytest.approx(1.06)
+    assert prov["best_valid_loss_source"] == "min_loss_valid_step"
+    assert prov["best_valid_step"] == 16
+    assert prov["run_id"] == "killed_base"
+
+
 def test_form_deposit_emits_target_scale_schema(tmp_path: Path) -> None:
     cand: list[Path] = []
     base: list[Path] = []

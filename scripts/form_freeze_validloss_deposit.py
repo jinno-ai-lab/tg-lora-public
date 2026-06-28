@@ -48,8 +48,10 @@ def extract_best_valid_loss(path: str | Path) -> tuple[float, dict[str, Any]]:
 
     Prefers the durable ``run_footer.best_valid_loss`` field; falls back to the
     minimum ``loss_valid`` across ``step`` lines for runs that predate the
-    footer. Returns ``(value, provenance)`` where provenance names the run so a
-    deposited float always traces back to its source artifact.
+    footer, or whose footer carries ``best_valid_loss: null`` (an interrupted
+    run that never updated ``best_loss``). Returns ``(value, provenance)`` where
+    provenance names the run so a deposited float always traces back to its
+    source artifact.
     """
     path = Path(path)
     run_id = path.stem
@@ -80,7 +82,11 @@ def extract_best_valid_loss(path: str | Path) -> tuple[float, dict[str, Any]]:
                 ):
                     min_step_loss = float(loss_valid)
                     min_step = record.get("step")
-            elif rtype == "run_footer" and "best_valid_loss" in record:
+            elif rtype == "run_footer" and record.get("best_valid_loss") is not None:
+                # An interrupted run writes a footer with ``best_valid_loss: null``
+                # (best_loss never updated) — treat that as "no footer value" and
+                # fall through to the per-step minimum rather than crashing on
+                # ``float(None)``.
                 footer_value = float(record["best_valid_loss"])
                 footer_step = record.get("best_valid_step")
 
