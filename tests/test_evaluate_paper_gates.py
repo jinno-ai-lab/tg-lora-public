@@ -309,6 +309,92 @@ class TestG2Memory:
         assert not g23["pass"]
         assert "No frontier_report.json" in g23["detail"]
 
+    # G2.3 routing-distinction regression. The five G2.3 tests above each assert
+    # only the per-check ``detail`` / ``pass`` flag. They do NOT assert the
+    # ``evaluated`` field that decides the gate's *route* downstream:
+    #   - data-missing (absent report)   -> evaluated=False  -> "run the sweep
+    #     producer" (the claim is UNMEASURED — no data to judge).
+    #   - measured breach (report loaded, no separation) -> evaluated absent
+    #     (i.e. the default True) -> "curated next_action" (the experiment RAN
+    #     and measured a negative result, not a missing one).
+    # A regression that collapsed the measured-breach path to also return
+    # ``evaluated=False`` would misroute a measured negative to "go produce
+    # data" — and it would pass every detail-string test above. This pins the
+    # distinction so that misrouting cannot return silently.
+    def test_g23_data_missing_routes_to_unmeasured_evaluated_false(self, tmp_path):
+        from scripts.evaluate_paper_gates import _check_g2
+        summary = _make_summary()
+        # data-missing: the path points at a file that does not exist
+        result = _check_g2(summary, frontier_report_path=str(tmp_path / "absent.json"))
+        g23 = next(c for c in result["checks"] if c["check"].startswith("G2.3"))
+        assert not g23["pass"]
+        assert "No frontier_report.json" in g23["detail"]
+        # no measured boundary was ever read -> detail must not claim one
+        assert "boundary=" not in g23["detail"]
+        # routes to INSUFFICIENT EVIDENCE / "run the sweep producer"
+        assert result.get("evaluated") is False
+        assert result["passed"] is False
+
+    def test_g23_measured_breach_routes_to_evaluated_curated_next_action(self, tmp_path):
+        from scripts.evaluate_paper_gates import _check_g2
+        frontier = {
+            "frontier_separation_detected": False,
+            "frontier_boundary": 512,
+            "runs": [
+                {"seq_len": 512, "baseline_status": "completed",
+                 "tg_status": "completed", "frontier_separation": False},
+            ],
+        }
+        fp = tmp_path / "frontier_report.json"
+        fp.write_text(json.dumps(frontier))
+
+        summary = _make_summary()
+        result = _check_g2(summary, frontier_report_path=str(fp))
+        g23 = next(c for c in result["checks"] if c["check"].startswith("G2.3"))
+        assert not g23["pass"]
+        assert "No frontier separation" in g23["detail"]
+        assert "boundary=512" in g23["detail"]
+        # the experiment RAN and measured a negative result -> evaluated (the
+        # default True), NOT the data-missing evaluated=False. There must be no
+        # ``evaluated`` key — its presence-and-False would misroute to "produce
+        # data".
+        assert "evaluated" not in result
+        assert result["passed"] is False
+
+    def test_g23_data_missing_and_measured_breach_route_distinctly(self, tmp_path):
+        """The two G2.3 failure modes must not collapse onto one route.
+
+        data-missing -> evaluated=False (run sweep producer);
+        measured-breach -> evaluated absent (curated next_action). If a change
+        makes measured-breach also return evaluated=False the two routes
+        become indistinguishable and a measured negative is misrouted to
+        "produce data" — this cross-assertion fails before that ships.
+        """
+        from scripts.evaluate_paper_gates import _check_g2
+        summary = _make_summary()
+
+        data_missing = _check_g2(
+            summary, frontier_report_path=str(tmp_path / "absent.json")
+        )
+        frontier = {
+            "frontier_separation_detected": False,
+            "frontier_boundary": 512,
+            "runs": [{"seq_len": 512, "baseline_status": "completed",
+                      "tg_status": "completed", "frontier_separation": False}],
+        }
+        fp = tmp_path / "frontier_report.json"
+        fp.write_text(json.dumps(frontier))
+        measured_breach = _check_g2(summary, frontier_report_path=str(fp))
+
+        # distinct routes: only data-missing carries evaluated=False
+        assert data_missing.get("evaluated") is False
+        assert measured_breach.get("evaluated") is not False
+        # distinct details: only the measured case names a boundary
+        dm = next(c for c in data_missing["checks"] if c["check"].startswith("G2.3"))
+        mb = next(c for c in measured_breach["checks"] if c["check"].startswith("G2.3"))
+        assert "boundary=" not in dm["detail"]
+        assert "boundary=" in mb["detail"]
+
 
 class TestFindFrontierReport:
     def test_discovers_in_same_directory(self, tmp_path):
