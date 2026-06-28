@@ -202,13 +202,20 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
     proxy_scale = bool(data.get("proxy_scale", True))
     synthetic = bool(data.get("synthetic", False))
     negative_control = bool(data.get("negative_control", False))
+    # ``full_context`` (default True when absent): did the run train at the full
+    # §4 seq_len=1024? A 12GB probe is seq_len=256 (TASK-0152 lines 86-97) —
+    # genuine 9B / target-scale, but NOT the full verdict, so the strong claim is
+    # withheld. ``seq_len`` lets the REDUCED CONTEXT caveat state the shortfall.
+    full_context = bool(data.get("full_context", True))
+    seq_len = data.get("seq_len")
     scale = "PROXY" if proxy_scale else "TARGET"
     recorded = data.get("verdict")
     lines = [
         "freeze_replay — GOAL §4 judge on recorded samples (no GPU)",
         f"  source: {path}",
         f"  scale: {scale}_SCALE  (proxy_scale={proxy_scale}, "
-        f"synthetic={synthetic}, negative_control={negative_control})  "
+        f"synthetic={synthetic}, negative_control={negative_control}, "
+        f"full_context={full_context})  "
         f"task={data.get('task', '?')}  architecture={data.get('architecture', '?')}",
         "",
         format_surrogate_valid_loss_ci(ci),
@@ -244,12 +251,11 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
             "a proxy-scale §4 result; do not cite it as target-scale."
         )
     else:
-        # Target-scale. A genuine target-scale recording grants the citable
-        # claim; a negative-control recording does NOT (its verdict is a
-        # sensitivity probe, never a §4 order result), so the "this verdict IS
-        # the §4 target-scale result" claim is withheld and the additive
-        # NEGATIVE_CONTROL note below says why — keeping the prose claim and the
-        # machine ``citable_as_target_scale`` gate from drifting apart.
+        # Target-scale. Withhold the strong "this verdict IS the §4 target-scale
+        # result" claim unless full-context genuine: a negative control is a
+        # sensitivity probe; a reduced-context probe IS genuine 9B but not the
+        # full seq_len=1024 verdict. The cross-check pins these to the machine
+        # gates so prose and JSON cannot drift.
         if negative_control:
             arm = _resolve_negative_control_arm(data)
             arm_clause = (
@@ -257,11 +263,20 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
                 else "the surrogate arm was"
             )
             lines.append(
-                "  note: TARGET_SCALE — samples are from a 9B run, so the "
-                "recording IS at target scale; however a negative control was "
-                f"applied ({arm_clause} deliberately degraded on a non-order "
-                "lever), so the verdict is a sensitivity probe recorded at "
-                "target scale, NOT a citable §4 order result."
+                "  note: TARGET_SCALE — the recording is at target scale (a 9B "
+                "run); however a negative control was applied "
+                f"({arm_clause} deliberately degraded on a non-order lever), so "
+                "the verdict is a sensitivity probe recorded at target scale, "
+                "NOT a citable §4 order result."
+            )
+        elif not full_context:
+            seq_clause = f" at seq_len={seq_len}" if seq_len is not None else ""
+            lines.append(
+                "  note: REDUCED CONTEXT — samples are from a 9B run, so the "
+                "recording IS at target scale; however it was trained"
+                f"{seq_clause}, a reduced-context probe (the only config a 12GB "
+                "GPU fits), NOT the full GOAL §4 seq_len=1024 verdict. Do not "
+                "cite it as the full §4 verdict."
             )
         else:
             lines.append(
@@ -299,13 +314,24 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
 def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLossCI) -> dict[str, Any]:
     """Machine-readable replay: the judge output plus the file's provenance.
 
-    ``citable_as_target_scale`` is the single boolean a downstream consumer
-    checks before citing a recording's verdict as a §4 target-scale result —
-    ``True`` only for a genuine target-scale recording
-    (``proxy_scale=False`` and not ``synthetic``). It mirrors the prose rule
-    :func:`format_replay` renders, so the human-readable claim and the machine
-    gate can never drift apart.
+    Two citation gates, each mirroring a prose claim :func:`format_replay`
+    renders so the human claim and the machine gate cannot drift:
+
+    * ``citable_as_target_scale`` — ``True`` for a genuine target-scale recording
+      (``proxy_scale=False``, not ``synthetic``, not a negative control). A
+      reduced-context (seq_len=256) 9B probe still qualifies — it IS a real 9B
+      run, just not at seq_len=1024.
+    * ``citable_as_full_section4_verdict`` — ``True`` only when target-scale AND
+      ``full_context``. A reduced-context probe is ``False``: it must not be
+      cited as the *full* §4 verdict (TASK-0152 lines 86-97, enforced as a field).
     """
+    proxy_scale = bool(data.get("proxy_scale", True))
+    synthetic = bool(data.get("synthetic", False))
+    negative_control = bool(data.get("negative_control", False))
+    full_context = bool(data.get("full_context", True))
+    citable_as_target_scale = (
+        not proxy_scale and not synthetic and not negative_control
+    )
     return {
         "replayed_verdict": ci.significance_verdict,
         "recorded_verdict": data.get("verdict"),
@@ -314,29 +340,23 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
             or ci.significance_verdict == data.get("verdict")
         ),
         "source": str(path),
-        "proxy_scale": bool(data.get("proxy_scale", True)),
-        "synthetic": bool(data.get("synthetic", False)),
-        "negative_control": bool(data.get("negative_control", False)),
-        # Which arm a negative control degraded (resolved from
-        # ``negative_control_arm`` when present, else inferred from the arms'
-        # recorded budgets vs ``total``). Surfaced so a downstream consumer can
-        # tell a candidate-degraded (DOWNWARD) from a surrogate-degraded
-        # (UPWARD) sensitivity probe without re-deriving it from the budgets.
+        "proxy_scale": proxy_scale,
+        "synthetic": synthetic,
+        "negative_control": negative_control,
+        # Reduced-context provenance: full §4 seq_len=1024? Default True when
+        # absent (backward compatible). ``seq_len`` records the exact context.
+        "full_context": full_context,
+        "seq_len": data.get("seq_len"),
+        # Which arm a negative control degraded (from ``negative_control_arm`` or
+        # inferred from the arms' budgets vs ``total``).
         "negative_control_arm": _resolve_negative_control_arm(data),
-        # Machine-readable citation gate (GOAL §4): this recording's verdict MAY
-        # be cited as a §4 target-scale result only when it is target-scale AND
-        # genuine AND not a negative control — the exact prose rule
-        # ``format_replay`` renders (a proxy, synthetic, or negative-control
-        # recording withholds the "this verdict IS the §4 target-scale result"
-        # claim). Surfacing it as one boolean closes the contract on the machine
-        # path too, so a consumer does not infer citability from raw flags: this
-        # is the feedback's "must not be cited as a §4 target-scale result"
-        # warning enforced as a field, not prose.
-        "citable_as_target_scale": (
-            not bool(data.get("proxy_scale", True))
-            and not bool(data.get("synthetic", False))
-            and not bool(data.get("negative_control", False))
-        ),
+        # Citation gate level 1 (target-scale): genuine target-scale (mirrors the
+        # prose "samples are from a 9B run").
+        "citable_as_target_scale": citable_as_target_scale,
+        # Citation gate level 2 (full §4 verdict): target-scale AND full_context.
+        # A reduced-context probe is target-scale but NOT the full verdict
+        # (TASK-0152 lines 86-97) — so a 12GB deposit cannot be over-cited.
+        "citable_as_full_section4_verdict": citable_as_target_scale and full_context,
         "candidate_mean": ci.candidate_mean,
         "surrogate_mean": ci.surrogate_mean,
         "point_improvement": ci.point_improvement,

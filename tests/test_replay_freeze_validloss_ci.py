@@ -218,8 +218,12 @@ class TestLoadSamples:
 
 
 def _data(candidate, surrogate, *, base_seed=0, proxy_scale=True, synthetic=False,
-          negative_control=False):
-    return {
+          negative_control=False, full_context=True):
+    # ``full_context`` is emitted only when False — a genuine full-context 9B
+    # recording need not carry the field (the judge defaults it True), while a
+    # reduced-context probe (the only thing a 12GB box can run) carries it
+    # explicitly so it cannot be mis-cited as the full §4 verdict.
+    d = {
         "candidate_losses": list(candidate),
         "surrogate_losses": list(surrogate),
         "base_seed": base_seed,
@@ -227,6 +231,9 @@ def _data(candidate, surrogate, *, base_seed=0, proxy_scale=True, synthetic=Fals
         "synthetic": synthetic,
         "negative_control": negative_control,
     }
+    if not full_context:
+        d["full_context"] = False
+    return d
 
 
 class TestReplaySamples:
@@ -872,33 +879,76 @@ class TestMachineCitationGate:
         assert out["citable_as_target_scale"] is False  # ...but not citable
 
     def test_machine_gate_matches_human_prose_across_all_recordings(self):
-        # The boolean is provably consistent with the prose claim: it is True
-        # exactly when the human-readable note grants the "this verdict IS the §4
-        # target-scale result" claim. Any future edit to one path without the
-        # other fails here.
+        # Two citation levels, each pinned to its prose claim so machine and prose
+        # cannot drift: citable_as_target_scale == "samples are from a 9B run";
+        # citable_as_full_section4_verdict == "this verdict IS" in prose.
         cases = [
-            ("<genuine-9b>", _data([1.0] * 4, [2.0] * 4, proxy_scale=False)),
+            ("<genuine-9b-full>", _data([1.0] * 4, [2.0] * 4, proxy_scale=False)),
+            # reduced-context 9B probe: real 9B floats, full_context=False.
+            ("<genuine-9b-reduced>", _data(
+                [1.0] * 4, [2.0] * 4, proxy_scale=False, full_context=False)),
             (str(FIXTURE), load_samples(FIXTURE)),
             (str(FIXTURE_TARGET), load_samples(FIXTURE_TARGET)),
-            # A negative-control recording at target scale: real floats, target
-            # scale, but a sensitivity probe — not citable, and the prose grants
-            # no claim (the NEGATIVE_CONTROL note replaces the TARGET_SCALE claim).
+            # negative-control at target scale: a sensitivity probe, not citable.
             ("<negctrl-target>", _data(
                 [2.0] * 4, [1.0] * 4, proxy_scale=False, negative_control=True)),
             (str(FIXTURE_NEGCTRL), load_samples(FIXTURE_NEGCTRL)),
-            # The symmetric negative control: a real SURPASSES from a degraded
-            # surrogate. It is a genuine measurement and significant, yet still
-            # NOT citable — the negative_control flag withholds the claim on both
-            # arms, and the prose grants none. This is the case that could fool a
-            # consumer reading the SURPASSES verdict alone.
             (str(FIXTURE_NEGCTRL_SURROGATE), load_samples(FIXTURE_NEGCTRL_SURROGATE)),
         ]
         for label, data in cases:
             ci = replay_samples(data)
-            machine = replay_to_json(label, data, ci)["citable_as_target_scale"]
-            human_grants_claim = "this verdict IS" in format_replay(label, data, ci)
-            assert machine is human_grants_claim, (
-                f"{label}: machine citable_as_target_scale={machine} but "
-                f"human prose grants the citable claim={human_grants_claim}"
-            )
+            out = replay_to_json(label, data, ci)
+            prose = format_replay(label, data, ci)
+            assert out["citable_as_full_section4_verdict"] is ("this verdict IS" in prose)
+            assert out["citable_as_target_scale"] is ("samples are from a 9B run" in prose)
+
+
+# Reduced-context provenance guard (the seq_len=256 probe honesty axis)
+
+
+class TestReducedContextProvenanceGuard:
+    """A reduced-context (seq_len=256) 9B probe IS target-scale but NOT the full
+    §4 seq_len=1024 verdict (TASK-0152 lines 86-97). The guard splits the two
+    claims: judged faithfully and labeled target-scale, but the "this verdict IS
+    the §4 target-scale result" claim is withheld until a full-context recording
+    overwrites the deposit."""
+
+    def test_reduced_context_probe_is_target_scale_but_not_full_verdict(self):
+        data = _data([1.0] * 4, [2.0] * 4, proxy_scale=False, full_context=False)
+        out = replay_to_json("<9b-reduced>", data, replay_samples(data))
+        text = format_replay("<9b-reduced>", data, replay_samples(data))
+        assert out["citable_as_target_scale"] is True   # context is independent of scale
+        assert out["full_context"] is False
+        assert out["citable_as_full_section4_verdict"] is False  # strong claim withheld
+        assert "this verdict IS" not in text
+        assert "REDUCED CONTEXT" in text
+        assert "not the full" in text.lower()
+
+    def test_full_context_probe_grants_full_verdict_claim(self):
+        data = _data([1.0] * 4, [2.0] * 4, proxy_scale=False, full_context=True)
+        out = replay_to_json("<9b-full>", data, replay_samples(data))
+        text = format_replay("<9b-full>", data, replay_samples(data))
+        assert out["citable_as_full_section4_verdict"] is True
+        assert "this verdict IS" in text  # the citable claim a full run earns
+        assert "REDUCED CONTEXT" not in text
+
+    def test_reduced_context_defaults_to_full_when_field_absent(self):
+        # Backward compat: a legacy deposit with no full_context field is treated
+        # as full-context (existing fixtures omit it; they're non-citable anyway).
+        data = _data([1.0] * 4, [2.0] * 4, proxy_scale=False)
+        data.pop("full_context", None)
+        out = replay_to_json("<legacy-9b>", data, replay_samples(data))
+        assert out["full_context"] is True
+        assert out["citable_as_full_section4_verdict"] is True
+
+    def test_reduced_context_note_names_seq_len_when_recorded(self):
+        data = _data([1.0] * 4, [2.0] * 4, proxy_scale=False, full_context=False)
+        data["seq_len"] = 256
+        text = format_replay("<9b-256>", data, replay_samples(data))
+        assert "seq_len=256" in text  # the caveat states the exact shortfall
+
+    def test_reduced_context_does_not_block_verdict_recomputation(self):
+        # The guard withholds the claim, never the verdict.
+        data = _data([1.0] * 4, [2.0] * 4, proxy_scale=False, full_context=False)
+        assert replay_samples(data).significance_verdict == SURPASSES
 

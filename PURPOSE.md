@@ -152,6 +152,27 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-06-28 追記・reduced-context provenance guard 追加（feat）— §4 verdict 誤引用防止をコード契約化】**
+> AI-Hub feedback 第5回。(2)/(3)/(4) は引き続き本 repo 該当なし（[[ai-hub-feedback-infra-vs-this-repo]]）、
+> (1)「real 9B §4 verdict を出すか境界を正式 unblock せよ」は**12GB RTX 3060 の物理制約 + public/private 境界合意**
+> で二重に gated（seq_len=1024 は OOM・seq256 のみ動作・実測済 [[gpu-usable-proxy-runs]]）。その代わり**数値が出た瞬間に
+> 誤引用を許さない honesty guard**を、recipe の prose 警告（TASK-0152 lines 86-97「reduced-context probe は完全 §4 verdict
+> ではない・tag は deposit に正しく付与する」）から**コード契約**に昇格させた（provenance-guard 家族の第4成员:
+> proxy/synthetic/negative_control に続き `full_context`）:
+> - **`scripts/form_freeze_validloss_deposit.py`（feat）**: `--seq-len` / `--full-context` flag 追加。12GB 現実を**正直な default**
+>   とし `full_context=False`（`seq_len>=1024` または明示 `--full-context` のみ True）。deposit に `full_context`/`seq_len` を付与。
+> - **`scripts/replay_freeze_validloss_ci.py`（feat）**: **2-level citability** を導入。`citable_as_target_scale`（不変・real 9B run）
+>   に加え NEW `citable_as_full_section4_verdict`（= target_scale AND full_context）を追加。reduced-context probe は
+>   target-scale だが **full verdict ではなく**、強い "this verdict IS the §4 target-scale result" 主張を**差し控え**、
+>   `seq_len` を明示した REDUCED CONTEXT caveat を描画。legacy deposit（field 無し）は full 扱いで後方互換。
+> - **実データ検証**: upstream `runs/9b_verdict/cand_seed42/run_metrics.jsonl`（best_valid_loss=1.0439）で form→replay を
+>   実行 → `citable_as_target_scale=True`・`citable_as_full_section4_verdict=False`・seq256 caveat 描画を確認（越境せず・read-only）。
+> - **test green + lint clean**: `tests/test_form_freeze_validloss_deposit.py`（+6）・`tests/test_replay_validloss_ci` の
+>   `TestReducedContextProvenanceGuard`（5 test）+ 機械/prose 双方向 drift-guard cross-check 更新 = **両 file 79 passed**・
+>   canary GREEN・ruff clean・net diff 168 行（§5「diff 200行以下」内）。**9B §4 verdict 自体は依然 pending**（real campaign 待ち）だが、
+>   数値が出た瞬間に「seq256 probe を完全 verdict として誤引用する」過ちがコードレベルで不可能になった。
+> 次の一手は（合意後）Tier-1 multi-seed 9B PF campaign 実行 → `form --seq-len` で deposit → `replay --json` で §4 verdict 記録。
+
 > **【2026-06-28 追記・Tier-1 deposit 形成の turnkey 化（feat）— 9B lever の分類 C→A 変換】**
 > AI-Hub feedback 第4回。提案 (3) critique/experiment-loop・(4) 871/866 計数は**本 iter でも**
 > `grep -rni critique.?loop|experiment.?loop = 該当なし`・`MS-008/871/866 = 本 repo 全文に存在せず`

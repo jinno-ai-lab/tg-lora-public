@@ -126,6 +126,8 @@ def form_deposit(
     architecture: str = "heterogeneous",
     base_seed: int = 0,
     total: int | None = None,
+    seq_len: int | None = None,
+    full_context: bool = False,
 ) -> dict[str, Any]:
     """Build a judge-ready §4 deposit from candidate + surrogate run artifacts.
 
@@ -133,6 +135,15 @@ def form_deposit(
     the comparison arm (Tier-1 deposits the full-backprop baseline here per
     TASK-0152). One ``best_valid_loss`` per run becomes one entry in the
     corresponding losses array, in input order.
+
+    ``seq_len`` / ``full_context`` tag the deposit's context: the sole config a
+    12GB GPU fits is seq_len=256 (TASK-0152 lines 86-97), a reduced-context
+    probe that is NOT the full §4 seq_len=1024 verdict. The honest default is
+    reduced-context until a ``seq_len >= 1024`` (or explicit ``full_context``)
+    proves otherwise — mis-labeling a reduced probe as the full verdict is the
+    dangerous over-cite direction. The replay judge reads these fields:
+    ``citable_as_target_scale`` opens for a real 9B run regardless of context,
+    ``citable_as_full_section4_verdict`` only for a full-context deposit.
     """
     candidate_paths = [Path(p) for p in candidate_paths]
     surrogate_paths = [Path(p) for p in surrogate_paths]
@@ -159,16 +170,26 @@ def form_deposit(
         f"candidate arms: {', '.join(candidate_labels)} | "
         f"surrogate(baseline) arms: {', '.join(surrogate_labels)}"
     )
+    # full_context: seq_len>=1024 (or explicit --full-context) marks the deposit
+    # the full §4 verdict; else reduced-context (the honest 12GB default). See
+    # the docstring for the over-cite hazard.
+    is_full_context = bool(
+        full_context or (seq_len is not None and seq_len >= 1024)
+    )
     return {
         "candidate_losses": candidate_losses,
         "surrogate_losses": surrogate_losses,
         "n_candidate": len(candidate_losses),
         "n_surrogate": len(surrogate_losses),
         # genuine target-scale recording — NOT proxy plumbing, synthetic, or a
-        # negative control, so the §4 citation gate opens for it.
+        # negative control, so the §4 target-scale citation gate opens for it.
         "proxy_scale": False,
         "synthetic": False,
         "negative_control": False,
+        # reduced-context provenance. ``citable_as_target_scale`` opens (it IS a
+        # real 9B run); ``citable_as_full_section4_verdict`` only when full_context.
+        "full_context": is_full_context,
+        "seq_len": seq_len,
         "model": model,
         "device": device,
         "task": task,
@@ -229,6 +250,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="per-arm training budget (cycles); symmetric => not a negative control",
     )
     p.add_argument(
+        "--seq-len", type=int, default=None,
+        help="max seq_len the runs trained at; >=1024 marks the deposit the full "
+             "§4 verdict (default None = reduced-context, the honest 12GB assumption).",
+    )
+    p.add_argument(
+        "--full-context", action="store_true",
+        help="mark the deposit the full §4 seq_len=1024 verdict; set ONLY for runs "
+             "that fit full context (>12GB GPU), never a 12GB seq_len=256 probe.",
+    )
+    p.add_argument(
         "--output",
         default=None,
         help="write the deposit JSON here; omit to print to stdout",
@@ -248,6 +279,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         architecture=args.architecture,
         base_seed=args.base_seed,
         total=args.total,
+        seq_len=args.seq_len,
+        full_context=args.full_context,
     )
     text = json.dumps(deposit, indent=args.indent)
     if args.output:

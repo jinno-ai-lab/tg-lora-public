@@ -310,3 +310,68 @@ def test_form_deposit_rejects_empty_arm(tmp_path: Path) -> None:
     # no surrogate runs => cannot form a comparison deposit
     with pytest.raises((ValueError, SystemExit)):
         form_deposit(cand, [], model="M", device="cuda", base_seed=0)
+
+
+# ---------------------------------------------------------------------------
+# Reduced-context provenance tag (the seq_len=256 probe honesty axis)
+# ---------------------------------------------------------------------------
+
+
+def _pair(tmp_path: Path) -> tuple[Path, Path]:
+    c = _write_run_metrics(tmp_path / "c.jsonl", run_id="c", seed=42, best=1.0, step_losses=[1.0])
+    b = _write_run_metrics(tmp_path / "b.jsonl", run_id="b", seed=42, best=1.3, step_losses=[1.3])
+    return c, b
+
+
+@pytest.mark.parametrize(
+    "seq_len, full_context, expected",
+    [
+        (1024, False, True),   # seq_len>=1024 marks the full §4 verdict
+        (256, False, False),   # seq_len=256 stays reduced-context
+        (None, True, True),    # explicit --full-context override
+    ],
+)
+def test_form_deposit_context_tag(
+    tmp_path: Path, seq_len: int | None, full_context: bool, expected: bool
+) -> None:
+    # The form CLI tags the deposit's context: only seq_len>=1024 or an explicit
+    # --full-context marks it the full §4 verdict — the over-cite a 12GB seq256
+    # probe could otherwise invite is impossible by construction (TASK-0152 86-97).
+    c, b = _pair(tmp_path)
+    deposit = form_deposit(
+        [c], [b], model="M", device="cuda", seq_len=seq_len, full_context=full_context
+    )
+    assert deposit["full_context"] is expected
+    assert deposit["seq_len"] == seq_len
+
+
+def test_default_deposit_is_reduced_context(tmp_path: Path) -> None:
+    # No flags => the honest 12GB-GPU assumption: reduced-context. A default of
+    # True here is exactly the over-cite the guard exists to prevent.
+    c, b = _pair(tmp_path)
+    deposit = form_deposit([c], [b], model="M", device="cuda", base_seed=0)
+    assert deposit["full_context"] is False
+    assert deposit["seq_len"] is None
+
+
+def test_reduced_deposit_replays_target_scale_but_not_full_verdict(tmp_path: Path) -> None:
+    # End-to-end honesty contract: a default (reduced-context) deposit opens
+    # citable_as_target_scale (real 9B run) but NOT citable_as_full_section4_verdict.
+    c, b = _pair(tmp_path)
+    deposit = form_deposit([c], [b], model="M", device="cuda")
+    out = replay_to_json("<formed>", deposit, replay_samples(deposit))
+    assert out["citable_as_target_scale"] is True
+    assert out["citable_as_full_section4_verdict"] is False
+
+
+def test_cli_seq_len_and_full_context_flags(tmp_path: Path) -> None:
+    # --seq-len 1024 marks the deposit full; the default (no flag) stays reduced.
+    c, b = _pair(tmp_path)
+    full = tmp_path / "full.json"
+    assert main(["--candidate", str(c), "--surrogate", str(b), "--model", "M",
+                 "--device", "cuda", "--seq-len", "1024", "--output", str(full)]) == 0
+    assert json.loads(full.read_text())["full_context"] is True
+    reduced = tmp_path / "reduced.json"
+    assert main(["--candidate", str(c), "--surrogate", str(b), "--model", "M",
+                 "--device", "cuda", "--output", str(reduced)]) == 0
+    assert json.loads(reduced.read_text())["full_context"] is False
