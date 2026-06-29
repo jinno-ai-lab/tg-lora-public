@@ -29,6 +29,7 @@ See docs/design/10_progressive_freezing.md for the design rationale.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 import torch
@@ -40,9 +41,53 @@ from src.tg_lora.activation_matching import (
     ActivationMatchingBreakdown,
     ActivationMatchingLoss,
 )
-from src.tg_lora.freeze_schedule import FreezeSchedule
+from src.tg_lora.freeze_schedule import FreezeSchedule, FreezeScheduleConfig
 
 logger = logging.getLogger("tg-lora")
+
+
+def build_freeze_schedule_from_config(
+    schedule_cfg: Mapping[str, object] | None,
+    active_layer_indices: Iterable[int],
+    num_epochs: int,
+    *,
+    default_start_epoch: int = 0,
+) -> FreezeSchedule | None:
+    """Resolve a multi-layer freeze-schedule config block, or ``None``.
+
+    Config→schedule glue so ``train_tg_lora`` can construct a multi-layer
+    controller from a config block — making the Progressive Freeze mechanism
+    (design §4.1) reachable from a real run, the prerequisite for the Tier-2 §4
+    order verdict's valid_loss axis (multi-layer ``output_first`` vs
+    ``random_order``). Returns ``None`` when ``schedule_cfg`` is absent/empty (the
+    trainer keeps its single-shot Phase 1 gate); otherwise resolves the request
+    into a :class:`FreezeSchedule` the controller drives via :meth:`progress` /
+    :meth:`layers_due_at`. ``FreezeScheduleConfig`` validates the request, so a
+    malformed config raises ``ValueError`` at construction. ``num_epochs`` drops
+    freezes landing past the run (matches :class:`FreezeCostAccountant`);
+    ``default_start_epoch`` is the single-shot start cycle passed when the block
+    omits ``start_epoch`` (a depth/rate generalization, not a timing shift).
+    """
+    if not schedule_cfg:
+        return None
+    active = list(active_layer_indices)
+    convergence_order = schedule_cfg.get("convergence_order")
+    stability_epoch = schedule_cfg.get("stability_epoch")
+    config = FreezeScheduleConfig(
+        active_layer_indices=active,
+        num_epochs=int(num_epochs),
+        max_depth=int(schedule_cfg.get("max_depth", len(active))),
+        start_epoch=int(schedule_cfg.get("start_epoch", default_start_epoch)),
+        spacing=int(schedule_cfg.get("spacing", 1)),
+        policy=str(schedule_cfg.get("policy", "output_first")),
+        convergence_order=tuple(convergence_order)  # type: ignore[arg-type]
+        if convergence_order is not None
+        else None,
+        stability_epoch=dict(stability_epoch)  # type: ignore[arg-type]
+        if stability_epoch is not None
+        else None,
+    )
+    return FreezeSchedule.plan(config)
 
 
 @dataclass

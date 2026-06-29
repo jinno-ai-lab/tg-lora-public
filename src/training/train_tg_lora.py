@@ -61,7 +61,10 @@ from src.tg_lora.prefix_feature_cache import (
     save_prefix_feature_dataset,
 )
 from src.tg_lora.prefix_runtime_offload import offload_prefix_runtime_to_cpu
-from src.tg_lora.progressive_freeze import ProgressiveFreezeController
+from src.tg_lora.progressive_freeze import (
+    ProgressiveFreezeController,
+    build_freeze_schedule_from_config,
+)
 from src.tg_lora.random_walk_controller import RandomWalkController
 from src.tg_lora.rollback_manager import RollbackManager
 from src.tg_lora.velocity import Velocity, beta_from_window
@@ -1362,19 +1365,35 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     activation_cache = ActivationCache()
     num_decoder_layers = get_num_layers(model)
 
-    # Progressive freeze controller (Phase 1 gate)
+    # Progressive freeze controller (Phase 1 single-shot gate by default;
+    # Phase 2 multi-layer progressive when progressive_freeze_schedule is set).
     progressive_freeze: ProgressiveFreezeController | None = None
     if tg_cfg.get("progressive_freeze_enabled", False):
+        pf_start_cycle = int(tg_cfg.get("progressive_freeze_start_cycle", 3))
+        pf_schedule = build_freeze_schedule_from_config(
+            tg_cfg.get("progressive_freeze_schedule"),
+            active_layer_indices=fixed_active_indices,
+            num_epochs=int(cfg.training.max_cycles),
+            default_start_epoch=pf_start_cycle,
+        )
         progressive_freeze = ProgressiveFreezeController(
-            start_cycle=int(tg_cfg.get("progressive_freeze_start_cycle", 3)),
+            start_cycle=pf_start_cycle,
             freeze_layer=tg_cfg.get("progressive_freeze_layer", "last_active"),
             active_layer_indices=fixed_active_indices,
+            schedule=pf_schedule,
         )
         logger.info(
-            "Progressive freeze enabled: start_cycle=%d layer=%s active=%s",
+            "Progressive freeze enabled: start_cycle=%d layer=%s active=%s"
+            " mode=%s",
             progressive_freeze._start_cycle,
             tg_cfg.get("progressive_freeze_layer", "last_active"),
             sorted(fixed_active_indices),
+            (
+                "progressive(depth=%d,policy=%s)"
+                % (pf_schedule.realized_depth, pf_schedule.config.policy)
+            )
+            if pf_schedule is not None
+            else "single-shot",
         )
 
     # Dynamic reversible freeze controller (Guard experiment)
@@ -1994,22 +2013,39 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
             # 2. Pilot前snapshot
             W0 = snapshot_lora(model)
 
-            # --- Progressive Freeze Gate (Phase 1) ---
+            # --- Progressive Freeze Gate ---
             # After W0 snapshot (includes target layer) and before pilot steps.
-            # On trigger: capture xin, freeze layer. Subsequent cycles skip this block.
-            if progressive_freeze is not None and progressive_freeze.should_freeze(cycle):
-                model.train()
-                _, pf_xin_shape = progressive_freeze.cache_xin(
-                    model, valid_quick_loader, input_device,
-                )
-                pf_result = progressive_freeze.apply_freeze(model)
-                logger.info(
-                    "Progressive freeze: cycle=%d layer=%d params=%d xin_shape=%s",
-                    cycle,
-                    pf_result.frozen_layer_idx,
-                    pf_result.num_frozen_params,
-                    pf_xin_shape,
-                )
+            # Phase 2 (schedule set): freeze the layer(s) due this cycle via
+            # progress(); the frozen set grows cumulatively (design §4.1).
+            # Phase 1 (no schedule): single-shot, one layer, once.
+            if progressive_freeze is not None:
+                if (
+                    progressive_freeze.schedule is not None
+                    and progressive_freeze.layers_due_at(cycle)
+                ):
+                    model.train()
+                    pf_results = progressive_freeze.progress(
+                        model, cycle, valid_quick_loader, input_device,
+                    )
+                    logger.info(
+                        "Progressive freeze: cycle=%d froze=%s cumulative=%s",
+                        cycle,
+                        [r.frozen_layer_idx for r in pf_results],
+                        sorted(progressive_freeze.frozen_layers),
+                    )
+                elif progressive_freeze.should_freeze(cycle):
+                    model.train()
+                    _, pf_xin_shape = progressive_freeze.cache_xin(
+                        model, valid_quick_loader, input_device,
+                    )
+                    pf_result = progressive_freeze.apply_freeze(model)
+                    logger.info(
+                        "Progressive freeze: cycle=%d layer=%d params=%d xin_shape=%s",
+                        cycle,
+                        pf_result.frozen_layer_idx,
+                        pf_result.num_frozen_params,
+                        pf_xin_shape,
+                    )
 
             # --- Dynamic Reversible Freeze (M10) ---
             dynfreeze_all_frozen = False
@@ -4567,7 +4603,9 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
         summary["progressive_freeze"] = {
             "enabled": True,
             "frozen_layer": progressive_freeze.frozen_layer_idx,
+            "frozen_layers": sorted(progressive_freeze.frozen_layers),
             "start_cycle": progressive_freeze._start_cycle,
+            "mode": "progressive" if progressive_freeze.schedule is not None else "single_shot",
         }
 
     if fault_reason is not None:
