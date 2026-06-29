@@ -152,6 +152,18 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-06-29 追記・9B §4 verdict 取得 + 境界 closed-with-limitation の耐久化（test + docs）— 「pending 無期限放置」の最終解消】**
+> AI-Hub feedback（本 iter）。4 提案を本 mirror で検証した結果、実質的な新規作業は **(1) の成果の耐久化** のみ:
+> - **(1)「Tier-1 multi-seed seq256 campaign を走らせ citable_as_target_scale / citable_as_full_section4_verdict を実データで exercising せよ」+「seq1024 が恒久 OOM なら境界を正式 close せよ」** → **前 commit `e99e3c7`（milestone #10）で実施済み**: seed{42,43,44} candidate(TG-LoRA) vs baseline(full backprop) の 6 run を走らせ real best_valid_loss を deposit、verdict=**TIES**（CI[95%]=[−0.0205,+0.0018]・candidate mean 1.051 vs baseline mean 1.044・n=3/3 non-thin）。`citable_as_target_scale=True` / `citable_as_full_section4_verdict=False` を実データで exercising 済み。境界は **seq256 verdict 記録 + seq1024 完全判定の >12GB GPU への正式 defer** で closed-with-limitation。
+> - **(3) G2.3 misrouting の回帰 test** → **`3d2bf08` で追加済み**（data-missing vs measured-breach の route を pin）。
+> - **(2) make-run が routed target を実行し red→green を capture** / **(4) finding-blocked `loop_upgrade` gap の close** → いずれも **AI Hub 自身の infra**: `recover_gate_block` / `recover` / `loop_upgrade` / `finding-blocked` / `make-run` orchestrator は本 repo 全文に存在せず（grep 該当なし）・本 checkout の `.audit/` も空 = [[ai-hub-feedback-infra-vs-this-repo]]。本 repo には該当コードがないため実施不可。
+>
+> よって本 iter は 5番目の provenance guard を足さず、**記録済み verdict を durable にする**（feedback #1 の「REAL 数値を gate に流す」を耐久性ある結論へ昇格）:
+> - **verdict 絶対値 pin（test）**: `TestRealTargetScale9BDeposit` は従来 `test_real_verdict_is_pinned_and_faithful` が `replayed_verdict == data["verdict"]`（deposit 自身の verdict field との**整合性**）のみを検査していた。これは「losses 再取得 + verdict field を新 verdict に再描画」の**協調 drift** を検知できず（整合性は保たれたまま TIES→UNDERSHOOTS 等の科学的結果が黙って変わる余地）、記録済み claim を不変量にしていなかった。`test_real_verdict_pins_literal_ties_and_ci_bounds` を追加: verdict=**TIES**（literal・`data["verdict"]` ではない）・CI が零を跨ぐ構造理由・cited 数値（means 1.0510/1.0438・CI[−0.0205, +0.0018]）・non-thin・非 material を**絶対値**で pin。**mutation 証明**: candidate losses を +0.05 摂動し verdict field を新 verdict に再描画すると、旧 test は pass のまま新 test が fail する（= 旧 test が見逃す協調 drift を新 test が捕る）ことを確認。real 数値が「再現可能」から「durable な回帰不変量」へ昇格。
+> - **`次の一手` section の陳腐化解消（docs）**: `e99e3c7` は境界 closure を milestone / verdict-log section（milestone #10）に記録したが、**本 `次の一手` section の直前の最新 entry（下記 2026-06-28）は依然「9B §4 verdict 自体は依然 pending（real campaign 待ち）」「次の一手は campaign 実行 → deposit → verdict 記録」と記載したままで、記録済み verdict と矛盾**していた — まさに feedback #1 が命名した「'9B §4 verdict pending' の無期限放置」失敗モードが、**実行指示を出す section に文字通り残存**していた。本 entry がそれを supersede する（旧 entry は歴史 log として残置・削除しない）。
+>
+> **真の次の一手（現状・誠実）**: (a) seq1024 + valid_full(493) による完全 §4 verdict は **>12GB VRAM の別ハードウェアへ正式 deferred**（"pending" ではなく accepted-with-limitation・無期限放置ではない）。(b) Tier-2 §4 **order** verdict（random-order surrogate arm の upstream 移植・order-sensitivity 診断の ratio=0.000 を 9B target-scale で解像する）が、真に残る target-scale 研究課題（別 TDD・upstream private repo `src.data` 必要）。`[[ai-hub-feedback-infra-vs-this-repo]]` `[[gpu-usable-proxy-runs]]`。
+
 > **【2026-06-28 追記・reduced-context provenance guard 追加（feat）— §4 verdict 誤引用防止をコード契約化】**
 > AI-Hub feedback 第5回。(2)/(3)/(4) は引き続き本 repo 該当なし（[[ai-hub-feedback-infra-vs-this-repo]]）、
 > (1)「real 9B §4 verdict を出すか境界を正式 unblock せよ」は**12GB RTX 3060 の物理制約 + public/private 境界合意**

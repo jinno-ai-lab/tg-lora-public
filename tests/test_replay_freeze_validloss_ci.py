@@ -1031,3 +1031,32 @@ class TestRealTargetScale9BDeposit:
         assert out["replayed_verdict"] == data["verdict"]
         assert out["faithful"] is True
 
+    def test_real_verdict_pins_literal_ties_and_ci_bounds(self):
+        # The faithfulness test above asserts the replayed verdict matches the
+        # deposit's OWN ``verdict`` field — an internal-consistency check. It
+        # cannot catch a coordinated change (losses re-harvested to a different
+        # real measurement AND the ``verdict`` field repainted to match), which
+        # would let the cited scientific result drift silently. Pin the ABSOLUTE
+        # result instead: the real 9B seq256 verdict is TIES at these specific
+        # magnitudes, with a CI that straddles zero. If the deposit floats ever
+        # shift (an upstream re-run) or the bootstrap math changes, this forces a
+        # deliberate update to the cited numbers — the checked-in scientific
+        # claim becomes a durable regression invariant, not merely reproducible.
+        data = load_samples(FIXTURE_REAL_9B)
+        out = replay_to_json(FIXTURE_REAL_9B, data, replay_samples(data))
+        # The verdict is the literal TIES (the recorded §0 quality-parity null),
+        # not whatever the file happens to claim.
+        assert out["replayed_verdict"] == TIES
+        # The structural reason TIES holds: the bootstrap CI crosses zero.
+        assert out["lower"] < 0.0 < out["upper"]
+        # The exact magnitudes cited in the deposit commit / PURPOSE milestone
+        # #10 — candidate TG-LoRA vs full-backprop baseline.
+        assert round(out["candidate_mean"], 4) == 1.0510
+        assert round(out["surrogate_mean"], 4) == 1.0438
+        assert round(out["lower"], 4) == -0.0205
+        assert round(out["upper"], 4) == 0.0018
+        # Non-thin (n=3/3 on both arms) and not a material win — a parity null,
+        # not noise and not a (small) TG-LoRA victory.
+        assert out["is_thin_evidence"] is False
+        assert out["is_material"] is False
+
