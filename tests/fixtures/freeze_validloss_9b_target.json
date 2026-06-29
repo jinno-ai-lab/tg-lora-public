@@ -1,0 +1,29 @@
+{
+  "candidate_losses": [
+    1.0439615974901244,
+    1.0642999137053266,
+    1.0446555614471436
+  ],
+  "surrogate_losses": [
+    1.0471437172964215,
+    1.0403182641603053,
+    1.0438065179623663
+  ],
+  "n_candidate": 3,
+  "n_surrogate": 3,
+  "proxy_scale": false,
+  "synthetic": false,
+  "negative_control": false,
+  "full_context": false,
+  "seq_len": 256,
+  "model": "Qwen/Qwen3.5-9B",
+  "device": "cuda-rtx3060",
+  "task": "lm_next_token",
+  "architecture": "homogeneous",
+  "base_seed": 0,
+  "total": 15,
+  "candidate_total": 15,
+  "surrogate_total": 15,
+  "source": "Formed by scripts/form_freeze_validloss_deposit.py from upstream run_metrics.jsonl best_valid_loss (one float per seed per arm). candidate arms: tg_lora_20260628_192221(seed=42,best_valid=1.0439615974901244,step=432), tg_lora_20260629_081634(seed=43,best_valid=1.0642999137053266,step=696), tg_lora_20260629_084306(seed=44,best_valid=1.0446555614471436,step=408) | surrogate(baseline) arms: baseline_20260629_072954(seed=42,best_valid=1.0471437172964215,step=50), baseline_20260629_074447(seed=43,best_valid=1.0403182641603053,step=50), baseline_20260629_080047(seed=44,best_valid=1.0438065179623663,step=50)",
+  "verdict": "TIES"
+}

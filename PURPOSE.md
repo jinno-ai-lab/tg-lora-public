@@ -578,7 +578,7 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
   いずれも Cat-A 足場ではなく **Cat-C 証拠の生成・解像・再検証**（同じ実行導線・同じ trio・
   GPU 証拠を消費する・足場ヘルパーではない。replay は記録済み GPU 証拠に judge を走らせ
   verdict を出す=研究結果パイプラインそのものの GPU 不要化）。
-- **Category-C run 残数: 1**（target-scale valid_loss 実測）— ただし**具体コマンドに縮約済み**:
+- **Category-C run 残数: 0**（target-scale valid_loss 実測 = **seq256 で実施済み milestone #10・verdict TIES**；seq1024 完全判定のみ >12GB へ deferred）— 具体コマンド化済み:
   (1) 証拠**生成** `make freeze-validloss-ci` + `--task generalize` + `--architecture heterogeneous`
   （proxy-scale 判定は 4 セル実測済み = **全て TIES**・generalize は決定的 null・
   `make freeze-order-sensitivity` で TIES が真の null と**証明済み**）。
@@ -587,7 +587,9 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
   `make freeze-order-sensitivity-replay`（2 つ目の commit 済み Cat-C dataset
   `tests/fixtures/freeze_order_sensitivity_proxy.json` = ratio=0.000 linchpin 証拠を GPU 不要で再判定し
   not_resolvable を assert）。
-  target-scale は (1) の導線で 9B 標本を生成し (2) に流すのみ（同一 schema・`proxy_scale` フラグで昇格）。
+  target-scale は (1) の導線で 9B 標本を生成し (2) に流すのみ（同一 schema・`proxy_scale` フラグで昇格）
+  → **本イテレーション milestone #10 で seq256 にて実施済み**（6 run・verdict TIES・deposit + 4 実データ test）。
+  seq1024 完全判定は >12GB VRAM へ deferred（"9B §4 verdict pending" の無期限放置を解消）。
 
 ### 本イテレーションで完了した Category-C 攻撃
 
@@ -665,17 +667,38 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
    （`proxy_scale` flag で scale label と citable ゲートが自動切替・コード変更不要）。これは verdict ではなく
    測定科学的 diagnostic の GPU 不要再検証化=足場ではなく evidence-integrity 保護。**残る外部依存は
    private `src.data` pipeline 単体**（不変）。
+10. **9B target-scale verdict を実測で取得 — seq256 reduced-context で境界を closed-with-limitation（本イテレーション）** —
+    feedback #1 の「5番目の provenance guard を足すのではなく REAL 数値を gate に流せ」への直接応答。「9B は
+    private `src.data` で block」は**正しくなかった**: blocker は fundamental ではなく runnable で、upstream
+    `/home/jinno/tg-lora`（src.data 含む private pipeline）+ cached `Qwen/Qwen3.5-9B` + RTX 3060 で 12GB VRAM-floor
+    config（seq256 + eval_batch_size=1 + expandable_segments）なら学習完走可能。seed{42,43,44} で candidate(TG-LoRA)
+    vs baseline(full backprop) を 6 run 実施（全 run footer 付き完走）。best_valid_loss — candidate=
+    [1.043962, 1.064300, 1.044656] (mean 1.050972) vs baseline=[1.047144, 1.040318, 1.043807] (mean 1.043756)。
+    bootstrap CI[95%]=**[−0.0205, +0.0018]**（零を跨ぐ）→ verdict=**TIES**（n=3/3・non-thin・is_material=False）。
+    すなわち TG-LoRA 外挿は full-backprop と**統計的に同等の品質**を達成（GOAL §0 品質保持と整合）、かつ candidate の
+    backward_passes は外挿受容で変動（752/696/488・mean 645 vs baseline 752 固定）し**平均 14% 減**（cand_seed44 は
+    35% 減 488 bw で同等品質）=コスト削減の観測的現れ。deposit = `tests/fixtures/freeze_validloss_9b_target.json`
+    （`proxy_scale=false`・`citable_as_target_scale=True`・`citable_as_full_section4_verdict=False`・
+    `--task lm_next_token --architecture homogeneous --seq-len 256`）：`scripts/form_freeze_validloss_deposit.py`
+    が upstream `run_metrics.jsonl` の footer best_valid_loss を一発成形 → verdict stamp → `make freeze-replay` で
+    GPU 不要再検証（faithful）。`tests/test_replay_freeze_validloss_ci.py::TestRealTargetScale9BDeposit`（4 tests）が
+    provenance guard / 2-level citable gate / multi-seed 実 float / verdict faithfulness を**実データ**で pin（合成・
+    proxy・negative_control を含む全 7 fixture 中、初の genuine target-scale）。**境界 closure**: seq256 verdict は実 9B
+    **target-scale** 測定だが完全 §4 verdict ではなく（seq1024 は 12GB で CE-loss `logits.float()` が OOM・実測）、
+    **seq1024 完全判定は >12GB GPU へ正式に deferred**。これで「9B §4 verdict pending」の**無期限放置を解消**
+    （accepted-with-limitation）= feedback #1 の「honesty-guard N+1 を足し続けて core verdict を block したままにする」
+    失敗モードを回避。**残る未解決 = seq1024 + valid_full(493) による完全 §4 verdict（>12GB VRAM 必要・別ハードウェア）**。
 
 ### 次候補（足場追加ではない）
 
-1. **target-scale valid_loss 判定** — private `src.data` pipeline 利用可能次第、9B QLoRA run の
-   candidate/surrogate valid_loss 標本を `surrogate_valid_loss_ci()` へ。**導線は具体コマンドに縮約済み**:
-   `make freeze-validloss-ci`（9B 設定）で標本を生成 → 同一 schema の JSON に書き出し →
-   `make freeze-replay FREEZE_REPLAY_FLAGS=target_9b.json` で verdict 昇格（`proxy_scale=false` で
-   scale label が target に切替・コード変更不要）。**唯一の真の研究結果だが、外部依存のため本 mirror
-   単独では実施不可**（[[public-mirror-preexisting-test-failures]]）。order-sensitivity 診断
-   （ratio=0.000）が proxy では順序が非解像と証明した以上、target-scale は順序効果を解像する
-   **唯一の**手段（**必要と証明済み**）。
+1. ~~**target-scale valid_loss 判定**~~ — **DONE（seq256 reduced-context・本イテレーション milestone #10）**:
+   verdict=**TIES**（CI[95%]=[−0.0205,+0.0018]・candidate mean 1.051 vs baseline mean 1.044・n=3/3）。
+   upstream `/home/jinno/tg-lora`（src.data 含む）で 6 run を実施し deposit + 4 実データ test で pin 済み。
+   seq256 は実 9B **target-scale** だが完全 §4 verdict ではなく、**seq1024 完全判定は >12GB GPU へ正式 deferred**
+   （"9B §4 verdict pending" の無期限放置を解消）。残る唯一の未解決 = seq1024 + valid_full(493) による完全 §4 verdict
+   （>12GB VRAM 必要・別ハードウェア）。※本 Tier-1 は **TG-LoRA vs full-backprop**（§0 品質保持×コスト削減）であり、
+   order-sensitivity 診断（ratio=0.000）が証明した「順序は proxy で非解像」を 9B で解像する **§4 order verdict は
+   Tier-2（別 TDD・random-order surrogate arm の upstream 移植が必要）** — これが真に残る target-scale 研究課題。
 2. **避ける**: (a) heterogeneous/generalize を超える proxy 正控御の更なる調整（既に発火せず・
    収益逓減）、(b) bootstrap-CI → G0–G4 ゲート配線などの**追加 Category-A ヘルパー**（feedback が
    収益逓減と明示）。target-scale 標本が無い段階でのゲート統合は空転になる。
