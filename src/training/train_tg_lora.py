@@ -775,6 +775,7 @@ def _save_fault_checkpoint(
     psa_prior: PSAPrior | None,
     swap_cycle_vq: int | None,
     swap_cycle_vf: int | None,
+    progressive_freeze: ProgressiveFreezeController | None,
 ) -> None:
     """Save model + full training state on fault (OOM / CUDA error).
 
@@ -896,6 +897,9 @@ def _save_fault_checkpoint(
             psa_state=psa_prior.state_dict() if psa_prior is not None else None,
             swap_cycle_vq=swap_cycle_vq,
             swap_cycle_vf=swap_cycle_vf,
+            progressive_freeze_state=(
+                progressive_freeze.state_dict() if progressive_freeze is not None else None
+            ),
         )
         save_training_state(ts, run_dir / "training_state.pt")
     except Exception as exc:
@@ -1467,6 +1471,29 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 sorted(dynfreeze.frozen_layer_indices),
                 dynfreeze._frozen_since_cycle,
             )
+        # Restore the progressive-freeze cumulative set + re-apply requires_grad.
+        # The controller is rebuilt fresh above from config and the LoRA adapter
+        # weights were just restored from safetensors (weights only — NOT the
+        # freeze's ``requires_grad=False`` flag). The cycle loop's
+        # ``layers_due_at(cycle)`` gate fires only for cycles ``>= cycle_offset``,
+        # so without this the pre-fault cumulative freezes are never re-applied:
+        # the frozen layers silently re-train (undoing Progressive Freezing's
+        # cost reduction) and the run footer's ``frozen_layers`` (Tier-2 §4
+        # order-verdict arm provenance) reports only post-fault freezes. Sibling
+        # resume-state-loss to dynfreeze / LAWA / warmup.
+        if (
+            progressive_freeze is not None
+            and ts.progressive_freeze_state is not None
+        ):
+            progressive_freeze.load_state_dict(ts.progressive_freeze_state)
+            refrozen = progressive_freeze.refreeze_loaded_layers(model)
+            if refrozen:
+                logger.info(
+                    "Progressive freeze resumed: re-froze layers %s "
+                    "(cumulative_frozen=%s)",
+                    refrozen,
+                    sorted(progressive_freeze.frozen_layers),
+                )
         # Restore the best-full-eval trackers so the post-resume save-best gate
         # compares against the genuine pre-fault best, not inf — otherwise the
         # first full eval after resume unconditionally overwrites "best_model/".
@@ -4362,6 +4389,11 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                     psa_state=psa_prior.state_dict() if psa_prior is not None else None,
                     swap_cycle_vq=swap_cycle_vq,
                     swap_cycle_vf=swap_cycle_vf,
+                    progressive_freeze_state=(
+                        progressive_freeze.state_dict()
+                        if progressive_freeze is not None
+                        else None
+                    ),
                 )
                 # Bound on-disk checkpoint growth (M10.3 disk-death guard): the
                 # save -> training-state -> artifact -> prune sequence lives in
@@ -4444,6 +4476,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 psa_prior=psa_prior,
                 swap_cycle_vq=swap_cycle_vq,
                 swap_cycle_vf=swap_cycle_vf,
+                progressive_freeze=progressive_freeze,
             )
 
     pbar.close()

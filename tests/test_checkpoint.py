@@ -275,6 +275,17 @@ class TestTrainingStateRoundtrip:
             # dropped (sibling resume-state-loss axis).
             swap_cycle_vq=4,
             swap_cycle_vf=4,
+            # Mid-run progressive-freeze cumulative set (GOAL §1.6 / design §4.1):
+            # layers 3 then 2 froze across earlier cycles, so resume does not
+            # rebuild the set empty and (a) leave those layers silently
+            # re-trainable — undoing the cost reduction that defines Progressive
+            # Freezing — and (b) report only post-fault freezes in the run
+            # footer's ``frozen_layers`` (the Tier-2 §4 order-verdict arm
+            # provenance). Sibling resume-state-loss axis.
+            progressive_freeze_state={
+                "frozen_layers": [2, 3],
+                "last_frozen_layer": 2,
+            },
         )
 
     def test_roundtrip_preserves_values(self, tmp_path):
@@ -351,6 +362,14 @@ class TestTrainingStateRoundtrip:
         # plain ints (caller-scoped scalars, None-safe).
         assert loaded.swap_cycle_vq == 4
         assert loaded.swap_cycle_vf == 4
+        # Progressive-freeze cumulative frozen-layer set must survive resume so
+        # the resumed controller re-applies requires_grad on the frozen layers
+        # (safetensors does not carry it) and the run footer's frozen_layers
+        # reflects the full run, not post-fault only (sibling resume-state-loss).
+        assert loaded.progressive_freeze_state == {
+            "frozen_layers": [2, 3],
+            "last_frozen_layer": 2,
+        }
         assert loaded.controller_state.K == 3
         assert loaded.controller_state.alpha == 0.3
         assert loaded.velocity._state is not None
@@ -535,6 +554,29 @@ class TestTrainingStateRoundtrip:
         loaded = load_training_state(path)
         assert loaded.swap_cycle_vq is None
         assert loaded.swap_cycle_vf is None
+
+    def test_legacy_checkpoint_without_progressive_freeze_state_loads_clean(
+        self, tmp_path
+    ):
+        """A pre-fix checkpoint omits ``progressive_freeze_state``; load must not
+        break and must read as the safe 'no frozen set' default (None).
+
+        None is the only sane legacy reading: the resume path treats a missing
+        frozen set as 'start empty' (the pre-fix behavior, no fabricated freezes)
+        and skips the ``refreeze_loaded_layers`` step. Also covers a
+        progressive-freeze-disabled run (every committed config sets
+        ``progressive_freeze_enabled: false``), which never records a frozen set.
+        Mirrors the psa_state / act_regime_state / swap_cycle legacy tolerance."""
+        state = self._make_state()
+        path = tmp_path / "legacy_pf.pt"
+        save_training_state(state, path)
+        # Strip the key to simulate a pre-fix checkpoint blob.
+        blob = torch.load(path, weights_only=False)
+        blob.pop("progressive_freeze_state", None)
+        torch.save(blob, path)
+
+        loaded = load_training_state(path)
+        assert loaded.progressive_freeze_state is None
     """The §4 release-cooldown map (``released_at``) must survive a real
     ``save_training_state``→``load_training_state`` round-trip.
 

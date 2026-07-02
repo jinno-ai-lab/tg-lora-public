@@ -417,3 +417,129 @@ class TestComputeLocalLoss:
             ctrl.compute_local_loss(
                 model, loader[0], ActivationMatchingLoss(), batch_idx=7
             )
+
+
+class TestResumeState:
+    """Cumulative frozen-layer set must survive a fault/periodic resume.
+
+    The training loop rebuilds this controller fresh from config on resume and
+    restores LoRA adapter weights from safetensors (weights only — NOT the
+    freeze's ``requires_grad=False`` flag). The cycle loop's ``layers_due_at``
+    gate fires only for cycles ``>= cycle_offset``, so pre-fault cumulative
+    freezes are never re-applied: without persisting the frozen set a resumed
+    run silently un-freezes every layer frozen before the fault (undoing the
+    cost reduction that defines Progressive Freezing) AND the run-summary
+    footer's ``frozen_layers`` (the Tier-2 §4 order-verdict arm provenance)
+    reports only post-fault freezes. Sibling resume-state-loss to dynfreeze /
+    LAWA / warmup.
+    """
+
+    def test_state_dict_roundtrip_preserves_cumulative_frozen_set(self):
+        model = _ForwardingModel(num_layers=4)
+        set_trainable_lora_layers(model, {1, 2, 3})
+        ctrl = ProgressiveFreezeController(
+            start_cycle=1, active_layer_indices={1, 2, 3}
+        )
+        ctrl.apply_freeze_layer(model, 3, _make_xin_loader(), "cpu")
+        ctrl.apply_freeze_layer(model, 2, _make_xin_loader(), "cpu")
+        assert ctrl.frozen_layers == frozenset({2, 3})
+
+        state = ctrl.state_dict()
+        resumed = ProgressiveFreezeController(
+            start_cycle=1, active_layer_indices={1, 2, 3}
+        )
+        resumed.load_state_dict(state)
+
+        assert resumed.frozen_layers == frozenset({2, 3})
+        assert resumed.frozen_layer_idx == 2
+
+    def test_state_dict_carries_only_freeze_set_not_xin_caches(self):
+        # The Level-2 activation-matching ``xin`` caches (Phase-3, MS-PF3) are a
+        # separate research axis not on the Tier-2 valid_loss path; they are not
+        # persisted. state_dict must expose only the frozen-set state the resume
+        # path needs, so a future reader does not expect tensor round-trips here.
+        model = _ForwardingModel(num_layers=4)
+        set_trainable_lora_layers(model, {3})
+        ctrl = ProgressiveFreezeController(start_cycle=1, active_layer_indices={3})
+        ctrl.apply_freeze_layer(model, 3, _make_xin_loader(), "cpu")
+
+        state = ctrl.state_dict()
+        assert set(state.keys()) == {"frozen_layers", "last_frozen_layer"}
+        assert state["frozen_layers"] == [3]
+        assert state["last_frozen_layer"] == 3
+
+    def test_load_state_dict_none_is_noop(self):
+        # A pre-fix checkpoint (no progressive_freeze_state) or a disabled run
+        # round-trips as None; load must be None-safe so the resume path mirrors
+        # the LAWA / dynfreeze ``None``-safe contract rather than raising.
+        ctrl = ProgressiveFreezeController(start_cycle=1, active_layer_indices={2, 3})
+        ctrl.load_state_dict(None)
+        assert ctrl.frozen_layers == frozenset()
+        assert ctrl.frozen_layer_idx is None
+
+    def test_refreeze_re_applies_requires_grad_after_adapter_load(self):
+        # Simulate the resume sequence: the frozen set is restored, the model's
+        # LoRA params come back from safetensors ALL trainable (the weight load
+        # does not carry requires_grad), then refreeze flips the frozen layers
+        # back off. Without refreeze, layers 2/3 would silently re-train.
+        model = FakeTransformerModel(4)
+        set_trainable_lora_layers(model, {1, 2, 3})
+        resumed = ProgressiveFreezeController(
+            start_cycle=1, active_layer_indices={1, 2, 3}
+        )
+        resumed.load_state_dict({"frozen_layers": [3, 2], "last_frozen_layer": 2})
+
+        refrozen = resumed.refreeze_loaded_layers(model)
+
+        assert refrozen == [2, 3]
+        layer_map = iter_all_lora_params_by_layer(model)
+        for _, param in layer_map[2]:
+            assert not param.requires_grad
+        for _, param in layer_map[3]:
+            assert not param.requires_grad
+        # A layer never frozen stays trainable.
+        for _, param in layer_map[1]:
+            assert param.requires_grad
+
+    def test_refreeze_empty_safe_and_idempotent(self):
+        # A fresh controller (nothing frozen yet) refreezes nothing; calling it
+        # twice on a frozen controller is a no-op the second time.
+        model = FakeTransformerModel(4)
+        set_trainable_lora_layers(model, {2, 3})
+        fresh = ProgressiveFreezeController(start_cycle=1, active_layer_indices={2, 3})
+        assert fresh.refreeze_loaded_layers(model) == []
+        for _, param in iter_all_lora_params_by_layer(model)[2]:
+            assert param.requires_grad
+
+        fresh.load_state_dict({"frozen_layers": [3], "last_frozen_layer": 3})
+        assert fresh.refreeze_loaded_layers(model) == [3]
+        assert fresh.refreeze_loaded_layers(model) == [3]  # idempotent
+
+    def test_full_resume_re_freezes_cumulative_set_on_fresh_model(self):
+        # End-to-end controller-level resume: two layers frozen pre-fault, the
+        # serialized set round-trips through state_dict, and refreeze restores
+        # requires_grad on a model whose adapter weights were just reloaded.
+        model = _ForwardingModel(num_layers=4)
+        set_trainable_lora_layers(model, {1, 2, 3})
+        pre_fault = ProgressiveFreezeController(
+            start_cycle=1, active_layer_indices={1, 2, 3}
+        )
+        pre_fault.apply_freeze_layer(model, 3, _make_xin_loader(), "cpu")
+        pre_fault.apply_freeze_layer(model, 2, _make_xin_loader(), "cpu")
+        serialized = pre_fault.state_dict()
+
+        # Resume: fresh controller + fresh model (all trainable, as after a
+        # safetensors adapter load that does not carry requires_grad).
+        resumed_model = _ForwardingModel(num_layers=4)
+        set_trainable_lora_layers(resumed_model, {1, 2, 3})
+        resumed = ProgressiveFreezeController(
+            start_cycle=1, active_layer_indices={1, 2, 3}
+        )
+        resumed.load_state_dict(serialized)
+        resumed.refreeze_loaded_layers(resumed_model)
+
+        assert resumed.frozen_layers == frozenset({2, 3})
+        for _, param in iter_all_lora_params_by_layer(resumed_model)[2]:
+            assert not param.requires_grad
+        for _, param in iter_all_lora_params_by_layer(resumed_model)[3]:
+            assert not param.requires_grad

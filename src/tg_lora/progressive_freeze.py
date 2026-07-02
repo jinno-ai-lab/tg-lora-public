@@ -621,6 +621,76 @@ class ProgressiveFreezeController:
     def clear_xin_cache(self) -> None:
         self._xin_cache.clear()
 
+    # -- resume state (fault / periodic checkpoint) -------------------------
+
+    def state_dict(self) -> dict:
+        """Serialize the cumulative freeze state for checkpoint resume.
+
+        The progressive-freeze run's defining state is the cumulative
+        ``_frozen_layers`` set (design §4.1: it only ever grows). The training
+        loop rebuilds this controller fresh from config on resume, and the LoRA
+        adapter weights are restored from safetensors — which carries weights but
+        NOT the ``requires_grad=False`` flag the freeze set. Without persisting
+        ``_frozen_layers``, a fault-resume rebuilds it empty, the loop's
+        ``layers_due_at(cycle)`` gate (which fires only for cycles
+        ``>= cycle_offset``, skipping the cycles before the fault) never
+        re-freezes the pre-fault layers, and (a) those layers silently re-train —
+        undoing the cost reduction that defines Progressive Freezing — and
+        (b) the run-summary footer's ``frozen_layers`` (the Tier-2 §4 order-verdict
+        arm provenance :func:`progressive_freeze_run_summary` emits) reports only
+        post-fault freezes. Sibling resume-state-loss to dynfreeze / LAWA / warmup
+        (all already persisted in :class:`~src.utils.checkpoint.TrainingState`).
+
+        The Level-2 activation-matching ``xin`` caches are deliberately NOT
+        persisted here: they back the Phase-3 local loss (MS-PF3), a separate
+        research axis not on the Tier-2 valid_loss path the freeze-set state
+        serves. A resumed Phase-3 run would need to re-cache ``xin`` on its next
+        freeze; since the frozen set is restored, the Tier-2 valid_loss axis is
+        fully closed by the frozen-set state alone.
+        """
+        return {
+            "frozen_layers": sorted(self._frozen_layers),
+            "last_frozen_layer": self._last_frozen_layer,
+        }
+
+    def load_state_dict(self, state: dict | None) -> None:
+        """Restore cumulative freeze state from a checkpoint.
+
+        Inverse of :meth:`state_dict`. Restores ``_frozen_layers`` /
+        ``_last_frozen_layer`` only; the caller must then call
+        :meth:`refreeze_loaded_layers` to re-apply ``requires_grad=False`` on the
+        freshly adapter-loaded model (safetensors does not carry it). Accepts
+        ``None`` (no progressive-freeze state / a pre-fix checkpoint / a disabled
+        run) as a no-op, so the resume path mirrors the LAWA / dynfreeze
+        ``None``-safe contract rather than needing a separate guard at every
+        call site.
+        """
+        if not state:
+            return
+        self._frozen_layers = {int(idx) for idx in state.get("frozen_layers", [])}
+        last = state.get("last_frozen_layer")
+        self._last_frozen_layer = int(last) if last is not None else None
+
+    def refreeze_loaded_layers(self, model: nn.Module) -> list[int]:
+        """Re-apply ``requires_grad=False`` to every loaded frozen layer.
+
+        After :meth:`load_state_dict` the controller knows WHICH layers were
+        frozen, but the model's LoRA params (just loaded from safetensors) are
+        all ``requires_grad=True``. This walks ``_frozen_layers`` and flips each
+        layer's LoRA params back to frozen — closing the resume gap the
+        safetensors weight load opens. Returns the layers re-frozen (ascending),
+        empty when nothing was frozen or the model lacks those layers. Idempotent
+        and safe to call on a fresh controller (empty ``_frozen_layers``).
+        """
+        layer_map = iter_all_lora_params_by_layer(model)
+        refrozen: list[int] = []
+        for layer_idx in sorted(self._frozen_layers):
+            if layer_idx in layer_map:
+                for _name, param in layer_map[layer_idx]:
+                    param.requires_grad = False
+                refrozen.append(layer_idx)
+        return refrozen
+
 
 def progressive_freeze_run_summary(controller: ProgressiveFreezeController) -> dict:
     """Build the run-summary provenance block for a progressive-freeze run.

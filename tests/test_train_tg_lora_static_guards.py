@@ -107,3 +107,46 @@ def test_training_entry_point_is_ruff_clean() -> None:
         "makes the audit's standing claim false. ruff output:\n"
         + (proc.stdout + proc.stderr).strip()
     )
+
+
+def test_progressive_freeze_resume_state_is_wired() -> None:
+    """The progressive-freeze resume-state fix must stay wired end-to-end.
+
+    ``ProgressiveFreezeController`` was given ``state_dict`` /
+    ``load_state_dict`` / ``refreeze_loaded_layers`` (tested directly in
+    ``tests/test_progressive_freeze.py``) and ``TrainingState`` gained a
+    ``progressive_freeze_state`` field (round-tripped in
+    ``tests/test_checkpoint.py``). This guard pins the *wiring* in the
+    src.data-blocked training entry point (unimportable here, so verified by
+    source string rather than by running it): the fault + periodic save sites
+    must serialize the frozen set, the fault call must thread the controller,
+    and the resume path must restore + refreeze it. A future edit that drops any
+    leg reopens the resume-state-loss gap (frozen layers silently re-train after
+    a fault; run-footer provenance reports only post-fault freezes) and fails
+    this assertion.
+    """
+    assert TARGET.is_file(), f"training entry point not found at {TARGET}"
+    source = TARGET.read_text(encoding="utf-8")
+
+    # The fault-checkpoint helper receives the controller as a parameter (it
+    # lives in the caller's scope, like ``dynfreeze``).
+    assert "progressive_freeze: ProgressiveFreezeController | None," in source, (
+        "_save_fault_checkpoint must thread progressive_freeze as a parameter"
+    )
+    # Both save sites (fault + periodic) serialize the frozen set.
+    assert source.count("progressive_freeze.state_dict()") == 2, (
+        "both TrainingState save sites (fault + periodic) must serialize "
+        "progressive_freeze.state_dict()"
+    )
+    # The fault call passes the controller through.
+    assert "progressive_freeze=progressive_freeze," in source, (
+        "the _save_fault_checkpoint call must pass progressive_freeze through"
+    )
+    # The resume path restores the set and re-applies requires_grad on the
+    # freshly adapter-loaded model (safetensors does not carry requires_grad).
+    assert "refreeze_loaded_layers(model)" in source, (
+        "the resume path must call progressive_freeze.refreeze_loaded_layers"
+    )
+    assert "ts.progressive_freeze_state" in source, (
+        "the resume path must read the persisted progressive_freeze_state"
+    )

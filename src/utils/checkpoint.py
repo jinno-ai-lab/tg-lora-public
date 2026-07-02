@@ -535,6 +535,23 @@ class TrainingState:
     # fabricated cycle).
     swap_cycle_vq: int | None = None
     swap_cycle_vf: int | None = None
+    # Progressive Freeze (GOAL §1.6 / design §4.1) cumulative frozen-layer set —
+    # the serialized ``ProgressiveFreezeController.state_dict()`` (sorted frozen
+    # layer indices + most-recent index). Must survive resume: the training loop
+    # rebuilds the controller fresh from config and restores LoRA weights from
+    # safetensors (weights only — NOT the freeze's ``requires_grad=False`` flag),
+    # and the cycle loop's ``layers_due_at(cycle)`` gate fires only for cycles
+    # ``>= cycle_offset``, so the pre-fault cumulative freezes are never
+    # re-applied. Without this the frozen layers silently re-train (undoing the
+    # cost reduction that defines Progressive Freezing) AND the run-summary
+    # footer's ``frozen_layers`` — the Tier-2 §4 order-verdict arm provenance —
+    # reports only post-fault freezes. Sibling resume-state-loss to dynfreeze /
+    # LAWA / warmup (the controller's own state_dict docstring states why the
+    # Level-2 ``xin`` caches are not persisted: a separate Phase-3 axis not on
+    # the Tier-2 valid_loss path). ``None`` = progressive-freeze disabled or a
+    # pre-fix checkpoint (the set rebuilds empty, the pre-fix behavior — no
+    # fabricated freezes).
+    progressive_freeze_state: dict | None = None
 
 
 @dataclass
@@ -665,6 +682,7 @@ def save_training_state(state: TrainingState, path: Path) -> None:
         "psa_state": state.psa_state,
         "swap_cycle_vq": state.swap_cycle_vq,
         "swap_cycle_vf": state.swap_cycle_vf,
+        "progressive_freeze_state": state.progressive_freeze_state,
         "dynfreeze_state": (
             {
                 "frozen_layer_indices": state.dynfreeze_state.frozen_layer_indices,
@@ -819,5 +837,11 @@ def load_training_state(path: Path) -> TrainingState:
         # act_regime_state legacy paths.
         swap_cycle_vq=blob.get("swap_cycle_vq"),
         swap_cycle_vf=blob.get("swap_cycle_vf"),
+        # Absent on pre-fix checkpoints / progressive-freeze-disabled runs →
+        # None, the only sane reading of a checkpoint that predates the field:
+        # the resume path treats a missing frozen set as 'start empty' (the
+        # pre-fix behavior, no fabricated freezes) and skips refreeze. Mirrors
+        # the psa_state / act_regime_state / lawa_state legacy paths.
+        progressive_freeze_state=blob.get("progressive_freeze_state"),
         dynfreeze_state=dynfreeze_state,
     )
