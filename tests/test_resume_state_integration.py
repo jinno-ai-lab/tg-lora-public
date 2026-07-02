@@ -118,6 +118,7 @@ from src.tg_lora.activation_regime import (
 )
 from src.tg_lora.dynamic_freeze import DynFreezeState, DynamicFreezeController
 from src.tg_lora.psa import PSAPrior
+from src.tg_lora.regime import Regime, RegimeDetector
 from src.tg_lora.weight_averaging import LAWAAverager
 from src.training.trainer_loop import NumericalInstabilityError
 from src.utils.checkpoint import (
@@ -192,6 +193,25 @@ def _populate_dynfreeze_state() -> DynFreezeState:
     )
 
 
+def _populate_regime_detector() -> RegimeDetector:
+    """A PSA regime detector with non-trivial accumulated state: a populated
+    loss/velocity window, a non-default current regime, and 3 recorded
+    transitions.
+
+    ``transition_count`` (the field reported per-cycle as
+    ``psa_regime_transitions`` and persisted to ``run_metrics.jsonl``) defaults
+    to 0; restoring 3 proves ``load_state_dict`` overwrote the constructed
+    default, not merely that a detector exists. ``window`` matches the config
+    default (8) so the saved windows load without trimming.
+    """
+    det = RegimeDetector(window=8, min_history=3, transition_z=1.0)
+    det._losses.extend([2.0, 1.9, 1.85, 1.82, 2.5])
+    det._velocities.extend([-0.1, -0.05, -0.03, 0.68])
+    det._regime = Regime.TRANSITION
+    det._transition_count = 3
+    return det
+
+
 def _populate_lawa_state() -> dict:
     """A populated LAWA snapshot window (GOAL §3.3): window_size 4, mid-run
     cycle 5, two recorded snapshots.
@@ -251,6 +271,11 @@ def _build_saved_state(tmp_path, expected):
     expected["act_counts"] = dict(act_tracker._counts)
     expected["act_regime_state"] = act_tracker.state_dict()
 
+    regime_detector = _populate_regime_detector()
+    expected["psa_regime_state"] = regime_detector.state_dict()
+    expected["regime_transition_count"] = regime_detector.transition_count
+    expected["regime_regime"] = regime_detector.regime
+
     expected["best_lawa_loss"] = 1.23
     expected["triggered_target_steps"] = [250, 500]
     expected["efficiency_accounting"] = _saved_efficiency_accounting()
@@ -282,6 +307,7 @@ def _build_saved_state(tmp_path, expected):
     base.act_regime_state = expected["act_regime_state"]
     base.efficiency_accounting = expected["efficiency_accounting"]
     base.psa_state = expected["psa_state"]
+    base.psa_regime_state = expected["psa_regime_state"]
     base.best_full_eval_loss = expected["best_full_eval_loss"]
     base.best_full_eval_perplexity = expected["best_full_eval_perplexity"]
     base.warmup_released = expected["warmup_released"]
@@ -449,6 +475,9 @@ def _run_fault_resume(tmp_path, state_path):
     deps["src.training.train_tg_lora.PSAPrior"] = _capturing_factory(
         PSAPrior, "psa_prior", captured_objs
     )
+    deps["src.training.train_tg_lora.RegimeDetector"] = _capturing_factory(
+        RegimeDetector, "regime_detector", captured_objs
+    )
     deps["src.training.train_tg_lora.ActivationFingerprintTracker"] = (
         _capturing_factory(
             ActivationFingerprintTracker, "act_regime_tracker", captured_objs
@@ -551,6 +580,29 @@ class TestResumeStateIntegration:
         assert fault_ts.psa_state is not None
         assert len(fault_ts.psa_state["delta_history"]) == expected[
             "psa_history_count"
+        ]
+
+        # ---- psa_regime_state (object, via load_state_dict) ----
+        restored_regime = captured_objs.get("regime_detector")
+        assert restored_regime is not None, (
+            "regime_detector.load_state_dict was never called on resume — the "
+            "PSA regime-detector restore wiring is broken (an over-broad guard "
+            "or dropped restore line would reset psa_regime_transitions to 0)"
+        )
+        assert restored_regime.transition_count == expected[
+            "regime_transition_count"
+        ], (
+            "regime transition_count did not survive resume — the per-cycle "
+            "psa_regime_transitions (persisted to run_metrics.jsonl) would reset "
+            "to 0 after a fault/periodic resume"
+        )
+        assert restored_regime.regime == expected["regime_regime"], (
+            "regime current-regime did not survive resume"
+        )
+        # The in-loop detector re-snapshotted by the loop's own save must match.
+        assert fault_ts.psa_regime_state is not None
+        assert fault_ts.psa_regime_state["transition_count"] == expected[
+            "regime_transition_count"
         ]
 
         # ---- act_regime_state (object, via load_state_dict) ----

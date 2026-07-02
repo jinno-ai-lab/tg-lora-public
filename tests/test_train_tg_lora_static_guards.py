@@ -150,3 +150,41 @@ def test_progressive_freeze_resume_state_is_wired() -> None:
     assert "ts.progressive_freeze_state" in source, (
         "the resume path must read the persisted progressive_freeze_state"
     )
+
+
+def test_regime_detector_resume_state_is_wired() -> None:
+    """The PSA regime-detector resume-state fix must stay wired end-to-end.
+
+    ``RegimeDetector`` was given ``state_dict`` / ``load_state_dict`` (tested
+    directly in ``tests/test_regime.py``) and ``TrainingState`` gained a
+    ``psa_regime_state`` field (round-tripped in ``tests/test_checkpoint.py``).
+    This guard pins the *wiring* in the src.data-blocked training entry point
+    (unimportable here, so verified by source string rather than by running it):
+    the fault + periodic save sites must serialize the detector, the fault call
+    must thread the detector, and the resume path must restore it. A future edit
+    that drops any leg reopens the resume-state-loss gap (the per-cycle
+    ``psa_regime_transitions``, persisted to ``run_metrics.jsonl``, resets to 0
+    after a fault/periodic resume) and fails this assertion.
+    """
+    assert TARGET.is_file(), f"training entry point not found at {TARGET}"
+    source = TARGET.read_text(encoding="utf-8")
+
+    # The fault-checkpoint helper receives the detector as a parameter (it lives
+    # in the caller's scope, like ``psa_prior``).
+    assert "regime_detector: RegimeDetector | None," in source, (
+        "_save_fault_checkpoint must thread regime_detector as a parameter"
+    )
+    # Both save sites (fault + periodic) serialize the detector.
+    assert source.count("regime_detector.state_dict()") == 2, (
+        "both TrainingState save sites (fault + periodic) must serialize "
+        "regime_detector.state_dict()"
+    )
+    # The fault call passes the detector through.
+    assert "regime_detector=regime_detector," in source, (
+        "the _save_fault_checkpoint call must pass regime_detector through"
+    )
+    # The resume path restores the persisted regime state into the in-loop
+    # detector constructed in the enable_psa block.
+    assert "regime_detector.load_state_dict(restored_training_state.psa_regime_state)" in (
+        source
+    ), "the resume path must call regime_detector.load_state_dict with the persisted field"

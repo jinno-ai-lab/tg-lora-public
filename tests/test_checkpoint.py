@@ -132,6 +132,22 @@ def _unit(v: torch.Tensor) -> torch.Tensor:
     return v / (v.norm() + 1e-12)
 
 
+def _psa_regime_state_sample() -> dict:
+    """A representative ``RegimeDetector.state_dict()`` with a populated
+    run-wide surface (loss / velocity classification windows + current regime +
+    transition count), so the checkpoint round-trip exercises the
+    resume-persistent PSA regime state. These must survive resume or the
+    per-cycle ``psa_regime_transitions`` (persisted to ``run_metrics.jsonl``)
+    resets to 0 (sibling resume-state-loss axis to ``psa_state`` /
+    ``act_regime_state``)."""
+    return {
+        "losses": [2.0, 1.9, 1.85, 1.82, 2.5],
+        "velocities": [-0.1, -0.05, -0.03, 0.68],
+        "regime": "transition",
+        "transition_count": 3,
+    }
+
+
 class TestSaveCheckpointNormal:
     def test_creates_directory(self, tmp_path):
         model, tokenizer = _mock_model_and_tokenizer(tmp_path, file_count=2)
@@ -268,6 +284,12 @@ class TestTrainingStateRoundtrip:
             # layer_delta_analysis omitted on a short residual run). Sibling
             # resume-state-loss axis.
             psa_state=_psa_state_sample(),
+            # Mid-run PSA regime detector accumulation (GOAL §1.5 / §3.3): the
+            # detector has classified 3 transitions so resume does not rebuild it
+            # fresh and the per-cycle ``psa_regime_transitions`` (persisted to
+            # ``run_metrics.jsonl``) does not reset to 0. Sibling resume-state-loss
+            # axis to ``psa_state`` / ``act_regime_state``.
+            psa_regime_state=_psa_regime_state_sample(),
             # Mid-run async-cache-swap state (GOAL §3.3 cache-ablation): both
             # loaders were swapped to the cached dataset at cycle 4 so resume
             # does not reset them to None and the run-end summary's
@@ -356,6 +378,16 @@ class TestTrainingStateRoundtrip:
             loaded.psa_state["delta_history"][1][_lora_name],
             state.psa_state["delta_history"][1][_lora_name],
         )
+        # PSA regime detector accumulation (GOAL §1.5 / §3.3) must survive resume
+        # so the per-cycle ``psa_regime_transitions`` (persisted to
+        # ``run_metrics.jsonl``) does not reset to 0 (sibling resume-state-loss).
+        assert loaded.psa_regime_state is not None
+        assert loaded.psa_regime_state["transition_count"] == 3
+        assert loaded.psa_regime_state["regime"] == "transition"
+        assert loaded.psa_regime_state["losses"] == state.psa_regime_state["losses"]
+        assert loaded.psa_regime_state["velocities"] == state.psa_regime_state[
+            "velocities"
+        ]
         # Async-cache-swap completion cycles (GOAL §3.3) must survive resume so
         # the run-end summary's async_cache_swap_cycle_valid_quick/full fields
         # are not silently dropped after a fault/periodic resume. Round-trip as
@@ -532,6 +564,25 @@ class TestTrainingStateRoundtrip:
 
         loaded = load_training_state(path)
         assert loaded.psa_state is None
+
+    def test_legacy_checkpoint_without_psa_regime_state_loads_clean(self, tmp_path):
+        """A pre-fix checkpoint omits ``psa_regime_state``; load must not break
+        and must read as the safe 'start fresh' default (None). None is the only
+        sane legacy reading: the resume path treats a missing regime state as a
+        fresh detector (the pre-fix behavior, no fabricated transitions), not a
+        fabricated non-empty one. Also covers an ``enable_psa: false`` run, which
+        never serialized the detector. Mirrors the ``psa_state`` /
+        ``act_regime_state`` legacy tolerance."""
+        state = self._make_state()
+        path = tmp_path / "legacy.pt"
+        save_training_state(state, path)
+        # Strip the key to simulate a pre-fix checkpoint blob.
+        blob = torch.load(path, weights_only=False)
+        blob.pop("psa_regime_state", None)
+        torch.save(blob, path)
+
+        loaded = load_training_state(path)
+        assert loaded.psa_regime_state is None
 
     def test_legacy_checkpoint_without_swap_cycle_loads_clean(self, tmp_path):
         """A pre-fix checkpoint omits ``swap_cycle_vq``/``swap_cycle_vf``; load

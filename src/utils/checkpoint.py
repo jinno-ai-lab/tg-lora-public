@@ -520,6 +520,18 @@ class TrainingState:
     # or a pre-fix checkpoint (the prior rebuilds empty, the pre-fix behavior —
     # no fabricated priors).
     psa_state: dict | None = None
+    # PSA regime detector (GOAL §1.5 / §3.3, the ``RegimeDetector`` that gates
+    # the PSA prior reset on a stable→transition shift) run-wide state — the
+    # serialized ``RegimeDetector.state_dict()`` (loss / velocity classification
+    # windows + current regime + the run-wide transition count). Must survive
+    # resume: without it a fault/periodic resume rebuilds the detector fresh and
+    # the per-cycle ``psa_regime_transitions`` (persisted to ``run_metrics.jsonl``)
+    # resets to 0 — a silent resume-state-loss sibling to the fixed PSA prior
+    # (``psa_state``) / activation-regime (``act_regime_state``) gaps. ``None`` =
+    # PSA disabled (``enable_psa: false`` — currently every config in this mirror)
+    # or a pre-fix checkpoint (the detector rebuilds fresh, the pre-fix behavior —
+    # no fabricated transitions).
+    psa_regime_state: dict | None = None
     # Async prefix-cache swap completion cycles (GOAL §3.3 cache-ablation
     # apparatus) — the caller-scoped cycle at which the ``valid_quick`` /
     # ``valid_full`` loader was swapped to the asynchronously-built cached
@@ -680,6 +692,7 @@ def save_training_state(state: TrainingState, path: Path) -> None:
         "act_regime_state": state.act_regime_state,
         "efficiency_accounting": state.efficiency_accounting,
         "psa_state": state.psa_state,
+        "psa_regime_state": state.psa_regime_state,
         "swap_cycle_vq": state.swap_cycle_vq,
         "swap_cycle_vf": state.swap_cycle_vf,
         "progressive_freeze_state": state.progressive_freeze_state,
@@ -830,6 +843,12 @@ def load_training_state(path: Path) -> TrainingState:
         # pre-fix behavior, no fabricated priors). Mirrors the act_regime_state /
         # efficiency_accounting / lawa_state legacy paths.
         psa_state=blob.get("psa_state"),
+        # Absent on pre-fix checkpoints / ``enable_psa: false`` runs → None, the
+        # only sane reading of a checkpoint that predates the field or predates
+        # PSA: the resume path treats a missing regime state as 'start fresh'
+        # (the pre-fix behavior, no fabricated transitions). Mirrors the psa_state
+        # / act_regime_state legacy paths.
+        psa_regime_state=blob.get("psa_regime_state"),
         # Absent on pre-fix checkpoints / async-cache-disabled runs → None, the
         # only sane reading of a checkpoint that predates the field or predates
         # a swap firing: the resume path treats a missing cycle as 'no swap yet'

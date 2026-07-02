@@ -33,6 +33,7 @@ from src.tg_lora.activation_regime import ActivationFingerprintTracker
 from src.tg_lora.dynamic_freeze import DynamicFreezeController
 from src.tg_lora.weight_averaging import LAWAAverager
 from src.tg_lora.psa import PSAPrior
+from src.tg_lora.regime import RegimeDetector
 from src.tg_lora.extrapolator import (
     ExtrapolationStats,
     ZerothOrderStepStats,
@@ -773,6 +774,7 @@ def _save_fault_checkpoint(
     act_regime_tracker: ActivationFingerprintTracker | None,
     efficiency_accounting: dict | None,
     psa_prior: PSAPrior | None,
+    regime_detector: RegimeDetector | None,
     swap_cycle_vq: int | None,
     swap_cycle_vf: int | None,
     progressive_freeze: ProgressiveFreezeController | None,
@@ -848,6 +850,15 @@ def _save_fault_checkpoint(
     run — a silent resume-state-loss sibling to the fixed act-regime / LAWA /
     efficiency-accounting gaps. Mirrors the act_regime_tracker threading.
 
+    ``regime_detector`` likewise: it is the GOAL §1.5 / §3.3 PSA regime detector
+    (``None`` when ``enable_psa: false``, so it is built in the same block as
+    ``psa_prior``). A fault checkpoint must record its run-wide accumulation
+    (loss / velocity classification windows + current regime + the run-wide
+    transition count) or resume rebuilds it fresh and the per-cycle
+    ``psa_regime_transitions`` (persisted to ``run_metrics.jsonl``) resets to 0 —
+    a silent resume-state-loss sibling to the fixed psa_prior / act-regime gaps.
+    Mirrors the psa_prior threading.
+
     ``swap_cycle_vq`` / ``swap_cycle_vf`` likewise: they are the caller-scoped
     cycles at which the ``valid_quick`` / ``valid_full`` loader was swapped to
     the asynchronously-built cached dataset (GOAL §3.3 cache-ablation
@@ -895,6 +906,9 @@ def _save_fault_checkpoint(
             ),
             efficiency_accounting=efficiency_accounting,
             psa_state=psa_prior.state_dict() if psa_prior is not None else None,
+            psa_regime_state=(
+                regime_detector.state_dict() if regime_detector is not None else None
+            ),
             swap_cycle_vq=swap_cycle_vq,
             swap_cycle_vf=swap_cycle_vf,
             progressive_freeze_state=(
@@ -1676,7 +1690,6 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     psa_regime_reset_enabled = True
     if bool(tg_cfg.get("enable_psa", False)):
         from src.tg_lora.psa import amplify_gradients_psa, summarize_by_layer_type
-        from src.tg_lora.regime import RegimeDetector
         psa_regime_reset_enabled = bool(tg_cfg.get("psa_regime_reset_enabled", True))
         psa_prior = PSAPrior(
             history_length=int(tg_cfg.get("psa_history_length", 6)),
@@ -1720,6 +1733,29 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
             psa_prior.history_count,
             len(psa_prior.priors),
             psa_prior._last_update_step,
+        )
+
+    # Restore the PSA regime detector accumulation on resume. Placed here (after
+    # the detector is constructed, alongside the psa_prior restore) rather than
+    # in the resume block above because ``regime_detector`` is built just above —
+    # restoring there would hit UnboundLocalError. ``restored_training_state`` is
+    # the None-when-not-resuming handle. Without this restore a checkpoint taken
+    # after the detector has recorded transitions loads a fresh detector and the
+    # per-cycle ``psa_regime_transitions`` (persisted to ``run_metrics.jsonl``)
+    # resets to 0 — a silent resume-state-loss sibling to the fixed PSA prior
+    # (``psa_state``) / activation-regime (``act_regime_state``) gaps. Mirrors the
+    # psa_prior / act-regime restores; guarded so PSA-disabled runs and pre-fix
+    # checkpoints (None) are untouched.
+    if (
+        regime_detector is not None
+        and restored_training_state is not None
+        and restored_training_state.psa_regime_state is not None
+    ):
+        regime_detector.load_state_dict(restored_training_state.psa_regime_state)
+        logger.info(
+            "PSA regime detector restored: transitions=%d regime=%s",
+            regime_detector.transition_count,
+            regime_detector.regime.value,
         )
 
     # Activation-fingerprint regime inventory (GOAL §4 step 1)
@@ -4387,6 +4423,11 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                     ),
                     efficiency_accounting=_snapshot_efficiency_accounting(locals()),
                     psa_state=psa_prior.state_dict() if psa_prior is not None else None,
+                    psa_regime_state=(
+                        regime_detector.state_dict()
+                        if regime_detector is not None
+                        else None
+                    ),
                     swap_cycle_vq=swap_cycle_vq,
                     swap_cycle_vf=swap_cycle_vf,
                     progressive_freeze_state=(
@@ -4474,6 +4515,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 act_regime_tracker,
                 efficiency_accounting=_snapshot_efficiency_accounting(locals()),
                 psa_prior=psa_prior,
+                regime_detector=regime_detector,
                 swap_cycle_vq=swap_cycle_vq,
                 swap_cycle_vf=swap_cycle_vf,
                 progressive_freeze=progressive_freeze,
