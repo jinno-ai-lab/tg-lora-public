@@ -64,6 +64,7 @@ from src.tg_lora.prefix_runtime_offload import offload_prefix_runtime_to_cpu
 from src.tg_lora.progressive_freeze import (
     ProgressiveFreezeController,
     build_freeze_schedule_from_config,
+    progressive_freeze_run_summary,
 )
 from src.tg_lora.random_walk_controller import RandomWalkController
 from src.tg_lora.rollback_manager import RollbackManager
@@ -4600,13 +4601,9 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
         summary["async_cache_swap_cycle_valid_full"] = swap_cycle_vf
 
     if progressive_freeze is not None:
-        summary["progressive_freeze"] = {
-            "enabled": True,
-            "frozen_layer": progressive_freeze.frozen_layer_idx,
-            "frozen_layers": sorted(progressive_freeze.frozen_layers),
-            "start_cycle": progressive_freeze._start_cycle,
-            "mode": "progressive" if progressive_freeze.schedule is not None else "single_shot",
-        }
+        summary["progressive_freeze"] = progressive_freeze_run_summary(
+            progressive_freeze
+        )
 
     if fault_reason is not None:
         summary["status"] = "failed"

@@ -86,6 +86,13 @@ def build_freeze_schedule_from_config(
         return None
     active = list(active_layer_indices)
     policy = str(schedule_cfg.get("policy", "output_first"))
+    # Pre-resolution arm identity. The Tier-2 §4 order verdict's candidate
+    # (output_first) and surrogate (random_order) freeze the SAME layers at full
+    # depth in a different order, so the run-summary footer needs the REQUESTED
+    # policy + seed to tell the arms apart once frozen_layers collides. Capture
+    # it here before random_order resolves to convergence_order below.
+    requested_policy = policy
+    surrogate_seed: int | None = None
     convergence_order = schedule_cfg.get("convergence_order")
     stability_epoch = schedule_cfg.get("stability_epoch")
 
@@ -110,7 +117,8 @@ def build_freeze_schedule_from_config(
                 "policy 'random_order' requires a 'seed' for a reproducible "
                 "surrogate"
             )
-        convergence_order = random_freeze_order(active, int(seed))
+        surrogate_seed = int(seed)
+        convergence_order = random_freeze_order(active, surrogate_seed)
         policy = "convergence_order"
 
     config = FreezeScheduleConfig(
@@ -127,7 +135,11 @@ def build_freeze_schedule_from_config(
         if stability_epoch is not None
         else None,
     )
-    return FreezeSchedule.plan(config)
+    return FreezeSchedule.plan(
+        config,
+        requested_policy=requested_policy,
+        surrogate_seed=surrogate_seed,
+    )
 
 
 @dataclass
@@ -608,3 +620,37 @@ class ProgressiveFreezeController:
 
     def clear_xin_cache(self) -> None:
         self._xin_cache.clear()
+
+
+def progressive_freeze_run_summary(controller: ProgressiveFreezeController) -> dict:
+    """Build the run-summary provenance block for a progressive-freeze run.
+
+    The footer persisted by ``train_tg_lora`` must distinguish the Tier-2 §4
+    order verdict's candidate (``output_first``) and surrogate (``random_order``)
+    arms: at full depth they freeze the SAME layers in a different ORDER, so the
+    frozen-layer set is identical and the arm's policy + seed is the only
+    machine-readable distinguisher. Before this helper the summary recorded only
+    the frozen layers and the start cycle, so a deposited ``run_metrics.jsonl``
+    could not tell the arms apart — forcing the hand-labeling transcription hazard
+    the deposit CLI removed for ``best_valid_loss``.
+
+    Emits ``policy`` (the requested arm), ``resolved_policy`` (the planner policy
+    ``random_order`` collapses to), ``surrogate_seed`` (``None`` for a real arm)
+    and ``realized_depth`` only when a multi-layer schedule drove the run; a
+    single-shot Phase-1 run reports ``mode="single_shot"`` and omits them so
+    legacy footers stay single-shot.
+    """
+    block: dict = {
+        "enabled": True,
+        "frozen_layer": controller.frozen_layer_idx,
+        "frozen_layers": sorted(controller.frozen_layers),
+        "start_cycle": controller._start_cycle,
+        "mode": "progressive" if controller.schedule is not None else "single_shot",
+    }
+    schedule = controller.schedule
+    if schedule is not None:
+        block["policy"] = schedule.requested_policy
+        block["resolved_policy"] = schedule.config.policy
+        block["surrogate_seed"] = schedule.surrogate_seed
+        block["realized_depth"] = schedule.realized_depth
+    return block

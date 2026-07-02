@@ -243,6 +243,8 @@ class FreezeSchedule:
     config: FreezeScheduleConfig
     frozen_at_epoch: dict[int, int] = field(default_factory=dict)
     order: tuple[int, ...] = ()
+    requested_policy: str = ""
+    surrogate_seed: int | None = None
 
     @property
     def realized_depth(self) -> int:
@@ -250,7 +252,13 @@ class FreezeSchedule:
         return len(self.frozen_at_epoch)
 
     @classmethod
-    def plan(cls, config: FreezeScheduleConfig) -> "FreezeSchedule":
+    def plan(
+        cls,
+        config: FreezeScheduleConfig,
+        *,
+        requested_policy: str | None = None,
+        surrogate_seed: int | None = None,
+    ) -> "FreezeSchedule":
         """Resolve ``config`` into a realized :class:`FreezeSchedule`.
 
         The candidate freeze order is fixed per policy, truncated to
@@ -259,6 +267,14 @@ class FreezeSchedule:
         ``compromise`` that epoch is raised to the layer's stability floor.
         Candidates whose final epoch is ``>= num_epochs`` are dropped — they
         would land after the run ends.
+
+        ``requested_policy`` / ``surrogate_seed`` carry the Tier-2 §4 order
+        verdict's arm provenance onto the schedule: the policy as *requested*
+        (before ``random_order`` resolves to ``convergence_order``) and the seed
+        a surrogate arm was generated from. They default to the config's policy
+        / ``None`` so a directly planned schedule reports its own arm honestly;
+        the config→schedule glue (:func:`build_freeze_schedule_from_config`) is
+        what passes the pre-resolution identity through.
         """
         ordered = _resolve_order(config)
         truncated = ordered[: config.max_depth]
@@ -276,7 +292,15 @@ class FreezeSchedule:
                 frozen[layer] = epoch
 
         order = tuple(sorted(frozen, key=lambda idx: frozen[idx]))
-        return cls(config=config, frozen_at_epoch=frozen, order=order)
+        return cls(
+            config=config,
+            frozen_at_epoch=frozen,
+            order=order,
+            requested_policy=(
+                requested_policy if requested_policy is not None else config.policy
+            ),
+            surrogate_seed=surrogate_seed,
+        )
 
 
 def _resolve_order(config: FreezeScheduleConfig) -> tuple[int, ...]:

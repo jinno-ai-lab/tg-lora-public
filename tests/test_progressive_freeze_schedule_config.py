@@ -16,6 +16,7 @@ from src.tg_lora.freeze_schedule import FreezeSchedule, random_freeze_order
 from src.tg_lora.progressive_freeze import (
     ProgressiveFreezeController,
     build_freeze_schedule_from_config,
+    progressive_freeze_run_summary,
 )
 
 ACTIVE = [0, 1, 2, 3, 4, 5]  # output side = 5
@@ -202,3 +203,106 @@ def test_random_order_surrogate_drives_controller_gate():
     assert ctrl.layers_due_at(3) == [1]
     assert ctrl.layers_due_at(5) == [2]
     assert ctrl.layers_due_at(6) == []
+
+
+# -- Tier-2 §4 order-verdict arm provenance in the run-summary footer ----------
+#
+# The order verdict deposits candidate(output_first) vs surrogate(random_order)
+# best_valid_loss into run_metrics.jsonl. At full depth the two arms freeze the
+# SAME layers in a different ORDER, so the footer's frozen_layers set is
+# IDENTICAL across arms — the only machine-readable distinguisher is the arm
+# provenance (policy + surrogate seed). build_freeze_schedule_from_config used to
+# discard that provenance the moment random_order resolved to convergence_order,
+# and the run summary never recorded policy/seed: the arms were indistinguishable
+# in the deposited artifact, forcing hand-labeling — the exact P0 transcription
+# hazard form_freeze_validloss_deposit.py removed for best_valid_loss. These pin
+# that the provenance now survives resolution and reaches the summary block.
+
+
+def test_random_order_provenance_survives_resolution():
+    # random_order resolves to convergence_order internally, but the run summary
+    # must report the arm as the surrogate it IS: requested_policy keeps the
+    # pre-resolution policy, surrogate_seed keeps the seed, config.policy is the
+    # resolved planner policy.
+    sched = build_freeze_schedule_from_config(
+        {"policy": "random_order", "seed": 42, "max_depth": 3}, ACTIVE, 10,
+    )
+    assert sched is not None
+    assert sched.requested_policy == "random_order"
+    assert sched.surrogate_seed == 42
+    assert sched.config.policy == "convergence_order"
+
+
+def test_candidate_arm_provenance_is_unset():
+    # A real (non-surrogate) schedule reports its own policy and carries no seed.
+    sched = build_freeze_schedule_from_config(
+        {"policy": "output_first", "max_depth": 3}, ACTIVE, 10,
+    )
+    assert sched is not None
+    assert sched.requested_policy == "output_first"
+    assert sched.surrogate_seed is None
+
+
+def test_full_depth_candidate_and_surrogate_freeze_same_layers():
+    # THE hazard: at full depth (the verdict config) candidate and surrogate
+    # freeze the SAME layer set in a DIFFERENT order. frozen_layers in the footer
+    # is therefore identical across arms — provenance is the only distinguisher.
+    full = {"max_depth": len(ACTIVE), "start_epoch": 0}
+    cand = build_freeze_schedule_from_config(
+        {"policy": "output_first", **full}, ACTIVE, 50,
+    )
+    surr = build_freeze_schedule_from_config(
+        {"policy": "random_order", "seed": 42, **full}, ACTIVE, 50,
+    )
+    assert cand is not None and surr is not None
+    # Same layers frozen (full depth)...
+    assert set(cand.frozen_at_epoch) == set(ACTIVE)
+    assert set(surr.frozen_at_epoch) == set(ACTIVE)
+    assert set(cand.frozen_at_epoch) == set(surr.frozen_at_epoch)
+    # ...in a different ORDER (the sole degree of freedom the verdict resolves).
+    assert cand.order != surr.order
+    # The provenance is what tells them apart once frozen_layers collide.
+    assert cand.requested_policy != surr.requested_policy
+
+
+def test_run_summary_emits_distinguishable_arm_provenance():
+    # progressive_freeze_run_summary builds the footer block; candidate and
+    # surrogate summaries agree on depth/mode (the fields frozen_layers collides
+    # on) but differ on the arm provenance — proving the provenance is what makes
+    # the deposited arms distinguishable.
+    timing = {"max_depth": len(ACTIVE), "start_epoch": 0}
+    cand = ProgressiveFreezeController(
+        start_cycle=0, active_layer_indices=set(ACTIVE),
+        schedule=build_freeze_schedule_from_config(
+            {"policy": "output_first", **timing}, ACTIVE, 50,
+        ),
+    )
+    surr = ProgressiveFreezeController(
+        start_cycle=0, active_layer_indices=set(ACTIVE),
+        schedule=build_freeze_schedule_from_config(
+            {"policy": "random_order", "seed": 42, **timing}, ACTIVE, 50,
+        ),
+    )
+    csum = progressive_freeze_run_summary(cand)
+    ssum = progressive_freeze_run_summary(surr)
+    # Provenance keys present and distinguish the arms...
+    assert csum["policy"] == "output_first" and csum["surrogate_seed"] is None
+    assert ssum["policy"] == "random_order" and ssum["surrogate_seed"] == 42
+    assert csum["resolved_policy"] == "output_first"
+    assert ssum["resolved_policy"] == "convergence_order"
+    # ...while depth/mode (the fields frozen_layers would collide on) match.
+    assert csum["realized_depth"] == ssum["realized_depth"] == len(ACTIVE)
+    assert csum["mode"] == ssum["mode"] == "progressive"
+
+
+def test_run_summary_single_shot_omits_arm_provenance():
+    # A single-shot run (no schedule) has no arm provenance; the block reports
+    # the Phase-1 mode and omits policy/seed so legacy footers stay single-shot.
+    ctrl = ProgressiveFreezeController(
+        start_cycle=3, active_layer_indices=set(ACTIVE),
+    )
+    block = progressive_freeze_run_summary(ctrl)
+    assert block["enabled"] is True
+    assert block["mode"] == "single_shot"
+    for key in ("policy", "resolved_policy", "surrogate_seed", "realized_depth"):
+        assert key not in block
