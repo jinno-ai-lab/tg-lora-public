@@ -56,8 +56,15 @@ def _write_run_metrics(
     step_losses: list[float],
     model: str = "Qwen/Qwen3.5-9B",
     with_footer: bool = True,
+    progressive_freeze: dict | None = None,
 ) -> Path:
-    """Write a minimal ``run_metrics.jsonl`` honoring the real schema fields."""
+    """Write a minimal ``run_metrics.jsonl`` honoring the real schema fields.
+
+    ``progressive_freeze`` (the block ``progressive_freeze_run_summary`` emits —
+    ``policy`` / ``resolved_policy`` / ``surrogate_seed`` / ``mode``) is embedded
+    under ``tg_lora_summary`` exactly as ``train_tg_lora``'s footer writes it,
+    so the Tier-2 arm-identity extraction is exercised against the real shape.
+    """
     lines: list[str] = [
         json.dumps(
             {
@@ -82,16 +89,15 @@ def _write_run_metrics(
             )
         )
     if with_footer:
-        lines.append(
-            json.dumps(
-                {
-                    "type": "run_footer",
-                    "run_id": run_id,
-                    "best_valid_loss": best,
-                    "best_valid_step": 48,
-                }
-            )
-        )
+        footer: dict = {
+            "type": "run_footer",
+            "run_id": run_id,
+            "best_valid_loss": best,
+            "best_valid_step": 48,
+        }
+        if progressive_freeze is not None:
+            footer["tg_lora_summary"] = {"progressive_freeze": progressive_freeze}
+        lines.append(json.dumps(footer))
     path.write_text("\n".join(lines) + "\n")
     return path
 
@@ -160,6 +166,257 @@ def test_extract_falls_back_when_footer_best_is_null(tmp_path: Path) -> None:
     assert prov["best_valid_loss_source"] == "min_loss_valid_step"
     assert prov["best_valid_step"] == 16
     assert prov["run_id"] == "killed_base"
+
+
+def test_extract_surfaces_progressive_freeze_arm_provenance(tmp_path: Path) -> None:
+    # A Tier-2 surrogate (random_order) run: the footer's progressive_freeze
+    # block carries the requested policy + surrogate seed, the only
+    # machine-readable arm distinguisher at full freeze depth.
+    p = _write_run_metrics(
+        tmp_path / "surr_seed42.jsonl",
+        run_id="surr_seed42",
+        seed=42,
+        best=1.04,
+        step_losses=[1.2, 1.04],
+        progressive_freeze={
+            "enabled": True,
+            "frozen_layers": [0, 1, 2],
+            "start_cycle": 3,
+            "mode": "progressive",
+            "policy": "random_order",
+            "resolved_policy": "convergence_order",
+            "surrogate_seed": 42,
+            "realized_depth": 3,
+        },
+    )
+    _, prov = extract_best_valid_loss(p)
+    assert prov["arm_policy"] == "random_order"
+    assert prov["arm_resolved_policy"] == "convergence_order"
+    assert prov["surrogate_seed"] == 42
+    assert prov["freeze_mode"] == "progressive"
+
+
+def test_extract_arm_provenance_none_without_progressive_freeze(tmp_path: Path) -> None:
+    # A Tier-1 candidate (plain TG-LoRA, no progressive-freeze footer block)
+    # reports no arm identity — the extraction stays graceful so the Tier-1
+    # deposit path is unaffected.
+    p = _write_run_metrics(
+        tmp_path / "cand.jsonl",
+        run_id="cand",
+        seed=42,
+        best=1.03,
+        step_losses=[1.2, 1.03],
+    )
+    _, prov = extract_best_valid_loss(p)
+    assert prov["arm_policy"] is None
+    assert prov["surrogate_seed"] is None
+    assert prov["freeze_mode"] is None
+
+
+def test_arm_label_includes_policy_for_progressive_arm(tmp_path: Path) -> None:
+    p = _write_run_metrics(
+        tmp_path / "c.jsonl",
+        run_id="cand_seed42",
+        seed=42,
+        best=1.03,
+        step_losses=[1.03],
+        progressive_freeze={
+            "mode": "progressive",
+            "policy": "output_first",
+            "resolved_policy": "output_first",
+            "surrogate_seed": None,
+            "realized_depth": 2,
+        },
+    )
+    from scripts.form_freeze_validloss_deposit import _arm_label
+
+    _, prov = extract_best_valid_loss(p)
+    label = _arm_label(1.03, prov)
+    assert "arm=output_first" in label
+    assert "cand_seed42" in label
+
+
+def test_form_deposit_accepts_aligned_tier2_arms(tmp_path: Path) -> None:
+    # candidate = output_first (real arm, surrogate_seed None);
+    # surrogate = random_order (surrogate_seed set). Both multi-layer
+    # progressive => guard verifies and accepts the aligned assignment.
+    cand = _write_run_metrics(
+        tmp_path / "c.jsonl",
+        run_id="c",
+        seed=42,
+        best=1.03,
+        step_losses=[1.03],
+        progressive_freeze={
+            "mode": "progressive",
+            "policy": "output_first",
+            "resolved_policy": "output_first",
+            "surrogate_seed": None,
+            "realized_depth": 2,
+        },
+    )
+    surr = _write_run_metrics(
+        tmp_path / "s.jsonl",
+        run_id="s",
+        seed=42,
+        best=1.10,
+        step_losses=[1.10],
+        progressive_freeze={
+            "mode": "progressive",
+            "policy": "random_order",
+            "resolved_policy": "convergence_order",
+            "surrogate_seed": 7,
+            "realized_depth": 2,
+        },
+    )
+    deposit = form_deposit(
+        [cand],
+        [surr],
+        model="Qwen/Qwen3.5-9B",
+        device="cuda-rtx3060",
+        total=15,
+    )
+    assert deposit["candidate_losses"] == [1.03]
+    assert deposit["surrogate_losses"] == [1.10]
+    # machine-readable arm identity flows footer -> deposit
+    assert deposit["candidate_arm_policies"] == ["output_first"]
+    assert deposit["surrogate_arm_policies"] == ["random_order"]
+
+
+def test_form_deposit_rejects_surrogate_passed_as_candidate(tmp_path: Path) -> None:
+    # A random-order surrogate (seed set) mistakenly passed under --candidate.
+    # Without the guard this silently deposits a surrogate float in the
+    # candidate slot and inverts the verdict sign.
+    swapped = _write_run_metrics(
+        tmp_path / "s.jsonl",
+        run_id="s",
+        seed=42,
+        best=1.10,
+        step_losses=[1.10],
+        progressive_freeze={
+            "mode": "progressive",
+            "policy": "random_order",
+            "resolved_policy": "convergence_order",
+            "surrogate_seed": 7,
+            "realized_depth": 2,
+        },
+    )
+    real = _write_run_metrics(
+        tmp_path / "c.jsonl",
+        run_id="c",
+        seed=42,
+        best=1.03,
+        step_losses=[1.03],
+        progressive_freeze={
+            "mode": "progressive",
+            "policy": "output_first",
+            "resolved_policy": "output_first",
+            "surrogate_seed": None,
+            "realized_depth": 2,
+        },
+    )
+    with pytest.raises(ValueError, match="random-order surrogate"):
+        form_deposit(
+            [swapped],
+            [real],
+            model="Qwen/Qwen3.5-9B",
+            device="cuda-rtx3060",
+            total=15,
+        )
+
+
+def test_form_deposit_rejects_real_arm_passed_as_surrogate(tmp_path: Path) -> None:
+    # Symmetric: a real arm (output_first, seed None) passed under --surrogate
+    # where a random-order surrogate belongs. The candidate slot holds a proper
+    # real arm; the surrogate slot wrongly holds another real arm.
+    cand = _write_run_metrics(
+        tmp_path / "c.jsonl",
+        run_id="c",
+        seed=42,
+        best=1.03,
+        step_losses=[1.03],
+        progressive_freeze={
+            "mode": "progressive",
+            "policy": "output_first",
+            "resolved_policy": "output_first",
+            "surrogate_seed": None,
+            "realized_depth": 2,
+        },
+    )
+    real_as_surrogate = _write_run_metrics(
+        tmp_path / "s.jsonl",
+        run_id="s",
+        seed=43,
+        best=1.10,
+        step_losses=[1.10],
+        progressive_freeze={
+            "mode": "progressive",
+            "policy": "output_first",
+            "resolved_policy": "output_first",
+            "surrogate_seed": None,
+            "realized_depth": 2,
+        },
+    )
+    with pytest.raises(ValueError, match="was passed as --surrogate"):
+        form_deposit(
+            [cand],
+            [real_as_surrogate],
+            model="Qwen/Qwen3.5-9B",
+            device="cuda-rtx3060",
+            total=15,
+        )
+
+
+def test_form_deposit_skips_arm_guard_for_tier1_no_progressive(tmp_path: Path) -> None:
+    # Tier-1: candidate = plain TG-LoRA, surrogate = full-backprop baseline.
+    # Neither carries a progressive_freeze footer block, so the guard has
+    # nothing to verify and must stay silent (regression guard for the Tier-1
+    # deposit recipe in TASK-0152).
+    cand = _write_run_metrics(
+        tmp_path / "c.jsonl", run_id="c", seed=42, best=1.03, step_losses=[1.03]
+    )
+    base = _write_run_metrics(
+        tmp_path / "b.jsonl", run_id="b", seed=42, best=1.10, step_losses=[1.10]
+    )
+    deposit = form_deposit(
+        [cand],
+        [base],
+        model="Qwen/Qwen3.5-9B",
+        device="cuda-rtx3060",
+        total=15,
+    )
+    assert deposit["candidate_arm_policies"] == [None]
+    assert deposit["surrogate_arm_policies"] == [None]
+
+
+def test_form_deposit_skips_arm_guard_for_single_shot_mode(tmp_path: Path) -> None:
+    # A single-shot progressive-freeze footer (mode=single_shot, Phase 1 gate)
+    # carries a progressive_freeze block but no verifiable multi-layer arm
+    # identity — the guard must skip it, not reject it.
+    cand = _write_run_metrics(
+        tmp_path / "c.jsonl",
+        run_id="c",
+        seed=42,
+        best=1.03,
+        step_losses=[1.03],
+        progressive_freeze={
+            "enabled": True,
+            "frozen_layers": [2],
+            "start_cycle": 3,
+            "mode": "single_shot",
+        },
+    )
+    base = _write_run_metrics(
+        tmp_path / "b.jsonl", run_id="b", seed=42, best=1.10, step_losses=[1.10]
+    )
+    deposit = form_deposit(
+        [cand],
+        [base],
+        model="Qwen/Qwen3.5-9B",
+        device="cuda-rtx3060",
+        total=15,
+    )
+    # single_shot arm carries no requested policy => None, not rejected
+    assert deposit["candidate_arm_policies"] == [None]
 
 
 def test_form_deposit_emits_target_scale_schema(tmp_path: Path) -> None:

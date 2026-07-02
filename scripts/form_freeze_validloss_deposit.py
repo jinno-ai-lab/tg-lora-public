@@ -32,6 +32,14 @@ predate the footer. The formed deposit carries ``proxy_scale=false`` /
 recording, not proxy plumbing) plus a ``source`` string naming every
 contributing ``run_id`` / seed — so each deposited float traces back to its
 artifact and the §4 citation gate opens only for a real run.
+
+For the Tier-2 §4 order verdict (candidate ``output_first`` vs surrogate
+``random_order``, both multi-layer progressive-freeze runs) the footer's
+``progressive_freeze`` block is also surfaced: a swapped ``--candidate`` /
+``--surrogate`` — which flips the bootstrap sign and turns SURPASSES into
+UNDERSHOOTS — fails LOUD at form time rather than corrupting the verdict. The
+guard only fires for arms that carry progressive-freeze provenance, so the
+Tier-1 candidate (plain TG-LoRA) vs Tier-1 baseline path is unaffected.
 """
 
 from __future__ import annotations
@@ -61,6 +69,16 @@ def extract_best_valid_loss(path: str | Path) -> tuple[float, dict[str, Any]]:
     footer_step: Any = None
     min_step_loss: float | None = None
     min_step: Any = None
+    # Tier-2 §4 order-verdict arm identity from the footer's progressive-freeze
+    # block (c28e522): the requested ``policy`` (output_first / random_order) and
+    # ``surrogate_seed`` are the only machine-readable distinguisher between the
+    # candidate and surrogate arms once both freeze the same layers at full
+    # depth. Surfaced here so :func:`form_deposit` can reject a swapped
+    # --candidate/--surrogate before it silently inverts the verdict sign.
+    arm_policy: Any = None
+    arm_resolved_policy: Any = None
+    surrogate_seed: Any = None
+    freeze_mode: Any = None
     with path.open() as fh:
         for line in fh:
             line = line.strip()
@@ -82,13 +100,27 @@ def extract_best_valid_loss(path: str | Path) -> tuple[float, dict[str, Any]]:
                 ):
                     min_step_loss = float(loss_valid)
                     min_step = record.get("step")
-            elif rtype == "run_footer" and record.get("best_valid_loss") is not None:
+            elif rtype == "run_footer":
+                # Arm identity lives on the footer regardless of whether the run
+                # finished cleanly, so read it before the ``best_valid_loss`` null
+                # guard below (an interrupted Tier-2 run still has a verifiable
+                # arm). The block is emitted only when a progressive-freeze
+                # controller drove the run (train_tg_lora L4603).
+                pf_block = (record.get("tg_lora_summary") or {}).get(
+                    "progressive_freeze"
+                )
+                if isinstance(pf_block, dict):
+                    arm_policy = pf_block.get("policy")
+                    arm_resolved_policy = pf_block.get("resolved_policy")
+                    surrogate_seed = pf_block.get("surrogate_seed")
+                    freeze_mode = pf_block.get("mode")
                 # An interrupted run writes a footer with ``best_valid_loss: null``
                 # (best_loss never updated) — treat that as "no footer value" and
                 # fall through to the per-step minimum rather than crashing on
                 # ``float(None)``.
-                footer_value = float(record["best_valid_loss"])
-                footer_step = record.get("best_valid_step")
+                if record.get("best_valid_loss") is not None:
+                    footer_value = float(record["best_valid_loss"])
+                    footer_step = record.get("best_valid_step")
 
     if footer_value is not None:
         value, best_step, source_kind = footer_value, footer_step, "run_footer"
@@ -106,6 +138,10 @@ def extract_best_valid_loss(path: str | Path) -> tuple[float, dict[str, Any]]:
         "best_valid_step": best_step,
         "best_valid_loss_source": source_kind,
         "source": str(path),
+        "arm_policy": arm_policy,
+        "arm_resolved_policy": arm_resolved_policy,
+        "surrogate_seed": surrogate_seed,
+        "freeze_mode": freeze_mode,
     }
     return value, provenance
 
@@ -113,7 +149,46 @@ def extract_best_valid_loss(path: str | Path) -> tuple[float, dict[str, Any]]:
 def _arm_label(value: float, prov: dict[str, Any]) -> str:
     seed = prov.get("seed")
     step = prov.get("best_valid_step")
-    return f"{prov['run_id']}(seed={seed},best_valid={value},step={step})"
+    base = f"{prov['run_id']}(seed={seed},best_valid={value},step={step})"
+    policy = prov.get("arm_policy")
+    # Append the requested arm policy when the run carried progressive-freeze
+    # provenance, so the deposit's per-arm note states output_first vs
+    # random_order (the Tier-2 §4 order verdict's contrast) next to each float.
+    if policy is not None:
+        return f"{base},arm={policy}"
+    return base
+
+
+def _reject_swapped_arm(
+    slot: str, provenances: Sequence[dict[str, Any]], *, must_be_surrogate: bool
+) -> None:
+    """Fail loud when a Tier-2 arm is deposited into the wrong slot.
+
+    The Tier-2 §4 order verdict contrasts a real candidate arm
+    (``output_first`` — ``surrogate_seed is None``) against a random-order
+    surrogate (``surrogate_seed`` set). A candidate float deposited under
+    ``--surrogate`` (or vice versa) flips the bootstrap sign of
+    ``mean(surrogate) - mean(candidate)`` and silently turns SURPASSES into
+    UNDERSHOOTS. Only multi-layer progressive arms (``mode == "progressive"``)
+    carry the footer identity this checks; single-shot / no-progressive-freeze
+    arms (the Tier-1 candidate and the Tier-1 baseline surrogate) are
+    unverifiable and skipped.
+    """
+    for prov in provenances:
+        if prov.get("freeze_mode") != "progressive":
+            continue
+        is_surrogate = prov.get("surrogate_seed") is not None
+        if is_surrogate == must_be_surrogate:
+            continue
+        run_kind = "a random-order surrogate" if is_surrogate else "a real arm"
+        raise ValueError(
+            f"{prov.get('source', '<run>')}: this run is {run_kind} "
+            f"(policy={prov.get('arm_policy')!r}, "
+            f"surrogate_seed={prov.get('surrogate_seed')}) but was passed as "
+            f"--{slot}. Swapping the candidate and surrogate arms inverts the "
+            f"§4 verdict sign — re-check the --candidate / --surrogate "
+            f"assignment."
+        )
 
 
 def form_deposit(
@@ -154,17 +229,33 @@ def form_deposit(
 
     candidate_losses: list[float] = []
     candidate_labels: list[str] = []
+    candidate_provenances: list[dict[str, Any]] = []
     for p in candidate_paths:
         value, prov = extract_best_valid_loss(p)
         candidate_losses.append(value)
         candidate_labels.append(_arm_label(value, prov))
+        candidate_provenances.append(prov)
 
     surrogate_losses: list[float] = []
     surrogate_labels: list[str] = []
+    surrogate_provenances: list[dict[str, Any]] = []
     for p in surrogate_paths:
         value, prov = extract_best_valid_loss(p)
         surrogate_losses.append(value)
         surrogate_labels.append(_arm_label(value, prov))
+        surrogate_provenances.append(prov)
+
+    # Tier-2 §4 order-verdict arm guard. c28e522 gave each progressive-freeze
+    # run machine-readable arm identity in its footer (requested policy +
+    # surrogate seed); this consumes it so a SWAPPED --candidate/--surrogate
+    # — which silently inverts the verdict sign, the exact P0 hand-labeling
+    # hazard the float-extraction removed — fails LOUD at form time. Only a
+    # multi-layer progressive arm (mode=="progressive") carries verifiable
+    # identity: a Tier-1 candidate (plain TG-LoRA, no progressive-freeze
+    # footer) and a Tier-1 surrogate (full-backprop baseline) report no such
+    # block, so the guard has nothing to check and stays silent there.
+    _reject_swapped_arm("candidate", candidate_provenances, must_be_surrogate=False)
+    _reject_swapped_arm("surrogate", surrogate_provenances, must_be_surrogate=True)
 
     arms_note = (
         f"candidate arms: {', '.join(candidate_labels)} | "
@@ -181,6 +272,12 @@ def form_deposit(
         "surrogate_losses": surrogate_losses,
         "n_candidate": len(candidate_losses),
         "n_surrogate": len(surrogate_losses),
+        # Per-arm requested policy surfaced from each footer's progressive-freeze
+        # block (None where the run carried none — the Tier-1 candidate / the
+        # Tier-1 baseline). Machine-readable arm identity end-to-end: footer →
+        # deposit → (replay ignores unknown fields, so this is purely additive).
+        "candidate_arm_policies": [p.get("arm_policy") for p in candidate_provenances],
+        "surrogate_arm_policies": [p.get("arm_policy") for p in surrogate_provenances],
         # genuine target-scale recording — NOT proxy plumbing, synthetic, or a
         # negative control, so the §4 target-scale citation gate opens for it.
         "proxy_scale": False,

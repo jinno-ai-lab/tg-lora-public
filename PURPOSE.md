@@ -152,6 +152,14 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 
 ## 次の一手（next execution）
 
+> **【2026-07-03 追記・Tier-2 §4 order verdict の deposit-side arm-provenance 証明化（feat + test）— c28e522 の footer 契約を deposit→replay まで閉包】**
+> `c28e522` は Tier-2 candidate(`output_first`)/surrogate(`random_order`) 両腕の機械可読 arm 識別（`policy` + `surrogate_seed`）を **run footer に**永続化したが、消費者である deposit 形成経路（`form_freeze_validloss_deposit.py`）はそれを**読んでいなかった** — よって c28e522 が名指しした P0 ハザード「`--candidate`/`--surrogate` の取り違えが verdict の符号を暗黙に反転（SURPASSES↔UNDERSHOOTS）」は footer 層でしか閉じておらず、deposit 形成時にはまだ無防衛だった。本 iter でそれを**形成時 fail-loud** に閉包:
+> - **`extract_best_valid_loss`** が footer の `tg_lora_summary.progressive_freeze` block（`policy`/`resolved_policy`/`surrogate_seed`/`mode`）を provenance に浮上（block 無し=Tier-1 plain TG-LoRA / baseline は `None` で安全縮退）。
+> - **`form_deposit`** に `_reject_swapped_arm` を追加: `mode=="progressive"` の腕のみ検証し、candidate 構に surrogate（`surrogate_seed` 非 None）・surrogate 構に実腕（`surrogate_seed` None）が入ったら **`ValueError`** で停止。`mode=="progressive"` gating により Tier-1（PF footer 無し/single-shot）は**完全非影響**（TASK-0152 Tier-1 recipe そのまま動作・回帰 test で担保）。
+> - deposit JSON に加法的 `candidate_arm_policies` / `surrogate_arm_policies`（None entry は provenance 無し）を追加 — replay judge は `candidate_losses`/`surrogate_losses` 以外を無視するので**非破壊**（`test_deposit_replays_as_citable_target_scale` で回帰確認）。
+> - **test**: `tests/test_form_freeze_validloss_deposit.py` に 8 件追加（PF provenance 浮上 / None 縮退 / label の policy 表示 / 整列腕の受理 / surrogate→candidate 取違えの拒否 / 実腕→surrogate 取違えの拒否 / Tier-1 skip / single-shot skip）。canary `tests/test_cli_help_smoke.py` 37 passed/3 xfailed・replay 回帰 green。
+> - **位置づけ**: これは Tier-2 §4 order verdict の**もう一つの Category-A 前提**（verdict 自体は Category-C: 9B GPU + private `src.data`）。`0d590d2`(順序対比)→`c28e522`(footer 証明)→本 iter(deposit 証明化) と、 verdict が「config から再現可能」かつ「形成時 fail-loud」に向かって硬化中。残る真の研究課題は heterogeneous×generalize leg の実 9B 計測（>12GB・別 TDD）。
+
 > **【2026-06-29 追記・9B §4 verdict 取得 + 境界 closed-with-limitation の耐久化（test + docs）— 「pending 無期限放置」の最終解消】**
 > AI-Hub feedback（本 iter）。4 提案を本 mirror で検証した結果、実質的な新規作業は **(1) の成果の耐久化** のみ:
 > - **(1)「Tier-1 multi-seed seq256 campaign を走らせ citable_as_target_scale / citable_as_full_section4_verdict を実データで exercising せよ」+「seq1024 が恒久 OOM なら境界を正式 close せよ」** → **前 commit `e99e3c7`（milestone #10）で実施済み**: seed{42,43,44} candidate(TG-LoRA) vs baseline(full backprop) の 6 run を走らせ real best_valid_loss を deposit、verdict=**TIES**（CI[95%]=[−0.0205,+0.0018]・candidate mean 1.051 vs baseline mean 1.044・n=3/3 non-thin）。`citable_as_target_scale=True` / `citable_as_full_section4_verdict=False` を実データで exercising 済み。境界は **seq256 verdict 記録 + seq1024 完全判定の >12GB GPU への正式 defer** で closed-with-limitation。
