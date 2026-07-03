@@ -1,5 +1,6 @@
 import logging
 import os
+import pickle
 import re
 import shutil
 from dataclasses import dataclass
@@ -782,13 +783,105 @@ def save_training_state(state: TrainingState, path: Path) -> None:
     logger.info("Saved training state to %s (cycle %d)", path, state.cycle_state.cycle)
 
 
+class CheckpointIntegrityError(RuntimeError):
+    """A resume checkpoint exists on disk but is torn/truncated and won't load.
+
+    The load-side counterpart to the atomic-save guarantee. The atomic write
+    helpers (:func:`src.utils.atomic_save._atomic_torch_save` for single-file
+    artifacts and :func:`_atomic_publish_checkpoint_dir` for the staged LoRA
+    adapter dir) make it impossible for the TRAINING PROCESS to publish a torn
+    destination — a mid-commit fault leaves the destination either fully
+    reflecting the new state or still at its prior, loadable value, never torn.
+    So a checkpoint that trips this error could NOT have been torn by an
+    in-process fault; it reached the loader from a source the atomic guarantee
+    does not govern:
+
+      * a checkpoint written before the atomic helpers landed (commits
+        ``510b0d1`` for ``training_state.pt`` and ``620372c`` for the adapter
+        dir), still sitting in an old run dir,
+      * external corruption — disk-full during a non-atomic copy/backup of the
+        run dir, an NFS hiccup, a manual edit, or ``kill -9`` mid-``cp``.
+
+    Resume intentionally does NOT silently fall back to a fresh start: that
+    would hide the lost training progress (a GOAL.md honesty break). Instead
+    this fails loud, with the original loader error chained (``raise ... from
+    exc``), so the operator can delete or restore the corrupt file deliberately.
+    Silently restarting would defeat the resume guarantee the 12-site
+    persistence axis went to the trouble of capturing.
+    """
+
+
+# ``torch.load(weights_only=True)`` torn-file signatures, captured empirically
+# against torch 2.1.1 on truncated / empty / garbage inputs (pinned in
+# ``tests/test_checkpoint_integrity.py``):
+#   truncated zip archive -> RuntimeError("PytorchStreamReader failed reading
+#                                       zip archive: failed finding central
+#                                       directory")
+#   <8-byte / non-zip     -> RuntimeError("... not a ZIP archive")
+#   empty file            -> EOFError
+#   non-pickle garbage    -> pickle.UnpicklingError("Weights only load failed. ...")
+# ``RuntimeError`` is matched on MESSAGE (not type) so a genuine deserialization
+# bug that happens to raise ``RuntimeError`` is NOT masked — it re-raises
+# unchanged with its original traceback.
+_TORCH_ARCHIVE_CORRUPTION_MARKERS = (
+    "failed reading zip archive",
+    "not a ZIP archive",
+)
+
+
+def _is_torch_load_corruption(exc: BaseException) -> bool:
+    """True if *exc* is the signature ``torch.load`` raises on a torn / empty /
+    garbage file (as opposed to a real deserialization bug)."""
+    if isinstance(exc, (EOFError, pickle.UnpicklingError)):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc)
+        return any(marker in msg for marker in _TORCH_ARCHIVE_CORRUPTION_MARKERS)
+    return False
+
+
+def _is_safetensors_corruption(exc: BaseException) -> bool:
+    """True if *exc* is the signature ``safetensors.torch.load_file`` raises on
+    a torn / garbage ``.safetensors`` file. ``safetensors`` is a rigid format —
+    it either loads or the bytes are corrupt / truncated / version-mismatched —
+    so a ``SafetensorError`` on a file that exists is corruption, full stop."""
+    try:
+        from safetensors import SafetensorError
+    except ImportError:  # pragma: no cover - safetensors is a core dep; be robust
+        return type(exc).__module__.startswith("safetensors")
+    return isinstance(exc, SafetensorError)
+
+
 def load_training_state(path: Path) -> TrainingState:
     """Load training state from a previously saved checkpoint."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Training state not found: {path}")
 
-    blob = load_tensor_artifact(path)
+    try:
+        blob = load_tensor_artifact(path)
+    except (EOFError, pickle.UnpicklingError, RuntimeError) as exc:
+        # The load-side counterpart to the atomic-save guarantee. A torn /
+        # truncated / empty ``training_state.pt`` raises a corruption-signature
+        # error (see :func:`_is_torch_load_corruption`); diagnose it as
+        # :class:`CheckpointIntegrityError` so resume fails with an actionable
+        # message instead of an opaque ``EOFError``/``RuntimeError`` traceback.
+        # A ``RuntimeError`` that does NOT match the corruption signature is a
+        # genuine deserialization bug — re-raise it UNCHANGED so it is not masked.
+        if _is_torch_load_corruption(exc):
+            raise CheckpointIntegrityError(
+                f"Training-state checkpoint at {path} exists but is torn or "
+                f"corrupt and cannot be loaded for resume "
+                f"({type(exc).__name__}: {exc}). The atomic-save helper makes "
+                f"it impossible for the training process to WRITE a torn "
+                f"destination, so this file predates that helper (commit "
+                f"510b0d1) or was corrupted externally (disk-full during a "
+                f"non-atomic copy/backup, NFS, manual edit, kill -9 mid-"
+                f"transfer). Delete or restore it from a known-good checkpoint "
+                f"before resuming; resume intentionally does NOT silently "
+                f"restart from scratch, which would hide the lost progress."
+            ) from exc
+        raise
 
     # Restore CycleState — from_dict accepts both summary() and legacy checkpoint keys
     cycle_state = CycleState.from_dict(blob["cycle_state"])
@@ -927,3 +1020,41 @@ def load_training_state(path: Path) -> TrainingState:
         progressive_freeze_state=blob.get("progressive_freeze_state"),
         dynfreeze_state=dynfreeze_state,
     )
+
+
+def load_adapter_weights(adapter_dir: str | Path) -> dict:
+    """Load the LoRA adapter state dict from *adapter_dir* with load-side
+    integrity diagnosis.
+
+    Symmetric to :func:`save_checkpoint`'s atomic staging + directory publish:
+    a torn ``adapter_model.safetensors`` (a pre-fix checkpoint or external
+    corruption — the costlier artifact to lose to a torn write) is diagnosed as
+    :class:`CheckpointIntegrityError` rather than crashing resume with an opaque
+    ``SafetensorError``. ``safetensors`` is imported lazily so this module does
+    not hard-depend on it at import time (mirroring the lazy import the resume
+    path already used). Returns the state dict for
+    ``peft.set_peft_model_state_dict``.
+
+    Raises ``FileNotFoundError`` unchanged when the adapter file is absent (the
+    dir exists but the weights do not) — that is a missing-file condition, not
+    corruption, and is left to the caller to handle.
+    """
+    from safetensors.torch import load_file
+
+    adapter_path = Path(adapter_dir) / "adapter_model.safetensors"
+    try:
+        return load_file(adapter_path)
+    except FileNotFoundError:
+        raise
+    except Exception as exc:
+        if _is_safetensors_corruption(exc):
+            raise CheckpointIntegrityError(
+                f"LoRA adapter checkpoint at {adapter_path} exists but is torn "
+                f"or corrupt and cannot be loaded for resume "
+                f"({type(exc).__name__}: {exc}). The atomic staging + publish "
+                f"in save_checkpoint makes it impossible for the training "
+                f"process to WRITE a torn adapter (commit 620372c), so this "
+                f"file predates that helper or was corrupted externally. "
+                f"Restore it from a known-good checkpoint before resuming."
+            ) from exc
+        raise

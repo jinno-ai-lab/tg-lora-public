@@ -91,6 +91,7 @@ from src.training.trajectory_delta_artifact import (
 )
 from src.utils.checkpoint import (
     TrainingState,
+    load_adapter_weights,
     load_training_state,
     prune_trajectory_delta_artifacts_from_cfg,
     save_checkpoint,
@@ -1460,9 +1461,11 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
             adapter_dir = Path(ts.adapter_checkpoint_dir)
             if adapter_dir.exists():
                 from peft import set_peft_model_state_dict
-                from safetensors.torch import load_file
 
-                adapter_state = load_file(adapter_dir / "adapter_model.safetensors")
+                # Routed through load_adapter_weights so a torn adapter (pre-fix
+                # checkpoint / external corruption) is diagnosed as
+                # CheckpointIntegrityError instead of an opaque SafetensorError.
+                adapter_state = load_adapter_weights(adapter_dir)
                 set_peft_model_state_dict(model, adapter_state)
                 logger.info("Restored LoRA adapter weights from %s", adapter_dir)
             else:
