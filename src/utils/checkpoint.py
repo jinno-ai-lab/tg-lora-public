@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -30,24 +31,85 @@ def _sanitize_tensors(tensor_dict: dict[str, torch.Tensor], label: str) -> None:
         )
 
 
+def _atomic_publish_checkpoint_dir(tmp_dir: Path, save_dir: Path) -> None:
+    """Publish a fully-written *tmp_dir* as *save_dir* without ever leaving a
+    torn or half-swapped destination.
+
+    Each step is an atomic POSIX directory rename (``os.replace``). On the
+    overwrite path (e.g. ``best_model/``) the prior destination is moved aside
+    to a PID-suffixed backup BEFORE the new one is renamed in, so a fault
+    between the two renames leaves the destination either at its new (complete)
+    value or restored to its prior value — never empty, never a mix of old and
+    new files. The costly weight bytes are written fully into *tmp_dir* by
+    ``save_pretrained`` (→ ``safetensors.save_file``, which writes directly to
+    its target with no temp+rename) before this is ever called, so a torn
+    ``adapter_model.safetensors`` — the costliest artifact to lose to a torn
+    write, and one that sat OUTSIDE the ``_atomic_torch_save`` guarantee — can
+    never be what resume's ``load_file`` loads.
+    """
+    backup_dir = save_dir.parent / f"{save_dir.name}.old.{os.getpid()}"
+    swap_landed = False
+    try:
+        if save_dir.exists():
+            os.replace(save_dir, backup_dir)
+        os.replace(tmp_dir, save_dir)
+        swap_landed = True
+    finally:
+        if swap_landed:
+            if backup_dir.exists():
+                shutil.rmtree(backup_dir, ignore_errors=True)
+        else:
+            # Swap did not land: restore the prior destination if we moved it
+            # aside, so it reflects the last complete checkpoint rather than a
+            # gap, and remove the orphan temp holding the (never-published) new
+            # bytes so a crashed run does not litter the checkpoint directory.
+            if backup_dir.exists() and not save_dir.exists():
+                os.replace(backup_dir, save_dir)
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def save_checkpoint(model: torch.nn.Module, tokenizer, save_dir: Path) -> None:
-    """Save model and tokenizer to *save_dir* with readback verification.
+    """Save model and tokenizer to *save_dir* atomically, with readback verify.
 
     Used by both baseline and TG-LoRA trainers for periodic saves and
-    best-model persistence.
+    best-model persistence. ``model.save_pretrained`` ultimately calls
+    ``safetensors.save_file``, which writes directly to its destination with no
+    temp+rename — so a SIGINT (or OOM kill) during the multi-MB
+    ``adapter_model.safetensors`` dump would otherwise leave a torn weight file
+    that resume's ``load_file`` (``train_tg_lora.py``) would crash on or
+    silently restore as corrupt. To close that gap the full save is staged in a
+    PID-suffixed sibling temp dir and published by
+    :func:`_atomic_publish_checkpoint_dir` only once complete; a fault
+    mid-stage (``except BaseException`` catches ``KeyboardInterrupt``/
+    ``SystemExit`` too, mirroring ``_atomic_torch_save``) removes the orphan
+    temp so resume never sees a partial adapter.
     """
     save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(save_dir)
-    tokenizer.save_pretrained(save_dir)
+    tmp_dir = save_dir.parent / f"{save_dir.name}.tmp.{os.getpid()}"
+    # Clear an orphan temp left by a prior crashed run with the same PID before
+    # reusing it (the PID suffix makes cross-run reuse unlikely, not impossible).
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    tmp_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        model.save_pretrained(tmp_dir)
+        tokenizer.save_pretrained(tmp_dir)
 
-    # Readback verification
-    if not save_dir.is_dir():
-        logger.warning("Checkpoint directory missing after save: %s", save_dir)
-    else:
-        file_count = sum(1 for _ in save_dir.iterdir())
+        # Readback verification on the staged temp BEFORE it is published, so a
+        # save that silently produced nothing is surfaced (and, for an empty
+        # result, still published to preserve prior behavior).
+        file_count = sum(1 for _ in tmp_dir.iterdir())
         if file_count == 0:
-            logger.warning("Checkpoint directory is empty after save: %s", save_dir)
+            logger.warning("Checkpoint save produced an empty directory: %s", tmp_dir)
+    except BaseException:
+        # Never publish a partial checkpoint: the destination is untouched and
+        # the orphan temp is removed.
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+    _atomic_publish_checkpoint_dir(tmp_dir, save_dir)
 
 
 _CYCLE_DIR_RE = re.compile(r"^checkpoint-cycle-(\d+)$")

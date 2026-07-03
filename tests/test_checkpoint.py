@@ -16,6 +16,7 @@ from src.tg_lora.random_walk_controller import ControllerState
 from src.tg_lora.velocity import Velocity
 from src.utils.checkpoint import (
     TrainingState,
+    _atomic_publish_checkpoint_dir,
     _sanitize_tensors,
     load_training_state,
     save_checkpoint,
@@ -219,6 +220,142 @@ class TestSaveCheckpointExistingDir:
         save_checkpoint(model, tokenizer, save_dir)
         files = list(save_dir.iterdir())
         assert len(files) >= 1
+
+
+class TestAtomicCheckpointDirPublish:
+    """``save_checkpoint`` publishes the LoRA adapter dir atomically — a
+    mid-save fault never leaves a torn ``adapter_model.safetensors`` for resume.
+
+    Mirrors ``TestAtomicCheckpointSave`` (the ``torch.save`` sites) and
+    ``test_atomic_save.py`` (SIGINT/SystemExit at the helper).
+    ``save_pretrained`` → ``safetensors.save_file`` writes the costly weight
+    bytes directly to its target with no temp+rename, so ``save_checkpoint``
+    stages the full save in a PID-suffixed sibling temp dir and swaps it into
+    place only once complete. The largest artifact to lose to a torn write (the
+    LoRA weights) thus gets the same crash-atomicity guarantee the
+    ``training_state.pt`` writers already have — closing the gap that sat
+    outside the ``_atomic_torch_save`` axis.
+    """
+
+    @staticmethod
+    def _populated_tmp(tmp_path, name="ckpt", files=("adapter_model.safetensors",)):
+        tmp = tmp_path / f"{name}.tmp.{os.getpid()}"
+        tmp.mkdir(parents=True)
+        for f in files:
+            (tmp / f).write_bytes(b"\x00" * 8)
+        return tmp
+
+    def test_successful_publish_moves_complete_dir_no_temp(self, tmp_path):
+        save_dir = tmp_path / "ckpt"
+        tmp = self._populated_tmp(tmp_path)
+        _atomic_publish_checkpoint_dir(tmp, save_dir)
+
+        assert save_dir.is_dir()
+        assert (save_dir / "adapter_model.safetensors").exists()
+        # the temp was renamed into place, not copied, so it is gone
+        assert not tmp.exists()
+        assert not list(tmp_path.glob("ckpt.tmp.*"))
+
+    def test_fresh_publish_fault_creates_no_destination(self, tmp_path, monkeypatch):
+        def _boom(_src, _dst):
+            raise OSError("simulated mid-swap fault")
+
+        monkeypatch.setattr(os, "replace", _boom)
+        save_dir = tmp_path / "fresh"
+        tmp = self._populated_tmp(tmp_path, name="fresh")
+
+        with pytest.raises(OSError):
+            _atomic_publish_checkpoint_dir(tmp, save_dir)
+
+        # nothing published; the orphan temp holding the new bytes was removed
+        assert not save_dir.exists()
+        assert not list(tmp_path.glob("fresh.tmp.*"))
+
+    def test_overwrite_fault_restores_prior_checkpoint(self, tmp_path, monkeypatch):
+        # Prior complete checkpoint with a distinct (v1) weight file in place.
+        save_dir = tmp_path / "best_model"
+        save_dir.mkdir()
+        (save_dir / "adapter_model.safetensors").write_bytes(b"V1-WEIGHTS")
+        tmp = self._populated_tmp(tmp_path, name="best_model")
+
+        calls = {"n": 0}
+        orig_replace = os.replace
+
+        def _fault_publish_only(src, dst):
+            calls["n"] += 1
+            # Fault ONLY the new-weights publish (tmp_dir -> save_dir): the
+            # prior-aside move (save_dir -> backup) and the recovery restore
+            # (backup -> save_dir) must stay functional so we observe that the
+            # prior checkpoint is restored — exactly what would otherwise be lost
+            # to a bare save_pretrained truncating the destination mid-dump.
+            if Path(src) == tmp:
+                raise OSError("simulated mid-swap fault")
+            return orig_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", _fault_publish_only)
+
+        with pytest.raises(OSError):
+            _atomic_publish_checkpoint_dir(tmp, save_dir)
+
+        # The prior, still-loadable checkpoint is restored — NOT torn, NOT empty,
+        # NOT the half-written new weights. This is the load-bearing assertion.
+        assert (save_dir / "adapter_model.safetensors").read_bytes() == b"V1-WEIGHTS"
+        # orphan temp and the backup are both cleaned
+        assert not list(tmp_path.glob("best_model.tmp.*"))
+        assert not list(tmp_path.glob("best_model.old.*"))
+
+    def test_successful_overwrite_replaces_prior_and_cleans_backup(self, tmp_path):
+        save_dir = tmp_path / "best_model"
+        save_dir.mkdir()
+        (save_dir / "adapter_model.safetensors").write_bytes(b"OLD")
+        tmp = self._populated_tmp(tmp_path, name="best_model")
+
+        _atomic_publish_checkpoint_dir(tmp, save_dir)
+
+        # new weights land, prior backup removed
+        assert (save_dir / "adapter_model.safetensors").read_bytes() == b"\x00" * 8
+        assert not list(tmp_path.glob("best_model.old.*"))
+
+
+class TestSaveCheckpointAtomicEndToEnd:
+    """``save_checkpoint`` end-to-end: an interrupt mid-``save_pretrained`` never
+    publishes a destination and never leaves an orphan temp."""
+
+    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit, OSError])
+    def test_mid_save_interrupt_publishes_nothing_and_cleans_temp(
+        self, tmp_path, monkeypatch, interrupt
+    ):
+        save_dir = tmp_path / "cycle_ckpt"
+
+        def _interrupt_mid_save(d):
+            # Write a partial file then abort — mimics safetensors truncating
+            # adapter_model.safetensors when a SIGINT lands mid-dump.
+            Path(d).mkdir(parents=True, exist_ok=True)
+            (Path(d) / "adapter_model.safetensors").write_bytes(b"\x80PARTIAL")
+            raise interrupt("simulated interrupt mid-save")
+
+        model = MagicMock()
+        model.save_pretrained = _interrupt_mid_save
+        tokenizer = MagicMock()
+        tokenizer.save_pretrained = MagicMock()
+
+        with pytest.raises(interrupt):
+            save_checkpoint(model, tokenizer, save_dir)
+
+        # No destination published, and the orphan temp (holding the torn bytes)
+        # is removed so resume never sees a corrupt adapter_model.safetensors.
+        assert not save_dir.exists()
+        assert not list(tmp_path.glob("cycle_ckpt.tmp.*"))
+
+    def test_successful_save_publishes_dir_and_leaves_no_temp(self, tmp_path):
+        model, tokenizer = _mock_model_and_tokenizer(tmp_path, file_count=2)
+        save_dir = tmp_path / "ok_ckpt"
+
+        save_checkpoint(model, tokenizer, save_dir)
+
+        assert save_dir.is_dir()
+        assert len(list(save_dir.iterdir())) >= 1
+        assert not list(tmp_path.glob("ok_ckpt.tmp.*"))
 
 
 class TestTrainingStateRoundtrip:
