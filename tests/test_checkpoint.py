@@ -1,10 +1,12 @@
 """Tests for save_checkpoint, save/load_training_state, _sanitize_tensors."""
 
 import logging
+import os
 from collections import deque
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from src.tg_lora.cycle_state import CycleState
@@ -743,3 +745,96 @@ class TestSanitizeTensors:
         with caplog.at_level(logging.WARNING, logger="src.utils.checkpoint"):
             _sanitize_tensors(d, "my_label")
         assert any("my_label" in r.message for r in caplog.records)
+
+
+def _minimal_training_state() -> TrainingState:
+    """A real, loadable TrainingState with only the required fields populated.
+
+    The resume-state round-trip tests use the comprehensive fixture; the
+    atomicity tests below only need an object ``save_training_state`` will
+    actually serialize and reload, so a minimal state is enough.
+    """
+    return TrainingState(
+        cycle_state=CycleState(cycle=2, full_backward_passes=10, best_loss=2.0),
+        controller_state=ControllerState(
+            K=3,
+            N=5,
+            alpha=0.3,
+            beta=0.8,
+            lr=5e-4,
+            active_layer_strategy="last_25_percent_plus_random_2",
+            relative_update_cap=0.005,
+        ),
+        velocity=Velocity(max_history=10),
+        delta_tracker=DeltaTracker(max_history=10),
+    )
+
+
+class TestAtomicCheckpointSave:
+    """training_state.pt is written atomically — a mid-commit fault never
+    leaves a torn destination.
+
+    ``os.replace`` is the sole publish point (the temp file is the only thing
+    that ever holds the in-progress bytes). Monkeypatching ``os.replace`` to
+    raise simulates a fault exactly at the commit boundary and locks the
+    corruption-prevention contract at the behavior level:
+
+    - a fresh save that faults publishes NO destination file,
+    - a faulting overwrite leaves the prior, still-loadable checkpoint intact,
+    - the orphaned temp is cleaned up either way.
+
+    A regression to a bare ``torch.save(blob, path)`` would truncate the
+    destination during serialization; the prior-checkpoint-intact check below
+    would then fail (the prior file would be torn), so this test guards the
+    atomic-write structure against that regression.
+    """
+
+    def test_successful_save_publishes_and_leaves_no_temp(self, tmp_path):
+        state = _minimal_training_state()
+        path = tmp_path / "state.pt"
+        save_training_state(state, path)
+
+        assert path.exists()
+        # content round-trips (the published file is valid, not torn)
+        assert load_training_state(path).cycle_state.cycle == 2
+        # no PID-suffixed temp litters the directory on success
+        assert not list(tmp_path.glob("state.pt.tmp.*"))
+
+    def test_fresh_save_fault_creates_no_destination(self, tmp_path, monkeypatch):
+        def _boom(src, dst):
+            raise OSError("simulated mid-commit fault")
+
+        monkeypatch.setattr(os, "replace", _boom)
+
+        with pytest.raises(OSError):
+            save_training_state(_minimal_training_state(), tmp_path / "state.pt")
+
+        # no partial destination was published...
+        assert not (tmp_path / "state.pt").exists()
+        # ...and the orphaned temp was cleaned up
+        assert not list(tmp_path.glob("state.pt.tmp.*"))
+
+    def test_prior_checkpoint_survives_faulting_overwrite(self, tmp_path, monkeypatch):
+        # Save a valid v1 checkpoint (real os.replace), then fault at the commit
+        # boundary while attempting to overwrite it with a different v2 state.
+        path = tmp_path / "state.pt"
+        save_training_state(_minimal_training_state(), path)  # cycle == 2
+        assert path.exists()
+
+        def _boom(src, dst):
+            raise OSError("simulated mid-commit fault")
+
+        monkeypatch.setattr(os, "replace", _boom)
+
+        v2 = _minimal_training_state()
+        v2.cycle_state = CycleState(cycle=9, full_backward_passes=99, best_loss=0.5)
+        with pytest.raises(OSError):
+            save_training_state(v2, path)
+
+        # The prior, still-loadable checkpoint is intact with the OLD value — the
+        # torn-write (cycle 9) state was never published. A regressed bare
+        # torch.save(path) would have truncated it and this would reload as cycle 9
+        # or fail to load entirely.
+        assert path.exists()
+        assert load_training_state(path).cycle_state.cycle == 2
+        assert not list(tmp_path.glob("state.pt.tmp.*"))
