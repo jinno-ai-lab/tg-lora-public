@@ -19,6 +19,7 @@ from typing import Any
 # repo root importable so ``src.*`` resolves without a PYTHONPATH wrapper.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.utils.atomic_save import _atomic_torch_save
 from src.utils.tensor_artifact import load_tensor_artifact
 
 _FAULT_PATTERNS = {
@@ -287,7 +288,10 @@ def sanitize_checkpoint(
                         )
                         non_finite.append(key)
 
-            torch.save(state, dst_path / "training_state.pt")
+            # Route through the atomic helper so an OOM kill / SIGINT mid-dump
+            # never leaves a torn ``training_state.pt`` — the resume-critical
+            # artifact this sanitize step exists to keep loadable.
+            _atomic_torch_save(state, dst_path / "training_state.pt")
             if non_finite:
                 results.append(
                     RecoveryResult(

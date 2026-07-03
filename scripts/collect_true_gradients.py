@@ -12,6 +12,7 @@ from src.data.build_seed_dataset import load_dataset, LoraDataset
 from src.training.trainer_loop import create_optimizer, forward_backward, optimizer_step
 from src.training.config_schema import load_validate_and_build_config
 from src.training.trajectory_delta_artifact import load_trajectory_delta_artifact
+from src.utils.atomic_save import _atomic_torch_save
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("collect-gradients")
@@ -130,7 +131,11 @@ def main():
                     update_dict[name] = (param.data - W_backup[name].to(param.device)).detach().cpu().clone()
             
             target_path = output_dir / f"gradient_step_{cycle+1:06d}.pt"
-            torch.save({
+            # Atomic so an OOM kill / SIGINT mid-dump never leaves a torn
+            # ``gradient_step_*.pt`` — these effective-update artifacts are costly
+            # to recompute (a full forward/backward cycle each) and feed the
+            # trajectory-delta evaluation downstream.
+            _atomic_torch_save({
                 "step": cycle + 1,
                 "loss": loss_val,
                 "gradients": update_dict, # Keep key "gradients" for compatibility with evaluation script
