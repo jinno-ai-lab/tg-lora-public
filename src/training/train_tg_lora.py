@@ -4,7 +4,7 @@ import math
 import time
 from collections.abc import Sized
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import torch
 import numpy as np
@@ -927,6 +927,53 @@ def _is_cuda_error(exc: RuntimeError) -> bool:
     return "cuda" in msg or "device-side" in msg or "mps" in msg
 
 
+def _restore_adapter_weights(
+    model: torch.nn.Module,
+    adapter_checkpoint_dir: str | Path,
+    *,
+    apply_state: Callable[..., None] | None = None,
+) -> None:
+    """Resume-path load + apply of the LoRA adapter, integrity-checked.
+
+    The resume-side sibling of :func:`src.utils.checkpoint.save_checkpoint`'s
+    atomic staging + directory publish. :func:`load_adapter_weights` diagnoses a
+    torn / truncated / garbage ``adapter_model.safetensors`` — a pre-fix
+    checkpoint or external corruption, the costlier artifact to lose to a torn
+    write — as :class:`src.utils.checkpoint.CheckpointIntegrityError`. It runs
+    BEFORE ``apply_state`` mutates the model, so a torn adapter raises loud and
+    the model is left UNTOUCHED (never half-applied); the operator can restore a
+    known-good checkpoint deliberately, because resume intentionally does NOT
+    silently restart — that would hide the lost progress (a GOAL.md honesty
+    break). A missing adapter dir is a missing-file condition, not corruption:
+    warn and leave the weights fresh (the pre-existing contract).
+
+    ``apply_state`` is injectable (defaults to
+    ``peft.set_peft_model_state_dict``) so the no-mutation-on-torn-adapter
+    invariant is unit-testable on the public mirror, whose test environment
+    lacks the ``peft`` dependency. Extracted from the inlined resume block so the
+    load-side integrity gate — which sat anonymously inside a multi-thousand-line
+    loop — is a named, importable seam pinned by
+    ``tests/test_resume_adapter_integrity.py`` instead of an untested inline
+    statement-ordering coincidence.
+    """
+    adapter_dir = Path(adapter_checkpoint_dir)
+    if not adapter_dir.exists():
+        logger.warning(
+            "Adapter checkpoint dir not found: %s — LoRA weights are fresh",
+            adapter_dir,
+        )
+        return
+    if apply_state is None:
+        from peft import set_peft_model_state_dict
+
+        apply_state = set_peft_model_state_dict
+    # Integrity gate: load (torn → CheckpointIntegrityError) BEFORE apply, so a
+    # torn adapter never partially mutates the model.
+    adapter_state = load_adapter_weights(adapter_dir)
+    apply_state(model, adapter_state)
+    logger.info("Restored LoRA adapter weights from %s", adapter_dir)
+
+
 def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     set_seed(cfg.experiment.seed)
 
@@ -1458,21 +1505,10 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
         if train_batch_position > 0:
             batch_iter.advance(train_batch_position)
         if ts.adapter_checkpoint_dir is not None:
-            adapter_dir = Path(ts.adapter_checkpoint_dir)
-            if adapter_dir.exists():
-                from peft import set_peft_model_state_dict
-
-                # Routed through load_adapter_weights so a torn adapter (pre-fix
-                # checkpoint / external corruption) is diagnosed as
-                # CheckpointIntegrityError instead of an opaque SafetensorError.
-                adapter_state = load_adapter_weights(adapter_dir)
-                set_peft_model_state_dict(model, adapter_state)
-                logger.info("Restored LoRA adapter weights from %s", adapter_dir)
-            else:
-                logger.warning(
-                    "Adapter checkpoint dir not found: %s — LoRA weights are fresh",
-                    adapter_dir,
-                )
+            # Integrity-checked load + apply: a torn adapter_model.safetensors is
+            # diagnosed as CheckpointIntegrityError BEFORE the apply mutates the
+            # model, so a torn adapter can never leave the model half-applied.
+            _restore_adapter_weights(model, ts.adapter_checkpoint_dir)
         logger.info(
             "Resumed training from %s (cycle %d, batch_position=%d, acceptance_rate=%.1f%%)",
             resume_path,

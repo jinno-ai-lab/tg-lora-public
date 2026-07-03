@@ -154,3 +154,158 @@ def test_no_bare_torch_save_in_src() -> None:
         "prefix-feature cache) the resume-state axis exists to prevent. "
         "Offending sites:\n" + "\n".join(f"  {f}:{ln}" for f, ln in off_src)
     )
+
+
+def _call_name(func: ast.expr) -> str | None:
+    """Reduce a Call's func node to a bare name (``load_training_state`` or
+    ``model.foo`` → ``foo``), or ``None`` for non-name call targets."""
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def test_resume_path_wires_integrity_checked_loaders() -> None:
+    """The (shifted) ``train_tg_lora`` resume seam must route both checkpoint
+    loads through the integrity-checked helpers, load-before-apply, unwrapped.
+
+    Sibling philosophy to :func:`test_no_bare_torch_save_in_src`: the load-side
+    integrity helpers (:func:`~src.utils.checkpoint.load_training_state` and the
+    adapter restore via :func:`~src.training.train_tg_lora._restore_adapter_weights`)
+    only protect resume if the resume seam actually CALLS them, in order, and
+    does NOT swallow the :class:`~src.utils.checkpoint.CheckpointIntegrityError`
+    they raise on a torn checkpoint. The resume block physically moved when
+    ``train_tg_lora`` shifted out of ``scripts/`` into ``src/training/`` and
+    again as the file grew (the steering feedback flagged the line-number drift),
+    so a future edit could silently reroute resume around the helpers —
+    re-introducing the opaque ``EOFError`` / ``SafetensorError`` crash on a torn
+    checkpoint — or wrap them in a broad ``except`` that swallows the fail-loud
+    guarantee into a silent restart (a GOAL.md honesty break: it hides lost
+    progress). This AST guard pins the wiring against that drift:
+
+      * the ``_restore_adapter_weights`` helper calls ``load_adapter_weights``
+        (the integrity gate) BEFORE it applies — so a torn adapter raises with
+        zero model mutation;
+      * the ``if resume_path is not None:`` seam calls BOTH ``load_training_state``
+        and ``_restore_adapter_weights``; and
+      * neither critical load is enclosed by any ``try``/``except`` — an outer
+        try around the whole seam OR an inner try around just the one load call
+        could swallow a torn-checkpoint ``CheckpointIntegrityError`` into a
+        silent restart.
+
+    AST-parse of the source (not an import): ``src.training.train_tg_lora`` is
+    un-importable on the public mirror (private ``src.data`` + absent ``peft``),
+    so the guard mirrors :func:`test_no_bare_torch_save_in_src`'s source-parse
+    approach.
+    """
+    trainer = TARGET / "training" / "train_tg_lora.py"
+    assert trainer.is_file(), f"trainer entrypoint missing at {trainer}"
+    tree = ast.parse(trainer.read_text(encoding="utf-8"), filename=str(trainer))
+
+    # Parent map so the no-swallowing check can climb ancestors of the seam.
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            child.tlsparent = parent  # type: ignore[attr-defined]
+
+    module_funcs = {
+        n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)
+    }
+    assert "train_tg_lora" in module_funcs, "train_tg_lora entrypoint missing"
+    assert "_restore_adapter_weights" in module_funcs, (
+        "_restore_adapter_weights helper missing — the resume adapter-restore "
+        "seam (load_adapter_weights before apply) must be a named, importable "
+        "helper pinned by tests/test_resume_adapter_integrity.py, not an "
+        "untested inline statement ordering inside the loop"
+    )
+
+    # (1) The helper itself must load BEFORE it applies.
+    helper = module_funcs["_restore_adapter_weights"]
+    helper_calls = [
+        (_call_name(c.func), c.lineno)
+        for c in ast.walk(helper)
+        if isinstance(c, ast.Call)
+    ]
+    load_linenos = [ln for name, ln in helper_calls if name == "load_adapter_weights"]
+    apply_linenos = [
+        ln
+        for name, ln in helper_calls
+        if name in ("apply_state", "set_peft_model_state_dict")
+    ]
+    assert load_linenos and apply_linenos, (
+        "_restore_adapter_weights must call both load_adapter_weights (the "
+        "integrity gate) and apply_state (the model mutation)"
+    )
+    assert min(load_linenos) < min(apply_linenos), (
+        "_restore_adapter_weights must call load_adapter_weights BEFORE "
+        "apply_state — reordering lets a torn adapter_model.safetensors "
+        "half-apply the model instead of raising CheckpointIntegrityError"
+    )
+
+    # (2) Locate the resume seam inside train_tg_lora (if resume_path is not None:).
+    fn = module_funcs["train_tg_lora"]
+    resume_if: ast.If | None = None
+    for node in ast.walk(fn):
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "resume_path"
+            and node.test.ops
+            and isinstance(node.test.ops[0], ast.IsNot)
+            and node.test.comparators
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and node.test.comparators[0].value is None
+        ):
+            resume_if = node
+            break
+    assert resume_if is not None, (
+        "resume seam (if resume_path is not None:) missing from train_tg_lora — "
+        "the fault/periodic resume path must exist"
+    )
+
+    seam_calls = {
+        _call_name(c.func)
+        for c in ast.walk(resume_if)
+        if isinstance(c, ast.Call)
+    }
+    assert "load_training_state" in seam_calls, (
+        "resume seam must route training_state.pt through load_training_state "
+        "(the torn-checkpoint → CheckpointIntegrityError gate), not a raw "
+        "torch.load"
+    )
+    assert "_restore_adapter_weights" in seam_calls, (
+        "resume seam must restore the adapter via _restore_adapter_weights (the "
+        "load-before-apply integrity gate), not an inline safetensors path"
+    )
+
+    # (3) Neither critical load may be enclosed by a try/except — an outer try
+    #     around the whole seam OR an inner try around just the one load call
+    #     could swallow a torn-checkpoint CheckpointIntegrityError into a silent
+    #     restart (the GOAL.md honesty break). Climb EACH critical call's
+    #     ancestors to the function root; any Try on the path is a swallower.
+    critical_calls = [
+        c
+        for c in ast.walk(resume_if)
+        if isinstance(c, ast.Call)
+        and _call_name(c.func) in ("load_training_state", "_restore_adapter_weights")
+    ]
+    assert critical_calls, (
+        "resume seam must contain the load_training_state and "
+        "_restore_adapter_weights calls checked above"
+    )
+    for call_node in critical_calls:
+        swallower: ast.AST | None = None
+        cur: ast.AST | None = getattr(call_node, "tlsparent", None)
+        while cur is not None and cur is not fn:
+            if isinstance(cur, ast.Try):
+                swallower = cur
+                break
+            cur = getattr(cur, "tlsparent", None)
+        assert swallower is None, (
+            f"resume critical load {_call_name(call_node.func)}(...) at line "
+            f"{call_node.lineno} must NOT be enclosed in a try/except — a "
+            "handler there could swallow a torn-checkpoint "
+            "CheckpointIntegrityError into a silent restart, hiding lost "
+            f"progress. Found enclosing try at line {swallower.lineno}"
+        )
