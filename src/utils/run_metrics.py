@@ -523,7 +523,7 @@ class RunMetrics:
         side of the honesty contract: the analyzer's
         ``extract_loss_and_time(full_eval_only=True)`` /
         ``honesty_contract_status`` flip DORMANT→ACTIVE the moment such a record
-        is present, so L\* is taken from the full-eval loss instead of the
+        is present, so L* is taken from the full-eval loss instead of the
         contaminated pilot proxy (TASK-0141 last mile).
 
         Co-locate this call with ``cycle_state.record_full_eval(full_loss)`` at

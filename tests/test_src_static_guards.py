@@ -29,6 +29,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Sequence
 
 import pytest
 
@@ -36,20 +37,34 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 TARGET = REPO_ROOT / "src"
 
 
-def _run_ruff(target: Path) -> subprocess.CompletedProcess[str]:
+def _run_ruff(
+    target: Path, select: Sequence[str] = ()
+) -> subprocess.CompletedProcess[str]:
     ruff = shutil.which("ruff")
-    return subprocess.run(
-        [ruff, "check", str(target)], capture_output=True, text=True, check=False
-    )
+    cmd: list[str] = [ruff, "check"]
+    if select:
+        # ruff's default rule set is E4/E7/E9/F — it deliberately EXCLUDES the
+        # pycodestyle W rules. ``select`` opts a specific rule back in so a guard
+        # can police a defect class the default-clean check is blind to (W605).
+        cmd += ["--select", ",".join(select)]
+    cmd.append(str(target))
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
 
 def test_src_tree_is_ruff_clean() -> None:
-    """``ruff check src/`` must report zero findings across all rules.
+    """``ruff check src/`` must report zero findings across the default rules.
 
     Guards the ``src/`` lint-clean invariant: a non-zero count regresses it
     (re-introduced dead local, unused import, ambiguous name) and makes the
     audit's standing claim false. See the module docstring for the cleanup this
     locks in and the deliberate ``src/``-only scope.
+
+    Scope note: this runs ruff's *default* rule set (E4/E7/E9/F), which excludes
+    the pycodestyle ``W`` rules — so it does NOT catch invalid escape sequences
+    (W605). Those are policed separately by
+    :func:`test_src_tree_has_no_invalid_escape_sequences`, because a ``\\*`` in a
+    docstring passes this default check while Python emits a ``DeprecationWarning``
+    on every import (a ``SyntaxWarning`` from 3.12).
     """
     if shutil.which("ruff") is None:
         pytest.skip("ruff not on PATH; cannot enforce the cleanliness guard")
@@ -57,7 +72,32 @@ def test_src_tree_is_ruff_clean() -> None:
     assert TARGET.is_dir(), f"src/ tree not found at {TARGET}"
     proc = _run_ruff(TARGET)
     assert proc.returncode == 0, (
-        "src/ must be ruff-clean (zero findings across all rules) — a non-zero "
-        "count regresses the src/ lint-clean invariant and makes the audit's "
-        "standing claim false. ruff output:\n" + (proc.stdout + proc.stderr).strip()
+        "src/ must be ruff-clean across the default rule set (E4/E7/E9/F) — a "
+        "non-zero count regresses the src/ lint-clean invariant and makes the "
+        "audit's standing claim false. ruff output:\n" + (proc.stdout + proc.stderr).strip()
+    )
+
+
+def test_src_tree_has_no_invalid_escape_sequences() -> None:
+    """No ``src/`` file may contain an invalid escape sequence (ruff W605).
+
+    Companion to :func:`test_src_tree_is_ruff_clean`. That test's default rule
+    set excludes W605, so a ``\\*`` / ``\\d`` / ``\\m`` in a docstring passes it
+    silently while Python emits a ``DeprecationWarning`` on every import (a hard
+    ``SyntaxWarning`` from 3.12). One such site did exactly that for months — a
+    ``L\\*`` in ``run_metrics.record_full_eval_loss``'s docstring rendered as the
+    literal ``L\\*`` (not the intended ``L*``) and fired the warning on every
+    test run, all while the default-clean guard stayed green. This test selects
+    W605 explicitly to close that blind spot and keep the escape-sequence class
+    out of the imported core for good.
+    """
+    if shutil.which("ruff") is None:
+        pytest.skip("ruff not on PATH; cannot enforce the escape-sequence guard")
+
+    assert TARGET.is_dir(), f"src/ tree not found at {TARGET}"
+    proc = _run_ruff(TARGET, select=("W605",))
+    assert proc.returncode == 0, (
+        "src/ must contain no invalid escape sequences (W605) — each one is a "
+        "DeprecationWarning now and a SyntaxWarning from Python 3.12. "
+        "ruff output:\n" + (proc.stdout + proc.stderr).strip()
     )
