@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from src.tg_lora.activation_cache import _get_decoder_layers
+from src.utils.atomic_save import _atomic_torch_save
 from src.utils.tensor_artifact import load_tensor_artifact
 
 _PREFIX_FEATURE_CACHE_FORMAT_VERSION = 1
@@ -254,7 +255,7 @@ def save_prefix_feature_dataset(
         "split_layer_idx": split_layer_idx,
         "position_ids": position_ids,
     }
-    torch.save(blob, path)
+    _atomic_torch_save(blob, path)
 
 
 def merge_prefix_feature_cache_shards(
@@ -306,7 +307,7 @@ def merge_prefix_feature_cache_shards(
         "split_layer_idx": split_layer_idx,
         "position_ids": torch.cat(position_ids, dim=0) if has_position_ids else None,
     }
-    torch.save(merged_blob, path)
+    _atomic_torch_save(merged_blob, path)
 
 
 def load_prefix_feature_dataset(

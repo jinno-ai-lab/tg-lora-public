@@ -5,6 +5,8 @@ format version mismatch, inconsistent split_layer_idx, mixed position_ids presen
 """
 
 
+import os
+
 import pytest
 import torch
 
@@ -12,6 +14,7 @@ from src.tg_lora.prefix_feature_cache import (
     PrefixFeatureDataset, PrefixFeatureExample,
     compute_prefix_feature_shard_ranges, merge_prefix_feature_cache_shards,
     save_prefix_feature_dataset)
+from src.utils.tensor_artifact import load_tensor_artifact
 
 
 def _make_dataset(n: int, split_layer_idx: int = 2, with_position_ids: bool = True):
@@ -214,3 +217,71 @@ class TestMergeShards:
         assert blob["attention_mask"].shape[0] == 6
         assert blob["position_ids"].shape[0] == 6
         assert blob["metadata"]["merged"] is True
+
+
+class TestAtomicPrefixFeatureCacheSave:
+    """prefix-feature caches (single-shard + merged) are written atomically — a
+    mid-commit fault never leaves a torn destination.
+
+    Mirrors ``TestAtomicCheckpointSave`` (test_checkpoint.py). These caches are
+    multi-hundred-MB-to-GB and expensive to rebuild; a torn write would either
+    break the next ``load_prefix_feature_dataset`` outright or silently corrupt
+    the cached prefix features, forcing a full recompute. ``os.replace`` is the
+    sole publish point the atomic helper uses, so monkeypatching it to raise
+    simulates a fault at the commit boundary. The merged-cache case covers the
+    second save site (``merge_prefix_feature_cache_shards``), the largest of the
+    three routed through the helper.
+    """
+
+    def test_fresh_save_fault_creates_no_destination(self, tmp_path, monkeypatch):
+        def _boom(src, dst):
+            raise OSError("simulated mid-commit fault")
+
+        monkeypatch.setattr(os, "replace", _boom)
+
+        with pytest.raises(OSError):
+            save_prefix_feature_dataset(
+                _make_dataset(2), tmp_path / "cache.pt", metadata={"id": "v1"}
+            )
+
+        assert not (tmp_path / "cache.pt").exists()
+        assert not list(tmp_path.glob("cache.pt.tmp.*"))
+
+    def test_prior_cache_survives_faulting_overwrite(self, tmp_path, monkeypatch):
+        path = tmp_path / "cache.pt"
+        save_prefix_feature_dataset(_make_dataset(2), path, metadata={"id": "v1"})
+        assert path.exists()
+
+        def _boom(src, dst):
+            raise OSError("simulated mid-commit fault")
+
+        monkeypatch.setattr(os, "replace", _boom)
+
+        with pytest.raises(OSError):
+            save_prefix_feature_dataset(_make_dataset(3), path, metadata={"id": "v2"})
+
+        # prior cache intact + loadable; the torn v2 was never published
+        reloaded = load_tensor_artifact(path)
+        assert reloaded["metadata"] == {"id": "v1"}
+        assert not list(tmp_path.glob("cache.pt.tmp.*"))
+
+    def test_merged_cache_fresh_save_fault_creates_no_destination(
+        self, tmp_path, monkeypatch
+    ):
+        # Save two shards first (real os.replace), then fault at the merge commit.
+        p1 = tmp_path / "s1.pt"
+        p2 = tmp_path / "s2.pt"
+        save_prefix_feature_dataset(_make_dataset(2), p1, metadata={"id": "s1"})
+        save_prefix_feature_dataset(_make_dataset(2), p2, metadata={"id": "s2"})
+
+        def _boom(src, dst):
+            raise OSError("simulated mid-commit fault")
+
+        monkeypatch.setattr(os, "replace", _boom)
+
+        merged = tmp_path / "merged.pt"
+        with pytest.raises(OSError):
+            merge_prefix_feature_cache_shards([p1, p2], merged, metadata={"id": "m"})
+
+        assert not merged.exists()
+        assert not list(tmp_path.glob("merged.pt.tmp.*"))

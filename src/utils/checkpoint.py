@@ -1,5 +1,4 @@
 import logging
-import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -12,45 +11,10 @@ from src.tg_lora.delta_tracker import DeltaTracker
 from src.tg_lora.dynamic_freeze import DynFreezeState
 from src.tg_lora.random_walk_controller import ControllerState
 from src.tg_lora.velocity import Velocity
+from src.utils.atomic_save import _atomic_torch_save
 from src.utils.tensor_artifact import load_tensor_artifact
 
 logger = logging.getLogger(__name__)
-
-
-def _atomic_torch_save(blob, path: Path) -> None:
-    """Persist *blob* to *path* atomically so resume never sees a partial file.
-
-    A bare ``torch.save(blob, path)`` truncates *path* before writing, so an
-    interruption mid-dump (OOM kill, SIGINT during a multi-hundred-MB state
-    write) leaves a half-written ``training_state.pt`` that breaks the next
-    ``load_training_state`` — silently losing the run and ALL the resume state the
-    12-site persistence axis went to the trouble of capturing. That directly
-    undermines the resume guarantee the axis exists to provide.
-
-    Writing to a PID-suffixed temp file in the SAME directory and renaming it
-    into place is atomic on POSIX (same filesystem), so the destination either
-    fully reflects the new state or is left at its prior, still-loadable value —
-    never torn. The temp name is PID-suffixed so a temp orphaned by a prior
-    crashed run is not silently reused; any orphan is cleaned up on the failure
-    path. ``os.replace`` is the sole publish point — it is the seam the
-    interruption-injection test monkeypatches to prove no partial destination
-    survives a mid-commit fault.
-    """
-    path = Path(path)
-    tmp_path = path.parent / f"{path.name}.tmp.{os.getpid()}"
-    try:
-        torch.save(blob, tmp_path)
-        os.replace(tmp_path, path)
-    except BaseException:
-        # Never publish a partial checkpoint: if the rename did not land, the
-        # prior file (if any) must remain intact. Best-effort-remove the orphan
-        # temp so a crashed run does not litter the checkpoint directory.
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-        raise
 
 
 def _sanitize_tensors(tensor_dict: dict[str, torch.Tensor], label: str) -> None:

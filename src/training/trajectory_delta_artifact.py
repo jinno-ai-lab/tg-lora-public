@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from src.utils.atomic_save import _atomic_torch_save
 from src.utils.tensor_artifact import load_tensor_artifact
 
 
@@ -101,7 +102,7 @@ def save_trajectory_delta_artifact(
         "metadata": metadata.to_dict(),
         "delta_tensors": {name: tensor.detach().cpu() for name, tensor in delta_tensors.items()},
     }
-    torch.save(blob, target)
+    _atomic_torch_save(blob, target)
     return target
 
 

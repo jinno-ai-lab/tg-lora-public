@@ -26,6 +26,7 @@ slices. Runs ``ruff`` via subprocess and skips when ``ruff`` is absent.
 
 from __future__ import annotations
 
+import ast
 import shutil
 import subprocess
 from pathlib import Path
@@ -100,4 +101,56 @@ def test_src_tree_has_no_invalid_escape_sequences() -> None:
         "src/ must contain no invalid escape sequences (W605) — each one is a "
         "DeprecationWarning now and a SyntaxWarning from Python 3.12. "
         "ruff output:\n" + (proc.stdout + proc.stderr).strip()
+    )
+
+
+def test_no_bare_torch_save_in_src() -> None:
+    """The only ``torch.save`` call in ``src/`` lives in the atomic-save helper.
+
+    A bare ``torch.save(blob, path)`` truncates the destination before writing,
+    so an interruption mid-dump (OOM kill, SIGINT during a multi-hundred-MB
+    write) leaves a torn file that breaks the next load — losing a run
+    (``training_state.pt``), corrupting a large analysis artifact
+    (``trajectory_delta_artifacts/*.pt``), or forcing an expensive rebuild of a
+    multi-GB prefix-feature cache. Every on-disk artifact that must survive an
+    interruption routes through :func:`src.utils.atomic_save._atomic_torch_save`
+    (PID-suffixed temp + ``os.replace``) instead, so a load never sees a partial
+    file. ``save_pretrained`` (the LoRA/tokenizer checkpoint path) is unaffected
+    — it writes via the safetensors library, not ``torch.save``.
+
+    This guard pins that discipline with an AST scan: any ``torch.save(...)``
+    call outside :mod:`src.utils.atomic_save` reintroduces the mid-save
+    truncation hazard the resume-state persistence axis exists to prevent. AST
+    (not a text grep) so docstring and code-comment mentions of ``torch.save``
+    do not false-positive — only real call expressions are counted.
+    """
+    atomic_leaf = TARGET / "utils" / "atomic_save.py"
+    assert atomic_leaf.is_file(), (
+        f"atomic-save helper missing at {atomic_leaf}; the single torch.save "
+        "publish point that every on-disk artifact routes through must exist"
+    )
+
+    offenders: list[tuple[Path, int]] = []
+    for src_file in sorted(TARGET.rglob("*.py")):
+        tree = ast.parse(
+            src_file.read_text(encoding="utf-8"), filename=str(src_file)
+        )
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "save"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "torch"
+            ):
+                offenders.append((src_file, node.lineno))
+
+    off_src = [(f, ln) for f, ln in offenders if f != atomic_leaf]
+    assert not off_src, (
+        "Every on-disk artifact in src/ must persist via "
+        "src.utils.atomic_save._atomic_torch_save — a bare "
+        "torch.save(<path>) outside that helper reintroduces the mid-save "
+        "truncation hazard (torn checkpoint / torn trajectory artifact / torn "
+        "prefix-feature cache) the resume-state axis exists to prevent. "
+        "Offending sites:\n" + "\n".join(f"  {f}:{ln}" for f, ln in off_src)
     )
