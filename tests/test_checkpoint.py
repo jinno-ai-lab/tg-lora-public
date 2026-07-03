@@ -15,6 +15,7 @@ from src.tg_lora.dynamic_freeze import DynamicFreezeController, DynFreezeState
 from src.tg_lora.random_walk_controller import ControllerState
 from src.tg_lora.velocity import Velocity
 from src.utils.checkpoint import (
+    CheckpointSaveError,
     TrainingState,
     _atomic_publish_checkpoint_dir,
     _sanitize_tensors,
@@ -183,8 +184,15 @@ class TestSaveCheckpointReadbackVerification:
         ]
         assert checkpoint_warnings == []
 
-    def test_warning_when_directory_empty(self, tmp_path, caplog):
-        """save_pretrained leaves an empty directory → warning logged."""
+    def test_empty_save_pretrained_raises_and_publishes_nothing(self, tmp_path):
+        """save_pretrained leaves an empty directory → fail loud, do NOT publish.
+
+        A completed-but-empty save is the one path that still violated the
+        atomic-publish contract ("destination never non-loadable"): publishing
+        the empty temp over a prior good checkpoint would replace a loadable
+        destination with an empty one. It must raise ``CheckpointSaveError``
+        (after removing the orphan temp) rather than warn-and-publish.
+        """
 
         def _save_empty(save_dir):
             Path(save_dir).mkdir(parents=True, exist_ok=True)
@@ -195,21 +203,65 @@ class TestSaveCheckpointReadbackVerification:
         tokenizer.save_pretrained = lambda d: None
 
         save_dir = tmp_path / "empty_ckpt"
-        with caplog.at_level(logging.WARNING, logger="src.utils.checkpoint"):
+        with pytest.raises(CheckpointSaveError):
             save_checkpoint(model, tokenizer, save_dir)
-        assert any("checkpoint" in r.message.lower() for r in caplog.records)
+        # Nothing published, and the orphan empty temp is removed.
+        assert not save_dir.exists()
+        assert not list(tmp_path.glob("empty_ckpt.tmp.*"))
 
-    def test_warning_when_directory_missing(self, tmp_path, caplog):
-        """save_pretrained does not create directory → warning logged."""
+    def test_missing_save_pretrained_raises_and_publishes_nothing(self, tmp_path):
+        """save_pretrained does not create files → fail loud, do NOT publish."""
         model = MagicMock()
         model.save_pretrained = MagicMock()
         tokenizer = MagicMock()
         tokenizer.save_pretrained = MagicMock()
 
         save_dir = tmp_path / "missing_ckpt"
-        with caplog.at_level(logging.WARNING, logger="src.utils.checkpoint"):
+        with pytest.raises(CheckpointSaveError):
             save_checkpoint(model, tokenizer, save_dir)
-        assert any("checkpoint" in r.message.lower() for r in caplog.records)
+        assert not save_dir.exists()
+        assert not list(tmp_path.glob("missing_ckpt.tmp.*"))
+
+
+class TestSaveCheckpointEmptyDoesNotClobberPrior:
+    """The atomic-publish guarantee's last hole: a completed-but-empty save
+    must not overwrite a prior loadable checkpoint with a non-loadable one.
+
+    Symmetric in spirit to ``TestAtomicCheckpointDirPublish::
+    test_overwrite_fault_restores_prior_checkpoint`` (a mid-swap *fault* leaves
+    the prior checkpoint in place): here a save that *completes* but writes
+    nothing must likewise leave the prior, still-loadable checkpoint untouched —
+    the "resume loads cleanly" guarantee the feedback asks to confirm, at the
+    Cat-A fault-injection level (the real SIGINT-mid-save GPU run is Cat-C).
+    """
+
+    def test_empty_save_leaves_prior_checkpoint_loadable(self, tmp_path):
+        # 1) A prior good checkpoint is on disk.
+        save_dir = tmp_path / "best_model"
+        model, tokenizer = _mock_model_and_tokenizer(tmp_path, file_count=2)
+        save_checkpoint(model, tokenizer, save_dir)
+        prior_files = sorted(p.name for p in save_dir.iterdir())
+        assert prior_files  # non-empty prior
+
+        # 2) A later save attempt whose save_pretrained writes nothing.
+        def _save_empty(save_dir):
+            Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+        empty_model = MagicMock()
+        empty_model.save_pretrained = _save_empty
+        empty_tokenizer = MagicMock()
+        empty_tokenizer.save_pretrained = lambda d: None
+
+        with pytest.raises(CheckpointSaveError):
+            save_checkpoint(empty_model, empty_tokenizer, save_dir)
+
+        # 3) The prior checkpoint survives byte-for-byte — NOT clobbered, NOT
+        #    empty, NOT a mix. This is the load-bearing assertion.
+        assert save_dir.is_dir()
+        assert sorted(p.name for p in save_dir.iterdir()) == prior_files
+        # No orphan temp / backup litters the checkpoint directory.
+        assert not list(tmp_path.glob("best_model.tmp.*"))
+        assert not list(tmp_path.glob("best_model.old.*"))
 
 
 class TestSaveCheckpointExistingDir:

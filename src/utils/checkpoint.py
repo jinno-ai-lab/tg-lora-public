@@ -70,6 +70,29 @@ def _atomic_publish_checkpoint_dir(tmp_dir: Path, save_dir: Path) -> None:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+class CheckpointSaveError(RuntimeError):
+    """A checkpoint save completed but produced no loadable artifact.
+
+    The save-side counterpart to :class:`CheckpointIntegrityError`.
+    ``save_pretrained`` ran to completion without raising, yet left the staged
+    temp dir empty — a model/PEFT misconfiguration or a silently-failing
+    backend, not a mid-save fault (which the ``except BaseException`` clause in
+    :func:`save_checkpoint` already handles by discarding the orphan temp).
+
+    The atomic-publish guarantee (:func:`_atomic_publish_checkpoint_dir`) is
+    that the destination is *never* left non-loadable: it covers a mid-swap
+    FAULT (the prior checkpoint is restored) but not a save that *completes*
+    yet writes nothing — publishing an empty temp over a prior good checkpoint
+    would replace a loadable destination with an empty one, the one path that
+    still violated that contract after the write-side atomicity work. Failing
+    loud here (after removing the orphan empty temp) leaves any prior
+    checkpoint untouched and stops the caller proceeding to write a
+    ``training_state.pt`` next to a missing adapter, which would otherwise look
+    like a complete checkpoint on resume and crash ``load_adapter_weights`` with
+    a bare ``FileNotFoundError``.
+    """
+
+
 def save_checkpoint(model: torch.nn.Module, tokenizer, save_dir: Path) -> None:
     """Save model and tokenizer to *save_dir* atomically, with readback verify.
 
@@ -85,6 +108,11 @@ def save_checkpoint(model: torch.nn.Module, tokenizer, save_dir: Path) -> None:
     mid-stage (``except BaseException`` catches ``KeyboardInterrupt``/
     ``SystemExit`` too, mirroring ``_atomic_torch_save``) removes the orphan
     temp so resume never sees a partial adapter.
+
+    A save that *completes* but leaves the staged temp empty
+    (:class:`CheckpointSaveError`) is likewise never published: the destination
+    is left untouched so a prior checkpoint survives and the caller does not
+    proceed to write a weights-less ``training_state.pt``.
     """
     save_dir = Path(save_dir)
     tmp_dir = save_dir.parent / f"{save_dir.name}.tmp.{os.getpid()}"
@@ -97,12 +125,24 @@ def save_checkpoint(model: torch.nn.Module, tokenizer, save_dir: Path) -> None:
         model.save_pretrained(tmp_dir)
         tokenizer.save_pretrained(tmp_dir)
 
-        # Readback verification on the staged temp BEFORE it is published, so a
-        # save that silently produced nothing is surfaced (and, for an empty
-        # result, still published to preserve prior behavior).
+        # Readback verification on the staged temp BEFORE it is published. A
+        # save that produced nothing is a completed-but-empty write — the one
+        # case the atomic-publish guarantee did not yet cover (it handles
+        # mid-swap faults, not a non-raising empty result). Publishing the
+        # empty temp would replace a prior loadable checkpoint with a
+        # non-loadable destination, so fail loud instead: the orphan temp is
+        # removed below and the destination is left at its prior value.
         file_count = sum(1 for _ in tmp_dir.iterdir())
         if file_count == 0:
-            logger.warning("Checkpoint save produced an empty directory: %s", tmp_dir)
+            raise CheckpointSaveError(
+                f"save_pretrained produced an empty checkpoint directory at "
+                f"{tmp_dir} (model.save_pretrained and tokenizer.save_pretrained "
+                f"wrote no files). Refusing to publish an empty checkpoint over "
+                f"{save_dir}: the atomic-publish guarantee never leaves the "
+                f"destination non-loadable, so a silently-empty save fails loud "
+                f"rather than destroying any prior checkpoint or letting resume "
+                f"see a weights-less checkpoint dir. Check the model/PEFT setup."
+            )
     except BaseException:
         # Never publish a partial checkpoint: the destination is untouched and
         # the orphan temp is removed.
