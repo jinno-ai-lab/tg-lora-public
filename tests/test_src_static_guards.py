@@ -309,3 +309,125 @@ def test_resume_path_wires_integrity_checked_loaders() -> None:
             "CheckpointIntegrityError into a silent restart, hiding lost "
             f"progress. Found enclosing try at line {swallower.lineno}"
         )
+
+
+def test_baseline_resume_path_wires_integrity_checked_loaders() -> None:
+    """The ``train_baseline`` resume seam must route BOTH checkpoint loads
+    through the integrity-checked helpers, load-before-apply, unwrapped.
+
+    Sibling of :func:`test_resume_path_wires_integrity_checked_loaders` for the
+    OTHER training entrypoint (``train_baseline_qlora.train_baseline``). The
+    write side is already atomic for the baseline path
+    (``save_baseline_training_state`` → ``_atomic_torch_save``; ``save_checkpoint``
+    → the atomic directory publish), so this guard pins the symmetric LOAD side:
+    that resume routes ``training_state.pt`` through ``load_baseline_training_state``
+    (torn → :class:`~src.utils.checkpoint.CheckpointIntegrityError`) AND the LoRA
+    adapter through ``load_adapter_weights`` (load-before-apply, torn →
+    ``CheckpointIntegrityError``) — never a raw ``torch.load`` / inline
+    ``safetensors.load_file`` — and that neither critical load is swallowed by a
+    ``try``/``except`` that could turn a torn-checkpoint fail-loud into a silent
+    restart (a GOAL.md honesty break that hides lost progress). Without this the
+    baseline path is the asymmetric weak link a torn checkpoint would crash
+    opaquely on, the very gap the load-side integrity axis closed for the TG-LoRA
+    path. The baseline trainer is un-importable on the public mirror (absent
+    ``peft`` + private ``src.data``), so — like the TG-LoRA guard — this is an
+    AST source-parse, not an import.
+
+    The baseline path has TWO ``if resume_path is not None:`` blocks (one restores
+    optimizer/scheduler/scalars, one restores adapter weights + batch position),
+    so this guard checks BOTH seams rather than the single seam the TG-LoRA path
+    has.
+    """
+    trainer = TARGET / "training" / "train_baseline_qlora.py"
+    assert trainer.is_file(), f"baseline trainer entrypoint missing at {trainer}"
+    tree = ast.parse(trainer.read_text(encoding="utf-8"), filename=str(trainer))
+
+    # Parent map so the no-swallowing check can climb ancestors of each seam.
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            child.tlsparent = parent  # type: ignore[attr-defined]
+
+    module_funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    assert "train_baseline" in module_funcs, "train_baseline entrypoint missing"
+    fn = module_funcs["train_baseline"]
+
+    # Collect EVERY `if resume_path is not None:` seam inside train_baseline
+    # (there are two — see the docstring).
+    resume_seams: list[ast.If] = []
+    for node in ast.walk(fn):
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "resume_path"
+            and node.test.ops
+            and isinstance(node.test.ops[0], ast.IsNot)
+            and node.test.comparators
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and node.test.comparators[0].value is None
+        ):
+            resume_seams.append(node)
+    assert resume_seams, (
+        "resume seam (if resume_path is not None:) missing from train_baseline "
+        "— the fault/periodic resume path must exist"
+    )
+
+    seam_calls = [
+        (_call_name(c.func), c.lineno)
+        for seam in resume_seams
+        for c in ast.walk(seam)
+        if isinstance(c, ast.Call)
+    ]
+    seam_call_names = {name for name, _ in seam_calls}
+
+    # (1) training_state.pt routes through the integrity-checked loader.
+    assert "load_baseline_training_state" in seam_call_names, (
+        "resume seam must route training_state.pt through "
+        "load_baseline_training_state (the torn-checkpoint → "
+        "CheckpointIntegrityError gate), not a raw torch.load"
+    )
+
+    # (2) The LoRA adapter routes through the integrity-checked loader, BEFORE
+    #     the apply — so a torn adapter_model.safetensors raises with zero model
+    #     mutation. Mirrors _restore_adapter_weights's load-before-apply invariant.
+    load_linenos = [ln for name, ln in seam_calls if name == "load_adapter_weights"]
+    apply_linenos = [ln for name, ln in seam_calls if name == "set_peft_model_state_dict"]
+    assert load_linenos and apply_linenos, (
+        "resume seam must restore the adapter via load_adapter_weights (the "
+        "integrity gate) and set_peft_model_state_dict (the model mutation), "
+        "not an inline safetensors.load_file"
+    )
+    assert min(load_linenos) < min(apply_linenos), (
+        "resume seam must call load_adapter_weights BEFORE "
+        "set_peft_model_state_dict — reordering lets a torn "
+        "adapter_model.safetensors half-apply the model instead of raising "
+        "CheckpointIntegrityError"
+    )
+
+    # (3) Neither critical load may be enclosed by a try/except (same rationale
+    #     as the TG-LoRA guard). Climb EACH critical call's ancestors to the
+    #     function root; any Try on the path is a swallower.
+    critical_calls = [
+        c
+        for seam in resume_seams
+        for c in ast.walk(seam)
+        if isinstance(c, ast.Call)
+        and _call_name(c.func)
+        in ("load_baseline_training_state", "load_adapter_weights")
+    ]
+    assert critical_calls, "resume seam must contain the integrity-checked loads"
+    for call_node in critical_calls:
+        swallower: ast.AST | None = None
+        cur: ast.AST | None = getattr(call_node, "tlsparent", None)
+        while cur is not None and cur is not fn:
+            if isinstance(cur, ast.Try):
+                swallower = cur
+                break
+            cur = getattr(cur, "tlsparent", None)
+        assert swallower is None, (
+            f"resume critical load {_call_name(call_node.func)}(...) at line "
+            f"{call_node.lineno} must NOT be enclosed in a try/except — a "
+            "handler there could swallow a torn-checkpoint "
+            "CheckpointIntegrityError into a silent restart, hiding lost "
+            f"progress. Found enclosing try at line {swallower.lineno}"
+        )

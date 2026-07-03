@@ -670,7 +670,39 @@ def load_baseline_training_state(path: Path) -> dict:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Baseline training state not found: {path}")
-    blob = load_tensor_artifact(path)
+
+    try:
+        blob = load_tensor_artifact(path)
+    except (EOFError, pickle.UnpicklingError, RuntimeError) as exc:
+        # The load-side counterpart to the atomic-save guarantee — the SAME
+        # diagnosis :func:`load_training_state` applies on the TG-LoRA path, so
+        # BOTH training entrypoints fail resume with an actionable
+        # :class:`CheckpointIntegrityError` on a torn / truncated / empty
+        # ``training_state.pt`` instead of an opaque ``EOFError`` /
+        # ``RuntimeError`` traceback. ``save_baseline_training_state`` already
+        # persists atomically (via :func:`_atomic_torch_save`), so a file that
+        # trips this could NOT have been torn by an in-process fault — it
+        # predates the atomic helper (commit ``510b0d1``) or was corrupted
+        # externally (disk-full copy/backup, NFS, manual edit, ``kill -9`` mid-
+        # transfer). See :func:`load_training_state` for the full rationale. A
+        # ``RuntimeError`` that does NOT match the corruption signature is a
+        # genuine deserialization bug — re-raised UNCHANGED (``raise``) so it is
+        # not masked.
+        if _is_torch_load_corruption(exc):
+            raise CheckpointIntegrityError(
+                f"Baseline training-state checkpoint at {path} exists but is "
+                f"torn or corrupt and cannot be loaded for resume "
+                f"({type(exc).__name__}: {exc}). The atomic-save helper makes "
+                f"it impossible for the training process to WRITE a torn "
+                f"destination, so this file predates that helper (commit "
+                f"510b0d1) or was corrupted externally (disk-full during a "
+                f"non-atomic copy/backup, NFS, manual edit, kill -9 mid-"
+                f"transfer). Delete or restore it from a known-good checkpoint "
+                f"before resuming; resume intentionally does NOT silently "
+                f"restart from scratch, which would hide the lost progress."
+            ) from exc
+        raise
+
     state = BaselineTrainingState(
         global_step=blob.get("global_step", 0),
         best_loss=blob.get("best_loss", float("inf")),

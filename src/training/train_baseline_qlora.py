@@ -27,6 +27,7 @@ from src.training.trajectory_delta_artifact import (
     save_trajectory_delta_artifact)
 from src.utils.checkpoint import (
     BaselineTrainingState,
+    load_adapter_weights,
     load_baseline_training_state,
     prune_step_checkpoints_from_cfg,
     prune_trajectory_delta_artifacts_from_cfg,
@@ -320,11 +321,18 @@ def train_baseline(cfg: DictConfig, resume_path: str | None = None) -> None:
         bs = loaded["state"]
         train_batch_position = bs.train_batch_position
         if bs.adapter_checkpoint_dir is not None:
-            from safetensors.torch import load_file
             from peft import set_peft_model_state_dict
             adapter_dir = Path(bs.adapter_checkpoint_dir)
             if adapter_dir.exists():
-                adapter_state = load_file(adapter_dir / "adapter_model.safetensors")
+                # Route the baseline resume load through the integrity-checked
+                # ``load_adapter_weights`` (load-before-apply, torn →
+                # ``CheckpointIntegrityError``) — the symmetric counterpart to the
+                # TG-LoRA resume seam's ``_restore_adapter_weights``. A bare
+                # ``safetensors.load_file`` here would crash resume with an opaque
+                # ``SafetensorError`` on a torn ``adapter_model.safetensors`` (the
+                # costlier artifact to lose to a torn write), the very gap the
+                # load-side integrity axis closed for the TG-LoRA path.
+                adapter_state = load_adapter_weights(adapter_dir)
                 set_peft_model_state_dict(model, adapter_state)
                 logger.info("Restored adapter weights from %s", adapter_dir)
             else:

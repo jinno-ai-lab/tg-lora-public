@@ -41,9 +41,12 @@ from pathlib import Path
 import pytest
 
 from src.utils.checkpoint import (
+    BaselineTrainingState,
     CheckpointIntegrityError,
     load_adapter_weights,
+    load_baseline_training_state,
     load_training_state,
+    save_baseline_training_state,
     save_training_state,
 )
 from tests.test_fault_recovery import _make_training_state
@@ -59,6 +62,33 @@ def _write_valid_training_state(tmp_path: Path) -> Path:
     state = _make_training_state()  # cycle_offset == 3, fully populated
     path = tmp_path / "training_state.pt"
     save_training_state(state, path)
+    return path
+
+
+def _write_valid_baseline_training_state(tmp_path: Path) -> Path:
+    """Save a real, loadable baseline ``training_state.pt`` and return its path.
+
+    Sibling of :func:`_write_valid_training_state` for the OTHER training
+    entrypoint (``train_baseline_qlora``). Needs a trivial optimizer + scheduler
+    so ``save_baseline_training_state``'s ``state_dict()`` calls succeed; their
+    contents are irrelevant — the integrity tests only care that the bytes
+    round-trip through ``load_tensor_artifact`` (the load the diagnosis wraps).
+    """
+    import torch
+
+    state = BaselineTrainingState(
+        global_step=42,
+        best_loss=1.23,
+        best_step=40,
+        stale_steps=2,
+        train_batch_position=3,
+        adapter_checkpoint_dir=None,
+    )
+    param = torch.nn.Parameter(torch.zeros(1))
+    optimizer = torch.optim.SGD([param], lr=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda e: 1.0)
+    path = tmp_path / "baseline_state.pt"
+    save_baseline_training_state(state, optimizer, scheduler, path)
     return path
 
 
@@ -190,6 +220,113 @@ class TestLoadTrainingStateIntegrity:
             load_training_state(path)
 
         assert exc_info.value.__cause__ is signature
+
+
+# ---------------------------------------------------------------------------
+# load_baseline_training_state — torn/empty/garbage → CheckpointIntegrityError
+#
+# The baseline QLoRA entrypoint (``train_baseline_qlora``) reaches resume through
+# ``load_baseline_training_state``, NOT ``load_training_state`` — so the TG-LoRA
+# integrity tests above do not cover it. ``save_baseline_training_state`` already
+# persists atomically (via ``_atomic_torch_save``), but a torn file can still
+# reach the loader from a pre-fix checkpoint or external corruption (the same
+# sources :class:`CheckpointIntegrityError` documents). These mirror the
+# ``TestLoadTrainingStateIntegrity`` cases one-for-one so the load-side integrity
+# guarantee is symmetric across BOTH training entrypoints.
+# ---------------------------------------------------------------------------
+
+
+class TestLoadBaselineTrainingStateIntegrity:
+    """A torn/empty/garbage baseline ``training_state.pt`` is diagnosed, not
+    opaque — the symmetric counterpart to :class:`TestLoadTrainingStateIntegrity`
+    on the baseline QLoRA entrypoint."""
+
+    def test_truncated_checkpoint_raises_integrity_error(self, tmp_path):
+        path = _write_valid_baseline_training_state(tmp_path)
+        full = path.read_bytes()
+        path.write_bytes(full[: len(full) // 2])
+
+        with pytest.raises(CheckpointIntegrityError) as exc_info:
+            load_baseline_training_state(path)
+
+        msg = str(exc_info.value)
+        assert "torn or corrupt" in msg
+        assert "cannot be loaded for resume" in msg
+        assert str(path) in msg
+        assert "atomic-save helper" in msg
+
+    def test_truncated_checkpoint_chains_original_error(self, tmp_path):
+        path = _write_valid_baseline_training_state(tmp_path)
+        full = path.read_bytes()
+        path.write_bytes(full[: len(full) // 2])
+
+        with pytest.raises(CheckpointIntegrityError) as exc_info:
+            load_baseline_training_state(path)
+
+        assert exc_info.value.__cause__ is not None
+        assert isinstance(exc_info.value.__cause__, BaseException)
+
+    def test_empty_checkpoint_raises_integrity_error(self, tmp_path):
+        path = tmp_path / "baseline_state.pt"
+        path.write_bytes(b"")  # empty file → torch.load raises EOFError
+
+        with pytest.raises(CheckpointIntegrityError) as exc_info:
+            load_baseline_training_state(path)
+
+        assert isinstance(exc_info.value.__cause__, EOFError)
+
+    def test_garbage_checkpoint_raises_integrity_error(self, tmp_path):
+        path = tmp_path / "baseline_state.pt"
+        path.write_bytes(b"\x80\x02PARTIAL_TORN_DUMP_NOT_A_PICKLE")
+
+        with pytest.raises(CheckpointIntegrityError) as exc_info:
+            load_baseline_training_state(path)
+
+        assert "torn or corrupt" in str(exc_info.value)
+
+    def test_non_zip_first_bytes_raises_integrity_error(self, tmp_path):
+        import torch
+
+        src = tmp_path / "src.pt"
+        torch.save({"a": torch.tensor([1.0])}, src)
+        path = tmp_path / "baseline_state.pt"
+        path.write_bytes(src.read_bytes()[:8])
+
+        with pytest.raises(CheckpointIntegrityError) as exc_info:
+            load_baseline_training_state(path)
+
+        assert isinstance(exc_info.value.__cause__, RuntimeError)
+        assert "not a ZIP archive" in str(exc_info.value.__cause__) or (
+            "zip archive" in str(exc_info.value.__cause__)
+        )
+
+    def test_valid_checkpoint_loads_clean(self, tmp_path):
+        # No false positive: a real, loadable baseline checkpoint round-trips
+        # untouched (returns the {"state": BaselineTrainingState, ...} dict).
+        path = _write_valid_baseline_training_state(tmp_path)
+
+        loaded = load_baseline_training_state(path)
+
+        assert loaded["state"].global_step == 42  # proves it deserialized
+
+    def test_missing_checkpoint_still_raises_file_not_found(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            load_baseline_training_state(tmp_path / "does_not_exist.pt")
+
+    def test_non_corruption_runtime_error_is_not_masked(self, tmp_path, monkeypatch):
+        path = tmp_path / "baseline_state.pt"
+        path.write_bytes(b"\x80\x02")  # bytes present so we reach the loader
+
+        def _fake_real_bug(_path):
+            raise RuntimeError("a genuine deserialization bug in unrelated code")
+
+        monkeypatch.setattr("src.utils.checkpoint.load_tensor_artifact", _fake_real_bug)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            load_baseline_training_state(path)
+
+        assert not isinstance(exc_info.value, CheckpointIntegrityError)
+        assert "genuine deserialization bug" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
