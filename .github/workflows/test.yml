@@ -42,3 +42,35 @@ jobs:
         with:
           name: coverage-py${{ matrix.python-version }}
           path: coverage.xml
+
+  # GPU-free CI gates that must run on every push/PR. These are the make targets
+  # that previously existed only as local `make` entries with no CI invocation
+  # (i.e. inert) — wiring them here is the in-repo realization of the AI-Hub
+  # feedback "confirm the GPU-free gates are wired into the gate sequence, else
+  # they are inert". GPU-needing gates (freeze-validloss-ci, analyze-prefix-break-even-ci
+  # which needs a paper-summary input) stay out of this job by design.
+  gates:
+    name: GPU-free CI gates
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # Portable velocity-ops gate (REQ-149). Hardware-normalized cap_update
+      # overhead ratio — does NOT depend on the runner's absolute speed, so it
+      # cannot flap across github-hosted runners the way the old absolute-time
+      # --baseline comparison did. Invokes the script directly (not `make`) so it
+      # does not depend on a checked-in .venv existing.
+      - name: Portable velocity-ops gate
+        run: python scripts/benchmark_velocity_ops.py --quick --max-cap-overhead-ratio 3.0

@@ -58,6 +58,20 @@ def _parse_args() -> argparse.Namespace:
         default=20.0,
         help="Regression threshold %% (default: 20). Exit 1 if current > baseline * (1 + threshold/100).",
     )
+    parser.add_argument(
+        "--max-cap-overhead-ratio",
+        type=float,
+        default=None,
+        dest="max_cap_overhead_ratio",
+        help=(
+            "Portable CI gate: exit 1 if cap_update_overhead_ratio "
+            "(capped per-iter ms / no-cap per-iter ms, measured in the same run) "
+            "exceeds this ceiling. Hardware-normalized — both terms scale together "
+            "with host speed, so this catches algorithmic regressions (a redundant "
+            "clone/norm or an out-of-place op blowing up the capped path) without "
+            "the absolute-time non-portability of --baseline. Default: off."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -142,12 +156,22 @@ def benchmark_cap_update(iterations: int) -> dict:
         cap_update(u, ref, max_ratio=max_ratio)
     nocap_ms = (time.perf_counter() - t1) * 1000
 
+    # Hardware-normalized overhead of the capping step. Both the capped and
+    # no-cap loops clone the same (1024, 1024) tensor and run the two norm
+    # reductions; the capped path adds exactly one in-place ``mul_``. Their ratio
+    # therefore isolates the marginal cost of the cap arithmetic with the host's
+    # raw speed cancelling out — the only quantity in this benchmark that is
+    # portable across machines/CI runners (absolute per-iter ms is NOT: see
+    # ``--max-cap-overhead-ratio`` vs the local-only ``--baseline``).
+    overhead_ratio = elapsed_ms / nocap_ms if nocap_ms > 0 else None
+
     return {
         "cap_update_time_ms": elapsed_ms,
         "cap_update_per_iter_ms": elapsed_ms / iterations,
         "cap_update_mem_delta_kb": mem_after - mem_before,
         "cap_update_nocap_time_ms": nocap_ms,
         "cap_update_nocap_per_iter_ms": nocap_ms / iterations,
+        "cap_update_overhead_ratio": overhead_ratio,
         "cap_update_iterations": iterations,
         "cap_update_tensor_shape": list(shape),
     }
@@ -222,6 +246,25 @@ def main() -> None:
             "regressed": len(regressions) > 0,
         }
 
+    # Portable CI gate: the hardware-normalized cap overhead ratio. Computed
+    # from the RAW (pre-rounding) per-iter values so the verdict is exact.
+    portable_failure = None
+    if args.max_cap_overhead_ratio is not None:
+        cap = results["cap_update"]
+        cap_per = cap["cap_update_per_iter_ms"]
+        nocap_per = cap["cap_update_nocap_per_iter_ms"]
+        ratio = cap_per / nocap_per if nocap_per > 0 else float("inf")
+        ceiling = args.max_cap_overhead_ratio
+        passed = ratio <= ceiling
+        output["portable_gate"] = {
+            "metric": "cap_update_overhead_ratio",
+            "ratio": round(ratio, 3),
+            "ceiling": ceiling,
+            "passed": passed,
+        }
+        if not passed:
+            portable_failure = (ratio, ceiling)
+
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
     if args.baseline and regressions:
@@ -234,6 +277,32 @@ def main() -> None:
                 f"{r['ratio']:.1f}x > {r['threshold']:.1f}x)",
                 file=sys.stderr,
             )
+        print(
+            "  NOTE: --baseline compares ABSOLUTE per-iter ms against a "
+            "checked-in baseline and is only portable to the host that recorded "
+            "it; use --max-cap-overhead-ratio for the hardware-normalized CI gate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if portable_failure is not None:
+        ratio, ceiling = portable_failure
+        print(
+            "\nPORTABLE GATE FAILED — cap_update overhead ratio exceeded ceiling:",
+            file=sys.stderr,
+        )
+        print(
+            f"  cap_update_overhead_ratio: {ratio:.3f} > ceiling {ceiling:.3f} "
+            f"(capped per-iter ms / no-cap per-iter ms, same run)",
+            file=sys.stderr,
+        )
+        print(
+            "  The capped path adds one in-place mul_ over the shared clone+norm "
+            "cost, so this ratio is normally ~1.0-1.3 and hardware-independent; "
+            "a value far above ceiling signals an algorithmic regression such as "
+            "a redundant clone/norm or an out-of-place op in cap_update.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 

@@ -265,7 +265,14 @@ class TestBaselineRegressionDetection:
 
 
 class TestCIGateBaseline:
-    """Tests for the checked-in CI gate baseline (REQ-149)."""
+    """Tests for the velocity-ops CI gate contract (REQ-149).
+
+    The CI gate is the PORTABLE, hardware-normalized cap_update overhead ratio
+    (capped/no-cap per-iter ms, same run) — NOT the absolute-time --baseline
+    comparison, which is non-portable (it failed up to 12x under pytest load on a
+    12GB box vs the checked-in baseline). The checked-in baseline file is retained
+    for local, same-host diagnostics via --baseline / bench-velocity-ops-save-baseline.
+    """
 
     BASELINE_PATH = Path("baselines/velocity_ops.json")
 
@@ -284,24 +291,82 @@ class TestCIGateBaseline:
                 and "cap_update_per_iter_ms" in data[section]
             )
 
-    def test_ci_gate_passes(self):
-        """Simulate `make bench-velocity-ops-ci` — must exit 0 against checked-in baseline."""
+    def test_portable_ci_gate_passes(self):
+        """Simulate `make bench-velocity-ops-ci` — the portable overhead-ratio gate
+        must exit 0 on any host (the whole point of the ratio normalization)."""
         result = subprocess.run(
             [
                 sys.executable,
                 "scripts/benchmark_velocity_ops.py",
                 "--quick",
-                "--baseline",
-                str(self.BASELINE_PATH),
-                "--threshold",
-                "50",
+                "--max-cap-overhead-ratio",
+                "3.0",
             ],
             capture_output=True,
             text=True,
         )
         assert result.returncode == 0, (
-            f"CI gate failed (regression detected).\n"
-            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+            f"Portable CI gate failed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
         )
         data = json.loads(result.stdout)
-        assert data["baseline_comparison"]["regressed"] is False
+        assert data["portable_gate"]["passed"] is True
+        assert data["portable_gate"]["ceiling"] == 3.0
+
+
+class TestPortableCapOverheadGate:
+    """Both-sides boundary tests for the --max-cap-overhead-ratio CI gate (REQ-149).
+
+    Pinning BOTH the pass side (ceiling 3.0, the make/CI default) and the bite
+    side (ceiling 0.5, below the true ~1.0-2.0 ratio observed across hosts) proves
+    the gate actually enforces — it can neither silently pass a violation nor be a
+    no-op display-only metric.
+    """
+
+    def _run(self, ceiling: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [
+                sys.executable,
+                "scripts/benchmark_velocity_ops.py",
+                "--quick",
+                "--max-cap-overhead-ratio",
+                ceiling,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_overhead_ratio_reported(self):
+        """The benchmark reports a positive cap_update_overhead_ratio mirrored in portable_gate."""
+        result = self._run("3.0")
+        assert result.returncode == 0, result.stderr
+        data = json.loads(result.stdout)
+        ratio = data["cap_update"]["cap_update_overhead_ratio"]
+        assert ratio > 0
+        assert data["portable_gate"]["ratio"] == ratio
+
+    def test_gate_passes_at_default_ceiling(self):
+        """ceiling 3.0 (the make/CI default) passes — the ratio stays well under it."""
+        result = self._run("3.0")
+        assert result.returncode == 0, (
+            f"ceiling 3.0 should pass.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        data = json.loads(result.stdout)
+        assert data["portable_gate"]["passed"] is True
+
+    def test_gate_bites_under_tight_ceiling(self):
+        """ceiling 0.5 (below the true ratio) must bite — non-zero exit + clear message."""
+        result = self._run("0.5")
+        assert result.returncode == 1, (
+            f"ceiling 0.5 should fail.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert "PORTABLE GATE FAILED" in result.stderr
+        data = json.loads(result.stdout)
+        assert data["portable_gate"]["passed"] is False
+        assert data["portable_gate"]["ceiling"] == 0.5
+
+    def test_ratio_equals_cap_over_nocap(self):
+        """The reported ratio is exactly capped/nocap per-iter ms (computation check)."""
+        out = benchmark_cap_update(iterations=50)
+        expected = out["cap_update_per_iter_ms"] / out["cap_update_nocap_per_iter_ms"]
+        actual = out["cap_update_overhead_ratio"]
+        assert abs(actual - expected) <= 1e-9 * max(1.0, abs(expected))

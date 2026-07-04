@@ -541,9 +541,9 @@ bench-velocity-ops: ## Benchmark velocity EMA update and cap_update in-place ops
 	$(PYTHON_VENV) scripts/benchmark_velocity_ops.py \
 		--iterations $(or $(ITERATIONS),1000)
 
-bench-velocity-ops-ci: ## Run velocity ops benchmark against checked-in baseline (CI gate)
+bench-velocity-ops-ci: ## Portable CI gate: cap_update overhead ratio must stay within a hardware-normalized ceiling
 	$(PYTHON_VENV) scripts/benchmark_velocity_ops.py \
-		--quick --baseline baselines/velocity_ops.json --threshold 20
+		--quick --max-cap-overhead-ratio $(or $(MAX_CAP_OVERHEAD_RATIO),3.0)
 
 bench-velocity-ops-save-baseline: ## Regenerate baselines/velocity_ops.json (commit after running)
 	@mkdir -p baselines
