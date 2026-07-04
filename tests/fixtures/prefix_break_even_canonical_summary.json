@@ -1,0 +1,68 @@
+{
+  "cold": {
+    "run_dir": "/tmp/tmptuy0fbko/run/cold",
+    "report_path": null,
+    "baseline": {
+      "best_valid_loss": 2.3,
+      "wall_seconds": 300.0,
+      "gpu_peak_mb": 8200.0,
+      "loss_red_per_wall_minute": 0.040000000000000036,
+      "total_backward_passes": 200
+    },
+    "tg_lora": {
+      "best_valid_loss": 2.3,
+      "wall_seconds": 360.0,
+      "gpu_peak_mb": 8300.0,
+      "loss_red_per_wall_minute": 0.03333333333333336,
+      "total_backward_passes": 200,
+      "extrapolation_steps": 50,
+      "accepted_extrapolations": 40,
+      "acceptance_rate": 0.8,
+      "prefix_feature_cache_dir": "/tmp/tmptuy0fbko/run/cold/tg_lora/cache",
+      "prefix_feature_cache_total_build_seconds": 600.0,
+      "prefix_feature_cache_total_load_seconds": 5.0,
+      "prefix_feature_cache_valid_quick_source": "quick",
+      "prefix_feature_cache_valid_full_source": "full",
+      "prefix_feature_cache_runtime_offload_gpu_allocated_mb_before": 8000,
+      "prefix_feature_cache_runtime_offload_gpu_allocated_mb_after": 4000,
+      "prefix_feature_cache_runtime_offload_gpu_freed_mb": 4000,
+      "prefix_feature_cache_offloaded_prefix_modules": 12,
+      "prefix_feature_cache_offloaded_prefix_parameters": 1024
+    }
+  },
+  "warm": {
+    "run_dir": "/tmp/tmptuy0fbko/run/warm",
+    "report_path": null,
+    "baseline": {
+      "best_valid_loss": 2.3,
+      "wall_seconds": 300.0,
+      "gpu_peak_mb": 8200.0,
+      "loss_red_per_wall_minute": 0.040000000000000036,
+      "total_backward_passes": 200
+    },
+    "tg_lora": {
+      "best_valid_loss": 2.3,
+      "wall_seconds": 240.0,
+      "gpu_peak_mb": 10000.0,
+      "loss_red_per_wall_minute": 0.050000000000000044,
+      "total_backward_passes": 200,
+      "extrapolation_steps": 50,
+      "accepted_extrapolations": 40,
+      "acceptance_rate": 0.8,
+      "prefix_feature_cache_dir": "/tmp/tmptuy0fbko/run/warm/tg_lora/cache",
+      "prefix_feature_cache_total_build_seconds": 600.0,
+      "prefix_feature_cache_total_load_seconds": 5.0,
+      "prefix_feature_cache_valid_quick_source": "quick",
+      "prefix_feature_cache_valid_full_source": "full",
+      "prefix_feature_cache_runtime_offload_gpu_allocated_mb_before": 8000,
+      "prefix_feature_cache_runtime_offload_gpu_allocated_mb_after": 4000,
+      "prefix_feature_cache_runtime_offload_gpu_freed_mb": 4000,
+      "prefix_feature_cache_offloaded_prefix_modules": 12,
+      "prefix_feature_cache_offloaded_prefix_parameters": 1024
+    }
+  },
+  "delta": {
+    "tg_wall_speedup_pct": 33.33333333333333,
+    "tg_loss_red_per_wall_minute_delta_pct": 50.000000000000014
+  }
+}

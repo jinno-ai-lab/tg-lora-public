@@ -58,9 +58,14 @@ def _single_run_summary(
     warm_tg_gpu_mb: float = 8300.0,
 ) -> dict:
     return {
-        "cold": {"tg_lora": {"prefix_feature_cache_total_build_seconds": cold_build_seconds}},
+        "cold": {
+            "tg_lora": {"prefix_feature_cache_total_build_seconds": cold_build_seconds}
+        },
         "warm": {
-            "baseline": {"wall_seconds": warm_baseline_wall, "gpu_peak_mb": warm_baseline_gpu_mb},
+            "baseline": {
+                "wall_seconds": warm_baseline_wall,
+                "gpu_peak_mb": warm_baseline_gpu_mb,
+            },
             "tg_lora": {"wall_seconds": warm_tg_wall, "gpu_peak_mb": warm_tg_gpu_mb},
         },
     }
@@ -127,7 +132,9 @@ class TestExtractFromSingleRun:
 
 class TestExtractFromAggregate:
     def test_extracts_means(self):
-        s = _aggregate_summary(warm_baseline_wall=300.0, warm_tg_wall=240.0, tg_cache_build=600.0)
+        s = _aggregate_summary(
+            warm_baseline_wall=300.0, warm_tg_wall=240.0, tg_cache_build=600.0
+        )
         result = _extract_from_aggregate(s)
         assert result["warm_baseline_wall_seconds"] == 300.0
         assert result["warm_tg_wall_seconds"] == 240.0
@@ -182,7 +189,9 @@ class TestAnalyzeBreakEven:
         return _extract_from_single_run(_single_run_summary(**kwargs))
 
     def test_warm_win_break_even(self):
-        paper = self._paper(warm_baseline_wall=300.0, warm_tg_wall=240.0, cold_build_seconds=600.0)
+        paper = self._paper(
+            warm_baseline_wall=300.0, warm_tg_wall=240.0, cold_build_seconds=600.0
+        )
         result = analyze_break_even(paper, None)
 
         assert result["break_even_status"] == "warm_win"
@@ -192,7 +201,9 @@ class TestAnalyzeBreakEven:
         assert "Warm TG is already faster" in result["interpretation"]
 
     def test_no_warm_win(self):
-        paper = self._paper(warm_baseline_wall=240.0, warm_tg_wall=300.0, cold_build_seconds=600.0)
+        paper = self._paper(
+            warm_baseline_wall=240.0, warm_tg_wall=300.0, cold_build_seconds=600.0
+        )
         result = analyze_break_even(paper, None)
 
         assert result["break_even_status"] == "no_warm_win"
@@ -201,17 +212,23 @@ class TestAnalyzeBreakEven:
         assert "does not yet beat baseline" in result["interpretation"]
 
     def test_equal_warm_times(self):
-        paper = self._paper(warm_baseline_wall=300.0, warm_tg_wall=300.0, cold_build_seconds=600.0)
+        paper = self._paper(
+            warm_baseline_wall=300.0, warm_tg_wall=300.0, cold_build_seconds=600.0
+        )
         result = analyze_break_even(paper, None)
 
         assert result["break_even_status"] == "no_warm_win"
         assert result["warm_wall_delta_seconds"] == pytest.approx(0.0)
 
     def test_one_run_total_includes_cold_build(self):
-        paper = self._paper(warm_baseline_wall=300.0, warm_tg_wall=240.0, cold_build_seconds=600.0)
+        paper = self._paper(
+            warm_baseline_wall=300.0, warm_tg_wall=240.0, cold_build_seconds=600.0
+        )
         result = analyze_break_even(paper, None)
 
-        assert result["one_run_total_tg_seconds_including_cold_build"] == pytest.approx(840.0)
+        assert result["one_run_total_tg_seconds_including_cold_build"] == pytest.approx(
+            840.0
+        )
         assert result["one_run_total_delta_seconds"] == pytest.approx(300.0 - 840.0)
 
     def test_cold_build_source_paper_summary(self):
@@ -228,7 +245,9 @@ class TestAnalyzeBreakEven:
         assert result["cold_build_seconds"] == pytest.approx(400.0)
 
     def test_break_even_with_precompute_overrides_cold_build(self):
-        paper = self._paper(warm_baseline_wall=300.0, warm_tg_wall=240.0, cold_build_seconds=600.0)
+        paper = self._paper(
+            warm_baseline_wall=300.0, warm_tg_wall=240.0, cold_build_seconds=600.0
+        )
         precompute = {"overall_wall_seconds": 120.0}
         result = analyze_break_even(paper, precompute)
 
@@ -247,9 +266,13 @@ class TestAnalyzeBreakEven:
         assert result["warm_tg_gpu_peak_mb"] == pytest.approx(8300.0)
 
     def test_aggregate_paper_break_even(self):
-        paper = _extract_from_aggregate(_aggregate_summary(
-            warm_baseline_wall=300.0, warm_tg_wall=240.0, tg_cache_build=600.0,
-        ))
+        paper = _extract_from_aggregate(
+            _aggregate_summary(
+                warm_baseline_wall=300.0,
+                warm_tg_wall=240.0,
+                tg_cache_build=600.0,
+            )
+        )
         result = analyze_break_even(paper, None)
 
         assert result["summary_type"] == "aggregate"
@@ -277,23 +300,35 @@ class TestEvaluateGates:
 
     def test_no_gates_enabled_yields_no_failures(self):
         result = self._result()
-        assert evaluate_gates(
-            result,
-            require_warm_win=False,
-            max_break_even_runs=None,
-            require_one_run_win=False,
-        ) == []
+        assert (
+            evaluate_gates(
+                result,
+                require_warm_win=False,
+                max_break_even_runs=None,
+                require_one_run_win=False,
+            )
+            == []
+        )
 
     def test_require_warm_win_passes_when_warm_tg_beats_baseline(self):
         result = self._result()
-        assert evaluate_gates(
-            result, require_warm_win=True, max_break_even_runs=None, require_one_run_win=False
-        ) == []
+        assert (
+            evaluate_gates(
+                result,
+                require_warm_win=True,
+                max_break_even_runs=None,
+                require_one_run_win=False,
+            )
+            == []
+        )
 
     def test_require_warm_win_fails_when_no_warm_win(self):
         result = self._result(warm_baseline_wall=240.0, warm_tg_wall=300.0)
         failures = evaluate_gates(
-            result, require_warm_win=True, max_break_even_runs=None, require_one_run_win=False
+            result,
+            require_warm_win=True,
+            max_break_even_runs=None,
+            require_one_run_win=False,
         )
         assert len(failures) == 1
         assert failures[0]["gate"] == "--require-warm-win"
@@ -301,20 +336,35 @@ class TestEvaluateGates:
 
     def test_max_break_even_runs_passes_within_budget(self):
         result = self._result()  # ber=10.0
-        assert evaluate_gates(
-            result, require_warm_win=False, max_break_even_runs=20.0, require_one_run_win=False
-        ) == []
+        assert (
+            evaluate_gates(
+                result,
+                require_warm_win=False,
+                max_break_even_runs=20.0,
+                require_one_run_win=False,
+            )
+            == []
+        )
 
     def test_max_break_even_runs_boundary_is_inclusive(self):
         result = self._result()  # ber=10.0 exactly
-        assert evaluate_gates(
-            result, require_warm_win=False, max_break_even_runs=10.0, require_one_run_win=False
-        ) == []
+        assert (
+            evaluate_gates(
+                result,
+                require_warm_win=False,
+                max_break_even_runs=10.0,
+                require_one_run_win=False,
+            )
+            == []
+        )
 
     def test_max_break_even_runs_fails_over_budget(self):
         result = self._result()  # ber=10.0
         failures = evaluate_gates(
-            result, require_warm_win=False, max_break_even_runs=5.0, require_one_run_win=False
+            result,
+            require_warm_win=False,
+            max_break_even_runs=5.0,
+            require_one_run_win=False,
         )
         assert len(failures) == 1
         assert failures[0]["gate"] == "--max-break-even-runs"
@@ -323,7 +373,10 @@ class TestEvaluateGates:
     def test_max_break_even_runs_fails_when_no_warm_win(self):
         result = self._result(warm_baseline_wall=240.0, warm_tg_wall=300.0)
         failures = evaluate_gates(
-            result, require_warm_win=False, max_break_even_runs=20.0, require_one_run_win=False
+            result,
+            require_warm_win=False,
+            max_break_even_runs=20.0,
+            require_one_run_win=False,
         )
         assert len(failures) == 1
         assert failures[0]["gate"] == "--max-break-even-runs"
@@ -332,7 +385,10 @@ class TestEvaluateGates:
     def test_require_one_run_win_fails_when_cold_build_dominates(self):
         result = self._result()  # one_run_total_delta=-540.0
         failures = evaluate_gates(
-            result, require_warm_win=False, max_break_even_runs=None, require_one_run_win=True
+            result,
+            require_warm_win=False,
+            max_break_even_runs=None,
+            require_one_run_win=True,
         )
         assert len(failures) == 1
         assert failures[0]["gate"] == "--require-one-run-win"
@@ -341,9 +397,15 @@ class TestEvaluateGates:
         # cold_build=50 -> one run incl cold = 290 < baseline 300 -> delta +10
         result = self._result(cold_build_seconds=50.0)
         assert result["one_run_total_delta_seconds"] > 0
-        assert evaluate_gates(
-            result, require_warm_win=False, max_break_even_runs=None, require_one_run_win=True
-        ) == []
+        assert (
+            evaluate_gates(
+                result,
+                require_warm_win=False,
+                max_break_even_runs=None,
+                require_one_run_win=True,
+            )
+            == []
+        )
 
     # -- VRAM-budget gate: the consumer for the otherwise display-only ----------
     # warm_*_gpu_peak_mb metrics. Constitution P3 (VRAM cost accounting) + the
@@ -367,7 +429,9 @@ class TestEvaluateGates:
         assert "exceeds budget 8250.0" in failures[0]["message"]
 
     def test_max_warm_gpu_peak_mb_fails_when_baseline_exceeds(self):
-        result = self._result(warm_baseline_gpu_mb=9000.0)  # baseline=9000 > 8500; tg=8300 ok
+        result = self._result(
+            warm_baseline_gpu_mb=9000.0
+        )  # baseline=9000 > 8500; tg=8300 ok
         failures = evaluate_gates(result, max_warm_gpu_peak_mb=8500.0)
         assert len(failures) == 1
         assert failures[0]["gate"] == "--max-warm-gpu-peak-mb"
@@ -395,7 +459,10 @@ class TestEvaluateGates:
     def test_multiple_enabled_gates_collect_every_failure(self):
         result = self._result(warm_baseline_wall=240.0, warm_tg_wall=300.0)
         failures = evaluate_gates(
-            result, require_warm_win=True, max_break_even_runs=5.0, require_one_run_win=True
+            result,
+            require_warm_win=True,
+            max_break_even_runs=5.0,
+            require_one_run_win=True,
         )
         gates = {f["gate"] for f in failures}
         assert gates == {
@@ -412,13 +479,16 @@ class TestEvaluateGates:
 
 class TestCLI:
     def test_cli_with_single_run_summary(self, tmp_path):
-        summary_path = _write_json(
-            tmp_path / "summary.json", _single_run_summary()
-        )
+        summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path)],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 0, f"CLI failed: {result.stderr}"
         output = json.loads(result.stdout.split("Break-even analysis")[0])
@@ -432,24 +502,33 @@ class TestCLI:
             tmp_path / "aggregate_summary.json", _aggregate_summary()
         )
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path)],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 0, f"CLI failed: {result.stderr}"
 
     def test_cli_with_precompute_summary(self, tmp_path):
-        summary_path = _write_json(
-            tmp_path / "summary.json", _single_run_summary()
-        )
+        summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
         precompute_path = _write_json(
             tmp_path / "precompute.json", {"overall_wall_seconds": 400.0}
         )
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path),
-             "--precompute-summary", str(precompute_path)],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+                "--precompute-summary",
+                str(precompute_path),
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 0, f"CLI failed: {result.stderr}"
         output = json.loads(result.stdout.split("Break-even analysis")[0])
@@ -457,31 +536,41 @@ class TestCLI:
         assert output["cold_build_seconds"] == pytest.approx(400.0)
 
     def test_cli_custom_output_path(self, tmp_path):
-        summary_path = _write_json(
-            tmp_path / "summary.json", _single_run_summary()
-        )
+        summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
         output_path = tmp_path / "custom_output.json"
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path),
-             "--output", str(output_path)],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+                "--output",
+                str(output_path),
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 0, f"CLI failed: {result.stderr}"
         assert output_path.exists()
 
     def test_cli_missing_paper_summary_exits_nonzero(self):
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", "/nonexistent/path"],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                "/nonexistent/path",
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode != 0
 
     def test_cli_no_args_exits_nonzero(self):
         result = subprocess.run(
             [sys.executable, "scripts/analyze_prefix_cache_break_even.py"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         assert result.returncode != 0
 
@@ -489,9 +578,14 @@ class TestCLI:
         bad_path = tmp_path / "bad.json"
         bad_path.write_text("[1, 2, 3]")
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(bad_path)],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(bad_path),
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode != 0
         assert "must resolve to a JSON object" in result.stderr
@@ -506,18 +600,31 @@ class TestCLI:
             _single_run_summary(warm_baseline_wall=240.0, warm_tg_wall=300.0),
         )
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path)],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+            ],
+            capture_output=True,
+            text=True,
         )
-        assert result.returncode == 0, f"display-only path must stay exit 0: {result.stderr}"
+        assert result.returncode == 0, (
+            f"display-only path must stay exit 0: {result.stderr}"
+        )
 
     def test_cli_require_warm_win_passes(self, tmp_path):
         summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path), "--require-warm-win"],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+                "--require-warm-win",
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 0, f"gate should pass: {result.stderr}"
 
@@ -527,9 +634,15 @@ class TestCLI:
             _single_run_summary(warm_baseline_wall=240.0, warm_tg_wall=300.0),
         )
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path), "--require-warm-win"],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+                "--require-warm-win",
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 1
         assert "--require-warm-win" in result.stderr
@@ -537,18 +650,32 @@ class TestCLI:
     def test_cli_max_break_even_runs_passes_within_budget(self, tmp_path):
         summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path), "--max-break-even-runs", "20"],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+                "--max-break-even-runs",
+                "20",
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 0, f"gate should pass: {result.stderr}"
 
     def test_cli_max_break_even_runs_fails_over_budget(self, tmp_path):
         summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path), "--max-break-even-runs", "5"],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+                "--max-break-even-runs",
+                "5",
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 1
         assert "--max-break-even-runs" in result.stderr
@@ -558,9 +685,15 @@ class TestCLI:
         # default fixture: cold build 600 -> one run incl cold = 840 > 300
         summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path), "--require-one-run-win"],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+                "--require-one-run-win",
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 1
         assert "--require-one-run-win" in result.stderr
@@ -568,18 +701,32 @@ class TestCLI:
     def test_cli_max_warm_gpu_peak_mb_passes_within_budget(self, tmp_path):
         summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path), "--max-warm-gpu-peak-mb", "9000"],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+                "--max-warm-gpu-peak-mb",
+                "9000",
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 0, f"VRAM gate should pass: {result.stderr}"
 
     def test_cli_max_warm_gpu_peak_mb_fails_over_budget(self, tmp_path):
         summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path), "--max-warm-gpu-peak-mb", "8000"],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+                "--max-warm-gpu-peak-mb",
+                "8000",
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 1
         assert "--max-warm-gpu-peak-mb" in result.stderr
@@ -591,9 +738,16 @@ class TestCLI:
         summary["warm"]["tg_lora"]["gpu_peak_mb"] = None
         summary_path = _write_json(tmp_path / "summary.json", summary)
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path), "--max-warm-gpu-peak-mb", "12288"],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+                "--max-warm-gpu-peak-mb",
+                "12288",
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 1
         assert "not recorded" in result.stderr
@@ -602,10 +756,18 @@ class TestCLI:
         summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
         out_path = tmp_path / "out.json"
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path),
-             "--max-warm-gpu-peak-mb", "8000", "--output", str(out_path)],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+                "--max-warm-gpu-peak-mb",
+                "8000",
+                "--output",
+                str(out_path),
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 1
         record = json.loads(out_path.read_bytes())
@@ -619,11 +781,18 @@ class TestCLI:
         summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
         out_path = tmp_path / "out.json"
         result = subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path),
-             "--max-break-even-runs", "5",
-             "--output", str(out_path)],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+                "--max-break-even-runs",
+                "5",
+                "--output",
+                str(out_path),
+            ],
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 1
         record = json.loads(out_path.read_bytes())
@@ -638,9 +807,17 @@ class TestCLI:
         summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
         out_path = tmp_path / "out.json"
         subprocess.run(
-            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
-             "--paper-summary", str(summary_path), "--output", str(out_path)],
-            capture_output=True, text=True, check=True,
+            [
+                sys.executable,
+                "scripts/analyze_prefix_cache_break_even.py",
+                "--paper-summary",
+                str(summary_path),
+                "--output",
+                str(out_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
         )
         record = json.loads(out_path.read_bytes())
         assert "gates" not in record
@@ -653,17 +830,25 @@ class TestCLI:
 
 class TestEdgeCases:
     def test_very_small_warm_delta_large_break_even(self):
-        paper = _extract_from_single_run(_single_run_summary(
-            warm_baseline_wall=300.0, warm_tg_wall=299.99, cold_build_seconds=600.0,
-        ))
+        paper = _extract_from_single_run(
+            _single_run_summary(
+                warm_baseline_wall=300.0,
+                warm_tg_wall=299.99,
+                cold_build_seconds=600.0,
+            )
+        )
         result = analyze_break_even(paper, None)
         assert result["break_even_status"] == "warm_win"
         assert result["break_even_repeated_runs"] == pytest.approx(600.0 / 0.01)
 
     def test_large_cold_build_slow_amortization(self):
-        paper = _extract_from_single_run(_single_run_summary(
-            warm_baseline_wall=300.0, warm_tg_wall=240.0, cold_build_seconds=60000.0,
-        ))
+        paper = _extract_from_single_run(
+            _single_run_summary(
+                warm_baseline_wall=300.0,
+                warm_tg_wall=240.0,
+                cold_build_seconds=60000.0,
+            )
+        )
         result = analyze_break_even(paper, None)
         assert result["break_even_repeated_runs"] == pytest.approx(1000.0)
 
@@ -674,9 +859,13 @@ class TestEdgeCases:
             analyze_break_even(paper, precompute)
 
     def test_one_run_total_delta_negative_when_cold_expensive(self):
-        paper = _extract_from_single_run(_single_run_summary(
-            warm_baseline_wall=300.0, warm_tg_wall=240.0, cold_build_seconds=600.0,
-        ))
+        paper = _extract_from_single_run(
+            _single_run_summary(
+                warm_baseline_wall=300.0,
+                warm_tg_wall=240.0,
+                cold_build_seconds=600.0,
+            )
+        )
         result = analyze_break_even(paper, None)
         # total_tg = 600 + 240 = 840 > baseline 300
         assert result["one_run_total_delta_seconds"] == pytest.approx(-540.0)
@@ -740,7 +929,9 @@ def _write_run_metrics_jsonl(
     path.write_bytes(b"\n".join(lines) + b"\n")
 
 
-@pytest.mark.skipif(not _PRODUCER_AVAILABLE, reason="benchmark_prefix_cache import chain unavailable")
+@pytest.mark.skipif(
+    not _PRODUCER_AVAILABLE, reason="benchmark_prefix_cache import chain unavailable"
+)
 @pytest.mark.skipif(shutil.which("make") is None, reason="make not installed")
 class TestEndToEndPipelineGate:
     """Validate the gate target against REAL producer output, end to end."""
@@ -752,7 +943,9 @@ class TestEndToEndPipelineGate:
         candidate = Path(sys.executable).resolve().parent.parent
         if (candidate / "bin" / "python").exists():
             return str(candidate)
-        pytest.skip("sys.executable is not <venv>/bin/python; cannot derive VENV for make target")
+        pytest.skip(
+            "sys.executable is not <venv>/bin/python; cannot derive VENV for make target"
+        )
 
     @staticmethod
     def _build_real_summary(
@@ -767,16 +960,30 @@ class TestEndToEndPipelineGate:
         """Drive the REAL `build_benchmark_summary` producer over jsonl inputs
         to emit a pipeline-faithful summary.json. Returns its path."""
         run_root = tmp_path / "run"
-        _write_run_metrics_jsonl(run_root / "cold" / "baseline" / "run_metrics.jsonl",
-                                 wall_seconds=300.0, gpu_peak_mb=8200.0)
-        _write_run_metrics_jsonl(run_root / "cold" / "tg_lora" / "run_metrics.jsonl",
-                                 wall_seconds=360.0, gpu_peak_mb=8300.0,
-                                 build_seconds=cold_tg_build, tg=True)
-        _write_run_metrics_jsonl(run_root / "warm" / "baseline" / "run_metrics.jsonl",
-                                 wall_seconds=warm_baseline_wall, gpu_peak_mb=warm_baseline_gpu)
-        _write_run_metrics_jsonl(run_root / "warm" / "tg_lora" / "run_metrics.jsonl",
-                                 wall_seconds=warm_tg_wall, gpu_peak_mb=warm_tg_gpu,
-                                 build_seconds=cold_tg_build, tg=True)
+        _write_run_metrics_jsonl(
+            run_root / "cold" / "baseline" / "run_metrics.jsonl",
+            wall_seconds=300.0,
+            gpu_peak_mb=8200.0,
+        )
+        _write_run_metrics_jsonl(
+            run_root / "cold" / "tg_lora" / "run_metrics.jsonl",
+            wall_seconds=360.0,
+            gpu_peak_mb=8300.0,
+            build_seconds=cold_tg_build,
+            tg=True,
+        )
+        _write_run_metrics_jsonl(
+            run_root / "warm" / "baseline" / "run_metrics.jsonl",
+            wall_seconds=warm_baseline_wall,
+            gpu_peak_mb=warm_baseline_gpu,
+        )
+        _write_run_metrics_jsonl(
+            run_root / "warm" / "tg_lora" / "run_metrics.jsonl",
+            wall_seconds=warm_tg_wall,
+            gpu_peak_mb=warm_tg_gpu,
+            build_seconds=cold_tg_build,
+            tg=True,
+        )
         summary = build_benchmark_summary(run_root / "cold", run_root / "warm")
         out = tmp_path / "summary.json"
         out.write_bytes(orjson.dumps(summary, option=orjson.OPT_INDENT_2))
@@ -787,16 +994,23 @@ class TestEndToEndPipelineGate:
         env = {**os.environ, **env_overrides}
         return subprocess.run(
             ["make", "analyze-prefix-break-even-ci"],
-            cwd=_REPO_ROOT, env=env, capture_output=True, text=True,
+            cwd=_REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
         )
 
-    def test_producer_output_is_dense_pipeline_shape_not_minimal_fixture(self, tmp_path):
+    def test_producer_output_is_dense_pipeline_shape_not_minimal_fixture(
+        self, tmp_path
+    ):
         """Guard: the producer-emitted summary carries the full real key surface
         (>=18 tg_lora keys + delta), far denser than the 4-key _single_run_summary
         unit fixture — which is WHY this end-to-end exercise is a real coverage
         gain and not a duplicate of TestCLI. If the producer drops a field this
         pins, the gate's extractor may be reading a stale shape."""
-        summary_path = self._build_real_summary(tmp_path, warm_tg_wall=240.0, warm_tg_gpu=8300.0)
+        summary_path = self._build_real_summary(
+            tmp_path, warm_tg_wall=240.0, warm_tg_gpu=8300.0
+        )
         produced = orjson.loads(summary_path.read_bytes())
         tg = produced["warm"]["tg_lora"]
         # Real keys the minimal unit fixture omits but the pipeline always emits:
@@ -809,7 +1023,9 @@ class TestEndToEndPipelineGate:
             "loss_red_per_wall_minute",
             "total_backward_passes",
         ):
-            assert dense_key in tg, f"producer output missing real pipeline key: {dense_key}"
+            assert dense_key in tg, (
+                f"producer output missing real pipeline key: {dense_key}"
+            )
         assert "delta" in produced
         assert "tg_wall_speedup_pct" in produced["delta"]
         assert len(tg) >= 18
@@ -824,15 +1040,19 @@ class TestEndToEndPipelineGate:
         the VRAM budget (14000>12288). The VRAM gate must fire naming the TG arm
         while --require-warm-win passes — per-arm / per-gate independence on
         genuine producer output. Non-zero exit + verdict JSON recorded."""
-        summary_path = self._build_real_summary(tmp_path, warm_tg_wall=240.0, warm_tg_gpu=14000.0)
+        summary_path = self._build_real_summary(
+            tmp_path, warm_tg_wall=240.0, warm_tg_gpu=14000.0
+        )
         verdict = tmp_path / "verdict.json"
-        result = self._run_make_gate({
-            "VENV": self._venv_root(),
-            "PAPER_SUMMARY": str(summary_path),
-            "OUTPUT_PATH": str(verdict),
-            "REQUIRE_WARM_WIN": "1",
-            "MAX_WARM_GPU_PEAK_MB": "12288",
-        })
+        result = self._run_make_gate(
+            {
+                "VENV": self._venv_root(),
+                "PAPER_SUMMARY": str(summary_path),
+                "OUTPUT_PATH": str(verdict),
+                "REQUIRE_WARM_WIN": "1",
+                "MAX_WARM_GPU_PEAK_MB": "12288",
+            }
+        )
         assert result.returncode != 0, "VRAM-violating warm arm must exit non-zero"
         assert "--max-warm-gpu-peak-mb" in result.stderr
         assert "warm_tg_gpu_peak_mb" in result.stderr
@@ -841,7 +1061,9 @@ class TestEndToEndPipelineGate:
         assert "warm_baseline_gpu_peak_mb" not in result.stderr
         record = orjson.loads(verdict.read_bytes())
         assert record["gates"]["passed"] is False
-        assert {f["gate"] for f in record["gates"]["failures"]} == {"--max-warm-gpu-peak-mb"}
+        assert {f["gate"] for f in record["gates"]["failures"]} == {
+            "--max-warm-gpu-peak-mb"
+        }
         # The wall-clock gate passed even though the VRAM gate failed:
         assert record["break_even_status"] == "warm_win"
         requested = record["gates"]["requested"]
@@ -852,14 +1074,18 @@ class TestEndToEndPipelineGate:
         """Real pipeline output where warm TG LOSES on wall-clock (350>300).
         --require-warm-win must fire with no_warm_win; an unrequested VRAM gate
         stays out of the verdict entirely."""
-        summary_path = self._build_real_summary(tmp_path, warm_tg_wall=350.0, warm_tg_gpu=8300.0)
+        summary_path = self._build_real_summary(
+            tmp_path, warm_tg_wall=350.0, warm_tg_gpu=8300.0
+        )
         verdict = tmp_path / "verdict.json"
-        result = self._run_make_gate({
-            "VENV": self._venv_root(),
-            "PAPER_SUMMARY": str(summary_path),
-            "OUTPUT_PATH": str(verdict),
-            "REQUIRE_WARM_WIN": "1",
-        })
+        result = self._run_make_gate(
+            {
+                "VENV": self._venv_root(),
+                "PAPER_SUMMARY": str(summary_path),
+                "OUTPUT_PATH": str(verdict),
+                "REQUIRE_WARM_WIN": "1",
+            }
+        )
         assert result.returncode != 0
         assert "--require-warm-win" in result.stderr
         assert "no_warm_win" in result.stderr
@@ -873,17 +1099,172 @@ class TestEndToEndPipelineGate:
         """Positive control: real pipeline output that satisfies every enabled
         gate exits ZERO with gates.passed=True — so the target's accept path is
         exercised, not only the reject path (both sides of the boundary)."""
-        summary_path = self._build_real_summary(tmp_path, warm_tg_wall=240.0, warm_tg_gpu=8300.0)
+        summary_path = self._build_real_summary(
+            tmp_path, warm_tg_wall=240.0, warm_tg_gpu=8300.0
+        )
         verdict = tmp_path / "verdict.json"
-        result = self._run_make_gate({
-            "VENV": self._venv_root(),
-            "PAPER_SUMMARY": str(summary_path),
-            "OUTPUT_PATH": str(verdict),
-            "REQUIRE_WARM_WIN": "1",
-            "MAX_WARM_GPU_PEAK_MB": "12288",
-            "MAX_BREAK_EVEN_RUNS": "20",  # ber=10.0 <= 20
-        })
+        result = self._run_make_gate(
+            {
+                "VENV": self._venv_root(),
+                "PAPER_SUMMARY": str(summary_path),
+                "OUTPUT_PATH": str(verdict),
+                "REQUIRE_WARM_WIN": "1",
+                "MAX_WARM_GPU_PEAK_MB": "12288",
+                "MAX_BREAK_EVEN_RUNS": "20",  # ber=10.0 <= 20
+            }
+        )
         assert result.returncode == 0, f"all-green path must exit 0: {result.stderr}"
         record = orjson.loads(verdict.read_bytes())
         assert record["gates"]["passed"] is True
         assert record["gates"]["failures"] == []
+
+
+# ---------------------------------------------------------------------------
+# Checked-in canonical fixture — the STABLE paper-summary the GPU-free `gates`
+# CI job runs the break-even gate against (AI_HUB_MAKE_RUN_FEEDBACK #4: prove the
+# gate target is non-inert by invoking it on every push). CI cannot run a real
+# GPU A/B and should not invoke the producer in the `gates` job, so the fixture
+# is the portable input. These tests pin that it stays producer-faithful
+# (drift-guard) and carries a known budget-compliant verdict + fire boundary.
+# ---------------------------------------------------------------------------
+
+_CANONICAL_FIXTURE = (
+    _REPO_ROOT / "tests" / "fixtures" / "prefix_break_even_canonical_summary.json"
+)
+
+# Filesystem paths the producer embeds that vary per tmpdir — they are not part
+# of the gate's contract, so the drift-guard exempts only these when comparing
+# the checked-in fixture to a freshly produced one.
+_VOLATILE_PATH_KEYS = frozenset({"run_dir", "prefix_feature_cache_dir"})
+
+
+def _strip_volatile_paths(node: object) -> object:
+    """Recursively drop per-tmpdir filesystem-path keys so a checked-in fixture
+    can be compared for structural + value equality against a fresh producer run
+    (whose tmp paths necessarily differ)."""
+    if isinstance(node, dict):
+        return {
+            k: _strip_volatile_paths(v)
+            for k, v in node.items()
+            if k not in _VOLATILE_PATH_KEYS
+        }
+    if isinstance(node, list):
+        return [_strip_volatile_paths(v) for v in node]
+    return node
+
+
+def _build_canonical_real_summary(tmp_path: Path) -> Path:
+    """Drive the REAL `build_benchmark_summary` producer over the CANONICAL
+    budget-compliant inputs that produced the checked-in
+    `prefix_break_even_canonical_summary.json`. Used by the drift-guard to prove
+    that fixture stays byte-faithful to the live producer."""
+    run_root = tmp_path / "run"
+    _write_run_metrics_jsonl(
+        run_root / "cold" / "baseline" / "run_metrics.jsonl",
+        wall_seconds=300.0,
+        gpu_peak_mb=8200.0,
+    )
+    _write_run_metrics_jsonl(
+        run_root / "cold" / "tg_lora" / "run_metrics.jsonl",
+        wall_seconds=360.0,
+        gpu_peak_mb=8300.0,
+        build_seconds=600.0,
+        tg=True,
+    )
+    _write_run_metrics_jsonl(
+        run_root / "warm" / "baseline" / "run_metrics.jsonl",
+        wall_seconds=300.0,
+        gpu_peak_mb=8200.0,
+    )
+    _write_run_metrics_jsonl(
+        run_root / "warm" / "tg_lora" / "run_metrics.jsonl",
+        wall_seconds=240.0,
+        gpu_peak_mb=10000.0,
+        build_seconds=600.0,
+        tg=True,
+    )
+    summary = build_benchmark_summary(run_root / "cold", run_root / "warm")
+    out = tmp_path / "canonical_summary.json"
+    out.write_bytes(orjson.dumps(summary, option=orjson.OPT_INDENT_2))
+    return out
+
+
+class TestCheckedInCanonicalFixture:
+    """The fixture is reviewed-once but exercised forever after; these tests make
+    sure it cannot silently drift. None of them need `make` or the producer's
+    import chain except the drift-guard, so the boundary pins run in every
+    environment (including CI's `gates` job's mental model of 'just a fixture')."""
+
+    def test_fixture_exists_and_is_dense_pipeline_shape(self):
+        """The checked-in fixture carries the full producer key surface (>=18
+        warm.tg_lora keys), not a hand-pruned 4-key stub — otherwise re-running
+        the gate against it in CI would re-open the fixture-vs-pipeline gap."""
+        assert _CANONICAL_FIXTURE.exists(), (
+            f"missing canonical fixture: {_CANONICAL_FIXTURE}"
+        )
+        checked_in = orjson.loads(_CANONICAL_FIXTURE.read_bytes())
+        assert len(checked_in["warm"]["tg_lora"]) >= 18
+        # The gate extractor pulls real values out of this dense shape:
+        extracted = _extract_from_single_run(checked_in)
+        assert extracted["warm_tg_wall_seconds"] == 240.0
+        assert extracted["warm_baseline_wall_seconds"] == 300.0
+        assert extracted["cold_build_seconds"] == 600.0
+
+    @pytest.mark.skipif(
+        not _PRODUCER_AVAILABLE,
+        reason="benchmark_prefix_cache import chain unavailable",
+    )
+    def test_checked_in_fixture_matches_real_producer_output(self, tmp_path):
+        """Drift-guard: regenerate from the canonical inputs via the REAL producer
+        and assert structural + value equality with the checked-in fixture
+        (exempting only per-tmpdir path fields). Catches a dropped producer field
+        (shape drift) AND a changed canonical input (value drift) — so the
+        fixture can never silently regress to a stub, and the canonical inputs
+        cannot drift from what the fixture actually encodes."""
+        regenerated = orjson.loads(_build_canonical_real_summary(tmp_path).read_bytes())
+        checked_in = orjson.loads(_CANONICAL_FIXTURE.read_bytes())
+        assert _strip_volatile_paths(regenerated) == _strip_volatile_paths(checked_in)
+
+    def test_canonical_fixture_passes_the_ci_gate_config(self):
+        """The checked-in fixture MUST satisfy the exact gate config the CI
+        `gates` job uses (--require-warm-win --max-warm-gpu-peak-mb 12288) —
+        otherwise CI goes red the day this fixture drifts. Pins the accept
+        boundary against the stable artifact, in-process (no make, no GPU)."""
+        paper = _load_paper_summary(_CANONICAL_FIXTURE)
+        result = analyze_break_even(paper, None)
+        failures = evaluate_gates(
+            result,
+            require_warm_win=True,
+            max_warm_gpu_peak_mb=12288,
+        )
+        assert failures == [], (
+            f"canonical fixture must pass the CI gate config: {failures}"
+        )
+        assert result["break_even_status"] == "warm_win"
+        # Both warm arms under the 12288 MB RTX 3060 budget:
+        assert result["warm_baseline_gpu_peak_mb"] == 8200.0
+        assert result["warm_tg_gpu_peak_mb"] == 10000.0
+
+    def test_violating_mutation_fires_naming_only_the_tg_arm(self, tmp_path):
+        """The fire boundary against the STABLE fixture: bump warm TG VRAM over
+        budget and the gate must fire naming ONLY the TG arm (the baseline arm
+        stays under). This is the per-arm independence pin that the CI `gates`
+        job's reject-path assertion relies on."""
+        mutated = json.loads(_CANONICAL_FIXTURE.read_text())
+        mutated["warm"]["tg_lora"]["gpu_peak_mb"] = 14000.0  # over the 12288 budget
+        mutated_path = tmp_path / "violating.json"
+        mutated_path.write_text(json.dumps(mutated))
+        paper = _load_paper_summary(mutated_path)
+        result = analyze_break_even(paper, None)
+        failures = evaluate_gates(
+            result,
+            require_warm_win=True,
+            max_warm_gpu_peak_mb=12288,
+        )
+        assert failures, "VRAM-violating mutation must fail the gate"
+        assert {f["gate"] for f in failures} == {"--max-warm-gpu-peak-mb"}
+        # The wall-clock gate still passes (240 < 300) — only VRAM fails:
+        assert result["break_even_status"] == "warm_win"
+        # The TG arm is named; the under-budget baseline arm is NOT:
+        assert all("warm_tg_gpu_peak_mb" in f["message"] for f in failures)
+        assert all("warm_baseline_gpu_peak_mb" not in f["message"] for f in failures)

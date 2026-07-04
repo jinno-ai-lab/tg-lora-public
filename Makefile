@@ -7,7 +7,7 @@
 	compare compare-prefix compare-prefix-cold compare-prefix-warm compare-prefix-coldwarm compare-report paper-memory paper-memory-dry-run paper-memory-one-shot paper-memory-compare-modes paper-memory-all-modes paper-memory-evaluate-gates paper-memory-external-eval paper-memory-frontier-sweep paper-memory-cache-ablation cosine-n-ablation cosine-n-ablation-dry-run cosine-n-skip-ablation cosine-n-skip-ablation-dry-run precompute-prefix-cache ablation sweep accel-sweep \
 	bench-optimizer bench-prefix-cache bench-prefix-cache-one-shot analyze-prefix-break-even analyze-prefix-break-even-ci bench-velocity-ops bench-velocity-ops-ci bench-velocity-ops-save-baseline \
        test test-accel test-cov test-integration test-trajectory test-cli-help lint format clean clean-data clean-runs \
-       diagnose recover ci check-status \
+       diagnose recover ci gates-ci check-status \
        convert-mlx train-mlx train-mlx-baseline train-mlx-continuous train-mlx-upstream train-mlx-smoke mlx-data compare-mlx \
        help
 
@@ -550,6 +550,13 @@ bench-velocity-ops-save-baseline: ## Regenerate baselines/velocity_ops.json (com
 	$(PYTHON_VENV) scripts/benchmark_velocity_ops.py \
 		--quick --save-baseline baselines/velocity_ops.json
 
+gates-ci: ## Run every GPU-free CI gate in one target (the loop's gate sequence). No GPU run needed.
+	$(MAKE) bench-velocity-ops-ci
+	PAPER_SUMMARY=tests/fixtures/prefix_break_even_canonical_summary.json \
+	REQUIRE_WARM_WIN=1 MAX_WARM_GPU_PEAK_MB=12288 \
+	OUTPUT_PATH=runs/gates_ci/break_even_verdict.json \
+	$(MAKE) analyze-prefix-break-even-ci
+
 # ── Quality ──────────────────────────────────────────────────────────────────
 
 test: ## Run unit tests
@@ -740,10 +747,11 @@ sync-to-cuda: ## Rsync MLX runs from Mac to CUDA host. Usage: make sync-to-cuda 
 
 # ── CI ────────────────────────────────────────────────────────────────────────
 
-ci: ## Run full CI pipeline (lint + test + script import check)
+ci: ## Run full CI pipeline (lint + gates + test + script import check)
 	$(PYTHON_VENV) -m ruff check src/ tests/ scripts/ mlx/
 	$(PYTHON_VENV) -m ruff format --check src/ tests/ scripts/ mlx/
 	$(PYTHON_VENV) scripts/check_spine_anchors.py
+	$(MAKE) gates-ci
 	$(PYTHON_VENV) -m pytest tests/ mlx/tests/ -q
 	@$(PYTHON_VENV) -m pytest tests/ -k "accel" -q --tb=short
 	@$(PYTHON_VENV) -c "import scripts.diagnose; import scripts.recover; print('scripts import OK')" 2>/dev/null || \
