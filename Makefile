@@ -534,7 +534,8 @@ analyze-prefix-break-even-ci: ## CI gate variant: fail (non-zero) unless the col
 		$(if $(OUTPUT_PATH),--output $(OUTPUT_PATH)) \
 		$(if $(REQUIRE_WARM_WIN),--require-warm-win) \
 		$(if $(MAX_BREAK_EVEN_RUNS),--max-break-even-runs $(MAX_BREAK_EVEN_RUNS)) \
-		$(if $(REQUIRE_ONE_RUN_WIN),--require-one-run-win)
+		$(if $(REQUIRE_ONE_RUN_WIN),--require-one-run-win) \
+		$(if $(MAX_WARM_GPU_PEAK_MB),--max-warm-gpu-peak-mb $(MAX_WARM_GPU_PEAK_MB))
 
 bench-velocity-ops: ## Benchmark velocity EMA update and cap_update in-place ops
 	$(PYTHON_VENV) scripts/benchmark_velocity_ops.py \

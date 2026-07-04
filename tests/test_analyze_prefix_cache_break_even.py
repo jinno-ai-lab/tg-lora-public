@@ -328,6 +328,53 @@ class TestEvaluateGates:
             result, require_warm_win=False, max_break_even_runs=None, require_one_run_win=True
         ) == []
 
+    # -- VRAM-budget gate: the consumer for the otherwise display-only ----------
+    # warm_*_gpu_peak_mb metrics. Constitution P3 (VRAM cost accounting) + the
+    # RTX 3060 12GB target: the wall-clock gates above are moot if the cache-on
+    # arm OOMs the budget. Default fixture has baseline=8200 MB, tg=8300 MB.
+
+    def test_max_warm_gpu_peak_mb_passes_within_budget(self):
+        result = self._result()  # baseline=8200, tg=8300
+        assert evaluate_gates(result, max_warm_gpu_peak_mb=9000.0) == []
+
+    def test_max_warm_gpu_peak_mb_boundary_is_inclusive(self):
+        result = self._result()  # tg=8300.0 exactly
+        assert evaluate_gates(result, max_warm_gpu_peak_mb=8300.0) == []
+
+    def test_max_warm_gpu_peak_mb_fails_when_tg_exceeds(self):
+        result = self._result()  # tg=8300 > 8250; baseline=8200 ok
+        failures = evaluate_gates(result, max_warm_gpu_peak_mb=8250.0)
+        assert len(failures) == 1
+        assert failures[0]["gate"] == "--max-warm-gpu-peak-mb"
+        assert "warm_tg_gpu_peak_mb" in failures[0]["message"]
+        assert "exceeds budget 8250.0" in failures[0]["message"]
+
+    def test_max_warm_gpu_peak_mb_fails_when_baseline_exceeds(self):
+        result = self._result(warm_baseline_gpu_mb=9000.0)  # baseline=9000 > 8500; tg=8300 ok
+        failures = evaluate_gates(result, max_warm_gpu_peak_mb=8500.0)
+        assert len(failures) == 1
+        assert failures[0]["gate"] == "--max-warm-gpu-peak-mb"
+        assert "warm_baseline_gpu_peak_mb" in failures[0]["message"]
+
+    def test_max_warm_gpu_peak_mb_reports_each_offending_arm(self):
+        # both arms over an 8000 MB budget (baseline set to 9000, tg default 8300)
+        result = self._result(warm_baseline_gpu_mb=9000.0)
+        failures = evaluate_gates(result, max_warm_gpu_peak_mb=8000.0)
+        assert len(failures) == 2
+        messages = "\n".join(f["message"] for f in failures)
+        assert "warm_baseline_gpu_peak_mb" in messages
+        assert "warm_tg_gpu_peak_mb" in messages
+
+    def test_max_warm_gpu_peak_mb_fails_loud_when_unmeasured(self):
+        # gpu_peak_mb=None => the peak was never recorded (CPU run / legacy run);
+        # a budget cannot be certified against an unmeasured peak, so fail loud
+        # (constitution §7: don't conclude without measuring) rather than pass.
+        result = self._result(warm_tg_gpu_mb=None)
+        failures = evaluate_gates(result, max_warm_gpu_peak_mb=12288.0)
+        assert len(failures) == 1
+        assert failures[0]["gate"] == "--max-warm-gpu-peak-mb"
+        assert "not recorded" in failures[0]["message"]
+
     def test_multiple_enabled_gates_collect_every_failure(self):
         result = self._result(warm_baseline_wall=240.0, warm_tg_wall=300.0)
         failures = evaluate_gates(
@@ -500,6 +547,54 @@ class TestCLI:
         )
         assert result.returncode == 1
         assert "--require-one-run-win" in result.stderr
+
+    def test_cli_max_warm_gpu_peak_mb_passes_within_budget(self, tmp_path):
+        summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
+        result = subprocess.run(
+            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
+             "--paper-summary", str(summary_path), "--max-warm-gpu-peak-mb", "9000"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"VRAM gate should pass: {result.stderr}"
+
+    def test_cli_max_warm_gpu_peak_mb_fails_over_budget(self, tmp_path):
+        summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
+        result = subprocess.run(
+            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
+             "--paper-summary", str(summary_path), "--max-warm-gpu-peak-mb", "8000"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        assert "--max-warm-gpu-peak-mb" in result.stderr
+        assert "exceeds budget" in result.stderr
+
+    def test_cli_max_warm_gpu_peak_mb_unmeasured_fails_loud(self, tmp_path):
+        # tg gpu_peak_mb stripped -> the VRAM budget cannot be certified
+        summary = _single_run_summary()
+        summary["warm"]["tg_lora"]["gpu_peak_mb"] = None
+        summary_path = _write_json(tmp_path / "summary.json", summary)
+        result = subprocess.run(
+            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
+             "--paper-summary", str(summary_path), "--max-warm-gpu-peak-mb", "12288"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        assert "not recorded" in result.stderr
+
+    def test_cli_max_warm_gpu_peak_mb_verdict_recorded_in_output_json(self, tmp_path):
+        summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
+        out_path = tmp_path / "out.json"
+        result = subprocess.run(
+            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
+             "--paper-summary", str(summary_path),
+             "--max-warm-gpu-peak-mb", "8000", "--output", str(out_path)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        record = json.loads(out_path.read_bytes())
+        assert record["gates"]["passed"] is False
+        assert record["gates"]["requested"] == ["--max-warm-gpu-peak-mb=8000.0"]
+        assert record["gates"]["failures"][0]["gate"] == "--max-warm-gpu-peak-mb"
 
     def test_cli_gate_verdict_recorded_in_output_json(self, tmp_path):
         """The consumer leaves a paper trail: when a gate is requested the output

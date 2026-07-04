@@ -75,6 +75,19 @@ def _parse_args() -> argparse.Namespace:
         help="Fail unless a single run INCLUDING the cold build already beats the "
         "baseline (one_run_total_delta_seconds > 0).",
     )
+    gates.add_argument(
+        "--max-warm-gpu-peak-mb",
+        type=float,
+        default=None,
+        help=(
+            "Fail unless BOTH warm arms' gpu_peak_mb stay at or under this VRAM "
+            "budget (MB). This is the consumer for the otherwise display-only "
+            "warm_*_gpu_peak_mb metrics: the wall-clock gates are moot if the "
+            "cache-on arm OOMs the target GPU (e.g. 12288 for the RTX 3060 12GB "
+            "target). Boundary-inclusive; an unrecorded (None) gpu_peak_mb fails "
+            "loud rather than silently passing the budget."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -165,9 +178,10 @@ def analyze_break_even(paper: dict[str, Any], precompute: dict[str, Any] | None)
 def evaluate_gates(
     result: dict[str, Any],
     *,
-    require_warm_win: bool,
-    max_break_even_runs: float | None,
-    require_one_run_win: bool,
+    require_warm_win: bool = False,
+    max_break_even_runs: float | None = None,
+    require_one_run_win: bool = False,
+    max_warm_gpu_peak_mb: float | None = None,
 ) -> list[dict[str, str]]:
     """Turn the break-even metrics into a pass/fail decision.
 
@@ -192,6 +206,42 @@ def evaluate_gates(
                 ),
             }
         )
+
+    if max_warm_gpu_peak_mb is not None:
+        # Consume the otherwise display-only warm_*_gpu_peak_mb metrics: a
+        # wall-clock win is moot if either arm blows the VRAM budget (the
+        # cache-on arm OOMs the target GPU). Each offending arm reports its
+        # own failure so the verdict names the arm that broke budget; an
+        # unrecorded (None) peak fails loud — a budget cannot be certified
+        # against a measurement that was never taken.
+        for arm_key, arm_label in (
+            ("warm_baseline_gpu_peak_mb", "Condition-A baseline"),
+            ("warm_tg_gpu_peak_mb", "Condition-B TG"),
+        ):
+            peak = result.get(arm_key)
+            if peak is None:
+                failures.append(
+                    {
+                        "gate": "--max-warm-gpu-peak-mb",
+                        "message": (
+                            f"{arm_key} is not recorded; the {arm_label} peak VRAM "
+                            f"was never measured, so the {max_warm_gpu_peak_mb} MB "
+                            "budget cannot be certified (re-run with GPU accounting)."
+                        ),
+                    }
+                )
+            elif float(peak) > max_warm_gpu_peak_mb:
+                failures.append(
+                    {
+                        "gate": "--max-warm-gpu-peak-mb",
+                        "message": (
+                            f"{arm_key}={peak} MB exceeds budget "
+                            f"{max_warm_gpu_peak_mb} MB; the {arm_label} arm does not "
+                            "fit the target VRAM, so the wall-clock break-even is moot "
+                            "regardless of amortization."
+                        ),
+                    }
+                )
 
     if max_break_even_runs is not None:
         repeated = result["break_even_repeated_runs"]
@@ -249,6 +299,7 @@ def gate_eval_record(
             args.require_warm_win,
             args.max_break_even_runs is not None,
             args.require_one_run_win,
+            args.max_warm_gpu_peak_mb is not None,
         )
     ):
         return None
@@ -260,6 +311,8 @@ def gate_eval_record(
         requested.append(f"--max-break-even-runs={args.max_break_even_runs}")
     if args.require_one_run_win:
         requested.append("--require-one-run-win")
+    if args.max_warm_gpu_peak_mb is not None:
+        requested.append(f"--max-warm-gpu-peak-mb={args.max_warm_gpu_peak_mb}")
 
     return {
         "requested": requested,
@@ -289,6 +342,7 @@ def main() -> None:
         require_warm_win=args.require_warm_win,
         max_break_even_runs=args.max_break_even_runs,
         require_one_run_win=args.require_one_run_win,
+        max_warm_gpu_peak_mb=args.max_warm_gpu_peak_mb,
     )
     gates_record = gate_eval_record(args, failures)
     if gates_record is not None:
