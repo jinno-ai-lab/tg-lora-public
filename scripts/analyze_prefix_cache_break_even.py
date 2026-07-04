@@ -42,6 +42,39 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help="Optional output JSON path; defaults next to the paper summary",
     )
+    # Decision gates — the single consumer that turns the otherwise display-only
+    # break-even metrics (break_even_status / break_even_repeated_runs /
+    # one_run_total_delta_seconds) into a pass/fail CI verdict.  Every gate is
+    # opt-in: with none set the script keeps its pre-gate behavior (always exit 0,
+    # metrics stay display-only and the output JSON is byte-identical).
+    gates = parser.add_argument_group(
+        "decision gates",
+        description=(
+            "Turn the break-even metrics into a pass/fail decision. When any "
+            "enabled gate fails, each failure is printed to stderr and the "
+            "process exits with status 1. Without a gate flag the metrics remain "
+            "display-only (exit 0)."
+        ),
+    )
+    gates.add_argument(
+        "--require-warm-win",
+        action="store_true",
+        help="Fail unless warm TG beats warm baseline on wall-clock (a prerequisite "
+        "for the cold build to amortize at all).",
+    )
+    gates.add_argument(
+        "--max-break-even-runs",
+        type=float,
+        default=None,
+        help="Fail unless the cold build amortizes within this many warm reuses "
+        "(break_even_repeated_runs <= N). Boundary-inclusive.",
+    )
+    gates.add_argument(
+        "--require-one-run-win",
+        action="store_true",
+        help="Fail unless a single run INCLUDING the cold build already beats the "
+        "baseline (one_run_total_delta_seconds > 0).",
+    )
     return parser.parse_args()
 
 
@@ -129,6 +162,112 @@ def analyze_break_even(paper: dict[str, Any], precompute: dict[str, Any] | None)
     }
 
 
+def evaluate_gates(
+    result: dict[str, Any],
+    *,
+    require_warm_win: bool,
+    max_break_even_runs: float | None,
+    require_one_run_win: bool,
+) -> list[dict[str, str]]:
+    """Turn the break-even metrics into a pass/fail decision.
+
+    This is the single consumer that makes the previously display-only
+    ``break_even_status`` / ``break_even_repeated_runs`` /
+    ``one_run_total_delta_seconds`` metrics drive a CI exit code instead of
+    merely being printed.  Returns one record per failed gate (empty list =
+    every enabled gate passed); each record carries ``gate`` (the flag name)
+    and ``message`` (human-readable detail for stderr).
+    """
+    failures: list[dict[str, str]] = []
+
+    if require_warm_win and result["break_even_status"] != "warm_win":
+        failures.append(
+            {
+                "gate": "--require-warm-win",
+                "message": (
+                    f"break_even_status={result['break_even_status']!r}; warm TG "
+                    f"({result['warm_tg_wall_seconds']}s) does not beat warm baseline "
+                    f"({result['warm_baseline_wall_seconds']}s), so the prefix cache "
+                    "cannot amortize regardless of reuse count."
+                ),
+            }
+        )
+
+    if max_break_even_runs is not None:
+        repeated = result["break_even_repeated_runs"]
+        if repeated is None:
+            failures.append(
+                {
+                    "gate": "--max-break-even-runs",
+                    "message": (
+                        "break_even_repeated_runs is None (no warm win); the cold "
+                        f"build cannot amortize within {max_break_even_runs} runs."
+                    ),
+                }
+            )
+        elif repeated > max_break_even_runs:
+            failures.append(
+                {
+                    "gate": "--max-break-even-runs",
+                    "message": (
+                        f"break_even_repeated_runs={repeated:.3f} exceeds budget "
+                        f"{max_break_even_runs} "
+                        f"(cold_build={result['cold_build_seconds']}s / "
+                        f"warm_delta={result['warm_wall_delta_seconds']}s)."
+                    ),
+                }
+            )
+
+    if require_one_run_win and float(result["one_run_total_delta_seconds"]) <= 0:
+        failures.append(
+            {
+                "gate": "--require-one-run-win",
+                "message": (
+                    f"one_run_total_delta_seconds={result['one_run_total_delta_seconds']:.3f} "
+                    f"<= 0; a single run including the cold build "
+                    f"({result['one_run_total_tg_seconds_including_cold_build']}s) does not "
+                    f"come out ahead of the baseline ({result['warm_baseline_wall_seconds']}s)."
+                ),
+            }
+        )
+
+    return failures
+
+
+def gate_eval_record(
+    args: argparse.Namespace, failures: list[dict[str, str]]
+) -> dict[str, Any] | None:
+    """Build the ``gates`` record for the output JSON.
+
+    Returns ``None`` when no gate was requested so the gate-free output stays
+    byte-identical to the pre-gate behavior (existing JSON consumers are
+    unaffected).  When any gate is requested the verdict is recorded so the
+    deposit artifact carries the decision, not just the numbers.
+    """
+    if not any(
+        (
+            args.require_warm_win,
+            args.max_break_even_runs is not None,
+            args.require_one_run_win,
+        )
+    ):
+        return None
+
+    requested: list[str] = []
+    if args.require_warm_win:
+        requested.append("--require-warm-win")
+    if args.max_break_even_runs is not None:
+        requested.append(f"--max-break-even-runs={args.max_break_even_runs}")
+    if args.require_one_run_win:
+        requested.append("--require-one-run-win")
+
+    return {
+        "requested": requested,
+        "passed": not failures,
+        "failures": failures,
+    }
+
+
 def main() -> None:
     args = _parse_args()
     paper_summary_path = Path(args.paper_summary)
@@ -141,6 +280,20 @@ def main() -> None:
             raise ValueError("precompute summary must resolve to a JSON object")
 
     result = analyze_break_even(paper_summary, precompute_summary)
+
+    # Consume the metrics: evaluate any requested decision gates before writing
+    # so the deposit artifact records the verdict, then reflect a gate failure
+    # in the process exit code.
+    failures = evaluate_gates(
+        result,
+        require_warm_win=args.require_warm_win,
+        max_break_even_runs=args.max_break_even_runs,
+        require_one_run_win=args.require_one_run_win,
+    )
+    gates_record = gate_eval_record(args, failures)
+    if gates_record is not None:
+        result["gates"] = gates_record
+
     output_path = (
         Path(args.output)
         if args.output
@@ -149,6 +302,15 @@ def main() -> None:
     save_json(result, output_path)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     print(f"Break-even analysis written to {output_path}")
+
+    if failures:
+        for failure in failures:
+            print(
+                f"GATE FAILED [{failure['gate']}]: {failure['message']}",
+                file=sys.stderr,
+            )
+        print(f"{len(failures)} gate(s) failed; exiting non-zero.", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

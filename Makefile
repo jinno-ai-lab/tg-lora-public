@@ -5,7 +5,7 @@
        ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize freeze-replay \
 
 	compare compare-prefix compare-prefix-cold compare-prefix-warm compare-prefix-coldwarm compare-report paper-memory paper-memory-dry-run paper-memory-one-shot paper-memory-compare-modes paper-memory-all-modes paper-memory-evaluate-gates paper-memory-external-eval paper-memory-frontier-sweep paper-memory-cache-ablation cosine-n-ablation cosine-n-ablation-dry-run cosine-n-skip-ablation cosine-n-skip-ablation-dry-run precompute-prefix-cache ablation sweep accel-sweep \
-	bench-optimizer bench-prefix-cache bench-prefix-cache-one-shot analyze-prefix-break-even bench-velocity-ops bench-velocity-ops-ci bench-velocity-ops-save-baseline \
+	bench-optimizer bench-prefix-cache bench-prefix-cache-one-shot analyze-prefix-break-even analyze-prefix-break-even-ci bench-velocity-ops bench-velocity-ops-ci bench-velocity-ops-save-baseline \
        test test-accel test-cov test-integration test-trajectory test-cli-help lint format clean clean-data clean-runs \
        diagnose recover ci check-status \
        convert-mlx train-mlx train-mlx-baseline train-mlx-continuous train-mlx-upstream train-mlx-smoke mlx-data compare-mlx \
@@ -526,6 +526,15 @@ analyze-prefix-break-even: ## Quantify when cold-build cost amortizes against wa
 		--paper-summary $(PAPER_SUMMARY) \
 		$(if $(PRECOMPUTE_SUMMARY),--precompute-summary $(PRECOMPUTE_SUMMARY)) \
 		$(if $(OUTPUT_PATH),--output $(OUTPUT_PATH))
+
+analyze-prefix-break-even-ci: ## CI gate variant: fail (non-zero) unless the cold build amortizes per the gate vars
+	$(PYTHON_VENV) scripts/analyze_prefix_cache_break_even.py \
+		--paper-summary $(PAPER_SUMMARY) \
+		$(if $(PRECOMPUTE_SUMMARY),--precompute-summary $(PRECOMPUTE_SUMMARY)) \
+		$(if $(OUTPUT_PATH),--output $(OUTPUT_PATH)) \
+		$(if $(REQUIRE_WARM_WIN),--require-warm-win) \
+		$(if $(MAX_BREAK_EVEN_RUNS),--max-break-even-runs $(MAX_BREAK_EVEN_RUNS)) \
+		$(if $(REQUIRE_ONE_RUN_WIN),--require-one-run-win)
 
 bench-velocity-ops: ## Benchmark velocity EMA update and cap_update in-place ops
 	$(PYTHON_VENV) scripts/benchmark_velocity_ops.py \

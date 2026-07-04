@@ -17,6 +17,7 @@ from scripts.analyze_prefix_cache_break_even import (
     _extract_from_single_run,
     _load_paper_summary,
     analyze_break_even,
+    evaluate_gates,
 )
 
 
@@ -240,6 +241,107 @@ class TestAnalyzeBreakEven:
 
 
 # ---------------------------------------------------------------------------
+# evaluate_gates — the consumer that turns display-only metrics into a verdict
+# ---------------------------------------------------------------------------
+
+
+class TestEvaluateGates:
+    """The gate is the consumer the steering input asked for: it makes the
+    previously display-only break_even_status / break_even_repeated_runs /
+    one_run_total_delta_seconds metrics drive a pass/fail decision instead of
+    being a 4th symmetric aggregation axis with no consumer."""
+
+    def _result(self, **kwargs) -> dict:
+        # default fixture: warm_baseline=300, warm_tg=240, cold_build=600 ->
+        #   break_even_status='warm_win', break_even_repeated_runs=10.0,
+        #   one_run_total_delta_seconds=-540.0 (cold build dominates one run)
+        paper = _extract_from_single_run(_single_run_summary(**kwargs))
+        return analyze_break_even(paper, None)
+
+    def test_no_gates_enabled_yields_no_failures(self):
+        result = self._result()
+        assert evaluate_gates(
+            result,
+            require_warm_win=False,
+            max_break_even_runs=None,
+            require_one_run_win=False,
+        ) == []
+
+    def test_require_warm_win_passes_when_warm_tg_beats_baseline(self):
+        result = self._result()
+        assert evaluate_gates(
+            result, require_warm_win=True, max_break_even_runs=None, require_one_run_win=False
+        ) == []
+
+    def test_require_warm_win_fails_when_no_warm_win(self):
+        result = self._result(warm_baseline_wall=240.0, warm_tg_wall=300.0)
+        failures = evaluate_gates(
+            result, require_warm_win=True, max_break_even_runs=None, require_one_run_win=False
+        )
+        assert len(failures) == 1
+        assert failures[0]["gate"] == "--require-warm-win"
+        assert "no_warm_win" in failures[0]["message"]
+
+    def test_max_break_even_runs_passes_within_budget(self):
+        result = self._result()  # ber=10.0
+        assert evaluate_gates(
+            result, require_warm_win=False, max_break_even_runs=20.0, require_one_run_win=False
+        ) == []
+
+    def test_max_break_even_runs_boundary_is_inclusive(self):
+        result = self._result()  # ber=10.0 exactly
+        assert evaluate_gates(
+            result, require_warm_win=False, max_break_even_runs=10.0, require_one_run_win=False
+        ) == []
+
+    def test_max_break_even_runs_fails_over_budget(self):
+        result = self._result()  # ber=10.0
+        failures = evaluate_gates(
+            result, require_warm_win=False, max_break_even_runs=5.0, require_one_run_win=False
+        )
+        assert len(failures) == 1
+        assert failures[0]["gate"] == "--max-break-even-runs"
+        assert "exceeds budget 5.0" in failures[0]["message"]
+
+    def test_max_break_even_runs_fails_when_no_warm_win(self):
+        result = self._result(warm_baseline_wall=240.0, warm_tg_wall=300.0)
+        failures = evaluate_gates(
+            result, require_warm_win=False, max_break_even_runs=20.0, require_one_run_win=False
+        )
+        assert len(failures) == 1
+        assert failures[0]["gate"] == "--max-break-even-runs"
+        assert "None" in failures[0]["message"]
+
+    def test_require_one_run_win_fails_when_cold_build_dominates(self):
+        result = self._result()  # one_run_total_delta=-540.0
+        failures = evaluate_gates(
+            result, require_warm_win=False, max_break_even_runs=None, require_one_run_win=True
+        )
+        assert len(failures) == 1
+        assert failures[0]["gate"] == "--require-one-run-win"
+
+    def test_require_one_run_win_passes_when_cold_build_cheap(self):
+        # cold_build=50 -> one run incl cold = 290 < baseline 300 -> delta +10
+        result = self._result(cold_build_seconds=50.0)
+        assert result["one_run_total_delta_seconds"] > 0
+        assert evaluate_gates(
+            result, require_warm_win=False, max_break_even_runs=None, require_one_run_win=True
+        ) == []
+
+    def test_multiple_enabled_gates_collect_every_failure(self):
+        result = self._result(warm_baseline_wall=240.0, warm_tg_wall=300.0)
+        failures = evaluate_gates(
+            result, require_warm_win=True, max_break_even_runs=5.0, require_one_run_win=True
+        )
+        gates = {f["gate"] for f in failures}
+        assert gates == {
+            "--require-warm-win",
+            "--max-break-even-runs",
+            "--require-one-run-win",
+        }
+
+
+# ---------------------------------------------------------------------------
 # CLI tests
 # ---------------------------------------------------------------------------
 
@@ -329,6 +431,107 @@ class TestCLI:
         )
         assert result.returncode != 0
         assert "must resolve to a JSON object" in result.stderr
+
+    # -- decision gates: the metrics now drive a CI exit code -----------------
+
+    def test_cli_no_gate_flag_keeps_exit_zero_even_with_no_warm_win(self, tmp_path):
+        """Backward-compat: gates are strictly opt-in. Without a gate flag the
+        script stays display-only (exit 0) even when the verdict is bad."""
+        summary_path = _write_json(
+            tmp_path / "summary.json",
+            _single_run_summary(warm_baseline_wall=240.0, warm_tg_wall=300.0),
+        )
+        result = subprocess.run(
+            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
+             "--paper-summary", str(summary_path)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"display-only path must stay exit 0: {result.stderr}"
+
+    def test_cli_require_warm_win_passes(self, tmp_path):
+        summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
+        result = subprocess.run(
+            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
+             "--paper-summary", str(summary_path), "--require-warm-win"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"gate should pass: {result.stderr}"
+
+    def test_cli_require_warm_win_fails(self, tmp_path):
+        summary_path = _write_json(
+            tmp_path / "summary.json",
+            _single_run_summary(warm_baseline_wall=240.0, warm_tg_wall=300.0),
+        )
+        result = subprocess.run(
+            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
+             "--paper-summary", str(summary_path), "--require-warm-win"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        assert "--require-warm-win" in result.stderr
+
+    def test_cli_max_break_even_runs_passes_within_budget(self, tmp_path):
+        summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
+        result = subprocess.run(
+            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
+             "--paper-summary", str(summary_path), "--max-break-even-runs", "20"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"gate should pass: {result.stderr}"
+
+    def test_cli_max_break_even_runs_fails_over_budget(self, tmp_path):
+        summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
+        result = subprocess.run(
+            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
+             "--paper-summary", str(summary_path), "--max-break-even-runs", "5"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        assert "--max-break-even-runs" in result.stderr
+        assert "exceeds budget" in result.stderr
+
+    def test_cli_require_one_run_win_fails_when_cold_dominates(self, tmp_path):
+        # default fixture: cold build 600 -> one run incl cold = 840 > 300
+        summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
+        result = subprocess.run(
+            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
+             "--paper-summary", str(summary_path), "--require-one-run-win"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        assert "--require-one-run-win" in result.stderr
+
+    def test_cli_gate_verdict_recorded_in_output_json(self, tmp_path):
+        """The consumer leaves a paper trail: when a gate is requested the output
+        JSON carries the verdict, so a deposit artifact records the decision."""
+        summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
+        out_path = tmp_path / "out.json"
+        result = subprocess.run(
+            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
+             "--paper-summary", str(summary_path),
+             "--max-break-even-runs", "5",
+             "--output", str(out_path)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        record = json.loads(out_path.read_bytes())
+        assert "gates" in record
+        assert record["gates"]["passed"] is False
+        assert record["gates"]["requested"] == ["--max-break-even-runs=5.0"]
+        assert record["gates"]["failures"][0]["gate"] == "--max-break-even-runs"
+
+    def test_cli_no_gate_flag_leaves_output_byte_identical(self, tmp_path):
+        """No gate flag -> no `gates` key in the output JSON (existing consumers
+        are unaffected; the gate is purely additive)."""
+        summary_path = _write_json(tmp_path / "summary.json", _single_run_summary())
+        out_path = tmp_path / "out.json"
+        subprocess.run(
+            [sys.executable, "scripts/analyze_prefix_cache_break_even.py",
+             "--paper-summary", str(summary_path), "--output", str(out_path)],
+            capture_output=True, text=True, check=True,
+        )
+        record = json.loads(out_path.read_bytes())
+        assert "gates" not in record
 
 
 # ---------------------------------------------------------------------------
