@@ -14,6 +14,12 @@ from src.tg_lora.dynamic_freeze import DynFreezeState
 from src.tg_lora.random_walk_controller import ControllerState
 from src.tg_lora.velocity import Velocity
 from src.utils.atomic_save import _atomic_torch_save
+from src.utils.checkpoint_integrity import (
+    CheckpointIntegrityError,
+    CheckpointSaveError,
+    _is_safetensors_corruption,
+    _is_torch_load_corruption,
+)
 from src.utils.tensor_artifact import load_tensor_artifact
 
 logger = logging.getLogger(__name__)
@@ -68,29 +74,6 @@ def _atomic_publish_checkpoint_dir(tmp_dir: Path, save_dir: Path) -> None:
                 os.replace(backup_dir, save_dir)
             if tmp_dir.exists():
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-class CheckpointSaveError(RuntimeError):
-    """A checkpoint save completed but produced no loadable artifact.
-
-    The save-side counterpart to :class:`CheckpointIntegrityError`.
-    ``save_pretrained`` ran to completion without raising, yet left the staged
-    temp dir empty — a model/PEFT misconfiguration or a silently-failing
-    backend, not a mid-save fault (which the ``except BaseException`` clause in
-    :func:`save_checkpoint` already handles by discarding the orphan temp).
-
-    The atomic-publish guarantee (:func:`_atomic_publish_checkpoint_dir`) is
-    that the destination is *never* left non-loadable: it covers a mid-swap
-    FAULT (the prior checkpoint is restored) but not a save that *completes*
-    yet writes nothing — publishing an empty temp over a prior good checkpoint
-    would replace a loadable destination with an empty one, the one path that
-    still violated that contract after the write-side atomicity work. Failing
-    loud here (after removing the orphan empty temp) leaves any prior
-    checkpoint untouched and stops the caller proceeding to write a
-    ``training_state.pt`` next to a missing adapter, which would otherwise look
-    like a complete checkpoint on resume and crash ``load_adapter_weights`` with
-    a bare ``FileNotFoundError``.
-    """
 
 
 def save_checkpoint(model: torch.nn.Module, tokenizer, save_dir: Path) -> None:
@@ -853,75 +836,6 @@ def save_training_state(state: TrainingState, path: Path) -> None:
     }
     _atomic_torch_save(blob, path)
     logger.info("Saved training state to %s (cycle %d)", path, state.cycle_state.cycle)
-
-
-class CheckpointIntegrityError(RuntimeError):
-    """A resume checkpoint exists on disk but is torn/truncated and won't load.
-
-    The load-side counterpart to the atomic-save guarantee. The atomic write
-    helpers (:func:`src.utils.atomic_save._atomic_torch_save` for single-file
-    artifacts and :func:`_atomic_publish_checkpoint_dir` for the staged LoRA
-    adapter dir) make it impossible for the TRAINING PROCESS to publish a torn
-    destination — a mid-commit fault leaves the destination either fully
-    reflecting the new state or still at its prior, loadable value, never torn.
-    So a checkpoint that trips this error could NOT have been torn by an
-    in-process fault; it reached the loader from a source the atomic guarantee
-    does not govern:
-
-      * a checkpoint written before the atomic helpers landed (commits
-        ``510b0d1`` for ``training_state.pt`` and ``620372c`` for the adapter
-        dir), still sitting in an old run dir,
-      * external corruption — disk-full during a non-atomic copy/backup of the
-        run dir, an NFS hiccup, a manual edit, or ``kill -9`` mid-``cp``.
-
-    Resume intentionally does NOT silently fall back to a fresh start: that
-    would hide the lost training progress (a GOAL.md honesty break). Instead
-    this fails loud, with the original loader error chained (``raise ... from
-    exc``), so the operator can delete or restore the corrupt file deliberately.
-    Silently restarting would defeat the resume guarantee the 12-site
-    persistence axis went to the trouble of capturing.
-    """
-
-
-# ``torch.load(weights_only=True)`` torn-file signatures, captured empirically
-# against torch 2.1.1 on truncated / empty / garbage inputs (pinned in
-# ``tests/test_checkpoint_integrity.py``):
-#   truncated zip archive -> RuntimeError("PytorchStreamReader failed reading
-#                                       zip archive: failed finding central
-#                                       directory")
-#   <8-byte / non-zip     -> RuntimeError("... not a ZIP archive")
-#   empty file            -> EOFError
-#   non-pickle garbage    -> pickle.UnpicklingError("Weights only load failed. ...")
-# ``RuntimeError`` is matched on MESSAGE (not type) so a genuine deserialization
-# bug that happens to raise ``RuntimeError`` is NOT masked — it re-raises
-# unchanged with its original traceback.
-_TORCH_ARCHIVE_CORRUPTION_MARKERS = (
-    "failed reading zip archive",
-    "not a ZIP archive",
-)
-
-
-def _is_torch_load_corruption(exc: BaseException) -> bool:
-    """True if *exc* is the signature ``torch.load`` raises on a torn / empty /
-    garbage file (as opposed to a real deserialization bug)."""
-    if isinstance(exc, (EOFError, pickle.UnpicklingError)):
-        return True
-    if isinstance(exc, RuntimeError):
-        msg = str(exc)
-        return any(marker in msg for marker in _TORCH_ARCHIVE_CORRUPTION_MARKERS)
-    return False
-
-
-def _is_safetensors_corruption(exc: BaseException) -> bool:
-    """True if *exc* is the signature ``safetensors.torch.load_file`` raises on
-    a torn / garbage ``.safetensors`` file. ``safetensors`` is a rigid format —
-    it either loads or the bytes are corrupt / truncated / version-mismatched —
-    so a ``SafetensorError`` on a file that exists is corruption, full stop."""
-    try:
-        from safetensors import SafetensorError
-    except ImportError:  # pragma: no cover - safetensors is a core dep; be robust
-        return type(exc).__module__.startswith("safetensors")
-    return isinstance(exc, SafetensorError)
 
 
 def load_training_state(path: Path) -> TrainingState:
