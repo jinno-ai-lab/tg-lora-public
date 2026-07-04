@@ -5,6 +5,8 @@ paper summary loading/validation, break-even calculation, and CLI behavior.
 """
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +21,21 @@ from scripts.analyze_prefix_cache_break_even import (
     analyze_break_even,
     evaluate_gates,
 )
+
+# The end-to-end tests (TestEndToEndPipelineGate) drive the REAL benchmark
+# producer over run_metrics.jsonl. That producer pulls a heavier import chain
+# (scripts.benchmark_prefix_cache -> scripts.compare_runs -> src.utils.* ) than
+# the analyze script itself needs, so import it lazily and skip those tests when
+# the chain is unavailable rather than failing collection.
+try:  # pragma: no cover - environment-dependent import chain
+    from scripts.benchmark_prefix_cache import build_benchmark_summary
+
+    _PRODUCER_AVAILABLE = True
+except Exception:  # pragma: no cover
+    build_benchmark_summary = None  # type: ignore[assignment]
+    _PRODUCER_AVAILABLE = False
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _write_json(path: Path, obj: dict) -> Path:
@@ -663,3 +680,210 @@ class TestEdgeCases:
         result = analyze_break_even(paper, None)
         # total_tg = 600 + 240 = 840 > baseline 300
         assert result["one_run_total_delta_seconds"] == pytest.approx(-540.0)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end pipeline gate — closes the fixture-vs-pipeline gap
+# ---------------------------------------------------------------------------
+#
+# Steering input (AI_HUB_MAKE_RUN_FEEDBACK): every other gate test feeds a
+# hand-pruned 4-key fixture. These tests instead drive the REAL
+# `build_benchmark_summary` producer over run_metrics.jsonl inputs (the format
+# train_* emits) and then exercise the REAL `make analyze-prefix-break-even-ci`
+# target — so the gate's accept/reject boundary is validated against genuine
+# pipeline output, not only unit fixtures. The producer output is far denser
+# (18 tg_lora keys + delta) than the _single_run_summary unit fixture, which is
+# why this is real coverage rather than a duplicate of TestCLI.
+
+
+def _write_run_metrics_jsonl(
+    path: Path,
+    *,
+    wall_seconds: float,
+    gpu_peak_mb: float,
+    build_seconds: float | None = None,
+    tg: bool = False,
+) -> None:
+    """Write a run_metrics.jsonl the real `load_run`/`summarize_comparison_run`
+    producer can consume: a run_header line, step records, and a run_footer."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    records = [
+        {"type": "step", "step": 0, "loss_train": 2.5, "total_backward_passes": 100},
+        {"type": "step", "step": 1, "loss_train": 2.4, "total_backward_passes": 200},
+    ]
+    footer: dict = {
+        "type": "run_footer",
+        "total_wall_seconds": wall_seconds,
+        "gpu_peak_mb": gpu_peak_mb,
+        "best_valid_loss": 2.3,
+    }
+    if tg:
+        # Mirror the full tg_lora_summary surface the real producer forwards.
+        footer["tg_lora_summary"] = {
+            "extrapolation_steps": 50,
+            "accepted": 40,
+            "acceptance_rate": 0.8,
+            "prefix_feature_cache_dir": str(path.parent / "cache"),
+            "prefix_feature_cache_total_build_seconds": build_seconds,
+            "prefix_feature_cache_total_load_seconds": 5.0,
+            "prefix_feature_cache_valid_quick_source": "quick",
+            "prefix_feature_cache_valid_full_source": "full",
+            "prefix_feature_cache_runtime_offload_gpu_allocated_mb_before": 8000,
+            "prefix_feature_cache_runtime_offload_gpu_allocated_mb_after": 4000,
+            "prefix_feature_cache_runtime_offload_gpu_freed_mb": 4000,
+            "prefix_feature_cache_offloaded_prefix_modules": 12,
+            "prefix_feature_cache_offloaded_prefix_parameters": 1024,
+        }
+    lines = [orjson.dumps({"type": "run_header", "config": "x"})]
+    lines += [orjson.dumps(r) for r in records]
+    lines.append(orjson.dumps(footer))
+    path.write_bytes(b"\n".join(lines) + b"\n")
+
+
+@pytest.mark.skipif(not _PRODUCER_AVAILABLE, reason="benchmark_prefix_cache import chain unavailable")
+@pytest.mark.skipif(shutil.which("make") is None, reason="make not installed")
+class TestEndToEndPipelineGate:
+    """Validate the gate target against REAL producer output, end to end."""
+
+    @staticmethod
+    def _venv_root() -> str:
+        # The Makefile recipe is `$(VENV)/bin/python`. Point VENV at the python
+        # running pytest so the gate target resolves without a repo .venv.
+        candidate = Path(sys.executable).resolve().parent.parent
+        if (candidate / "bin" / "python").exists():
+            return str(candidate)
+        pytest.skip("sys.executable is not <venv>/bin/python; cannot derive VENV for make target")
+
+    @staticmethod
+    def _build_real_summary(
+        tmp_path: Path,
+        *,
+        warm_tg_wall: float,
+        warm_tg_gpu: float,
+        warm_baseline_wall: float = 300.0,
+        warm_baseline_gpu: float = 8200.0,
+        cold_tg_build: float = 600.0,
+    ) -> Path:
+        """Drive the REAL `build_benchmark_summary` producer over jsonl inputs
+        to emit a pipeline-faithful summary.json. Returns its path."""
+        run_root = tmp_path / "run"
+        _write_run_metrics_jsonl(run_root / "cold" / "baseline" / "run_metrics.jsonl",
+                                 wall_seconds=300.0, gpu_peak_mb=8200.0)
+        _write_run_metrics_jsonl(run_root / "cold" / "tg_lora" / "run_metrics.jsonl",
+                                 wall_seconds=360.0, gpu_peak_mb=8300.0,
+                                 build_seconds=cold_tg_build, tg=True)
+        _write_run_metrics_jsonl(run_root / "warm" / "baseline" / "run_metrics.jsonl",
+                                 wall_seconds=warm_baseline_wall, gpu_peak_mb=warm_baseline_gpu)
+        _write_run_metrics_jsonl(run_root / "warm" / "tg_lora" / "run_metrics.jsonl",
+                                 wall_seconds=warm_tg_wall, gpu_peak_mb=warm_tg_gpu,
+                                 build_seconds=cold_tg_build, tg=True)
+        summary = build_benchmark_summary(run_root / "cold", run_root / "warm")
+        out = tmp_path / "summary.json"
+        out.write_bytes(orjson.dumps(summary, option=orjson.OPT_INDENT_2))
+        return out
+
+    @staticmethod
+    def _run_make_gate(env_overrides: dict) -> subprocess.CompletedProcess:
+        env = {**os.environ, **env_overrides}
+        return subprocess.run(
+            ["make", "analyze-prefix-break-even-ci"],
+            cwd=_REPO_ROOT, env=env, capture_output=True, text=True,
+        )
+
+    def test_producer_output_is_dense_pipeline_shape_not_minimal_fixture(self, tmp_path):
+        """Guard: the producer-emitted summary carries the full real key surface
+        (>=18 tg_lora keys + delta), far denser than the 4-key _single_run_summary
+        unit fixture — which is WHY this end-to-end exercise is a real coverage
+        gain and not a duplicate of TestCLI. If the producer drops a field this
+        pins, the gate's extractor may be reading a stale shape."""
+        summary_path = self._build_real_summary(tmp_path, warm_tg_wall=240.0, warm_tg_gpu=8300.0)
+        produced = orjson.loads(summary_path.read_bytes())
+        tg = produced["warm"]["tg_lora"]
+        # Real keys the minimal unit fixture omits but the pipeline always emits:
+        for dense_key in (
+            "prefix_feature_cache_total_load_seconds",
+            "prefix_feature_cache_offloaded_prefix_modules",
+            "prefix_feature_cache_runtime_offload_gpu_freed_mb",
+            "extrapolation_steps",
+            "acceptance_rate",
+            "loss_red_per_wall_minute",
+            "total_backward_passes",
+        ):
+            assert dense_key in tg, f"producer output missing real pipeline key: {dense_key}"
+        assert "delta" in produced
+        assert "tg_wall_speedup_pct" in produced["delta"]
+        assert len(tg) >= 18
+        # And the extractor still pulls the right values out of the dense shape:
+        extracted = _extract_from_single_run(produced)
+        assert extracted["warm_baseline_gpu_peak_mb"] == 8200.0
+        assert extracted["warm_tg_gpu_peak_mb"] == 8300.0
+        assert extracted["cold_build_seconds"] == 600.0
+
+    def test_vram_violation_fires_nonzero_with_per_arm_record(self, tmp_path):
+        """Real pipeline output: warm TG WINS on wall-clock (240<300) but BLOWS
+        the VRAM budget (14000>12288). The VRAM gate must fire naming the TG arm
+        while --require-warm-win passes — per-arm / per-gate independence on
+        genuine producer output. Non-zero exit + verdict JSON recorded."""
+        summary_path = self._build_real_summary(tmp_path, warm_tg_wall=240.0, warm_tg_gpu=14000.0)
+        verdict = tmp_path / "verdict.json"
+        result = self._run_make_gate({
+            "VENV": self._venv_root(),
+            "PAPER_SUMMARY": str(summary_path),
+            "OUTPUT_PATH": str(verdict),
+            "REQUIRE_WARM_WIN": "1",
+            "MAX_WARM_GPU_PEAK_MB": "12288",
+        })
+        assert result.returncode != 0, "VRAM-violating warm arm must exit non-zero"
+        assert "--max-warm-gpu-peak-mb" in result.stderr
+        assert "warm_tg_gpu_peak_mb" in result.stderr
+        assert "exceeds budget" in result.stderr
+        # The baseline arm (8200 MB) is under budget and must NOT be named:
+        assert "warm_baseline_gpu_peak_mb" not in result.stderr
+        record = orjson.loads(verdict.read_bytes())
+        assert record["gates"]["passed"] is False
+        assert {f["gate"] for f in record["gates"]["failures"]} == {"--max-warm-gpu-peak-mb"}
+        # The wall-clock gate passed even though the VRAM gate failed:
+        assert record["break_even_status"] == "warm_win"
+        requested = record["gates"]["requested"]
+        assert "--require-warm-win" in requested
+        assert "--max-warm-gpu-peak-mb=12288.0" in requested
+
+    def test_wallclock_loss_fires_require_warm_win(self, tmp_path):
+        """Real pipeline output where warm TG LOSES on wall-clock (350>300).
+        --require-warm-win must fire with no_warm_win; an unrequested VRAM gate
+        stays out of the verdict entirely."""
+        summary_path = self._build_real_summary(tmp_path, warm_tg_wall=350.0, warm_tg_gpu=8300.0)
+        verdict = tmp_path / "verdict.json"
+        result = self._run_make_gate({
+            "VENV": self._venv_root(),
+            "PAPER_SUMMARY": str(summary_path),
+            "OUTPUT_PATH": str(verdict),
+            "REQUIRE_WARM_WIN": "1",
+        })
+        assert result.returncode != 0
+        assert "--require-warm-win" in result.stderr
+        assert "no_warm_win" in result.stderr
+        record = orjson.loads(verdict.read_bytes())
+        assert record["gates"]["passed"] is False
+        assert record["gates"]["failures"][0]["gate"] == "--require-warm-win"
+        assert record["break_even_status"] == "no_warm_win"
+        assert record["gates"]["requested"] == ["--require-warm-win"]
+
+    def test_all_green_path_exits_zero_when_warm_wins_and_under_budget(self, tmp_path):
+        """Positive control: real pipeline output that satisfies every enabled
+        gate exits ZERO with gates.passed=True — so the target's accept path is
+        exercised, not only the reject path (both sides of the boundary)."""
+        summary_path = self._build_real_summary(tmp_path, warm_tg_wall=240.0, warm_tg_gpu=8300.0)
+        verdict = tmp_path / "verdict.json"
+        result = self._run_make_gate({
+            "VENV": self._venv_root(),
+            "PAPER_SUMMARY": str(summary_path),
+            "OUTPUT_PATH": str(verdict),
+            "REQUIRE_WARM_WIN": "1",
+            "MAX_WARM_GPU_PEAK_MB": "12288",
+            "MAX_BREAK_EVEN_RUNS": "20",  # ber=10.0 <= 20
+        })
+        assert result.returncode == 0, f"all-green path must exit 0: {result.stderr}"
+        record = orjson.loads(verdict.read_bytes())
+        assert record["gates"]["passed"] is True
+        assert record["gates"]["failures"] == []
