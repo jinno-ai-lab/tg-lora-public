@@ -552,9 +552,14 @@ bench-velocity-ops-save-baseline: ## Regenerate baselines/velocity_ops.json (com
 
 gates-ci: ## Run every GPU-free CI gate in one target (the loop's gate sequence). No GPU run needed.
 	$(MAKE) bench-velocity-ops-ci
-	PAPER_SUMMARY=tests/fixtures/prefix_break_even_canonical_summary.json \
+	# PAPER_SUMMARY / OUTPUT_PATH are overridable so the loop's gate sequence can
+	# run against REAL pipeline output (a genuine GPU A/B summary), not only the
+	# checked-in canonical fixture — closing the fixture-vs-pipeline gap at the
+	# sequence level. Defaults preserve the canonical-fixture behavior (AI_HUB
+	# feedback: confirm the gates are exercisable against real producer output).
+	PAPER_SUMMARY=$(or $(PAPER_SUMMARY),tests/fixtures/prefix_break_even_canonical_summary.json) \
 	REQUIRE_WARM_WIN=1 MAX_WARM_GPU_PEAK_MB=12288 \
-	OUTPUT_PATH=runs/gates_ci/break_even_verdict.json \
+	OUTPUT_PATH=$(or $(OUTPUT_PATH),runs/gates_ci/break_even_verdict.json) \
 	$(MAKE) analyze-prefix-break-even-ci
 
 # ── Quality ──────────────────────────────────────────────────────────────────

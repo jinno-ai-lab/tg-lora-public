@@ -1120,6 +1120,105 @@ class TestEndToEndPipelineGate:
 
 
 # ---------------------------------------------------------------------------
+# make gates-ci — the loop's GATE SEQUENCE (the aggregate that runs EVERY
+# GPU-free gate in one target). This is the seam AI_HUB_MAKE_RUN_FEEDBACK #4
+# names: "confirm the gates are wired into the loop's gate sequence, else they
+# are inert". Until this class NO test exercised `make gates-ci` as a whole —
+# only its individual sub-targets (`analyze-prefix-break-even-ci` above,
+# `bench-velocity-ops-ci` standalone). Two boundaries are pinned here:
+#   accept — the canonical default config exits 0 (every gate green)
+#   reject — a PAPER_SUMMARY override pointing the sequence at a producer-
+#            faithful VRAM-VIOLATING summary propagates non-zero through the
+#            aggregate, proving (a) the sequence now accepts real pipeline
+#            output instead of being locked to the fixture and (b) a single
+#            gate failing fails the whole sequence (the gate is not inert in
+#            the loop's sequence). This closes both the fixture-vs-pipeline
+#            gap at the SEQUENCE level and the loop-wiring seam in one exercise.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not _PRODUCER_AVAILABLE, reason="benchmark_prefix_cache import chain unavailable"
+)
+@pytest.mark.skipif(shutil.which("make") is None, reason="make not installed")
+class TestGatesCiLoopSequence:
+    """The loop's gate sequence (`make gates-ci`), exercised end to end.
+
+    Drives the REAL aggregate target — which itself runs the velocity-ops gate
+    then the break-even gate — so a regression in EITHER gate's wiring into the
+    sequence, or in the sequence's failure aggregation, fails here. Reuses the
+    producer-driven summary builder and venv-derivation from the e2e class
+    above (no fixture hand-pruning)."""
+
+    @staticmethod
+    def _run_make_gates_ci(env_overrides: dict) -> subprocess.CompletedProcess:
+        env = {**os.environ, **env_overrides}
+        return subprocess.run(
+            ["make", "gates-ci"],
+            cwd=_REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_default_canonical_config_exits_zero(self, tmp_path):
+        """Accept boundary for the LOOP SEQUENCE: with no PAPER_SUMMARY
+        override, `make gates-ci` runs every GPU-free gate against the checked-in
+        canonical fixture (and the velocity-ops micro-benchmark) and exits 0.
+        Pins that the aggregate is green on the reviewed default — not only its
+        individual sub-targets — so the sequence cannot silently drop a gate."""
+        verdict = tmp_path / "gates_default_verdict.json"
+        result = self._run_make_gates_ci(
+            {
+                "VENV": TestEndToEndPipelineGate._venv_root(),
+                "OUTPUT_PATH": str(verdict),
+            }
+        )
+        assert result.returncode == 0, (
+            f"make gates-ci must exit 0 on the canonical default:\n{result.stderr}"
+        )
+        # The break-even sub-target recorded its all-green verdict:
+        record = orjson.loads(verdict.read_bytes())
+        assert record["gates"]["passed"] is True
+        assert record["gates"]["failures"] == []
+
+    def test_override_propagates_break_even_failure(self, tmp_path):
+        """Reject boundary for the LOOP SEQUENCE: point `make gates-ci` at a
+        producer-faithful VRAM-VIOLATING summary (warm TG 14000 > 12288 budget)
+        via the PAPER_SUMMARY override. The aggregate must exit NON-zero and
+        name only the TG arm — proving the sequence (a) now accepts real
+        pipeline output instead of being locked to the fixture (the
+        fixture-vs-pipeline gap at the sequence level) and (b) propagates a
+        break-even gate failure to a non-zero aggregate exit (the gate is not
+        inert in the loop's sequence). The under-budget baseline arm must NOT
+        be named, pinning per-arm independence through the full sequence."""
+        summary_path = TestEndToEndPipelineGate._build_real_summary(
+            tmp_path, warm_tg_wall=240.0, warm_tg_gpu=14000.0
+        )
+        verdict = tmp_path / "gates_violating_verdict.json"
+        result = self._run_make_gates_ci(
+            {
+                "VENV": TestEndToEndPipelineGate._venv_root(),
+                "PAPER_SUMMARY": str(summary_path),
+                "OUTPUT_PATH": str(verdict),
+            }
+        )
+        assert result.returncode != 0, (
+            "VRAM-violating override must fail the whole gates-ci sequence:\n"
+            f"{result.stdout}"
+        )
+        assert "--max-warm-gpu-peak-mb" in result.stderr
+        assert "warm_tg_gpu_peak_mb" in result.stderr
+        # The under-budget baseline arm (8200 MB) is NOT named:
+        assert "warm_baseline_gpu_peak_mb" not in result.stderr
+        record = orjson.loads(verdict.read_bytes())
+        assert record["gates"]["passed"] is False
+        assert {f["gate"] for f in record["gates"]["failures"]} == {
+            "--max-warm-gpu-peak-mb"
+        }
+
+
+# ---------------------------------------------------------------------------
 # Checked-in canonical fixture — the STABLE paper-summary the GPU-free `gates`
 # CI job runs the break-even gate against (AI_HUB_MAKE_RUN_FEEDBACK #4: prove the
 # gate target is non-inert by invoking it on every push). CI cannot run a real
