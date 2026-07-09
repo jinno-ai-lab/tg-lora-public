@@ -105,7 +105,10 @@ jobs:
             --require-warm-win --max-warm-gpu-peak-mb 12288 \
             --output runs/gates_ci/break_even_verdict.json
           # Reject boundary: a VRAM-violating mutation must exit non-zero and
-          # name only the TG arm (the baseline arm is under budget).
+          # name only the TG arm (the baseline arm is under budget). The verdict
+          # is read via the STRUCTURED `arm` field (the metric key), not by
+          # substring-matching the human-readable message — so per-arm
+          # attribution survives any future message rewording.
           python -c "import json,pathlib; d=json.loads(pathlib.Path('$FIX').read_text()); d['warm']['tg_lora']['gpu_peak_mb']=14000.0; pathlib.Path('runs/gates_ci/break_even_violating.json').write_text(json.dumps(d))"
           set +e
           python scripts/analyze_prefix_cache_break_even.py \
@@ -118,7 +121,7 @@ jobs:
             echo "ERROR: break-even gate must exit non-zero on a VRAM-violating summary, got exit 0" >&2
             exit 1
           fi
-          python -c "import json; d=json.load(open('runs/gates_ci/break_even_violating_verdict.json')); msgs=' '.join(f['message'] for f in d['gates']['failures']); assert d['gates']['passed'] is False and 'warm_tg_gpu_peak_mb' in msgs and 'warm_baseline_gpu_peak_mb' not in msgs, 'reject verdict malformed'; print('reject verdict gate:', d['gates']['failures'][0]['gate'])"
+          python -c "import json; d=json.load(open('runs/gates_ci/break_even_violating_verdict.json')); arms={f.get('arm') for f in d['gates']['failures']}; assert d['gates']['passed'] is False and arms=={'warm_tg_gpu_peak_mb'}, 'reject verdict malformed, arms='+str(arms); print('reject verdict gate/arm:', d['gates']['failures'][0]['gate'], d['gates']['failures'][0]['arm'])"
           # Reject boundary #2 — --max-break-even-runs: the canonical fixture has
           # break_even_repeated_runs = cold_build(600)/warm_delta(60) = 10.0, so a
           # run budget of 5 must fire naming ONLY the amortization gate (warm-win

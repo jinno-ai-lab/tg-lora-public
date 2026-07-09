@@ -182,22 +182,31 @@ def evaluate_gates(
     max_break_even_runs: float | None = None,
     require_one_run_win: bool = False,
     max_warm_gpu_peak_mb: float | None = None,
-) -> list[dict[str, str]]:
+) -> list[dict[str, str | None]]:
     """Turn the break-even metrics into a pass/fail decision.
 
     This is the single consumer that makes the previously display-only
     ``break_even_status`` / ``break_even_repeated_runs`` /
     ``one_run_total_delta_seconds`` metrics drive a CI exit code instead of
     merely being printed.  Returns one record per failed gate (empty list =
-    every enabled gate passed); each record carries ``gate`` (the flag name)
-    and ``message`` (human-readable detail for stderr).
+    every enabled gate passed); each record carries:
+
+    - ``gate`` — the flag name (e.g. ``--max-warm-gpu-peak-mb``).
+    - ``arm`` — *structured* per-arm attribution. For the VRAM gate this is the
+      metric key of the offending arm (``warm_baseline_gpu_peak_mb`` /
+      ``warm_tg_gpu_peak_mb``); for the cross-arm gates (warm-win /
+      break-even-runs / one-run-win) it is ``None`` because no single arm is at
+      fault. A consumer reads ``f["arm"]`` to learn which arm broke budget
+      without substring-matching the human-readable ``message``.
+    - ``message`` — human-readable detail for stderr.
     """
-    failures: list[dict[str, str]] = []
+    failures: list[dict[str, str | None]] = []
 
     if require_warm_win and result["break_even_status"] != "warm_win":
         failures.append(
             {
                 "gate": "--require-warm-win",
+                "arm": None,
                 "message": (
                     f"break_even_status={result['break_even_status']!r}; warm TG "
                     f"({result['warm_tg_wall_seconds']}s) does not beat warm baseline "
@@ -211,9 +220,11 @@ def evaluate_gates(
         # Consume the otherwise display-only warm_*_gpu_peak_mb metrics: a
         # wall-clock win is moot if either arm blows the VRAM budget (the
         # cache-on arm OOMs the target GPU). Each offending arm reports its
-        # own failure so the verdict names the arm that broke budget; an
-        # unrecorded (None) peak fails loud — a budget cannot be certified
-        # against a measurement that was never taken.
+        # own failure so the verdict names the arm that broke budget; the arm
+        # is carried in the structured ``arm`` field (the metric key) so a
+        # consumer reads it without parsing the message. An unrecorded (None)
+        # peak fails loud — a budget cannot be certified against a measurement
+        # that was never taken.
         for arm_key, arm_label in (
             ("warm_baseline_gpu_peak_mb", "Condition-A baseline"),
             ("warm_tg_gpu_peak_mb", "Condition-B TG"),
@@ -223,6 +234,7 @@ def evaluate_gates(
                 failures.append(
                     {
                         "gate": "--max-warm-gpu-peak-mb",
+                        "arm": arm_key,
                         "message": (
                             f"{arm_key} is not recorded; the {arm_label} peak VRAM "
                             f"was never measured, so the {max_warm_gpu_peak_mb} MB "
@@ -234,6 +246,7 @@ def evaluate_gates(
                 failures.append(
                     {
                         "gate": "--max-warm-gpu-peak-mb",
+                        "arm": arm_key,
                         "message": (
                             f"{arm_key}={peak} MB exceeds budget "
                             f"{max_warm_gpu_peak_mb} MB; the {arm_label} arm does not "
@@ -249,6 +262,7 @@ def evaluate_gates(
             failures.append(
                 {
                     "gate": "--max-break-even-runs",
+                    "arm": None,
                     "message": (
                         "break_even_repeated_runs is None (no warm win); the cold "
                         f"build cannot amortize within {max_break_even_runs} runs."
@@ -259,6 +273,7 @@ def evaluate_gates(
             failures.append(
                 {
                     "gate": "--max-break-even-runs",
+                    "arm": None,
                     "message": (
                         f"break_even_repeated_runs={repeated:.3f} exceeds budget "
                         f"{max_break_even_runs} "
@@ -272,6 +287,7 @@ def evaluate_gates(
         failures.append(
             {
                 "gate": "--require-one-run-win",
+                "arm": None,
                 "message": (
                     f"one_run_total_delta_seconds={result['one_run_total_delta_seconds']:.3f} "
                     f"<= 0; a single run including the cold build "
@@ -285,7 +301,7 @@ def evaluate_gates(
 
 
 def gate_eval_record(
-    args: argparse.Namespace, failures: list[dict[str, str]]
+    args: argparse.Namespace, failures: list[dict[str, str | None]]
 ) -> dict[str, Any] | None:
     """Build the ``gates`` record for the output JSON.
 

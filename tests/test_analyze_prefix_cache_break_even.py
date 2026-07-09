@@ -425,6 +425,7 @@ class TestEvaluateGates:
         failures = evaluate_gates(result, max_warm_gpu_peak_mb=8250.0)
         assert len(failures) == 1
         assert failures[0]["gate"] == "--max-warm-gpu-peak-mb"
+        assert failures[0]["arm"] == "warm_tg_gpu_peak_mb"
         assert "warm_tg_gpu_peak_mb" in failures[0]["message"]
         assert "exceeds budget 8250.0" in failures[0]["message"]
 
@@ -435,6 +436,7 @@ class TestEvaluateGates:
         failures = evaluate_gates(result, max_warm_gpu_peak_mb=8500.0)
         assert len(failures) == 1
         assert failures[0]["gate"] == "--max-warm-gpu-peak-mb"
+        assert failures[0]["arm"] == "warm_baseline_gpu_peak_mb"
         assert "warm_baseline_gpu_peak_mb" in failures[0]["message"]
 
     def test_max_warm_gpu_peak_mb_reports_each_offending_arm(self):
@@ -442,6 +444,13 @@ class TestEvaluateGates:
         result = self._result(warm_baseline_gpu_mb=9000.0)
         failures = evaluate_gates(result, max_warm_gpu_peak_mb=8000.0)
         assert len(failures) == 2
+        # Structured per-arm attribution: each offending arm names itself in the
+        # `arm` field (the metric key), so a consumer enumerates failing arms
+        # without substring-matching the human-readable message.
+        assert {f["arm"] for f in failures} == {
+            "warm_baseline_gpu_peak_mb",
+            "warm_tg_gpu_peak_mb",
+        }
         messages = "\n".join(f["message"] for f in failures)
         assert "warm_baseline_gpu_peak_mb" in messages
         assert "warm_tg_gpu_peak_mb" in messages
@@ -454,7 +463,44 @@ class TestEvaluateGates:
         failures = evaluate_gates(result, max_warm_gpu_peak_mb=12288.0)
         assert len(failures) == 1
         assert failures[0]["gate"] == "--max-warm-gpu-peak-mb"
+        assert failures[0]["arm"] == "warm_tg_gpu_peak_mb"
         assert "not recorded" in failures[0]["message"]
+
+    def test_vram_arm_field_is_structured_not_message_embedded(self):
+        # Load-bearing contract test: the per-arm attribution is a STRUCTURED
+        # field (the metric key), not text buried in `message`. A consumer must
+        # be able to read which arm broke budget via failures[i]["arm"] alone —
+        # independent of how the message is worded. If a future edit rephrases
+        # the message and drops the bare metric key, the `arm` field still names
+        # the offending arm, so the enforced CI gate's per-arm verdict cannot
+        # silently degrade to "some gate failed, no idea which arm".
+        result = self._result(warm_tg_gpu_mb=14000.0)  # only TG over a 12288 budget
+        failures = evaluate_gates(result, max_warm_gpu_peak_mb=12288.0)
+        assert len(failures) == 1
+        assert failures[0]["arm"] == "warm_tg_gpu_peak_mb"
+        assert failures[0]["arm"] != "warm_baseline_gpu_peak_mb"
+        # The arm key matches the result-dict key the verdict reports the value under:
+        assert failures[0]["arm"] in result
+
+    def test_non_arm_gate_failures_carry_none_arm(self):
+        # Cross-arm gates (warm-win / break-even-runs / one-run-win) compare the
+        # two arms holistically, so no single arm is at fault. Their failure
+        # records carry arm=None so a consumer uniformly reads f["arm"] and gets
+        # either the metric key or a clear "not arm-specific" sentinel — never a
+        # KeyError, never a misleading arm.
+        result = self._result(warm_baseline_wall=240.0, warm_tg_wall=300.0)
+        failures = evaluate_gates(
+            result,
+            require_warm_win=True,
+            max_break_even_runs=5.0,
+            require_one_run_win=True,
+        )
+        assert {f["gate"] for f in failures} == {
+            "--require-warm-win",
+            "--max-break-even-runs",
+            "--require-one-run-win",
+        }
+        assert all(f["arm"] is None for f in failures)
 
     def test_multiple_enabled_gates_collect_every_failure(self):
         result = self._result(warm_baseline_wall=240.0, warm_tg_wall=300.0)
@@ -1064,6 +1110,13 @@ class TestEndToEndPipelineGate:
         assert {f["gate"] for f in record["gates"]["failures"]} == {
             "--max-warm-gpu-peak-mb"
         }
+        # Structured per-arm attribution on REAL producer output: the failing arm
+        # is named by the `arm` field (the metric key), not only by stderr text —
+        # so a downstream control plane reads verdict.gates.failures[*].arm to
+        # learn which arm to shrink/retry, without parsing the message string.
+        assert {f["arm"] for f in record["gates"]["failures"]} == {
+            "warm_tg_gpu_peak_mb"
+        }
         # The wall-clock gate passed even though the VRAM gate failed:
         assert record["break_even_status"] == "warm_win"
         requested = record["gates"]["requested"]
@@ -1469,6 +1522,10 @@ class TestCheckedInCanonicalFixture:
         )
         assert failures, "VRAM-violating mutation must fail the gate"
         assert {f["gate"] for f in failures} == {"--max-warm-gpu-peak-mb"}
+        # Structured per-arm attribution: the TG arm is named by the `arm` field;
+        # the under-budget baseline arm carries no failure record at all. This is
+        # the per-arm independence pin the CI `gates` job's reject assertion reads.
+        assert {f["arm"] for f in failures} == {"warm_tg_gpu_peak_mb"}
         # The wall-clock gate still passes (240 < 300) — only VRAM fails:
         assert result["break_even_status"] == "warm_win"
         # The TG arm is named; the under-budget baseline arm is NOT:
