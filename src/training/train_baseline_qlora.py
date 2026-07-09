@@ -531,9 +531,8 @@ def train_baseline(cfg: DictConfig, resume_path: str | None = None) -> None:
 
         pbar.close()
     except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
-        if isinstance(exc, torch.cuda.OutOfMemoryError) or (
-            isinstance(exc, RuntimeError) and "CUDA" in str(exc)
-        ):
+        is_cuda_runtime = isinstance(exc, RuntimeError) and "CUDA" in str(exc)
+        if isinstance(exc, torch.cuda.OutOfMemoryError) or is_cuda_runtime:
             logger.error("Fault during training: %s — saving checkpoint", exc)
             oom_dir = run_dir / "oom_checkpoint"
             try:
@@ -550,6 +549,17 @@ def train_baseline(cfg: DictConfig, resume_path: str | None = None) -> None:
                 logger.info("OOM checkpoint saved to %s", oom_dir)
             except Exception:
                 logger.error("Failed to save OOM checkpoint", exc_info=True)
+            # Producer half of the exit-code contract (AGENTS.md "Process exit
+            # codes") — symmetric with train_tg_lora.py's fault path. A deferrable
+            # GPU OOM (checkpoint saved, safe to resume at reduced batch) must emit
+            # OOM_EXIT_CODE (3); a real CUDA fault that a smaller batch would still
+            # reproduce must emit 2. Before this the handler bare-`raise`d the
+            # original exception, so a *handled* baseline OOM exited 1 and was
+            # keyable only off the log line — violating the documented contract.
+            from src.utils.device import fault_exit_code, is_gpu_oom_error
+
+            reason = "oom" if is_gpu_oom_error(exc) else "cuda_error"
+            raise SystemExit(fault_exit_code(reason))
         raise
 
     # Activation regime inventory summary (GOAL §4 step 1)

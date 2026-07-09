@@ -15,6 +15,7 @@ from torch.utils.data import Dataset
 
 from src.eval.eval_loss import EvalLossResult
 from src.training.train_baseline_qlora import train_baseline
+from src.utils.device import OOM_EXIT_CODE
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -897,3 +898,113 @@ class TestMLflowParamConsistency:
             "seed",
         }
         assert shared_keys.issubset(set(params.keys()))
+
+
+# ---------------------------------------------------------------------------
+# 10. Graceful-fault exit-code contract (producer side) — symmetric with TG-LoRA
+# ---------------------------------------------------------------------------
+
+
+class TestFaultExitContract:
+    """The baseline graceful-fault handler emits the canonical exit code.
+
+    Mirrors the TG-LoRA trainer contract
+    (``tests/test_fault_recovery.py::TestOOMGracefulTermination::test_oom_exits_defer_exit_code``):
+    a handled GPU OOM (fault checkpoint saved, safe to resume at a reduced batch)
+    must exit ``OOM_EXIT_CODE`` (3) so the control plane / classifier reads
+    "defer and retry", while a real CUDA fault (reproducible at a smaller batch)
+    must exit 2. Before this the handler bare-`raise`d the original exception
+    (exit 1), violating the AGENTS.md "Process exit codes" contract that is
+    documented for BOTH trainers.
+    """
+
+    @staticmethod
+    def _run_to_fault(cfg_overrides, forward_exc):
+        """Run train_baseline with ``forward_backward`` raising ``forward_exc``.
+
+        No-ops ``save_checkpoint`` to isolate the exit-code routing from the
+        fault-checkpoint I/O (the mock model has no LoRA layers, so the real
+        ``save_checkpoint`` would fail loud on the atomic-publish guard before
+        control flow reached the fault-exit line). Returns the captured
+        ``SystemExit.code`` (or raises ``AssertionError`` if none fired).
+        """
+        cfg = _make_config(**(cfg_overrides or {}))
+        deps = _patch_all_deps(eval_losses=[2.0])
+        deps["src.training.train_baseline_qlora.forward_backward"] = MagicMock(
+            side_effect=forward_exc
+        )
+        deps["src.training.train_baseline_qlora.save_checkpoint"] = MagicMock()
+
+        captured: dict[str, object] = {}
+        with contextlib.ExitStack() as stack:
+            for target, mock_obj in deps.items():
+                stack.enter_context(patch(target, new=mock_obj))
+            try:
+                train_baseline(cfg)
+            except SystemExit as exc:
+                captured["code"] = exc.code
+
+        assert "code" in captured, "graceful fault must raise SystemExit (got none)"
+        return captured["code"]
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            torch.cuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 2GiB"),
+            RuntimeError("CUDA out of memory. Tried to allocate 2GiB"),
+        ],
+        ids=["oom_instance", "oom_runtime_message"],
+    )
+    def test_oom_exits_defer_code(self, exc):
+        """A handled OOM — whether an OutOfMemoryError instance OR a RuntimeError
+        carrying the 'out of memory' message — must exit OOM_EXIT_CODE (defer)."""
+        code = self._run_to_fault(
+            cfg_overrides={"training": {"max_steps": 5}, "eval": {"full_eval_every_steps": 999}},
+            forward_exc=exc,
+        )
+        assert code == OOM_EXIT_CODE, (
+            f"handled OOM must exit OOM_EXIT_CODE={OOM_EXIT_CODE} (defer/retry), "
+            f"got {code!r}"
+        )
+
+    def test_cuda_error_exits_fault_code(self):
+        """A non-OOM CUDA error must exit 2 (real fault), NOT the deferrable 3."""
+        code = self._run_to_fault(
+            cfg_overrides={"training": {"max_steps": 5}, "eval": {"full_eval_every_steps": 999}},
+            forward_exc=RuntimeError("CUDA error: device-side assert triggered"),
+        )
+        assert code == 2, f"real CUDA fault must exit 2 (not deferrable), got {code!r}"
+
+    def test_saves_fault_checkpoint_before_exit(self):
+        """A handled OOM still writes the fault checkpoint before exiting.
+
+        Pins that the exit-code routing did not regress the existing
+        save-on-fault behavior: the adapter checkpoint and training state are
+        written to the ``oom_checkpoint`` dir before the SystemExit fires.
+        """
+        cfg = _make_config(
+            training={"max_steps": 5},
+            eval={"full_eval_every_steps": 999},
+        )
+        deps = _patch_all_deps(eval_losses=[2.0])
+        deps["src.training.train_baseline_qlora.forward_backward"] = MagicMock(
+            side_effect=torch.cuda.OutOfMemoryError("CUDA out of memory")
+        )
+        save_ckpt = MagicMock()
+        save_state = MagicMock()
+        deps["src.training.train_baseline_qlora.save_checkpoint"] = save_ckpt
+        deps["src.training.train_baseline_qlora.save_baseline_training_state"] = save_state
+
+        with contextlib.ExitStack() as stack:
+            for target, mock_obj in deps.items():
+                stack.enter_context(patch(target, new=mock_obj))
+            with pytest.raises(SystemExit) as exc_info:
+                train_baseline(cfg)
+
+        assert exc_info.value.code == OOM_EXIT_CODE
+        save_ckpt.assert_called_once()
+        assert "oom_checkpoint" in str(save_ckpt.call_args.args[-1])
+        save_state.assert_called_once()
+        state_path = save_state.call_args.args[-1]
+        assert "training_state.pt" in str(state_path)
+        assert "oom_checkpoint" in str(state_path)

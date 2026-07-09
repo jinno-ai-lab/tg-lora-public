@@ -186,6 +186,7 @@ make lint              # コード品質チェック
 
 - **`3` の位置づけ**: graceful handler が OOM を捕獲できた（=復旧 checkpoint あり・縮小再開安全）ことのシグナル。`2` と明示的に区別するのは、OOM は「縮小すれば通る」繰延可能故障だが、数値不安定/CUDA-error は「縮小しても再現する」実故障だから — これを exit code だけで区別できなければ OOM 対策は void に繰延される。
 - **`3` を「defer and retry」と読む制御系の解釈は、operator / AI-Hub control plane の domain**（本 repo 外）。ここが保証するのは、生産者が上記の区別された code を**確実に吐く**こと、と分類器がそれを `oom` として**読む**こと（log text "out of memory" / `\bOOM\b` を副次経路として併用）。
+- **両 trainer で実装済み（symmetric）**: `train_tg_lora.py`（`numerical_instability` / `cuda_error` / `oom` の 3 値）と `train_baseline_qlora.py`（`cuda_error` / `oom` の 2 値・`is_gpu_oom_error()` で判定）が共に `src/utils/device.fault_exit_code()` 経由で区別された code を吐く。かつて baseline の graceful-OOM handler は fault checkpoint を保存した後 bare `raise`（exit 1）していたため、上記契約を**文書は両 trainer について謳うのに実装は TG のみ**という doc-vs-impl drift だった — 現在は閉包。`tests/test_fault_exit_contract.py` が両 trainer について static guard で pin する（bare `raise` / `SystemExit(2)` 硬 encoding への退行を妨ぐ）。
 
 ## Qwen3.5-9B 固有の注意点
 

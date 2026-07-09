@@ -4,25 +4,32 @@ Closes the producer-side half of the AI-Hub feedback gap — "the GPU lock's val
 depends on the control plane reading exit code 3 as 'defer and retry' rather than
 a training fault". On this public mirror the control plane / autonomous loop is
 AI-Hub infrastructure (not in-repo), so the verifiable in-repo realization is the
-PRODUCER half: the trainer must emit a distinct exit code for a deferrable OOM,
-and the in-repo classifier (``scripts/frontier_report.determine_status``) must
-recognize it. Before this contract, a *handled* TG-LoRA OOM (fault checkpoint
-saved, deferrable) logged "GPU OOM at cycle N" and exited 2 — neither of which
-the classifier recognized — so it was misread as a generic "failed" run and the
-defer/retry signal was lost in classification.
+PRODUCER half: BOTH trainers (``train_tg_lora`` and ``train_baseline_qlora``) must
+emit a distinct exit code for a deferrable OOM, and the in-repo classifier
+(``scripts/frontier_report.determine_status``) must recognize it. Before this
+contract, a *handled* TG-LoRA OOM (fault checkpoint saved, deferrable) logged
+"GPU OOM at cycle N" and exited 2 — neither of which the classifier recognized —
+so it was misread as a generic "failed" run and the defer/retry signal was lost in
+classification. The baseline trainer had the symmetric defect: its graceful-OOM
+handler saved a checkpoint and bare-`raise`d the original exception (exit 1), so
+it was keyable only off the log line — violating the contract AGENTS.md documents
+for BOTH entrypoints.
 
-Four invariants are pinned (each mutation-verifiable):
+Five invariants are pinned (each mutation-verifiable):
 
 1. ``src/utils/device.py`` defines ``OOM_EXIT_CODE = 3`` — the single source of
    truth for the contract value.
 2. ``src/training/train_tg_lora.py`` routes the fault exit through
    ``fault_exit_code`` (OOM→3, numerical/CUDA→2), NOT a hardcoded ``SystemExit(2)``.
-3. ``scripts/frontier_report.py`` recognizes ``OOM_EXIT_CODE`` in
+3. ``src/training/train_baseline_qlora.py`` routes its graceful fault exit through
+   ``fault_exit_code`` (OOM→3 / cuda_error→2) too, NOT a bare ``raise`` that
+   collapses both into a generic exit 1. Symmetric with the TG-LoRA trainer.
+4. ``scripts/frontier_report.py`` recognizes ``OOM_EXIT_CODE`` in
    ``determine_status`` so the classifier reads the producer's signal.
-4. ``AGENTS.md`` documents the contract so the operator/control-plane side has a
+5. ``AGENTS.md`` documents the contract so the operator/control-plane side has a
    spec to read exit 3 as "defer and retry".
 
-If a future change reverts the trainer to a bare ``SystemExit(2)``, drops the
+If a future change reverts EITHER trainer to a bare exit/``raise``, drops the
 classifier branch, or removes the AGENTS.md section, this guard fails loud — so
 the defer/retry signal cannot silently regress back into the void.
 """
@@ -34,6 +41,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEVICE_PY = REPO_ROOT / "src" / "utils" / "device.py"
 TRAINER_PY = REPO_ROOT / "src" / "training" / "train_tg_lora.py"
+BASELINE_PY = REPO_ROOT / "src" / "training" / "train_baseline_qlora.py"
 FRONTIER_PY = REPO_ROOT / "scripts" / "frontier_report.py"
 AGENTS_MD = REPO_ROOT / "AGENTS.md"
 
@@ -67,6 +75,33 @@ def test_trainer_routes_fault_exit_through_helper() -> None:
     assert "raise SystemExit(2)" not in text, (
         "train_tg_lora.py must not hardcode SystemExit(2) for the fault path; "
         "route through fault_exit_code instead"
+    )
+
+
+def test_baseline_routes_fault_exit_through_helper() -> None:
+    """The baseline trainer's graceful fault handler must NOT bare-`raise`.
+
+    It must classify the fault (OOM vs cuda_error) with ``is_gpu_oom_error`` and
+    route the exit through ``fault_exit_code`` so a deferrable OOM emits
+    ``OOM_EXIT_CODE`` (3) while a real CUDA fault emits 2 — symmetric with the
+    TG-LoRA trainer. AGENTS.md documents the contract for BOTH entrypoints;
+    before this the baseline saved a fault checkpoint then bare-`raise`d the
+    original exception (exit 1), so its handled OOM was keyable only off the log
+    line and the documented contract was violated.
+    """
+    text = BASELINE_PY.read_text()
+    assert "from src.utils.device import fault_exit_code, is_gpu_oom_error" in text, (
+        "train_baseline_qlora.py graceful-fault handler must import fault_exit_code "
+        "and is_gpu_oom_error from src.utils.device"
+    )
+    assert 'reason = "oom" if is_gpu_oom_error(exc) else "cuda_error"' in text, (
+        "train_baseline_qlora.py must classify the fault via is_gpu_oom_error(exc) "
+        "so a deferrable OOM is distinguished from a real CUDA fault"
+    )
+    assert "raise SystemExit(fault_exit_code(reason))" in text, (
+        "train_baseline_qlora.py graceful-fault exit must route through "
+        "fault_exit_code(reason), not a bare `raise` that collapses a deferrable "
+        "OOM and a real CUDA fault into a generic exit 1"
     )
 
 
