@@ -1118,6 +1118,113 @@ class TestEndToEndPipelineGate:
         assert record["gates"]["passed"] is True
         assert record["gates"]["failures"] == []
 
+    # The two AMORTIZATION gates — --max-break-even-runs and --require-one-run-win
+    # — answer the actual break-even question ("does the cold build pay off?").
+    # Before these tests they were exercised ONLY on the minimal 4-key
+    # _single_run_summary unit fixture (TestCLI) and hand-built dicts
+    # (TestEvaluateGates) — never against the dense 18-key real producer output,
+    # never through the real `make` target. That left the fixture-vs-pipeline gap
+    # open for 2 of the 4 gates. The three tests below close it: each reject
+    # boundary drives the REAL producer so a regression that only manifests on
+    # the dense pipeline shape (e.g. misreading cold_build_seconds out of the
+    # full tg_lora_summary surface) is caught here, not only in a unit stub.
+
+    def test_max_break_even_runs_fires_on_real_producer_output(self, tmp_path):
+        """Real producer output: warm TG wins on wall-clock (240<300) and is under
+        VRAM budget, so --require-warm-win PASSES — but break_even_repeated_runs
+        = cold_build(600)/warm_delta(60) = 10.0 EXCEEDS the --max-break-even-runs
+        5 budget. The amortization gate must fire INDEPENDENTLY of the warm-win
+        gate, naming only itself, with the cold_build/warm_delta decomposition."""
+        summary_path = self._build_real_summary(
+            tmp_path, warm_tg_wall=240.0, warm_tg_gpu=8300.0
+        )
+        verdict = tmp_path / "verdict.json"
+        result = self._run_make_gate(
+            {
+                "VENV": self._venv_root(),
+                "PAPER_SUMMARY": str(summary_path),
+                "OUTPUT_PATH": str(verdict),
+                "REQUIRE_WARM_WIN": "1",
+                "MAX_BREAK_EVEN_RUNS": "5",  # ber=10.0 > 5
+            }
+        )
+        assert result.returncode != 0, (
+            "amortization-boundary violation must exit non-zero"
+        )
+        assert "--max-break-even-runs" in result.stderr
+        assert "break_even_repeated_runs=10.000 exceeds budget 5.0" in result.stderr
+        # warm-win passed, so it must NOT be named alongside the amortization gate:
+        assert "--require-warm-win" not in result.stderr
+        record = orjson.loads(verdict.read_bytes())
+        assert record["gates"]["passed"] is False
+        assert {f["gate"] for f in record["gates"]["failures"]} == {
+            "--max-break-even-runs"
+        }
+        # The wall-clock prerequisite held even though amortization did not:
+        assert record["break_even_status"] == "warm_win"
+        assert record["break_even_repeated_runs"] == 10.0
+
+    def test_require_one_run_win_fires_on_real_producer_output(self, tmp_path):
+        """Real producer output where a single run INCLUDING the cold build does
+        NOT come out ahead: one_run_total = cold_build(600) + warm_tg(240) = 840 >
+        baseline 300, so one_run_total_delta = -540 <= 0. --require-one-run-win
+        must fire naming only itself, with the decomposition that a single run
+        (cold build + warm TG) loses to the baseline."""
+        summary_path = self._build_real_summary(
+            tmp_path, warm_tg_wall=240.0, warm_tg_gpu=8300.0
+        )
+        verdict = tmp_path / "verdict.json"
+        result = self._run_make_gate(
+            {
+                "VENV": self._venv_root(),
+                "PAPER_SUMMARY": str(summary_path),
+                "OUTPUT_PATH": str(verdict),
+                "REQUIRE_ONE_RUN_WIN": "1",
+            }
+        )
+        assert result.returncode != 0, (
+            "single-run-does-not-win violation must exit non-zero"
+        )
+        assert "--require-one-run-win" in result.stderr
+        assert "one_run_total_delta_seconds=-540.000 <= 0" in result.stderr
+        record = orjson.loads(verdict.read_bytes())
+        assert record["gates"]["passed"] is False
+        assert {f["gate"] for f in record["gates"]["failures"]} == {
+            "--require-one-run-win"
+        }
+        assert record["gates"]["requested"] == ["--require-one-run-win"]
+        assert record["one_run_total_delta_seconds"] == -540.0
+
+    def test_amortization_gates_pass_when_cold_build_is_small(self, tmp_path):
+        """Positive control for BOTH amortization gates on real producer output:
+        a small cold build (50s) means a single run including the build
+        (50+240=290) beats the baseline (300) → one_run_total_delta=+10 > 0, and
+        break_even_repeated_runs=50/60=0.833 <= 20. Both amortization gates pass
+        (exit 0) on the dense pipeline shape — the accept side these gates had no
+        real-output coverage for before. (VRAM/warm-win are left unrequested so
+        only the amortization gates' accept path is exercised.)"""
+        summary_path = self._build_real_summary(
+            tmp_path, warm_tg_wall=240.0, warm_tg_gpu=8300.0, cold_tg_build=50.0
+        )
+        verdict = tmp_path / "verdict.json"
+        result = self._run_make_gate(
+            {
+                "VENV": self._venv_root(),
+                "PAPER_SUMMARY": str(summary_path),
+                "OUTPUT_PATH": str(verdict),
+                "REQUIRE_ONE_RUN_WIN": "1",
+                "MAX_BREAK_EVEN_RUNS": "20",  # ber=0.833 <= 20
+            }
+        )
+        assert result.returncode == 0, (
+            f"both amortization gates must pass on small cold build: {result.stderr}"
+        )
+        record = orjson.loads(verdict.read_bytes())
+        assert record["gates"]["passed"] is True
+        assert record["gates"]["failures"] == []
+        assert record["one_run_total_delta_seconds"] == pytest.approx(10.0)
+        assert record["break_even_repeated_runs"] == pytest.approx(50.0 / 60.0)
+
 
 # ---------------------------------------------------------------------------
 # make gates-ci — the loop's GATE SEQUENCE (the aggregate that runs EVERY
