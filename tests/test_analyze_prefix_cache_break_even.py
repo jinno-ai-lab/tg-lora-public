@@ -537,7 +537,9 @@ class TestCLI:
             text=True,
         )
         assert result.returncode == 0, f"CLI failed: {result.stderr}"
-        output = json.loads(result.stdout.split("Break-even analysis")[0])
+        # Stdout is a clean JSON document (the "written to ..." status line is on
+        # stderr), so json.loads(stdout) parses directly — no fragile splitting.
+        output = json.loads(result.stdout)
         assert output["break_even_status"] == "warm_win"
 
         out_file = tmp_path / "summary_break_even.json"
@@ -577,7 +579,7 @@ class TestCLI:
             text=True,
         )
         assert result.returncode == 0, f"CLI failed: {result.stderr}"
-        output = json.loads(result.stdout.split("Break-even analysis")[0])
+        output = json.loads(result.stdout)
         assert output["cold_build_source"] == "parallel_precompute_summary"
         assert output["cold_build_seconds"] == pytest.approx(400.0)
 

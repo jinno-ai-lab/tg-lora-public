@@ -370,8 +370,13 @@ def main() -> None:
         else paper_summary_path.with_name(paper_summary_path.stem + "_break_even.json")
     )
     save_json(result, output_path)
+    # Stdout discipline: stdout carries ONLY the JSON document so a consumer
+    # (or an automated judge) can ``json.loads(stdout)`` directly — no fragile
+    # ``.split("Break-even analysis")`` surgery. The "written to ..." status
+    # line is a human diagnostic, so it goes to stderr. The authoritative
+    # artifact is always the written file (``output_path``), which CI/Make read.
     print(json.dumps(result, indent=2, ensure_ascii=False))
-    print(f"Break-even analysis written to {output_path}")
+    print(f"Break-even analysis written to {output_path}", file=sys.stderr)
 
     if failures:
         for failure in failures:
