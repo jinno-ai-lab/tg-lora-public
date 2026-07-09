@@ -55,7 +55,16 @@ def _load_jsonl(path: str | Path) -> list[dict[str, Any]]:
 
 
 def _extract_cycle_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Extract cycle step records from run_metrics.jsonl data."""
+    """Extract cycle step records from run_metrics.jsonl data.
+
+    Key names mirror the REAL producer (``src.utils.run_metrics.RunMetrics.
+    record_step``): it writes ``loss_train`` / ``loss_valid`` / ``grad_norm`` /
+    ``tg_lora_accepted`` / ``tg_lora_loss_pilot_eval`` / ``tg_lora_loss_after``.
+    The pilot/after keys previously read ``loss_pilot`` / ``loss_after`` — names
+    the producer never writes — so on genuine producer output they were silently
+    ``0.0`` (a disconnected producer→consumer contract). Read the producer's real
+    keys first, falling back to the legacy names for older/synthetic fixtures.
+    """
     cycles: list[dict[str, Any]] = []
     for rec in records:
         rec_type = rec.get("type", "")
@@ -66,8 +75,12 @@ def _extract_cycle_records(records: list[dict[str, Any]]) -> list[dict[str, Any]
                 "valid_loss": rec.get("loss_valid", rec.get("valid_loss")),
                 "grad_norm": rec.get("grad_norm"),
                 "velocity_magnitude": rec.get("velocity_magnitude"),
-                "loss_pilot": rec.get("loss_pilot", 0.0),
-                "loss_after": rec.get("loss_after", 0.0),
+                "loss_pilot": rec.get(
+                    "tg_lora_loss_pilot_eval", rec.get("loss_pilot", 0.0)
+                ),
+                "loss_after": rec.get(
+                    "tg_lora_loss_after", rec.get("loss_after", 0.0)
+                ),
                 "tg_lora_accepted": rec.get("tg_lora_accepted"),
             })
     return cycles
@@ -117,6 +130,8 @@ def _format_report_text(report: AdvisoryReport) -> str:
                 f"  {i}. [{action.priority.upper()}] {action.action_type}: "
                 f"{action.reason}{value_str}"
             )
+            if action.remediation:
+                lines.append(f"     -> remediation: {action.remediation}")
     lines.append("=" * 60)
     return "\n".join(lines)
 
@@ -134,6 +149,7 @@ def _report_to_dict(report: AdvisoryReport) -> dict[str, Any]:
                 "reason": a.reason,
                 "suggested_value": a.suggested_value,
                 "confidence": a.confidence,
+                "remediation": a.remediation,
             }
             for a in report.actions
         ],

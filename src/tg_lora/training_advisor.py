@@ -38,6 +38,28 @@ Priority = Literal["critical", "high", "medium", "low"]
 HealthStatus = Literal["healthy", "warning", "critical"]
 
 
+# Concrete remediation knobs — the EXACT config field paths an operator edits.
+# An advisory's entire value is being actionable, so every action names the knob
+# (not a vague hint). Centralized so a test can assert the literal knob string
+# and wording drift cannot silently degrade an action into noise. Field paths
+# mirror ``RunMetrics.write_header`` (the producer) and ``config_schema``:
+# ``cfg.tg_lora.K_initial`` / ``cfg.tg_lora.alpha_initial`` /
+# ``cfg.tg_lora.lr_initial`` / ``cfg.training.learning_rate`` /
+# ``cfg.training.max_cycles`` / ``cfg.training.max_steps``.
+REMEDIATION_KNOBS: dict[ActionType, str] = {
+    "increase_k": "raise tg_lora.K_initial (sample more layers per extrapolation cycle)",
+    "decrease_k": "lower tg_lora.K_initial (sample fewer layers per cycle)",
+    "adjust_alpha": "tune tg_lora.alpha_initial (extrapolation step count)",
+    "reduce_lr": "lower tg_lora.lr_initial (or training.learning_rate for baseline)",
+    "increase_lr": "raise tg_lora.lr_initial (or training.learning_rate for baseline)",
+    "stop_training": "set training.max_cycles / training.max_steps lower — the run has converged or stagnated",
+    "rollback": "resume from the best checkpoint (training resume_state.pt)",
+    "save_checkpoint": "best checkpoint is kept automatically — no config change needed",
+    "resume": "resume from the last checkpoint (training resume_state.pt)",
+    "no_action": "no config change needed — training is progressing normally",
+}
+
+
 @dataclass
 class AdvisoryAction:
     """A single recommended action with justification."""
@@ -47,10 +69,16 @@ class AdvisoryAction:
     reason: str
     suggested_value: float | None = None
     confidence: float = 1.0
+    remediation: str = ""
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError(f"confidence must be in [0, 1], got {self.confidence}")
+        # Default the remediation to the canonical knob string for this action
+        # type so an action is never emitted without an actionable knob — a
+        # caller that forgets to set it still gets the concrete field path.
+        if not self.remediation:
+            self.remediation = REMEDIATION_KNOBS.get(self.action_type, "")
 
 
 @dataclass

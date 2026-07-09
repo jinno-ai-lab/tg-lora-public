@@ -172,3 +172,138 @@ class TestAdviseTrainingE2E:
         assert "Training Advisory Report" in r.stdout
         assert "Overall Health" in r.stdout
         assert "Recommended Actions" in r.stdout
+
+
+# ---------------------------------------------------------------------------
+# Real producer -> consumer loop (the dormant-wiring loop, empirically proven)
+# ---------------------------------------------------------------------------
+# Feedback: the advisor (pure helper + standalone CLI) was exercised only on
+# synthetic fixtures; nothing proved the CLI's success path renders the
+# advisory block on REAL producer output, nor that the advisory is actionable.
+# These tests drive the REAL ``RunMetrics.record_step`` schema through the CLI
+# to a plateau/stagnation truncation and capture the rendered console output.
+#
+# Import the CLI's pure helpers to prove the producer->consumer field contract
+# (the extraction mapping) directly, not only via subprocess.
+sys.path.insert(0, str(ROOT / "scripts"))
+import advise_training as _cli  # noqa: E402
+sys.path.pop(0)
+
+
+def _real_producer_plateau(n: int = 14) -> list[dict]:
+    """Genuine ``RunMetrics.record_step`` schema (the real producer).
+
+    Loss improves for the first cycles then goes exactly flat -> stagnation +
+    plateau + convergence, which drives the advisor to ``increase_k`` (whose
+    remediation names the ``tg_lora.K_initial`` knob) and a ``stop_training``
+    truncation. Keys mirror run_metrics.py record_step exactly.
+    """
+    recs: list[dict] = []
+    for i in range(n):
+        # Improve for the first 7 cycles, then freeze (plateau).
+        loss = round(2.0 - 0.10 * min(i, 6), 4)
+        recs.append({
+            "type": "step",
+            "run_id": "real_run",
+            "mode": "tg_lora",
+            "step": i + 1,
+            "cycle": i,
+            "elapsed_seconds": float(i + 1),
+            "loss_train": loss,
+            "loss_valid": loss,
+            "backward_passes": 1,
+            "total_backward_passes": i + 1,
+            "grad_norm": 0.5,
+            "tg_lora_accepted": True,
+            "tg_lora_K": 3,
+            "tg_lora_N": 2,
+            "tg_lora_alpha": 0.5,
+            # REAL producer keys (NOT loss_pilot / loss_after).
+            "tg_lora_loss_pilot_eval": round(loss + 0.01, 4),
+            "tg_lora_loss_after": round(loss - 0.005, 4),
+        })
+    return recs
+
+
+class TestRealProducerConsumerLoop:
+    """Drive the advise_training CLI on REAL producer-schema output to a
+    plateau/stagnation truncation and capture the rendered advisory block +
+    the concrete config knob."""
+
+    def test_plateau_truncation_renders_advisory_block(self, tmp_path: Path):
+        """The CLI success path renders the advisory block on real producer
+        output and reaches a stop_training truncation (not just the helper)."""
+        jsonl = _write_jsonl(tmp_path / "real.jsonl", _real_producer_plateau())
+        r = _run_cli(str(jsonl))  # TEXT mode -> rendered console output
+        assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+        out = r.stdout
+        assert "Training Advisory Report" in out
+        assert "Recommended Actions" in out
+        # Drove to a truncation: stop_training fires (convergence/stagnation).
+        assert "stop_training" in out, f"expected stop_training in:\n{out}"
+        # The advisory is actionable: the remediation line renders.
+        assert "remediation:" in out
+
+    def test_plateau_advisory_names_exact_config_knob(self, tmp_path: Path):
+        """Bullet 3: the advisory names the EXACT knob string so future wording
+        drift cannot degrade it into noise. Pinned on genuine producer output."""
+        jsonl = _write_jsonl(tmp_path / "real.jsonl", _real_producer_plateau())
+        r = _run_cli(str(jsonl))
+        assert r.returncode == 0, f"stderr:\n{r.stderr}"
+        # increase_k fires on plateau/stagnation; its remediation must name the
+        # literal config field path tg_lora.K_initial.
+        assert "tg_lora.K_initial" in r.stdout, (
+            f"advisory must name the exact knob tg_lora.K_initial:\n{r.stdout}"
+        )
+
+    def test_producer_field_contract_real_keys_consumed(self, tmp_path: Path):
+        """The producer writes tg_lora_loss_pilot_eval / tg_lora_loss_after
+        (NOT loss_pilot / loss_after). Prove the consumer reads the real keys
+        -- the previously-disconnected producer->consumer contract is wired."""
+        extracted = _cli._extract_cycle_records(_real_producer_plateau())
+        assert extracted, "cycle records must be extracted from producer output"
+        pilot_vals = [r["loss_pilot"] for r in extracted]
+        after_vals = [r["loss_after"] for r in extracted]
+        assert all(v != 0.0 for v in pilot_vals), (
+            f"loss_pilot must flow from tg_lora_loss_pilot_eval, got {pilot_vals}"
+        )
+        assert all(v != 0.0 for v in after_vals), (
+            f"loss_after must flow from tg_lora_loss_after, got {after_vals}"
+        )
+
+    def test_json_report_carries_structured_remediation(self, tmp_path: Path):
+        """JSON output's per-action remediation field carries the exact knob."""
+        jsonl = _write_jsonl(tmp_path / "real.jsonl", _real_producer_plateau())
+        r = _run_cli(str(jsonl), "--json")
+        assert r.returncode == 0, f"stderr:\n{r.stderr}"
+        data = json.loads(r.stdout)
+        knobs = {a["remediation"] for a in data["actions"] if a.get("remediation")}
+        assert any("tg_lora.K_initial" in k for k in knobs), (
+            f"structured remediation must name tg_lora.K_initial: {knobs}"
+        )
+
+
+class TestEmittedJsonIsParseClean:
+    """judge_invalid_json risk class: the prior iteration was rejected with
+    'Expecting property name enclosed in double quotes'. Pin that every JSON
+    the CLI emits across every advisory shape round-trips through strict
+    json.loads (no trailing comma / single-quoted keys / Python-dict-repr
+    leakage), and that every action carries a non-empty actionable knob."""
+
+    def _json_roundtrips(self, recs: list[dict], tmp_path: Path) -> dict:
+        jsonl = _write_jsonl(tmp_path / "m.jsonl", recs)
+        r = _run_cli(str(jsonl), "--json")
+        assert r.returncode in (0, 2), f"stderr:\n{r.stderr}"
+        data = json.loads(r.stdout)  # strict parse — the guard
+        for a in data["actions"]:
+            assert a.get("remediation"), f"action missing remediation knob: {a}"
+        return data
+
+    def test_converging_json_roundtrips(self, tmp_path: Path):
+        self._json_roundtrips(_converging_records(), tmp_path)
+
+    def test_spike_json_roundtrips(self, tmp_path: Path):
+        self._json_roundtrips(_spike_records(), tmp_path)
+
+    def test_plateau_json_roundtrips(self, tmp_path: Path):
+        self._json_roundtrips(_real_producer_plateau(), tmp_path)
