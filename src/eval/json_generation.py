@@ -118,6 +118,29 @@ def generate_and_score_json(
     return scores
 
 
+def format_score_summary(scores: dict[str, Any], *, ndigits: int = 3) -> str:
+    """Render a JSON-extraction score dict as a strict-JSON stdout summary.
+
+    Drops ``_``-prefixed keys (``_preview`` and any other diagnostic bulk) and
+    rounds the float metrics (``valid`` / ``strict_valid`` / ``type_correct`` /
+    ``field_f1`` / ``exact_match`` / ``combined``) to ``ndigits`` for a readable
+    one-line summary.
+
+    Returns a ``json.dumps`` string — NOT a Python ``dict`` ``repr`` — so a
+    consumer (a pipeline step, an analysis script, or an automated judge) can
+    ``json.loads`` the printed line directly. Printing the dict comprehension
+    ``{k: round(v, 3) for k, v in scores.items() ...}`` instead serializes via
+    ``repr``: single-quoted keys that ``json.loads`` rejects with ``Expecting
+    property name enclosed in double quotes``.
+    """
+    summary = {
+        k: (round(v, ndigits) if isinstance(v, float) else v)
+        for k, v in scores.items()
+        if not k.startswith("_")
+    }
+    return json.dumps(summary, ensure_ascii=False)
+
+
 if __name__ == "__main__":
     # Quick smoke: score the test set with whatever model is given via env, else
     # just validate the gold self-consistency path (no model needed).
@@ -151,7 +174,7 @@ if __name__ == "__main__":
     s = generate_and_score_json(
         mdl, tok, records[:32], batch_size=8, max_new_tokens=96, n_preview=2
     )
-    print({k: round(v, 3) for k, v in s.items() if not k.startswith("_")})
+    print(format_score_summary(s))
     for p in s.get("_preview", []):
         print("NL:  ", p["prompt"])
         print("GOLD:", p["gold"])

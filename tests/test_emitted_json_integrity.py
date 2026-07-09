@@ -8,11 +8,15 @@ The previous make-run iteration was rejected with::
 
 That exact ``json.JSONDecodeError`` message is produced by only a few
 structural defects — a trailing comma (``{"a": 1,}``), a single-quoted key
-(``{'a': 1}``), or an unquoted key (``{a: 1}``). An audit of every
-JSON-emitting CLI in ``scripts/`` found they all serialize via ``json.dumps``
-/ ``save_json`` (so none can produce those defects), and every committed
-``.json``/``.jsonl`` round-trips through ``json.loads``. The rejection was
-therefore a *judge-side* parse failure, not a repo defect.
+(``{'a': 1}``), or an unquoted key (``{a: 1}``). The first pass of this guard
+audited only the CLIs that serialize via ``json.dumps`` / ``save_json`` (so
+none of *those* can produce the defect) and every committed ``.json`` /
+``.jsonl`` — and concluded the rejection was judge-side. That audit had a gap:
+it never covered ``print(<dict>)``, which serializes via Python ``repr``
+(single-quoted keys → the exact ``Expecting property name enclosed in double
+quotes``). ``src/eval/json_generation.py`` carried precisely such a
+``print({k: round(v, 3) for ...})`` in its ``__main__`` block — a latent
+defect, not a judge-side phantom. This iteration closes it.
 
 This file turns that finding into a **durable, mutation-verified guarantee**
 so the risk class stays closed rather than relying on a one-time audit:
@@ -38,12 +42,15 @@ by ``TestEmittedJsonIsParseClean`` in ``tests/test_advise_training_e2e.py``.
 This file extends the same guarantee to the remaining JSON emitters so the
 category is provably closed, not asserted script-by-script.
 """
+import ast
 import json
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from src.eval.json_generation import format_score_summary
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -219,6 +226,143 @@ class TestStrictHelperCatchesJudgeInvalidJsonModes:
 
 
 # ---------------------------------------------------------------------------
+# The latent print(<dict>) defect: JSON-eval summary must emit strict JSON
+# ---------------------------------------------------------------------------
+
+
+class TestScoreSummaryEmitsStrictJson:
+    """``src/eval/json_generation.py`` printed its JSON-extraction score
+    summary as ``print({k: round(v, 3) for k, v in s.items() ...})`` — a dict
+    comprehension serialized via ``repr``, so the JSON-evaluation module's own
+    stdout was single-quoted pseudo-JSON that ``json.loads`` rejects with the
+    literal ``Expecting property name enclosed in double quotes``. The summary
+    now goes through ``format_score_summary`` → ``json.dumps``. Pin that the
+    printed line is strict JSON a consumer can parse directly."""
+
+    def test_summary_round_trips_as_strict_json(self):
+        scores = {
+            "valid": 0.123456,
+            "strict_valid": 0.9,
+            "type_correct": 0.5,
+            "field_f1": 0.876543,
+            "exact_match": 0.0,
+            "combined": 0.333333,
+        }
+        rendered = format_score_summary(scores)
+        # The whole point: the printed line json.loads directly, no string surgery.
+        record = _strict_loads(rendered)
+        assert record == {
+            "valid": 0.123,
+            "strict_valid": 0.9,
+            "type_correct": 0.5,
+            "field_f1": 0.877,
+            "exact_match": 0.0,
+            "combined": 0.333,
+        }
+
+    def test_summary_drops_preview_and_other_diagnostic_keys(self):
+        """The ``_``-prefixed preview bulk (prompt/gold/pred strings) is
+        diagnostic, not a metric — it must not leak into the machine-readable
+        summary (it would also bloat the line and carry arbitrary text)."""
+        scores = {
+            "combined": 0.5,
+            "_preview": [
+                {"prompt": "p", "gold": '{"a": 1}', "pred": "not json{"},
+            ],
+            "_internal": "skip me",
+        }
+        rendered = format_score_summary(scores)
+        record = _strict_loads(rendered)
+        assert set(record) == {"combined"}
+        assert "_preview" not in rendered
+        assert "_internal" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Structural guard: forbid print(<dict/set repr>) across src/ + scripts/
+# ---------------------------------------------------------------------------
+
+
+# ``print()`` of a dict/set literal or comprehension serializes via Python
+# ``repr`` (single-quoted keys, or ``set(...)`` notation) — never valid JSON.
+# ``print()`` of a list IS valid JSON (``[1, 2, 3]``), so lists are permitted;
+# only dict/set reprs carry the single quotes that raise the rejection error.
+_REPR_PRINT_ARG_KINDS = (ast.Dict, ast.Set, ast.DictComp, ast.SetComp)
+
+
+def _repr_print_lines(source: str) -> list[int]:
+    """Line numbers of every ``print(<dict/set literal or comp>)`` in source."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    lines: list[int] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "print"
+        ):
+            if any(isinstance(a, _REPR_PRINT_ARG_KINDS) for a in node.args):
+                lines.append(node.lineno)
+    return lines
+
+
+def _repr_prints_under(root: Path) -> list[tuple[Path, int]]:
+    bad: list[tuple[Path, int]] = []
+    for py in sorted(root.rglob("*.py")):
+        for line in _repr_print_lines(py.read_text(encoding="utf-8")):
+            bad.append((py, line))
+    return bad
+
+
+class TestNoBareDictReprPrintedToStdout:
+    """The round-trip tests above prove the ``json.dumps`` emitters are clean,
+    but they cannot PREVENT a new emitter from doing ``print({some_dict})``.
+    That is the exact one-line regression that reintroduces the rejection
+    error, and it is statically detectable: a ``print()`` whose direct argument
+    is a dict/set literal or comprehension is always a ``repr`` print, never
+    strict JSON. Forbid it across ``src/`` and ``scripts/`` so the defect class
+    — the gap the first-pass ``json.dumps``-only audit left open — cannot
+    return. (``print(<list>)`` stays allowed: ``[1, 2, 3]`` is valid JSON.)"""
+
+    def test_no_dict_or_set_repr_print_in_src(self):
+        bad = _repr_prints_under(ROOT / "src")
+        assert not bad, (
+            "print(<dict/set repr>) emits single-quoted pseudo-JSON "
+            "(json.loads -> 'Expecting property name enclosed in double quotes'); "
+            f"use json.dumps instead: {[(str(p.relative_to(ROOT)), n) for p, n in bad]}"
+        )
+
+    def test_no_dict_or_set_repr_print_in_scripts(self):
+        bad = _repr_prints_under(ROOT / "scripts")
+        assert not bad, (
+            "print(<dict/set repr>) emits single-quoted pseudo-JSON; "
+            f"use json.dumps instead: {[(str(p.relative_to(ROOT)), n) for p, n in bad]}"
+        )
+
+    def test_guard_catches_the_original_defect_shape(self):
+        """Non-vacuity: feed the exact pre-fix line and assert it is flagged, so
+        the guard can never silently degrade into a no-op that lets the defect
+        class back in. (The real ``src/eval/json_generation.py`` no longer
+        matches — it calls ``format_score_summary`` now.)"""
+        assert _repr_print_lines(
+            "print({k: round(v, 3) for k, v in s.items() if not k.startswith('_')})\n"
+        ) == [1]
+        assert _repr_print_lines("print({'a': 1, 'b': 2})\n") == [1]
+        assert _repr_print_lines("print({1, 2, 3})\n") == [1]
+
+    def test_guard_does_not_flag_clean_prints(self):
+        """Positive control: ``json.dumps`` / list / f-string / plain-name
+        prints are NOT flagged (otherwise the guard over-rejects and the
+        catch-tests above pass for the wrong reason)."""
+        assert _repr_print_lines('print(json.dumps({"a": 1}))\n') == []
+        assert _repr_print_lines("print([1, 2, 3])\n") == []
+        assert _repr_print_lines('print(f"loss={x}")\n') == []
+        assert _repr_print_lines("print(summary)\n") == []
+
+
+# ---------------------------------------------------------------------------
 # Coverage map: assert the JSON-emitting surface is closed as a category
 # ---------------------------------------------------------------------------
 
@@ -228,13 +372,25 @@ class TestJsonEmitterSurfaceIsGuarded:
     JSON-emitting CLI is covered by a strict round-trip guard somewhere in
     the suite. This enumerates the covered emitters so a new one added
     without a guard shows up as a deliberate-omission gap rather than silent
-    drift. (This is a documentation-as-test pin, not a coverage tool.)"""
+    drift. (This is a documentation-as-test pin, not a coverage tool.)
+
+    Two complementary layers close the category: (1) the per-emitter strict
+    round-trip map below proves each listed CLI's stdout/file strict-parses;
+    (2) ``TestNoBareDictReprPrintedToStdout`` is a STRUCTURAL AST prohibition
+    that forbids ``print(<dict/set repr>)`` across ``src/`` + ``scripts/`` — the
+    one-line regression shape the per-emitter map cannot prevent (and the shape
+    ``src/eval/json_generation.py`` carried until ``format_score_summary``
+    replaced it)."""
 
     GUARDED_EMITTERS = {
         # (script, guard location)
         "scripts/advise_training.py": "tests/test_advise_training_e2e.py::TestEmittedJsonIsParseClean",
         "scripts/analyze_prefix_cache_break_even.py": "tests/test_emitted_json_integrity.py::TestBreakEvenStdoutIsCleanJsonDocument",
         "scripts/frontier_report.py": "tests/test_emitted_json_integrity.py::TestFrontierReportFileIsCleanJson",
+        # GPU-gated __main__ smoke; its stdout summary is now strict JSON via the
+        # pure helper, round-tripped by TestScoreSummaryEmitsStrictJson above, and
+        # the print-repr regression shape is blocked by the AST guard.
+        "src/eval/json_generation.py": "tests/test_emitted_json_integrity.py::TestScoreSummaryEmitsStrictJson",
     }
 
     def test_guarded_emitters_are_present_in_repo(self):
