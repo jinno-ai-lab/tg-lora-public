@@ -173,6 +173,20 @@ make lint              # コード品質チェック
 - 公開データセットの利用条件を遵守する
 - 初期検証では自社データを使用しない
 
+## Process exit codes（trainer → control plane）
+
+トレーナ(`src/training/train_tg_lora.py` / `train_baseline_qlora.py`)が吐くプロセス終了コードの**生産者側**契約。分類器(`scripts/frontier_report.determine_status`)はこれを読んで run を `completed` / `oom` / `failed` に分類する。
+
+| exit code | 意味 | 再試行可否 |
+|-----------|------|-----------|
+| `0` | 正常終了（summary あり） | — |
+| `2` | **実故障**（`numerical_instability` / `cuda_error`）。fault checkpoint 保存後に終了 | ❌ 再試行で再現する実障害。縮小再試行の対象外 |
+| `3` (`OOM_EXIT_CODE`) | **繰延可能な GPU OOM**。graceful handler が OOM を捕獲し fault checkpoint を保存済み = バッチ縮小で再開可能 | ✅ **defer and retry**（batch / seq_len を縮小して再実行） |
+| `137` | kernel OOM-killer による SIGKILL（graceful でない強制殺） | ⚠️ OOM だが checkpoint は保証されない |
+
+- **`3` の位置づけ**: graceful handler が OOM を捕獲できた（=復旧 checkpoint あり・縮小再開安全）ことのシグナル。`2` と明示的に区別するのは、OOM は「縮小すれば通る」繰延可能故障だが、数値不安定/CUDA-error は「縮小しても再現する」実故障だから — これを exit code だけで区別できなければ OOM 対策は void に繰延される。
+- **`3` を「defer and retry」と読む制御系の解釈は、operator / AI-Hub control plane の domain**（本 repo 外）。ここが保証するのは、生産者が上記の区別された code を**確実に吐く**こと、と分類器がそれを `oom` として**読む**こと（log text "out of memory" / `\bOOM\b` を副次経路として併用）。
+
 ## Qwen3.5-9B 固有の注意点
 
 - **LoRA target**: `target_modules="all-linear"` を指定（ハイブリッド構造の全Linear層に自動適用）

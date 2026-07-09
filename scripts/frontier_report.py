@@ -29,8 +29,21 @@ OOM_PATTERNS = [
     re.compile(r"CUDA out of memory", re.IGNORECASE),
     re.compile(r"CUDA error", re.IGNORECASE),
     re.compile(r"out of memory", re.IGNORECASE),
+    # The trainers' graceful-OOM handler logs "GPU out of memory (OOM) …" / the
+    # baseline logs "OOM checkpoint saved to …". Recognize the bare acronym too
+    # so a *handled* OOM (fault checkpoint saved, deferrable) is not misread as
+    # a generic "failed" run — without this, only a kernel OOM-kill (exit 137) or
+    # the literal "out of memory" substring classifies as OOM.
+    re.compile(r"\bOOM\b"),
     re.compile(r"\bKilled\b"),
 ]
+
+
+# Exit code the trainers emit for a *deferrable* GPU OOM (fault checkpoint saved,
+# safe to retry at reduced batch). Kept as a local literal so this script stays
+# stdlib-only; pinned equal to ``src.utils.device.OOM_EXIT_CODE`` by
+# ``tests/test_fault_exit_contract.py`` so the two cannot drift.
+OOM_EXIT_CODE = 3
 
 
 def detect_oom_from_log(log: str) -> bool:
@@ -46,6 +59,12 @@ def determine_status(
     if exit_code == 0 and summary_exists:
         return "completed"
     if exit_code == 137:
+        return "oom"
+    # A trainer-emitted deferrable-OOM exit code (graceful handler caught the
+    # OOM and saved a fault checkpoint). Distinct from the kernel OOM-kill (137)
+    # above and from a generic fault exit — recognize it before log scraping so
+    # the verdict holds even when the log line was rotated/truncated.
+    if exit_code == OOM_EXIT_CODE:
         return "oom"
     if detect_oom_from_log(log):
         return "oom"

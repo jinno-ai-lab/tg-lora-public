@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from scripts.frontier_report import (
+    OOM_EXIT_CODE,
     _read_run_meta,
     _split_oom_log,
     build_frontier_report,
@@ -101,6 +102,62 @@ class TestStatusDetermination:
 
     def test_failed_no_oom(self):
         assert determine_status(exit_code=1, log="ValueError: bad config", summary_exists=False) == "failed"
+
+
+class TestGracefulOomClassification:
+    """A *handled* GPU OOM (fault checkpoint saved, deferrable) must classify as
+    "oom", not "failed".
+
+    Regression for the producer→classifier gap: train_tg_lora.py's graceful-OOM
+    handler used to log "GPU OOM at cycle N" and exit 2, neither of which the old
+    classifier recognized (it keyed off exit 137 / the literal "out of memory" /
+    "Killed"), so a deferrable OOM was misread as a generic training fault — the
+    OOM-defer signal was lost in classification. The trainer now emits the
+    canonical phrasing AND a dedicated exit code; these tests pin both paths.
+    """
+
+    def test_handled_oom_exit_code_classifies_as_oom(self):
+        # The trainer's graceful-OOM exit code, with NO oom text in the log at all
+        # (e.g. log rotated/truncated) — must still be "oom", not "failed".
+        assert (
+            determine_status(exit_code=OOM_EXIT_CODE, log="", summary_exists=True)
+            == "oom"
+        )
+        assert (
+            determine_status(exit_code=OOM_EXIT_CODE, log="", summary_exists=False)
+            == "oom"
+        )
+
+    def test_handled_oom_log_text_classifies_as_oom(self):
+        # The new trainer log line contains both "out of memory" and "OOM"; even at
+        # the old generic exit 2 it must classify as "oom" via the log patterns.
+        log = "WARNING - GPU out of memory (OOM) at cycle 5: CUDA out of memory. — saving fault checkpoint"
+        assert determine_status(exit_code=2, log=log, summary_exists=True) == "oom"
+
+    def test_bare_oom_acronym_now_detected(self):
+        # The baseline's "OOM checkpoint saved to …" line carries only the acronym.
+        # Before the \bOOM\b pattern this was NOT recognized as an OOM log line.
+        assert (
+            detect_oom_from_log("INFO - OOM checkpoint saved to runs/x/oom_checkpoint")
+            is True
+        )
+
+    def test_numerical_fault_is_not_oom(self):
+        # OOM-specificity: a numerical-instability fault exits 2 with no OOM text
+        # and must stay "failed" — it is a real fault, not a deferral candidate.
+        assert (
+            determine_status(
+                exit_code=2, log="Numerical instability at cycle 5", summary_exists=True
+            )
+            == "failed"
+        )
+
+    def test_classifier_constant_matches_producer(self):
+        # Keep the stdlib-only classifier literal pinned to the producer constant
+        # so the two halves of the contract cannot drift silently.
+        from src.utils.device import OOM_EXIT_CODE as producer_code
+
+        assert OOM_EXIT_CODE == producer_code == 3
 
 
 class TestFrontierBoundary:

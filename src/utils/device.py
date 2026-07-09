@@ -162,6 +162,37 @@ def is_gpu_oom_error(exc: BaseException) -> bool:
     return False
 
 
+# Process exit code a trainer emits for a *deferrable* GPU OOM — the run caught
+# the OOM, saved a fault checkpoint, and is safe to resume at a reduced batch.
+# Deliberately distinct from the generic trainer fault exit (2) so a control
+# plane / wrapper script can key "defer and retry smaller" off the exit code
+# ALONE, without scraping the log. Picked to match the contract documented in
+# AGENTS.md ("Process exit codes"). The kernel OOM-killer remains 137 (SIGKILL),
+# which is a separate, ungraceful signal this does not replace.
+OOM_EXIT_CODE = 3
+
+
+def fault_exit_code(fault_reason: str | None) -> int:
+    """Map a trainer ``fault_reason`` to the process exit code it should emit.
+
+    - ``"oom"`` → :data:`OOM_EXIT_CODE` (3): a deferrable GPU OOM. The run saved
+      a fault checkpoint and is safe to retry at reduced batch; a control plane
+      reads 3 as "defer and retry", not as a training fault.
+    - any other non-None reason (``"numerical_instability"`` / ``"cuda_error"``)
+      → ``2``: a real fault that is NOT a deferral candidate (retrying unchanged
+      would reproduce it).
+    - ``None`` → ``0``: no fault occurred.
+
+    Centralizing this keeps the producer's half of the exit-code contract in one
+    place; the consumer half lives in ``scripts/frontier_report.determine_status``.
+    """
+    if fault_reason == "oom":
+        return OOM_EXIT_CODE
+    if fault_reason is not None:
+        return 2
+    return 0
+
+
 def resolve_compute_dtype(
     device: torch.device | str | None = None,
     dtype_str: str = "bf16",

@@ -4504,8 +4504,14 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
         if not is_gpu_oom_error(_oom):
             raise
         fault_reason = "oom"
+        # Log the canonical "out of memory" phrasing AND the exception text so
+        # scripts/frontier_report.detect_oom_from_log recognizes this graceful
+        # OOM (the bare acronym "GPU OOM" alone does not match its patterns) —
+        # this is the log-text backstop for the exit-code signal below.
         logger.warning(
-            "GPU OOM at cycle %d — saving fault checkpoint", cycle_state.cycle
+            "GPU out of memory (OOM) at cycle %d: %s — saving fault checkpoint",
+            cycle_state.cycle,
+            _oom,
         )
     except NumericalInstabilityError as exc:
         fault_reason = "numerical_instability"
@@ -4746,7 +4752,13 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
 
     if fault_reason is not None:
         logger.error("Training failed: %s at cycle %d", fault_reason, cycle_state.cycle)
-        raise SystemExit(2)
+        # Route the fault through the centralized exit-code contract: a deferrable
+        # OOM exits OOM_EXIT_CODE (3) so a control plane can "defer and retry"
+        # off the exit code alone; numerical/CUDA faults exit 2 (real fault, not
+        # a deferral candidate). See AGENTS.md "Process exit codes".
+        from src.utils.device import fault_exit_code
+
+        raise SystemExit(fault_exit_code(fault_reason))
 
     logger.info(f"Training complete. Summary: {summary}")
 

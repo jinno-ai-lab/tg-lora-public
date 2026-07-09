@@ -5,7 +5,9 @@ import pytest
 import torch
 
 from src.utils.device import (
+    OOM_EXIT_CODE,
     detect_device,
+    fault_exit_code,
     gpu_device_count,
     gpu_device_name,
     gpu_empty_cache,
@@ -231,3 +233,38 @@ class TestResolveComputeDtype:
     def test_default_is_bf16(self):
         dt = resolve_compute_dtype("cpu", "unknown")
         assert dt == torch.bfloat16
+
+
+# ── fault_exit_code (producer half of the OOM-defer exit-code contract) ──
+
+
+class TestFaultExitCode:
+    """``fault_exit_code`` maps trainer fault reasons to process exit codes.
+
+    The contract (see AGENTS.md "Process exit codes"): a deferrable GPU OOM is
+    the ONLY fault that exits ``OOM_EXIT_CODE`` (3) — every other trainer fault
+    exits 2, and no-fault exits 0. This is what lets a control plane read 3 as
+    "defer and retry" without parsing logs.
+    """
+
+    def test_oom_exit_code_is_three(self):
+        # Pinned literal: the value is the contract, not an implementation detail.
+        assert OOM_EXIT_CODE == 3
+
+    def test_oom_maps_to_defer_exit_code(self):
+        assert fault_exit_code("oom") == OOM_EXIT_CODE
+
+    @pytest.mark.parametrize("reason", ["numerical_instability", "cuda_error"])
+    def test_non_oom_faults_exit_two(self, reason):
+        # A real fault is NOT a deferral candidate — retrying unchanged reproduces it.
+        assert fault_exit_code(reason) == 2
+        assert fault_exit_code(reason) != OOM_EXIT_CODE
+
+    def test_no_fault_exits_zero(self):
+        assert fault_exit_code(None) == 0
+
+    def test_oom_distinct_from_other_faults(self):
+        # The whole point: OOM must not share an exit code with a real fault.
+        assert fault_exit_code("oom") != fault_exit_code("numerical_instability")
+        assert fault_exit_code("oom") != fault_exit_code("cuda_error")
+

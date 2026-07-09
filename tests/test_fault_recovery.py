@@ -20,6 +20,7 @@ from src.tg_lora.velocity import Velocity
 from src.training.trainer_loop import NumericalInstabilityError
 from src.utils.checkpoint import (TrainingState, load_training_state,
                                   save_training_state)
+from src.utils.device import OOM_EXIT_CODE
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -341,6 +342,66 @@ class TestOOMGracefulTermination:
 
         assert any("OOM" in r.message for r in caplog.records), (
             f"Expected OOM warning, got: {[r.message for r in caplog.records]}"
+        )
+
+    def test_oom_exits_defer_exit_code(self, tmp_path, caplog):
+        """A handled OOM must exit ``OOM_EXIT_CODE`` (defer-and-retry), not 2.
+
+        The graceful-OOM handler saves a fault checkpoint and is safe to resume at
+        reduced batch — that is only actionable if the process exit code distinguishes
+        "deferrable OOM" from a real fault. Pins the producer half of the contract
+        end-to-end (fault_reason='oom' → exit 3); numerical/CUDA faults stay at 2.
+        """
+        import contextlib
+
+        eval_losses = [2.0, 1.5] * 10
+        cfg = _make_run_dir_config(tmp_path)
+
+        oom_call = [0]
+
+        def oom_on_forward(*args, **kwargs):
+            oom_call[0] += 1
+            if oom_call[0] >= 3:
+                raise torch.cuda.OutOfMemoryError("CUDA OOM simulated")
+            return 2.0
+
+        deps = _patch_deps(eval_losses=eval_losses, run_dir=tmp_path)
+        deps["src.training.train_tg_lora.eval_loss"] = MagicMock(
+            side_effect=oom_on_forward
+        )
+        # Isolate the EXIT-CODE routing from the fault-checkpoint save: this test
+        # asserts the OOM path raises SystemExit(OOM_EXIT_CODE), not the checkpoint
+        # artifact (that is the sibling tests' job). The mock model has no LoRA
+        # layers, so the real save_checkpoint -> save_pretrained fails loud (the
+        # atomic-publish guard) on EVERY save (in-loop best_model, periodic, and the
+        # fault checkpoint) and would raise CheckpointSaveError before the SystemExit
+        # fires; no-op'ing the whole checkpoint-I/O path lets control flow reach the
+        # fault-exit line.
+        deps["src.training.train_tg_lora._save_fault_checkpoint"] = MagicMock()
+        deps["src.training.train_tg_lora.save_checkpoint"] = MagicMock()
+
+        mock_mlf = MagicMock()
+        mock_mlf.enabled = False
+        mock_mlf.__enter__ = MagicMock(return_value=mock_mlf)
+        mock_mlf.__exit__ = MagicMock(return_value=False)
+        deps["src.training.train_tg_lora.MLflowLogger"] = MagicMock(return_value=mock_mlf)
+
+        captured: dict[str, object] = {}
+        with contextlib.ExitStack() as stack:
+            for target, mock_obj in deps.items():
+                stack.enter_context(patch(target, new=mock_obj))
+            from src.training.train_tg_lora import train_tg_lora
+
+            with caplog.at_level(logging.WARNING, logger="tg-lora"):
+                try:
+                    train_tg_lora(cfg)
+                except SystemExit as exc:
+                    captured["code"] = exc.code
+
+        assert "code" in captured, "handled OOM must raise SystemExit (got none)"
+        assert captured["code"] == OOM_EXIT_CODE, (
+            f"handled OOM must exit OOM_EXIT_CODE={OOM_EXIT_CODE} (defer/retry), "
+            f"got {captured['code']!r}"
         )
 
 
