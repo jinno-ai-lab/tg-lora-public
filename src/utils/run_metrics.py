@@ -50,12 +50,56 @@ def _sanitize_perplexity(perplexity: float | None) -> float | None:
     return perplexity
 
 
+def _read_existing_provenance(
+    path: Path,
+) -> tuple[str | None, float | None, float | None]:
+    """Best-effort scan of an existing metrics file for the segment-continuation
+    fields ``append=True`` needs: the ``run_id`` (first line) and the last
+    record's ``elapsed_seconds`` + ``gpu_peak_mb`` (last line).
+
+    Returns ``(run_id, last_elapsed, last_peak)`` with ``None`` for anything
+    unreadable, so an appended segment degrades gracefully to a fresh run_id /
+    wall-clock restart instead of crashing at construction. The last record is
+    read from a single 4 KiB tail block so this stays cheap on long runs (it
+    runs once, at fault/periodic resume).
+    """
+    run_id: str | None = None
+    last_elapsed: float | None = None
+    last_peak: float | None = None
+    try:
+        with path.open("rb") as rf:
+            first = rf.readline()
+            if first:
+                try:
+                    run_id = orjson.loads(first).get("run_id")
+                except (ValueError, OSError):
+                    run_id = None
+            rf.seek(0, 2)
+            size = rf.tell()
+            rf.seek(max(0, size - 4096))
+            for line in reversed(rf.read().splitlines()):
+                if not line.strip():
+                    continue
+                try:
+                    rec = orjson.loads(line)
+                except (ValueError, OSError):
+                    continue
+                last_elapsed = rec.get("elapsed_seconds")
+                last_peak = rec.get("gpu_peak_mb")
+                break
+    except OSError:
+        return None, None, None
+    return run_id, last_elapsed, last_peak
+
+
 class RunMetrics:
     def __init__(
         self,
         run_dir: str | Path,
         mode: Literal["baseline", "tg_lora"],
         run_id: str | None = None,
+        *,
+        append: bool = False,
     ) -> None:
         if mode not in ("baseline", "tg_lora"):
             raise ValueError(f"mode must be 'baseline' or 'tg_lora', got {mode!r}")
@@ -69,7 +113,29 @@ class RunMetrics:
         self._start_time = time.perf_counter()
         self._gpu_peak_mb = 0.0
         self._path = self._dir / "run_metrics.jsonl"
-        self._file = open(self._path, "wb")
+
+        # On resume into the same run_dir (fault or periodic resume) the metrics
+        # file already holds the pre-resume run_header + per-cycle step records.
+        # Opening "wb" here would TRUNCATE that file — the on-disk analog of the
+        # resume-state-loss axis: every caller-scoped accumulator (cycle /
+        # velocity / controller / psa / progressive_freeze, 12/12) is carefully
+        # restored, but the per-cycle trajectory log the advisor / deposit /
+        # break-even gate read would silently lose everything before the fault.
+        # ``append=True`` opens "ab" and carries the existing run_id + wall-clock
+        # + gpu-peak forward so the resumed segment continues the same run.
+        self._appended = False
+        if append and self._path.exists():
+            prev_run_id, prev_elapsed, prev_peak = _read_existing_provenance(self._path)
+            self._appended = True
+            if prev_run_id:
+                self._run_id = prev_run_id
+            if prev_elapsed is not None:
+                self._start_time = time.perf_counter() - prev_elapsed
+            if prev_peak is not None:
+                self._gpu_peak_mb = prev_peak
+            self._file = open(self._path, "ab")
+        else:
+            self._file = open(self._path, "wb")
 
         try:
             gpu_reset_peak_stats(detect_device())
@@ -89,6 +155,11 @@ class RunMetrics:
         comparison_keys: dict | None = None,
         comparison_reference: dict | None = None,
     ) -> None:
+        # An appended segment already has the original header on disk; writing a
+        # second would interleave a run_header mid-file. The first header stays
+        # authoritative for the continued run.
+        if self._appended:
+            return
         gpu_name = ""
         gpu_total_mb = 0
         _info = gpu_info_dict()

@@ -993,7 +993,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     )
 
     run_dir = ensure_dir(cfg.logging.run_dir)
-    metrics = RunMetrics(run_dir, mode="tg_lora")
+    metrics = RunMetrics(run_dir, mode="tg_lora", append=resume_path is not None)
 
     raw_train_dataset = load_dataset(
         cfg.data.train_path,

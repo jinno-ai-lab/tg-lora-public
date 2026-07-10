@@ -657,3 +657,134 @@ def test_record_step_extra_fields_passthrough(tmp_path):
     lines = (tmp_path / "run_metrics.jsonl").read_text().strip().split("\n")
     step_record = json.loads(lines[0])
     assert step_record["psa_lt_attention_out_amp_mean"] == 1.23
+
+
+class TestAppendModeResumeContinuity:
+    """Resume into the same run_dir must NOT truncate the metrics file.
+
+    On-disk analog of the resume-state-loss axis: the per-cycle
+    ``run_metrics.jsonl`` — read by the advisor / deposit / break-even gate —
+    must survive a fault or periodic resume into the same ``run_dir``, just as
+    the 12/12 caller-scoped accumulators (cycle / velocity / controller / psa /
+    progressive_freeze) are restored. ``append=True`` opens the file in ``"ab"``
+    and carries ``run_id`` + wall-clock forward so the resumed segment continues
+    the same run instead of destroying its pre-resume trajectory.
+    """
+
+    @staticmethod
+    def _records(path) -> list[dict]:
+        lines = (path / "run_metrics.jsonl").read_text().splitlines()
+        return [json.loads(ln) for ln in lines if ln.strip()]
+
+    def test_fresh_construct_truncates_existing_file(self, tmp_path):
+        """Default ``append=False`` keeps legacy truncate semantics — a fresh run
+        into a populated run_dir starts clean (byte-identical to before this fix)."""
+        m = RunMetrics(tmp_path, mode="baseline", run_id="first")
+        m.record_step(step=1, loss_train=3.0, total_backward_passes=1)
+        m.close()
+        assert len(self._records(tmp_path)) == 1
+
+        m2 = RunMetrics(tmp_path, mode="baseline", run_id="second")  # truncate
+        m2.record_step(step=9, loss_train=9.0, total_backward_passes=9)
+        m2.close()
+
+        records = self._records(tmp_path)
+        assert len(records) == 1
+        assert records[0]["run_id"] == "second"
+        assert records[0]["step"] == 9
+
+    def test_append_preserves_and_extends_records(self, tmp_path):
+        """Pre-resume records survive; new records are appended after them —
+        nothing is lost on resume."""
+        m = RunMetrics(tmp_path, mode="baseline", run_id="run-A")
+        m.record_step(step=1, loss_train=3.0, total_backward_passes=1)
+        m.record_step(step=2, loss_train=2.5, total_backward_passes=2)
+        m.close()
+        assert len(self._records(tmp_path)) == 2
+
+        m2 = RunMetrics(tmp_path, mode="baseline", append=True)
+        m2.record_step(step=3, loss_train=2.2, total_backward_passes=3)
+        m2.close()
+
+        records = self._records(tmp_path)
+        # 2 pre-resume records preserved + 1 appended, none lost.
+        assert [r["step"] for r in records] == [1, 2, 3]
+        assert [r["loss_train"] for r in records] == [3.0, 2.5, 2.2]
+
+    def test_append_reuses_existing_run_id(self, tmp_path):
+        """``run_id`` is carried forward so the resumed segment shares the run's
+        identity (not a fresh timestamp)."""
+        m = RunMetrics(tmp_path, mode="tg_lora", run_id="shared-id")
+        m.record_step(step=1, loss_train=3.0, total_backward_passes=1)
+        m.close()
+
+        m2 = RunMetrics(tmp_path, mode="tg_lora", append=True)
+        assert m2.run_id == "shared-id"
+        m2.record_step(step=2, loss_train=2.5, total_backward_passes=2)
+        m2.close()
+
+        records = self._records(tmp_path)
+        assert {r["run_id"] for r in records} == {"shared-id"}
+
+    def test_append_skips_duplicate_header(self, tmp_path):
+        """``write_header`` is a no-op on an appended segment — the original
+        header stays authoritative; no second ``run_header`` is interleaved
+        mid-file."""
+        cfg = FakeCfg()
+        m = RunMetrics(tmp_path, mode="baseline", run_id="h-run")
+        m.write_header(
+            cfg,
+            budget_type="backward_passes",
+            budget_value=10,
+            param_counts={"total": 100, "trainable": 10},
+        )
+        m.record_step(step=1, loss_train=3.0, total_backward_passes=1)
+        m.close()
+
+        m2 = RunMetrics(tmp_path, mode="baseline", append=True)
+        m2.write_header(  # must be a no-op
+            cfg,
+            budget_type="backward_passes",
+            budget_value=20,
+            param_counts={"total": 200, "trainable": 20},
+        )
+        m2.record_step(step=2, loss_train=2.5, total_backward_passes=2)
+        m2.close()
+
+        records = self._records(tmp_path)
+        headers = [r for r in records if r["type"] == "run_header"]
+        assert len(headers) == 1  # no duplicate header
+        # The surviving header is the ORIGINAL (budget_value 10, not the 20 the
+        # no-op'd second call tried to write).
+        assert headers[0]["compute_budget"]["budget_value"] == 10
+
+    def test_append_continues_elapsed_monotonic(self, tmp_path):
+        """Wall-clock ``elapsed_seconds`` continues from the pre-resume value
+        rather than restarting at ~0 (footer ``total_wall_seconds`` likewise
+        derives from the same carried-forward ``_start_time``)."""
+        m = RunMetrics(tmp_path, mode="baseline", run_id="clk")
+        m.record_step(step=1, loss_train=3.0, total_backward_passes=1)
+        pre_elapsed = self._records(tmp_path)[-1]["elapsed_seconds"]
+        m.close()
+
+        m2 = RunMetrics(tmp_path, mode="baseline", append=True)
+        m2.record_step(step=2, loss_train=2.5, total_backward_passes=2)
+        m2.close()
+
+        appended = self._records(tmp_path)[-1]
+        # Continued, not restarted: an appended elapsed >= last pre-resume
+        # elapsed. A restart would read ~0, far below ``pre_elapsed``.
+        assert appended["elapsed_seconds"] >= pre_elapsed
+
+    def test_append_on_nonexistent_file_behaves_like_fresh(self, tmp_path):
+        """``append=True`` with no existing file degrades to a fresh write — the
+        header is emitted and the run starts normally (no silent skip)."""
+        fresh_dir = tmp_path / "never_used"
+        m = RunMetrics(fresh_dir, mode="baseline", append=True)
+        m.write_header(FakeCfg(), budget_type="backward_passes", budget_value=5)
+        m.record_step(step=1, loss_train=3.0, total_backward_passes=1)
+        m.close()
+
+        records = self._records(fresh_dir)
+        assert [r["type"] for r in records] == ["run_header", "step"]  # header kept
+

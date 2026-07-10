@@ -153,7 +153,7 @@ def train_baseline(cfg: DictConfig, resume_path: str | None = None) -> None:
     early_stop_patience = cfg.training.get("early_stopping_patience", None)
     min_steps_before_stop = cfg.training.get("min_steps_before_stop", 100)
 
-    metrics = RunMetrics(run_dir, mode="baseline")
+    metrics = RunMetrics(run_dir, mode="baseline", append=resume_path is not None)
     batch_plan_manifest_path = run_dir / "batch_plan_manifest.json"
     if save_batch_plan_manifest:
         batch_plan_manifest.save(batch_plan_manifest_path)

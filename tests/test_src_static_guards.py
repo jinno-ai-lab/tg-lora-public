@@ -431,3 +431,86 @@ def test_baseline_resume_path_wires_integrity_checked_loaders() -> None:
             "CheckpointIntegrityError into a silent restart, hiding lost "
             f"progress. Found enclosing try at line {swallower.lineno}"
         )
+
+
+# ---------------------------------------------------------------------------
+# On-disk resume-state-loss axis: RunMetrics must NOT truncate on resume.
+# The per-cycle ``run_metrics.jsonl`` is the on-disk 13th accumulator the 12/12
+# caller-scoped resume-state sites protect — if RunMetrics reopens it in ``"wb"``
+# at resume, every pre-resume cycle record is lost. Both trainers pass
+# ``append=resume_path is not None``; these guards pin that wiring. AST
+# source-parsed (trainers un-importable on the public mirror).
+# ---------------------------------------------------------------------------
+
+_TRAINERS = [
+    ("train_tg_lora", TARGET / "training" / "train_tg_lora.py"),
+    ("train_baseline", TARGET / "training" / "train_baseline_qlora.py"),
+]
+
+
+def _metrics_append_kwarg(tree: ast.Module, fn_name: str) -> ast.expr | None:
+    """Return the ``append=...`` value of the RunMetrics(...) call inside the
+    trainer function, or ``None`` if the construction or keyword is absent."""
+    module_funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    fn = module_funcs.get(fn_name)
+    if fn is None:
+        return None
+    for node in ast.walk(fn):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "RunMetrics"
+        ):
+            for kw in node.keywords:
+                if kw.arg == "append":
+                    return kw.value
+    return None
+
+
+def _is_resume_path_is_not_none(value: ast.expr) -> bool:
+    """True iff ``value`` is the AST shape ``resume_path is not None``."""
+    return (
+        isinstance(value, ast.Compare)
+        and isinstance(value.left, ast.Name)
+        and value.left.id == "resume_path"
+        and value.ops
+        and isinstance(value.ops[0], ast.IsNot)
+        and value.comparators
+        and isinstance(value.comparators[0], ast.Constant)
+        and value.comparators[0].value is None
+    )
+
+
+@pytest.mark.parametrize(
+    "fn_name,trainer", _TRAINERS, ids=[t[0] for t in _TRAINERS]
+)
+def test_run_metrics_constructed_append_resume_aware(
+    fn_name: str, trainer: Path
+) -> None:
+    """Each trainer must build RunMetrics with ``append=resume_path is not None``.
+
+    Pins the on-disk resume-continuity fix: when ``train_tg_lora`` /
+    ``train_baseline`` resume into the same ``run_dir`` (fault or periodic
+    resume), RunMetrics opens the existing ``run_metrics.jsonl`` in append mode
+    and carries ``run_id`` + wall-clock forward instead of truncating it.
+    Without this, every caller-scoped accumulator the 12/12 resume-state-loss
+    axis restores is silently undermined — the advisor / deposit / break-even
+    gate read the metrics FILE, so they would see only post-resume records and
+    the run-end summary would not reflect the full run. A future edit that drops
+    the ``append=`` keyword (or wires it to a constant) reopens that truncation
+    gap and fails here.
+    """
+    assert trainer.is_file(), f"trainer entrypoint missing at {trainer}"
+    tree = ast.parse(trainer.read_text(encoding="utf-8"), filename=str(trainer))
+
+    append_value = _metrics_append_kwarg(tree, fn_name)
+    assert append_value is not None, (
+        f"{trainer.name}: {fn_name}(...) must construct RunMetrics(...) with an "
+        "`append=` keyword (the resume-continuity fix) — found no append= "
+        "keyword on the RunMetrics call"
+    )
+    assert _is_resume_path_is_not_none(append_value), (
+        f"{trainer.name}: RunMetrics(...) must be built with "
+        "`append=resume_path is not None` — any other value (a hard-coded "
+        "True/False) breaks resume continuity for one of the run paths"
+    )
