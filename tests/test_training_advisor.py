@@ -282,6 +282,26 @@ class TestGenerateAdviceFromHistory:
         report = generate_advice_from_history(history)
         assert report.overall_health == "critical"
 
+    def test_none_train_loss_record_is_skipped_not_crash(self):
+        """A None train_loss (e.g. an eval-only record a direct caller passed raw,
+        with no usable loss signal) must be SKIPPED, not crash the advisor with
+        ``TypeError: must be real number, not NoneType`` from ``math.isnan(None)``.
+        The CLI's ``_extract_cycle_records`` surfaces ``loss_valid_full`` for
+        full-eval records so this is defense-in-depth for direct callers. The
+        finite records around the None one must still be consumed normally."""
+        history = [
+            {"cycle": 0, "train_loss": 2.0},
+            {"cycle": 1, "train_loss": None},  # eval-only record, no loss signal
+            {"cycle": 2, "train_loss": 1.5},
+            {"cycle": 3, "train_loss": 1.2},
+            {"cycle": 4, "train_loss": 1.05},
+        ]
+        report = generate_advice_from_history(history)
+        assert isinstance(report, AdvisoryReport)
+        # The finite records were consumed (4 cycles reached the advisor), and
+        # no TypeError was raised reaching this assertion.
+        assert report.overall_health in ("healthy", "warning", "critical")
+
 
 # ---------------------------------------------------------------------------
 # AdvisorConfig tests

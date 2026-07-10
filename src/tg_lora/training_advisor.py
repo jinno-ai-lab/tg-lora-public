@@ -553,8 +553,15 @@ def generate_advice_from_history(
     report = AdvisoryReport(overall_health="healthy", summary="No data")
     for record in history:
         train_loss = record["train_loss"]
-        # Skip non-finite losses that would crash the internal analyzer
         import math
+        # A None train_loss (e.g. an eval-only record the caller passed raw, with
+        # no usable loss signal) must not crash the advisor — skip it rather than
+        # hitting ``math.isnan(None)``. ``_extract_cycle_records`` surfaces
+        # ``loss_valid_full`` for full-eval records so this is defense-in-depth
+        # for direct callers passing un-sanitized history dicts.
+        if train_loss is None:
+            continue
+        # Skip non-finite losses that would crash the internal analyzer
         if math.isnan(train_loss) or math.isinf(train_loss):
             # Feed NaN to cycle monitor (which handles it) but skip analyzer
             cycle_data = {"cycle": record.get("cycle", 0), "train_loss": train_loss}

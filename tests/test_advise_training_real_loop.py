@@ -118,6 +118,48 @@ def _run_cli(*args: str) -> subprocess.CompletedProcess:
     )
 
 
+def _emit_real_with_full_eval(run_dir: Path, *, n_cycles: int = 8) -> Path:
+    """Drive the REAL RunMetrics producer over a trajectory that includes a
+    full-eval record (``record_full_eval_loss``), exactly as the trainer emits
+    at every full-eval site (``train_tg_lora.py:2720/2857/3025/4340/4581``).
+
+    A full-eval record carries ``loss_train=None`` + ``loss_valid=None`` + a
+    genuine ``loss_valid_full`` (the §5.1/§5.2 honest validation loss). The
+    consumer previously crashed on these with ``TypeError: must be real number,
+    not NoneType`` because ``math.isnan(None)`` and ``dict.get(k, default)``
+    returns ``None`` — not the default — when ``k`` is present-but-``None``. The
+    full-eval loss is the BEST loss so the consumer must surface it (not drop or
+    crash on it). Returns the emitted jsonl path.
+    """
+    metrics = RunMetrics(run_dir, mode="tg_lora", run_id="full_eval_test")
+    metrics.write_header(_FakeCfg(), budget_type="cycles", budget_value=n_cycles)
+    try:
+        for i in range(n_cycles - 1):
+            loss = round(2.0 - 0.10 * i, 4)
+            metrics.record_step(
+                step=i + 1,
+                cycle=i,
+                total_backward_passes=i + 1,
+                loss_train=loss,
+                loss_valid=loss,
+                grad_norm=0.5,
+                tg_lora_accepted=True,
+            )
+        # The final cycle is a full-eval cycle: the trainer emits a genuine
+        # full-eval loss via record_full_eval_loss (loss_train=None, honest
+        # loss_valid_full). Make it strictly the BEST loss.
+        best_full_eval = round(2.0 - 0.10 * (n_cycles - 1) - 0.05, 4)
+        metrics.record_full_eval_loss(
+            cycle=n_cycles - 1,
+            full_loss=best_full_eval,
+            total_backward_passes=n_cycles,
+            step=n_cycles,
+        )
+    finally:
+        metrics.close()
+    return run_dir / "run_metrics.jsonl"
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -216,4 +258,84 @@ class TestCommittedRealProducerFixture:
         knobs = {a["remediation"] for a in data["actions"] if a.get("remediation")}
         assert any("tg_lora.K_initial" in k for k in knobs), (
             f"structured remediation must name tg_lora.K_initial: {knobs}"
+        )
+
+
+class TestRealProducerFullEvalRecord:
+    """The producer's ``record_full_eval_loss`` (emitted at every full-eval site
+    in the trainer) writes ``step`` records with ``loss_train=None`` + a genuine
+    ``loss_valid_full``. The consumer previously crashed on these with
+    ``TypeError: must be real number, not NoneType`` (``math.isnan(None)``):
+    ``dict.get(k, default)`` returns ``None`` — not the default — when ``k`` is
+    present-but-``None``, so a full-eval record yielded a ``None`` train_loss.
+
+    These drive the REAL producer (``record_full_eval_loss``) AND the REAL CLI to
+    prove the honest full-eval loss now flows through the consumer instead of
+    crashing it. This closes the same producer→consumer contract axis that the
+    ``loss_pilot``/``loss_after`` key fix started: the producer emits records the
+    consumer must read without crashing."""
+
+    def test_full_eval_record_does_not_crash_consumer(self, tmp_path: Path):
+        """Regression: a real-producer file containing a full-eval record
+        (loss_train=null) no longer crashes the CLI. Before the fix this raised
+        ``TypeError: must be real number, not NoneType`` and the CLI exited with
+        a traceback (non-zero on --json)."""
+        path = _emit_real_with_full_eval(tmp_path)
+        r = _run_cli(str(path), "--json")
+        assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+        assert "Traceback" not in r.stderr, (
+            f"consumer must not crash on full-eval record:\n{r.stderr}"
+        )
+        data = json.loads(r.stdout)  # strict parse — fails if it crashed
+        assert data["overall_health"] in ("healthy", "warning", "critical")
+        assert isinstance(data["actions"], list) and data["actions"]
+
+    def test_full_eval_loss_surfaces_as_tracked_best(self, tmp_path: Path):
+        """The honest full-eval loss (``loss_valid_full``) is the BEST loss in
+        the trajectory. It must flow through the consumer as the tracked best
+        loss — proving the honest §5.1/§5.2 signal is CONSUMED, not silently
+        dropped or crashed on."""
+        path = _emit_real_with_full_eval(tmp_path)
+        r = _run_cli(str(path))  # TEXT mode to read the rendered best-loss line
+        assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+        out = r.stdout
+        assert "New best loss" in out, f"expected a best-loss line:\n{out}"
+        # The full-eval loss (1.25 for n_cycles=8) is the lowest; the advisor
+        # must report it. Pin the literal value so a regression that drops the
+        # full-eval record (and reports the higher pilot best instead) is caught.
+        assert "1.25" in out, (
+            f"full-eval loss 1.25 must surface as best; got:\n{out}"
+        )
+
+    def test_extract_surfaces_loss_valid_full_not_none(self, tmp_path: Path):
+        """Direct contract on the extraction helper: ``_extract_cycle_records``
+        surfaces ``loss_valid_full`` as ``train_loss`` for a full-eval record
+        (``loss_train=None`` in the file). Mutation-revertible: remove the
+        ``loss_valid_full`` surfacing in the extractor and this asserts ``None``,
+        while the two consumer tests above crash with TypeError."""
+        path = _emit_real_with_full_eval(tmp_path)
+        records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        # Sanity: the producer really did write a full-eval record with null
+        # loss_train (this is the defect trigger — confirm it's in the file).
+        full_eval_steps = [
+            r for r in records if r.get("type") == "step" and r.get("loss_train") is None
+        ]
+        assert full_eval_steps, "expected a full-eval record with loss_train=null"
+        assert all("loss_valid_full" in r for r in full_eval_steps)
+
+        sys.path.insert(0, str(ROOT / "scripts"))
+        try:
+            import advise_training as _cli  # type: ignore[import-not-found]
+        finally:
+            sys.path.pop(0)
+
+        extracted = _cli._extract_cycle_records(records)
+        # The last extracted record is the full-eval record.
+        full_eval_rec = extracted[-1]
+        assert full_eval_rec["train_loss"] is not None, (
+            "full-eval record must surface loss_valid_full as train_loss, not None "
+            f"(got {full_eval_rec})"
+        )
+        assert full_eval_rec["train_loss"] == 1.25, (
+            f"expected the honest full-eval loss 1.25, got {full_eval_rec['train_loss']}"
         )

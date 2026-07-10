@@ -64,15 +64,40 @@ def _extract_cycle_records(records: list[dict[str, Any]]) -> list[dict[str, Any]
     the producer never writes — so on genuine producer output they were silently
     ``0.0`` (a disconnected producer→consumer contract). Read the producer's real
     keys first, falling back to the legacy names for older/synthetic fixtures.
+
+    A full-eval record (``RunMetrics.record_full_eval_loss``, emitted at every
+    full-eval site in the trainer) carries ``loss_train=None`` / ``loss_valid=None``
+    and a genuine ``loss_valid_full`` — the §5.1/§5.2 HONEST validation loss.
+    ``dict.get(k, default)`` returns ``None`` (NOT the default) when ``k`` is
+    present-but-``None``, so without explicit handling a full-eval record yields a
+    ``None`` train_loss that crashes the advisor's ``math.isnan`` guard with
+    ``TypeError: must be real number, not NoneType``. Surface ``loss_valid_full``
+    as the loss for such records so the honest signal flows through and the
+    consumer never crashes on real producer output.
     """
     cycles: list[dict[str, Any]] = []
     for rec in records:
         rec_type = rec.get("type", "")
         if rec_type in ("cycle_step", "step"):
+            full_eval_loss = rec.get("loss_valid_full")
+            train_loss = rec.get("loss_train", rec.get("train_loss"))
+            valid_loss = rec.get("loss_valid", rec.get("valid_loss"))
+            # Full-eval record: loss_train/loss_valid are explicitly None but a
+            # genuine loss_valid_full is present. Surface it as the loss so the
+            # honest signal flows through and train_loss is never None.
+            if full_eval_loss is not None:
+                if train_loss is None:
+                    train_loss = full_eval_loss
+                if valid_loss is None:
+                    valid_loss = full_eval_loss
+            # Final guard: a record with no usable loss at all still must not
+            # yield None train_loss (the advisor's contract is a float train_loss).
+            if train_loss is None:
+                train_loss = 0.0
             cycles.append({
                 "cycle": rec.get("cycle", rec.get("step", 0)),
-                "train_loss": rec.get("loss_train", rec.get("train_loss", 0.0)),
-                "valid_loss": rec.get("loss_valid", rec.get("valid_loss")),
+                "train_loss": train_loss,
+                "valid_loss": valid_loss,
                 "grad_norm": rec.get("grad_norm"),
                 "velocity_magnitude": rec.get("velocity_magnitude"),
                 "loss_pilot": rec.get(
