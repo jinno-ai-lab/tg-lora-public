@@ -339,3 +339,172 @@ class TestRealProducerFullEvalRecord:
         assert full_eval_rec["train_loss"] == 1.25, (
             f"expected the honest full-eval loss 1.25, got {full_eval_rec['train_loss']}"
         )
+
+
+class TestRealProducerFullEvalInterleaved:
+    """The REAL trainer interleaves: on a full-eval cycle it emits a regular
+    ``record_step`` (pilot-proxy ``loss_train`` / ``loss_valid``) AND THEN a
+    ``record_full_eval_loss`` (``loss_train=None`` + honest ``loss_valid_full``)
+    with the SAME cycle number (``train_tg_lora.py:2954`` + ``:3025``, and the
+    other full-eval sites :2720/:2857/:4340/:4581). The sibling full-eval test
+    above (``_emit_real_with_full_eval``) emits the full-eval record for a cycle
+    that has NO regular record, so it never exercised this interleaving — and
+    that left a phantom-duplicate defect unguarded: the consumer turned BOTH
+    records into trajectory points, so one cycle became two points at different
+    loss scales (pilot proxy vs full-eval), corrupting the trajectory with a fake
+    crash-then-spike and inflating the cycle count.
+
+    These drive the REAL producer over the genuine interleaving and pin that the
+    consumer now MERGES the full-eval record into its cycle's existing record
+    (honest loss becomes ``valid_loss``) instead of appending a duplicate. The
+    merge is load-bearing: reverting it (full-eval records always append) makes
+    ``test_no_phantom_duplicate_one_point_per_cycle`` and
+    ``test_train_trajectory_not_corrupted_by_phantom_spike`` go RED."""
+
+    def _emit_interleaved(self, run_dir: Path, *, n_cycles: int = 8,
+                          full_eval_every: int = 3) -> tuple[Path, dict]:
+        """Drive the REAL RunMetrics producer exactly as the trainer does: a
+        regular ``record_step`` every cycle, PLUS a ``record_full_eval_loss`` on
+        full-eval cycles (same ``cycle``). The full-eval loss is on a DIFFERENT
+        scale (the full validation set, not the pilot subset), so a phantom
+        duplicate would visibly corrupt the trajectory. Returns (jsonl path,
+        {cycle: full_eval_loss} for the cycles that got a full-eval record)."""
+        metrics = RunMetrics(run_dir, mode="tg_lora", run_id="interleaved")
+        metrics.write_header(_FakeCfg(), budget_type="cycles", budget_value=n_cycles)
+        full_eval_losses: dict[int, float] = {}
+        try:
+            for i in range(n_cycles):
+                # Pilot-proxy train/valid loss (the cheap every-cycle proxy).
+                proxy = round(2.0 - 0.08 * i, 4)
+                metrics.record_step(
+                    step=i + 1,
+                    cycle=i,
+                    total_backward_passes=i + 1,
+                    loss_train=proxy,
+                    loss_valid=proxy,
+                    grad_norm=0.5,
+                    tg_lora_accepted=True,
+                    tg_lora_K=3,
+                    tg_lora_loss_pilot_eval=round(proxy + 0.01, 4),
+                    tg_lora_loss_after=round(proxy - 0.005, 4),
+                )
+                # Full-eval cycle: the trainer ALSO emits record_full_eval_loss
+                # (loss_train=None, honest loss_valid_full) on the SAME cycle.
+                if i % full_eval_every == 0 and i > 0:
+                    honest = round(proxy - 0.40, 4)  # genuinely lower / diff scale
+                    metrics.record_full_eval_loss(
+                        cycle=i,
+                        full_loss=honest,
+                        total_backward_passes=i + 1,
+                        step=i + 1,
+                    )
+                    full_eval_losses[i] = honest
+        finally:
+            metrics.close()
+        return run_dir / "run_metrics.jsonl", full_eval_losses
+
+    def test_no_phantom_duplicate_one_point_per_cycle(self, tmp_path: Path):
+        """The defect signature: with the real interleaving the consumer
+        previously returned a cycle number TWICE (once for the regular record,
+        once for the full-eval record). After the merge each cycle is exactly one
+        trajectory point. Mutation-revertible: drop the merge branch and the
+        full-eval cycles reappear as duplicates -> this asserts a dup exists."""
+        path, _ = self._emit_interleaved(tmp_path)
+        records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+        sys.path.insert(0, str(ROOT / "scripts"))
+        try:
+            import advise_training as _cli  # type: ignore[import-not-found]
+        finally:
+            sys.path.pop(0)
+
+        extracted = _cli._extract_cycle_records(records)
+        cyc = [e["cycle"] for e in extracted]
+        # Sanity: the file really does carry interleaved full-eval records
+        # (regular + full-eval sharing a cycle) — otherwise this test is inert.
+        full_eval_steps = [
+            r for r in records if r.get("type") == "step" and r.get("loss_valid_full") is not None
+        ]
+        assert full_eval_steps, "fixture must contain full-eval records"
+        shared = {r.get("cycle") for r in full_eval_steps}
+        assert shared, "full-eval records must share a cycle with a regular record"
+        # The merge: one point per cycle, no duplicates.
+        assert len(cyc) == len(set(cyc)), (
+            f"phantom duplicate cycles: {cyc} — full-eval record must merge, "
+            "not append"
+        )
+        assert len(extracted) <= 8, (
+            f"expected <=8 cycle points (one per cycle), got {len(extracted)}"
+        )
+
+    def test_full_eval_loss_merges_as_valid_loss(self, tmp_path: Path):
+        """The honest full-eval loss becomes the merged cycle's ``valid_loss``
+        (the honest §5.1 signal is CONSUMED), while ``train_loss`` stays the
+        regular record's pilot-proxy training loss (a full-eval loss is a
+        VALIDATION loss, not a training loss). Mutation-revertible: drop the
+        merge and the full-eval cycle's valid_loss reverts to the pilot proxy."""
+        path, full_eval_losses = self._emit_interleaved(tmp_path)
+        records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+        sys.path.insert(0, str(ROOT / "scripts"))
+        try:
+            import advise_training as _cli  # type: ignore[import-not-found]
+        finally:
+            sys.path.pop(0)
+
+        extracted = _cli._extract_cycle_records(records)
+        by_cycle = {e["cycle"]: e for e in extracted}
+        for cyc, honest in full_eval_losses.items():
+            entry = by_cycle[cyc]
+            assert entry["valid_loss"] == honest, (
+                f"cycle {cyc}: honest full-eval loss {honest} must surface as "
+                f"valid_loss, got {entry['valid_loss']}"
+            )
+            # train_loss is NOT the full-eval loss — it stays the regular
+            # record's training loss (different measurement).
+            assert entry["train_loss"] != honest, (
+                f"cycle {cyc}: full-eval valid loss must not overwrite train_loss"
+            )
+            # The regular record's metadata survives the merge.
+            assert entry["tg_lora_accepted"] is True
+
+    def test_train_trajectory_not_corrupted_by_phantom_spike(self, tmp_path: Path):
+        """The phantom duplicate corrupted the TRAIN trajectory with a fake
+        crash to the full-eval value (then a spike back). After the merge the
+        train_loss sequence is the clean per-cycle pilot proxy — no full-eval
+        value leaks into it. Mutation-revertible: drop the merge and the
+        full-eval losses (0.4+ below the proxy) reappear inside train_loss."""
+        path, full_eval_losses = self._emit_interleaved(tmp_path)
+        records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+        sys.path.insert(0, str(ROOT / "scripts"))
+        try:
+            import advise_training as _cli  # type: ignore[import-not-found]
+        finally:
+            sys.path.pop(0)
+
+        extracted = _cli._extract_cycle_records(records)
+        train_seq = [e["train_loss"] for e in extracted]
+        # No honest full-eval loss may appear in the train-loss sequence.
+        leaked = [v for v in train_seq if v in set(full_eval_losses.values())]
+        assert not leaked, (
+            f"full-eval losses leaked into train trajectory: {leaked} "
+            f"(train_seq={train_seq})"
+        )
+        # The train trajectory is monotonically non-increasing (pilot proxy
+        # improves each cycle) — a phantom duplicate would break monotonicity.
+        assert all(b <= a + 1e-9 for a, b in zip(train_seq, train_seq[1:])), (
+            f"train trajectory not monotonic (phantom spike?): {train_seq}"
+        )
+
+    def test_interleaved_cli_runs_clean(self, tmp_path: Path):
+        """The real CLI consumes a real interleaved producer file end-to-end:
+        no crash, a valid advisory, and the honest full-eval loss surfaces as the
+        tracked best loss (it is the lowest valid_loss)."""
+        path, _ = self._emit_interleaved(tmp_path)
+        r = _run_cli(str(path))
+        assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+        assert "Traceback" not in r.stderr, (
+            f"consumer must not crash on interleaved full-eval:\n{r.stderr}"
+        )
+        assert "Training Advisory Report" in r.stdout

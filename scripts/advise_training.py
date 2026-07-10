@@ -74,40 +74,73 @@ def _extract_cycle_records(records: list[dict[str, Any]]) -> list[dict[str, Any]
     ``TypeError: must be real number, not NoneType``. Surface ``loss_valid_full``
     as the loss for such records so the honest signal flows through and the
     consumer never crashes on real producer output.
+
+    A full-eval record is a SUPPLEMENTARY honest-validation measurement for a
+    cycle the trainer has ALREADY emitted a regular ``record_step`` for — on a
+    real full-eval cycle the trainer emits BOTH with the SAME cycle number
+    (``record_step`` then ``record_full_eval_loss``, e.g.
+    ``train_tg_lora.py:2954`` + ``:3025``). Folding each into its own trajectory
+    point yields a phantom DUPLICATE at a different loss scale (pilot-proxy train
+    loss vs full-eval valid loss) that corrupts the trajectory — a fake
+    crash-then-spike that can fire false divergence/anomaly detection and
+    inflates the cycle count. So a full-eval record for a cycle we already hold a
+    regular record for is MERGED: its honest loss becomes that cycle's
+    ``valid_loss`` rather than a new point. A standalone full-eval record (no
+    sibling regular record — e.g. an eval-only file) still surfaces as its own
+    point so the honest signal is consumed, not dropped.
     """
     cycles: list[dict[str, Any]] = []
+    # cycle number -> index in ``cycles``; powers the full-eval merge below.
+    cycle_index: dict[Any, int] = {}
     for rec in records:
         rec_type = rec.get("type", "")
-        if rec_type in ("cycle_step", "step"):
-            full_eval_loss = rec.get("loss_valid_full")
-            train_loss = rec.get("loss_train", rec.get("train_loss"))
-            valid_loss = rec.get("loss_valid", rec.get("valid_loss"))
-            # Full-eval record: loss_train/loss_valid are explicitly None but a
-            # genuine loss_valid_full is present. Surface it as the loss so the
-            # honest signal flows through and train_loss is never None.
-            if full_eval_loss is not None:
-                if train_loss is None:
-                    train_loss = full_eval_loss
-                if valid_loss is None:
-                    valid_loss = full_eval_loss
-            # Final guard: a record with no usable loss at all still must not
-            # yield None train_loss (the advisor's contract is a float train_loss).
+        if rec_type not in ("cycle_step", "step"):
+            continue
+        cycle_num = rec.get("cycle", rec.get("step", 0))
+        full_eval_loss = rec.get("loss_valid_full")
+        # A full-eval record (loss_valid_full present, loss_train null) for a
+        # cycle we already have a regular record for: fold its honest loss in as
+        # that cycle's valid_loss instead of appending a phantom duplicate.
+        if (
+            full_eval_loss is not None
+            and rec.get("loss_train") is None
+            and cycle_num is not None
+            and cycle_num in cycle_index
+        ):
+            cycles[cycle_index[cycle_num]]["valid_loss"] = full_eval_loss
+            continue
+        train_loss = rec.get("loss_train", rec.get("train_loss"))
+        valid_loss = rec.get("loss_valid", rec.get("valid_loss"))
+        # Full-eval record WITHOUT a sibling regular record (e.g. an eval-only
+        # file, or one that precedes its regular record in file order): surface
+        # the honest loss so the signal flows through and train_loss is never
+        # None.
+        if full_eval_loss is not None:
             if train_loss is None:
-                train_loss = 0.0
-            cycles.append({
-                "cycle": rec.get("cycle", rec.get("step", 0)),
-                "train_loss": train_loss,
-                "valid_loss": valid_loss,
-                "grad_norm": rec.get("grad_norm"),
-                "velocity_magnitude": rec.get("velocity_magnitude"),
-                "loss_pilot": rec.get(
-                    "tg_lora_loss_pilot_eval", rec.get("loss_pilot", 0.0)
-                ),
-                "loss_after": rec.get(
-                    "tg_lora_loss_after", rec.get("loss_after", 0.0)
-                ),
-                "tg_lora_accepted": rec.get("tg_lora_accepted"),
-            })
+                train_loss = full_eval_loss
+            if valid_loss is None:
+                valid_loss = full_eval_loss
+        # Final guard: a record with no usable loss at all still must not
+        # yield None train_loss (the advisor's contract is a float train_loss).
+        if train_loss is None:
+            train_loss = 0.0
+        entry = {
+            "cycle": cycle_num,
+            "train_loss": train_loss,
+            "valid_loss": valid_loss,
+            "grad_norm": rec.get("grad_norm"),
+            "velocity_magnitude": rec.get("velocity_magnitude"),
+            "loss_pilot": rec.get(
+                "tg_lora_loss_pilot_eval", rec.get("loss_pilot", 0.0)
+            ),
+            "loss_after": rec.get(
+                "tg_lora_loss_after", rec.get("loss_after", 0.0)
+            ),
+            "tg_lora_accepted": rec.get("tg_lora_accepted"),
+        }
+        cycles.append(entry)
+        if cycle_num is not None:
+            cycle_index[cycle_num] = len(cycles) - 1
     return cycles
 
 
