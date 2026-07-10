@@ -168,6 +168,96 @@ def test_extract_falls_back_when_footer_best_is_null(tmp_path: Path) -> None:
     assert prov["run_id"] == "killed_base"
 
 
+def _real_producer_metrics(tmp_path: Path, run_id: str, *, with_footer: bool = False):
+    """A REAL ``RunMetrics`` producer with a minimal but real ``run_header``.
+
+    Real interrupted runs always write their header early (``write_header`` runs
+    before any step), so a faithful reproduction emits one rather than relying
+    on the ``path.stem`` fallback for ``run_id`` provenance.
+    """
+    from types import SimpleNamespace
+
+    from src.utils.run_metrics import RunMetrics
+
+    cfg = SimpleNamespace(
+        model=SimpleNamespace(name_or_path="Qwen/Qwen3.5-9B"),
+        lora=SimpleNamespace(r=8, alpha=16),
+        training=SimpleNamespace(
+            batch_size=1,
+            grad_accumulation=4,
+            learning_rate=1e-4,
+            optimizer_lifecycle="recreate_per_cycle",
+        ),
+        experiment=SimpleNamespace(seed=42),
+        tg_lora=None,
+        alpha_line=None,
+        _path="configs/9b_tg_lora.yaml",
+    )
+    m = RunMetrics(tmp_path, mode="tg_lora", run_id=run_id)
+    m.write_header(cfg, budget_type="backward_passes", budget_value=10)
+    return m, cfg
+
+
+def test_extract_fallback_uses_honest_full_eval_when_lower(tmp_path: Path) -> None:
+    # The producer's ``cycle_state.best_loss`` (→ footer ``best_valid_loss``) is
+    # updated by BOTH the pilot proxy (``record_cycle`` → ``loss_valid``) AND
+    # the honest full-eval (``record_full_eval`` → ``loss_valid_full``). An
+    # interrupted run (no footer) that emitted an honest ``loss_valid_full``
+    # record BELOW the proxy minimum must surface that honest loss — otherwise
+    # the deposit misrepresents what the footer would have recorded. Uses the
+    # REAL ``RunMetrics`` producer (real header + step + full-eval records) so
+    # the defect is reproduced from the actual emission path.
+    m, _ = _real_producer_metrics(tmp_path, "killed_with_fulleval")
+    try:
+        # pilot-proxy losses per cycle (proxy min = 1.4 at step 48)
+        m.record_step(
+            step=24, cycle=0, loss_train=2.0, loss_valid=1.5, total_backward_passes=24
+        )
+        m.record_step(
+            step=48, cycle=1, loss_train=1.9, loss_valid=1.4, total_backward_passes=48
+        )
+        # honest full-eval (1.2 < proxy min 1.4): loss_valid=None, loss_valid_full=1.2
+        m.record_full_eval_loss(
+            cycle=1, full_loss=1.2, total_backward_passes=48, step=48
+        )
+        # NO write_footer — the run was interrupted/killed before completion.
+    finally:
+        m.close()
+
+    value, prov = extract_best_valid_loss(tmp_path / "run_metrics.jsonl")
+    assert value == pytest.approx(1.2)  # honest full-eval, NOT proxy min 1.4
+    assert prov["best_valid_loss_source"] == "min_loss_valid_step"
+    assert prov["best_valid_step"] == 48
+    assert prov["run_id"] == "killed_with_fulleval"
+
+
+def test_extract_fallback_takes_true_min_across_proxy_and_full_eval(
+    tmp_path: Path,
+) -> None:
+    # Guard against an over-correction that ALWAYS prefers ``loss_valid_full``:
+    # the fallback must take the true min across both fields (matching the
+    # producer's ``best_loss = min(proxy, full_eval)``). When the pilot proxy is
+    # the lower value, it wins. Real producer output.
+    m, _ = _real_producer_metrics(tmp_path, "proxy_lower")
+    try:
+        m.record_step(
+            step=24, cycle=0, loss_train=2.0, loss_valid=1.1, total_backward_passes=24
+        )
+        m.record_step(
+            step=48, cycle=1, loss_train=1.9, loss_valid=1.3, total_backward_passes=48
+        )
+        # honest full-eval (1.2) is HIGHER than the proxy min (1.1)
+        m.record_full_eval_loss(
+            cycle=1, full_loss=1.2, total_backward_passes=48, step=48
+        )
+    finally:
+        m.close()
+
+    value, prov = extract_best_valid_loss(tmp_path / "run_metrics.jsonl")
+    assert value == pytest.approx(1.1)  # proxy is the true min (1.1 < honest 1.2)
+    assert prov["best_valid_step"] == 24
+
+
 def test_extract_surfaces_progressive_freeze_arm_provenance(tmp_path: Path) -> None:
     # A Tier-2 surrogate (random_order) run: the footer's progressive_freeze
     # block carries the requested policy + surrogate seed, the only

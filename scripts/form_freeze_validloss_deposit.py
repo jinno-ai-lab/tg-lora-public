@@ -55,11 +55,17 @@ def extract_best_valid_loss(path: str | Path) -> tuple[float, dict[str, Any]]:
     """Read the best valid loss + provenance from one ``run_metrics.jsonl``.
 
     Prefers the durable ``run_footer.best_valid_loss`` field; falls back to the
-    minimum ``loss_valid`` across ``step`` lines for runs that predate the
-    footer, or whose footer carries ``best_valid_loss: null`` (an interrupted
-    run that never updated ``best_loss``). Returns ``(value, provenance)`` where
-    provenance names the run so a deposited float always traces back to its
-    source artifact.
+    minimum across ``step`` lines' ``loss_valid`` (pilot proxy) AND
+    ``loss_valid_full`` (honest full-eval) for runs that predate the footer, or
+    whose footer carries ``best_valid_loss: null`` (an interrupted run that
+    never updated ``best_loss``). The producer's ``cycle_state.best_loss``
+    tracker — which the footer's ``best_valid_loss`` mirrors — is updated by
+    BOTH the pilot proxy (``record_cycle``) and the honest full-eval
+    (``record_full_eval``), so the fallback takes the min across both fields to
+    stay faithful to what the footer would have recorded (otherwise an
+    interrupted run with honest full-eval records would silently surface the
+    proxy best). Returns ``(value, provenance)`` where provenance names the run
+    so a deposited float always traces back to its source artifact.
     """
     path = Path(path)
     run_id = path.stem
@@ -94,12 +100,22 @@ def extract_best_valid_loss(path: str | Path) -> tuple[float, dict[str, Any]]:
                 seed = record.get("seed", seed)
                 model_name = record.get("model_name", model_name)
             elif rtype == "step":
-                loss_valid = record.get("loss_valid")
-                if loss_valid is not None and (
-                    min_step_loss is None or loss_valid < min_step_loss
-                ):
-                    min_step_loss = float(loss_valid)
-                    min_step = record.get("step")
+                # Mirror the producer's ``cycle_state.best_loss`` tracker: it is
+                # updated by BOTH the pilot proxy (``record_cycle`` →
+                # ``loss_valid``) AND the honest full-eval (``record_full_eval``
+                # → ``loss_valid_full`` with ``loss_valid=None``). A fallback
+                # that reads only ``loss_valid`` would drop the honest §5.1/§5.2
+                # full-eval signal on an interrupted run (footer absent /
+                # ``best_valid_loss: null``) and report the proxy best —
+                # misrepresenting what the footer's ``best_valid_loss`` would
+                # have recorded. Take the running min across both fields.
+                for field in ("loss_valid", "loss_valid_full"):
+                    candidate = record.get(field)
+                    if candidate is None:
+                        continue
+                    if min_step_loss is None or candidate < min_step_loss:
+                        min_step_loss = float(candidate)
+                        min_step = record.get("step")
             elif rtype == "run_footer":
                 # Arm identity lives on the footer regardless of whether the run
                 # finished cleanly, so read it before the ``best_valid_loss`` null
