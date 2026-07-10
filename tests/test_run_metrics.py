@@ -788,3 +788,30 @@ class TestAppendModeResumeContinuity:
         records = self._records(fresh_dir)
         assert [r["type"] for r in records] == ["run_header", "step"]  # header kept
 
+    def test_append_carries_forward_gpu_peak(self, tmp_path):
+        """``gpu_peak_mb`` is carried forward from the pre-resume segment so the
+        resumed footer reports the GLOBAL peak across both segments, not just the
+        resumed segment's local peak — the on-disk analog of the caller-scoped
+        peak accumulator (the one accumulator the append-mode fix carries that
+        had no test). Without carry-forward a resumed run that never re-observes
+        the pre-resume peak would report a segment-local floor and understate the
+        run's true VRAM high-water mark the break-even gate reads."""
+        with patch("src.utils.run_metrics.gpu_peak_memory_mb", return_value=1500.0):
+            m = RunMetrics(tmp_path, mode="baseline", run_id="peak")
+            m.record_step(step=1, loss_train=3.0, total_backward_passes=1)
+            m.close()
+        # Pre-resume record carries the observed 1500 MB peak.
+        assert self._records(tmp_path)[-1]["gpu_peak_mb"] == 1500.0
+
+        # Resumed segment observes a LOWER peak (800) than the carried 1500.
+        with patch("src.utils.run_metrics.gpu_peak_memory_mb", return_value=800.0):
+            m2 = RunMetrics(tmp_path, mode="baseline", append=True)
+            m2.record_step(step=2, loss_train=2.5, total_backward_passes=2)
+            m2.write_footer(best_valid_loss=2.5, best_valid_step=2, final_train_loss=2.5)
+            m2.close()
+
+        footer = [r for r in self._records(tmp_path) if r["type"] == "run_footer"][-1]
+        # GLOBAL peak wins: the resumed 800 did NOT overwrite the carried 1500.
+        # Without carry-forward the footer would report 800 (segment-local).
+        assert footer["gpu_peak_mb"] == 1500.0
+

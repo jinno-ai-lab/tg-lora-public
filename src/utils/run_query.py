@@ -83,8 +83,17 @@ def list_runs(run_dir: str | Path) -> list[dict[str, Any]]:
         except (ValueError, orjson.JSONDecodeError):
             continue
 
+        # First header carries the run's original identity (run_id / started_at);
+        # ``write_header`` is a no-op on an appended segment, so the header is
+        # singular and first == last.
         header = next((r for r in records if r.get("type") == "run_header"), None)
-        footer = next((r for r in records if r.get("type") == "run_footer"), None)
+        # LAST footer wins: a run resumed into the same dir (resume-after-
+        # completion) appends a second ``run_footer``, and the latest is the run's
+        # most recent completion state. Matches ``get_footer`` /
+        # ``compare_runs.load_run`` / ``extract_best_valid_loss`` (all
+        # last-footer); a first-footer read would feed ``find_best_run`` stale
+        # ``best_valid_loss`` on the run-selection sweep.
+        footer = next((r for r in reversed(records) if r.get("type") == "run_footer"), None)
 
         if header is None:
             continue

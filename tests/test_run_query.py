@@ -327,6 +327,49 @@ def test_list_runs_multiple(tmp_path):
     assert ids == {"r1", "r2"}
 
 
+def test_list_runs_uses_latest_footer_on_multi_footer_file(tmp_path):
+    """A resumed-into-the-same-dir run (resume-after-completion) appends a SECOND
+    ``run_footer`` to the same ``run_metrics.jsonl``. ``list_runs`` must report the
+    LATEST footer's ``best_valid_loss`` — the run's most recent completion — not
+    the stale first one, matching ``get_footer`` / ``compare_runs.load_run`` /
+    ``form_freeze_validloss_deposit.extract_best_valid_loss`` (all last-footer).
+
+    The append-mode resume fix made multi-footer files real, so a first-footer
+    read silently feeds ``find_best_run`` stale data on the run-selection sweep
+    (``compare_runs.pick_best_run`` keys off ``list_runs``' ``best_valid_loss``)."""
+    d = tmp_path / "resumed"
+    # Segment 1: a run that COMPLETED with best_valid_loss=2.0 (now stale).
+    _write_run(
+        d,
+        run_id="resume-after-completion",
+        mode="baseline",
+        steps=[
+            {
+                "step": 1,
+                "loss_train": 3.0,
+                "backward_passes": 1,
+                "total_backward_passes": 1,
+            },
+        ],
+        footer_kwargs={"best_valid_loss": 2.0, "best_valid_step": 1, "final_train_loss": 2.5},
+    )
+    # Segment 2: resume into the same dir (append) → a second, LATEST footer.
+    m = RunMetrics(d, mode="baseline", append=True)
+    m.record_step(step=2, loss_train=1.6, backward_passes=1, total_backward_passes=2)
+    m.write_footer(best_valid_loss=1.5, best_valid_step=2, final_train_loss=1.6)
+    m.close()
+
+    runs = list_runs(tmp_path)
+    assert len(runs) == 1
+    # Latest footer wins — NOT the stale 2.0 from the first completion.
+    assert runs[0]["best_valid_loss"] == 1.5
+    # Contract: list_runs and get_footer must agree on "the footer" of a run.
+    assert (
+        runs[0]["best_valid_loss"]
+        == get_footer(d / "run_metrics.jsonl")["best_valid_loss"]
+    )
+
+
 def test_list_runs_empty_dir(tmp_path):
     assert list_runs(tmp_path) == []
 
