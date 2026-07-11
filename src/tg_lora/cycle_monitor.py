@@ -139,7 +139,16 @@ class CycleMonitor:
             current_loss = None
             if self._history:
                 last = self._history[-1]
-                current_loss = last.get("valid_loss") or last.get("train_loss")
+                # Mirror the loss-selection rule in ``update`` (``valid_loss
+                # if valid_loss is not None else train_loss``): a ``valid_loss``
+                # of exactly ``0.0`` is a legitimate value (perfect/near-perfect
+                # loss, e.g. the proxy memorize task), so ``... or train_loss``
+                # is wrong — Python treats ``0.0`` as falsy and silently falls
+                # through to ``train_loss``, surfacing the wrong loss in
+                # ``current_value`` (consumed by ``health_summary`` and the
+                # advisor reporting path).
+                valid = last.get("valid_loss")
+                current_loss = valid if valid is not None else last.get("train_loss")
 
             return StagnationReport(
                 detected=True,

@@ -114,6 +114,67 @@ class TestStagnationDetection:
         assert not report.stagnation.detected
 
 
+class TestStagnationCurrentLossSelection:
+    """``detect_stagnation().current_value`` must report the same loss that
+    ``update`` selects for best-tracking — ``valid_loss if valid_loss is not
+    None else train_loss`` (the rule at the top of ``update``). The stagnation
+    path previously used ``last.get("valid_loss") or last.get("train_loss")``,
+    which treats a legitimate ``valid_loss == 0.0`` as falsy and silently falls
+    through to ``train_loss``: the surfaced ``current_value`` (consumed by
+    ``health_summary`` and the advisor/``advise_training`` reporting path) then
+    reports the wrong loss. This is the stagnation-side companion to
+    ``TestNearZeroLossSpikeSuppression`` — a zero loss is a real value, not a
+    sentinel for "missing".
+    """
+
+    def test_zero_valid_loss_is_not_swallowed(self):
+        """``valid_loss == 0.0`` (perfect/near-perfect loss — e.g. the proxy
+        memorize task) must be reported as ``current_value``, not replaced by
+        ``train_loss`` via a falsy ``or``."""
+        m = CycleMonitor(patience=2)
+        m.update({"train_loss": 1.50, "valid_loss": 0.0})  # best = 0.0
+        m.update({"train_loss": 1.45, "valid_loss": 0.0})  # cycles_since_best = 1
+        report = m.update({"train_loss": 1.43, "valid_loss": 0.0})  # -> 2: detect
+        assert report.stagnation.detected
+        assert report.stagnation.current_value == 0.0, (
+            f"valid_loss=0.0 must be reported as current_value, got "
+            f"{report.stagnation.current_value} (train_loss leaked through `or`)"
+        )
+
+    @pytest.mark.parametrize(
+        "valid_loss, train_loss",
+        [
+            (0.0, 1.43),    # the falsy-swallow case (0.0 is a real value)
+            (0.5, 1.0),     # normal scale, truthy
+            (1e-12, 2.0),   # tiny-but-nonzero is truthy, still must round-trip
+        ],
+    )
+    def test_current_value_matches_best_loss_rule(self, valid_loss, train_loss):
+        """``current_value`` must equal the same selection ``update`` applies
+        for best-tracking, magnitude- and falsy-invariant across inputs."""
+        m = CycleMonitor(patience=2)
+        m.update({"train_loss": 10.0, "valid_loss": valid_loss})        # best
+        m.update({"train_loss": 9.0, "valid_loss": valid_loss + 0.1})   # csb = 1
+        report = m.update({"train_loss": train_loss, "valid_loss": valid_loss})
+        assert report.stagnation.detected
+        expected = valid_loss if valid_loss is not None else train_loss
+        assert report.stagnation.current_value == pytest.approx(expected), (
+            f"valid_loss={valid_loss}, train_loss={train_loss}: expected "
+            f"current_value={expected}, got {report.stagnation.current_value}"
+        )
+
+    def test_falls_back_to_train_loss_when_valid_absent(self):
+        """When ``valid_loss`` is genuinely absent (key missing -> None),
+        ``current_value`` falls back to ``train_loss``. Guards that the fix
+        does not break the legitimate missing-valid path."""
+        m = CycleMonitor(patience=2)
+        m.update({"train_loss": 1.00})  # best tracked from train_loss
+        m.update({"train_loss": 1.01})
+        report = m.update({"train_loss": 1.02})
+        assert report.stagnation.detected
+        assert report.stagnation.current_value == pytest.approx(1.02)
+
+
 class TestRecommendations:
     def test_nan_recommendations(self):
         m = CycleMonitor(nan_detection=True)
