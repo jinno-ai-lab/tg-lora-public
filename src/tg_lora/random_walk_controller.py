@@ -10,6 +10,28 @@ from src.tg_lora.layer_sampler import StrategyName
 _ALL_STRATEGIES: list[StrategyName] = list(get_args(StrategyName))
 
 
+def relative_degradation(loss_before: float, loss_after: float) -> float:
+    """Relative loss degradation from ``loss_before`` to ``loss_after``.
+
+    This is the **single source of truth** for the relative-tolerance metric
+    that every accept/rollback gate in the loop must share. ``rollback_tolerance``
+    (default ``0.005``) is a *relative* fraction — 0.5% — not an absolute loss
+    margin; that contract is pinned magnitude-invariant by
+    ``tests/test_accept_property.py::test_accept_magnitude_consistency`` and
+    mirrored here so every site that consumes ``rollback_tolerance`` reads the
+    same scale-invariant number.
+
+    Returns the signed relative change ``(loss_after - loss_before) /
+    max(abs(loss_before), 1e-8)``: negative ⇒ loss improved, positive ⇒ loss
+    degraded. The ``1e-8`` floor matches :meth:`RandomWalkController.accept` and
+    keeps the division finite when ``loss_before`` ≈ 0. Non-finite inputs return
+    ``+inf`` so any ``<= tolerance`` check rejects (never accepts a NaN/Inf loss).
+    """
+    if not (math.isfinite(loss_before) and math.isfinite(loss_after)):
+        return math.inf
+    return (loss_after - loss_before) / max(abs(loss_before), 1e-8)
+
+
 @dataclass
 class Proposal:
     K: int
@@ -381,8 +403,7 @@ class RandomWalkController:
             return False
         if loss_after <= loss_pilot:
             return True
-        relative = (loss_after - loss_pilot) / max(abs(loss_pilot), 1e-8)
-        return relative <= self.rollback_tolerance
+        return relative_degradation(loss_pilot, loss_after) <= self.rollback_tolerance
 
     def reward(self, loss_pilot: float, loss_after: float) -> None:
         self.state.accepted_count += 1

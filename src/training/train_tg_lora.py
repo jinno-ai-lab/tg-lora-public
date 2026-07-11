@@ -67,7 +67,7 @@ from src.tg_lora.progressive_freeze import (
     build_freeze_schedule_from_config,
     progressive_freeze_run_summary,
 )
-from src.tg_lora.random_walk_controller import RandomWalkController
+from src.tg_lora.random_walk_controller import RandomWalkController, relative_degradation
 from src.tg_lora.rollback_manager import RollbackManager
 from src.tg_lora.velocity import Velocity, beta_from_window
 from src.training.async_cache_builder import AsyncCacheBuilder
@@ -2543,7 +2543,14 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 dW = None
                 dW_steps = pilot_K
                 pilot_full_rollback = False
-                if loss_pilot > cycle_state.last_valid_loss + controller.rollback_tolerance:
+                # rollback_tolerance is a RELATIVE fraction (0.005 = 0.5%), per
+                # the property-tested contract (test_accept_magnitude_consistency);
+                # use relative_degradation so the pilot-overshoot trigger is
+                # scale-invariant instead of drifting with the current loss level.
+                if (
+                    relative_degradation(cycle_state.last_valid_loss, loss_pilot)
+                    > controller.rollback_tolerance
+                ):
                     # 中間点の中から最良を探す
                     best_intermediate_loss = loss_pilot
                     for i in range(len(intermediate_deltas) - 2, -1, -1):
@@ -3334,8 +3341,8 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                                 )
                                 if (
                                     math.isfinite(loss_new)
-                                    and loss_new
-                                    <= loss_before + controller.rollback_tolerance
+                                    and relative_degradation(loss_before, loss_new)
+                                    <= controller.rollback_tolerance
                                 ):
                                     _apply_alpha_direction_from_base(
                                         model,

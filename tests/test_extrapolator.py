@@ -421,6 +421,93 @@ def test_subspace_zeroth_order_step_rejects_and_rolls_back():
     assert torch.allclose(params[name], before)
 
 
+def _run_zo_step_with_fixed_loss_sequence(losses_sequence):
+    """Run ``subspace_zeroth_order_step`` with a scripted loss sequence.
+
+    The closure ignores the live params and returns the scripted losses in
+    order, so the final (4th) call is the candidate ``loss_new`` that the accept
+    gate compares against ``loss_initial`` (the 1st call). The middle two calls
+    feed the finite-difference gradient/hessian; we pick them to give a descent
+    ``g`` so the default ``stop_on_positive_primary_g=True`` does not abort
+    before the candidate is evaluated.
+
+    Returns ``(stats, loss_initial, loss_new)``.
+    """
+    model = FakeLoRAModel()
+    params = dict(iter_lora_params(model))
+    name = "linear.lora_A"
+    direction = torch.ones_like(params[name])
+    direction = direction / direction.norm()
+    basis = OrthonormalBasis(
+        vectors=[{name: direction}],
+        dim=1,
+        residual_norm=0.0,
+        short_norm=1.0,
+        long_norm=1.0,
+        tau_dim=0.15,
+    )
+    losses = iter(losses_sequence)
+
+    def loss_closure():
+        return next(losses)
+
+    stats = subspace_zeroth_order_step(
+        model,
+        basis,
+        {name},
+        loss_closure,
+        mu_ratio=0.01,
+        max_step_ratio=100.0,
+        tolerance=0.005,
+    )
+    return stats, stats.loss_initial, stats.loss_new
+
+
+def test_subspace_zeroth_order_step_accept_is_scale_invariant():
+    """``tolerance`` is RELATIVE — the same % degradation must give one verdict.
+
+    Two scripted sequences representing the *same* 0.3% degradation but at loss
+    scales 100x apart:
+
+      Run A (small magnitude): loss_initial=1.0   → loss_new=1.003
+      Run B (large magnitude): loss_initial=100.0 → loss_new=100.3
+
+    Under the RELATIVE contract (``relative_degradation(loss_initial, loss_new)
+    <= tolerance``) both degrade by exactly 0.003 ≤ 0.005 ⇒ both ACCEPT.
+
+    Under the historical ABSOLUTE bug (``loss_new <= loss_initial + tolerance``)
+    Run A passes (1.003 ≤ 1.005) but Run B FAILS (100.3 ≰ 100.005) ⇒ divergent
+    verdicts. Asserting both accept therefore pins the relative semantics.
+
+    Mutation proof: reverting the accept site to ``loss_initial + tolerance``
+    makes Run B reject and this test RED.
+    """
+    stats_a, initial_a, new_a = _run_zo_step_with_fixed_loss_sequence(
+        [1.0, 0.5, 0.0, 1.003]
+    )
+    stats_b, initial_b, new_b = _run_zo_step_with_fixed_loss_sequence(
+        [100.0, 50.0, 0.0, 100.3]
+    )
+
+    # Sanity: the scripted sequences landed where we expected.
+    assert initial_a == pytest.approx(1.0)
+    assert new_a == pytest.approx(1.003)
+    assert initial_b == pytest.approx(100.0)
+    assert new_b == pytest.approx(100.3)
+
+    # The relative degradation is identical (≈ 0.3%) at both scales.
+    from src.tg_lora.random_walk_controller import relative_degradation
+
+    assert relative_degradation(initial_a, new_a) == pytest.approx(
+        relative_degradation(initial_b, new_b), abs=1e-9
+    )
+    assert relative_degradation(initial_a, new_a) <= 0.005
+
+    # The load-bearing assertion: both scales accept the same relative bump.
+    assert stats_a.accepted is True
+    assert stats_b.accepted is True
+
+
 def test_subspace_zeroth_order_step_stops_on_non_descent_primary_g():
     model = FakeLoRAModel()
     params = dict(iter_lora_params(model))

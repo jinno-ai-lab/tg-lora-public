@@ -188,3 +188,51 @@ def test_regime_detector_resume_state_is_wired() -> None:
     assert "regime_detector.load_state_dict(restored_training_state.psa_regime_state)" in (
         source
     ), "the resume path must call regime_detector.load_state_dict with the persisted field"
+
+
+def test_rollback_tolerance_gates_use_relative_metric() -> None:
+    """The two in-loop ``rollback_tolerance`` gates must be RELATIVE, not absolute.
+
+    ``rollback_tolerance`` (default ``0.005``) is canonically a *relative* 0.5%
+    fraction — pinned magnitude-invariant for ``RandomWalkController.accept`` by
+    ``tests/test_accept_property.py`` and for the helper by
+    ``tests/test_relative_degradation.py``. Two sites in this entry point
+    previously misused the same knob as an *absolute* additive margin
+    (``loss_x <= loss_y + rollback_tolerance``), which made the pilot-overshoot
+    trigger and the alpha line-search accept drift with the current loss level:
+    over-tolerant when loss is small, under-tolerant when loss is large. They
+    now route through the shared ``relative_degradation`` helper. This guard
+    pins the wiring (unimportable here, so verified by source string): the
+    helper must be imported, both call sites must use it, and the historical
+    absolute ``+ rollback_tolerance`` patterns must be gone. A future edit that
+    inlines the absolute comparison back reopens the scale-drift gap and fails
+    this assertion.
+    """
+    assert TARGET.is_file(), f"training entry point not found at {TARGET}"
+    source = TARGET.read_text(encoding="utf-8")
+
+    # The shared helper is imported (alongside the controller it lives next to).
+    assert (
+        "from src.tg_lora.random_walk_controller import RandomWalkController, relative_degradation"
+        in source
+    ), "relative_degradation must be imported from random_walk_controller"
+
+    # Both in-loop gates route through the helper against the same tolerance.
+    assert (
+        source.count("relative_degradation(cycle_state.last_valid_loss, loss_pilot)") >= 1
+    ), "the pilot-overshoot trigger must use relative_degradation(last_valid_loss, loss_pilot)"
+    assert (
+        source.count("relative_degradation(loss_before, loss_new)") >= 1
+    ), "the alpha line-search accept must use relative_degradation(loss_before, loss_new)"
+
+    # The historical absolute-misuse patterns must be GONE. ``+ rollback_tolerance``
+    # as an additive loss margin is the bug shape; if either returns the gate is
+    # scale-dependent again.
+    assert source.count("last_valid_loss + controller.rollback_tolerance") == 0, (
+        "the pilot trigger must not use absolute 'last_valid_loss + rollback_tolerance' "
+        "— rollback_tolerance is a relative fraction (property-tested)"
+    )
+    assert source.count("loss_before + controller.rollback_tolerance") == 0, (
+        "the alpha line-search accept must not use absolute "
+        "'loss_before + rollback_tolerance' — rollback_tolerance is a relative fraction"
+    )

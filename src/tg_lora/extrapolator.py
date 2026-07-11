@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.func import jvp
 
 from src.model.lora_utils import iter_lora_params
+from src.tg_lora.random_walk_controller import relative_degradation
 from src.tg_lora.activation_cache import (
     _get_decoder_layers,
     forward_from_hidden_states,
@@ -544,7 +545,7 @@ def subspace_zeroth_order_step(
 
     accepted = (
         math.isfinite(loss_new)
-        and loss_new <= loss_initial + tolerance
+        and relative_degradation(loss_initial, loss_new) <= tolerance
         and _all_lora_params_finite(params)
     )
     stats.accepted = accepted
