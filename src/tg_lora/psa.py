@@ -96,14 +96,29 @@ class PSAPrior:
         if n < 2:
             return
 
-        tensor_names = sorted(history[0].keys())
+        # Union of keys across ALL history entries, not just ``history[0]``:
+        # a tensor may be absent from some entries when its layer is
+        # reversibly frozen by ``DynamicFreezeController`` (frozen layers are
+        # excluded from ``snapshot_lora_delta`` — they are not updated in the
+        # pilot), then reappear on release. Considering only ``history[0]``
+        # would never extract a tensor that was frozen at the window start.
+        all_names: set[str] = set()
+        for d in history:
+            all_names.update(d.keys())
+        tensor_names = sorted(all_names)
         new_priors: dict[str, torch.Tensor] = {}
 
         for name in tensor_names:
             rows = []
             for d in history:
+                # ``continue`` (not ``break``): skip entries where this tensor
+                # is absent (its layer frozen that step) and keep collecting
+                # the rest, so a freeze gap mid-window does not drop the
+                # tensor entirely — a dropped tensor gets no prior and is
+                # silently skipped by ``amplify_gradients`` (no subspace
+                # amplification) for the whole run.
                 if name not in d:
-                    break
+                    continue
                 rows.append(d[name].flatten().to(torch.float32))
             if len(rows) < 2:
                 continue

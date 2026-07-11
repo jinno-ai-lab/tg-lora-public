@@ -114,6 +114,59 @@ class TestPSAPrior:
         for name, v in prior.priors.items():
             assert abs(v.norm().item() - 1.0) < 1e-6, f"Prior for {name} not unit norm"
 
+    def test_extract_priors_skips_freeze_gap_not_drop(self):
+        """A tensor absent from one mid-history entry must still get a prior
+        built from its remaining entries.
+
+        When ``DynamicFreezeController`` reversibly freezes a layer, that
+        layer's tensors are excluded from ``snapshot_lora_delta`` (frozen
+        layers are not updated in the pilot — see ``train_tg_lora.py``), so
+        the recorded delta is absent for the frozen steps and reappears on
+        release. ``extract_priors`` previously ``break``-ed on the first
+        missing entry, dropping the tensor entirely instead of skipping the
+        gap — so ``amplify_gradients`` silently skipped it (no prior → no
+        amplification). It must ``continue`` past the gap.
+        """
+        torch.manual_seed(0)
+        prior = PSAPrior(history_length=6, gain=0.5)
+        a = torch.randn(8)
+        b = torch.randn(8)
+        history = [
+            {"A": a.clone(), "B": b.clone()},  # both trainable
+            {"A": a.clone()},                   # B frozen this step (absent)
+            {"A": a.clone(), "B": b.clone()},  # B released
+            {"A": a.clone(), "B": b.clone()},  # B still trainable
+        ]
+        prior.extract_priors(history)
+        assert "A" in prior.priors
+        assert "B" in prior.priors, (
+            "B has 3 usable entries (steps 0,2,3); `break` on the step-1 "
+            "freeze gap dropped it entirely instead of skipping the gap"
+        )
+
+    def test_extract_priors_handles_tensor_absent_in_first_entry(self):
+        """A tensor absent from ``history[0]`` but present in later entries
+        (a layer frozen at the window start, released mid-window) must still
+        be extracted. The previous ``sorted(history[0].keys())`` only
+        considered the first entry's keys, so such a tensor was never even
+        visited."""
+        torch.manual_seed(0)
+        prior = PSAPrior(history_length=6, gain=0.5)
+        a = torch.randn(8)
+        b = torch.randn(8)
+        history = [
+            {"A": a.clone()},                   # B frozen at window start
+            {"A": a.clone(), "B": b.clone()},  # B released
+            {"A": a.clone(), "B": b.clone()},
+            {"A": a.clone(), "B": b.clone()},
+        ]
+        prior.extract_priors(history)
+        assert "A" in prior.priors
+        assert "B" in prior.priors, (
+            "B is present in steps 1-3; `sorted(history[0].keys())` never "
+            "considered it because history[0] omits it"
+        )
+
     def test_empty_history_no_crash(self):
         prior = PSAPrior()
         prior.extract_priors([])
