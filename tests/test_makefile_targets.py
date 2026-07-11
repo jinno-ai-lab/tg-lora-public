@@ -1,5 +1,8 @@
 """Verify Makefile smoke, ablation, bench-optimizer, and experiment config target wiring."""
 
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -408,3 +411,47 @@ class TestPrefixTarget:
 
     def test_module_exists(self) -> None:
         assert (REPO_ROOT / "src/training/train_tg_lora.py").is_file()
+
+
+# ── GPU-free dry-run validation (TASK-0154) ─────────────────────────────────
+
+
+class TestPaperMemoryDryRun:
+    """``make paper-memory-dry-run`` must validate the suffix-only verdict
+    suite's config assembly without a GPU *or* a materialized ``.venv``.
+
+    Regression for the ``VENV_PYTHON`` interpreter fallback in
+    ``scripts/run_paper_memory_suite.sh``: the suite's OmegaConf seed-patch step
+    resolved to ``.venv/bin/python``, so on any fresh clone (CI included) where
+    that path is absent the dry-run exited 127 *before* reporting any validation
+    — the very tool meant to prove the verdict path assembles GPU-free was itself
+    broken. The fix falls back to a discoverable ``python3``.
+    """
+
+    def test_dry_run_validates_when_venv_python_absent(self, tmp_path: Path) -> None:
+        pytest.importorskip("omegaconf")
+        if shutil.which("bash") is None or shutil.which("python3") is None:
+            pytest.skip("bash/python3 unavailable")
+        # Force the fallback branch: an interpreter path that does not exist, so
+        # the script must discover ``python3`` rather than exit 127.
+        absent_python = tmp_path / "absent_venv" / "bin" / "python"
+        env = {
+            **os.environ,
+            "DRY_RUN": "true",
+            "SEEDS": "42",
+            "OUTPUT_BASE": str(tmp_path / "dryrun"),
+            "BASELINE_CONFIG": "configs/9b_baseline_suffix_only_last25.yaml",
+            "TG_CONFIG": "configs/9b_tg_lora_prefix_feature_cache_paper_poc.yaml",
+            "VENV_PYTHON": str(absent_python),
+        }
+        result = subprocess.run(
+            ["bash", str(REPO_ROOT / "scripts" / "run_paper_memory_suite.sh")],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stderr + result.stdout
+        assert "[OK]" in result.stdout
+        assert "DRY RUN complete" in result.stdout

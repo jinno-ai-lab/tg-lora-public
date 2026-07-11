@@ -2,6 +2,14 @@
 set -euo pipefail
 
 VENV_PYTHON="${VENV_PYTHON:-.venv/bin/python}"
+# Fall back to a discoverable interpreter when the venv python is absent, so the
+# GPU-free dry-run (`make paper-memory-dry-run`) validates config assembly on a
+# fresh clone / CI without a materialized .venv. Without this the dry-run exits
+# 127 at the OmegaConf seed-patch step before it can report any validation. The
+# real (non-dry-run) training run still requires a venv with torch/peft/bnb.
+if [[ ! -x "${VENV_PYTHON}" ]] && command -v python3 >/dev/null 2>&1; then
+    VENV_PYTHON="$(command -v python3)"
+fi
 TARGET_BP="${TARGET_BP:-240}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
 QUICK_EVAL_EXAMPLES="${QUICK_EVAL_EXAMPLES:-32}"
