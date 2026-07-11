@@ -2,7 +2,7 @@
        smoke smoke-tg smoke-bl \
        train-baseline train-tg-lora train-tg-lora-optreuse train-tg-lora-prefix \
        eval eval-lora eval-downstream eval-downstream-mlx eval-llm-jp-eval-mlx eval-mlx eval-base eval-35b-base eval-35b-ckpt \
-       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize freeze-replay \
+       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize freeze-validloss-ci-9b freeze-replay \
 
 	compare compare-prefix compare-prefix-cold compare-prefix-warm compare-prefix-coldwarm compare-report paper-memory paper-memory-dry-run paper-memory-one-shot paper-memory-compare-modes paper-memory-all-modes paper-memory-evaluate-gates paper-memory-external-eval paper-memory-frontier-sweep paper-memory-cache-ablation cosine-n-ablation cosine-n-ablation-dry-run cosine-n-skip-ablation cosine-n-skip-ablation-dry-run precompute-prefix-cache ablation sweep accel-sweep \
 	bench-optimizer bench-prefix-cache bench-prefix-cache-one-shot analyze-prefix-break-even analyze-prefix-break-even-ci bench-velocity-ops bench-velocity-ops-ci bench-velocity-ops-save-baseline \
@@ -865,6 +865,22 @@ freeze-validloss-ci-negative-control: ## Sensitivity negative control: under-tra
 
 freeze-validloss-ci-negative-control-surrogate: ## Symmetric sensitivity negative control: under-trained surrogate fires real SURPASSES (auto CUDA)
 	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci $(FREEZE_VALIDLOSS_CI_FLAGS) --surrogate-total 2 --json --output tests/fixtures/freeze_validloss_negative_control_surrogate_proxy.json
+
+# The FIRST real-9B + real-data §4 A/B verdict. Binds the suffix-only config
+# (configs/9b_baseline_suffix_only_last25.yaml) to the GPU and runs the real
+# Qwen3.5-9B QLoRA — an output-first progressive-freeze candidate vs random-order
+# surrogates — on real public Dolly data, feeding the real valid_loss samples to
+# surrogate_valid_loss_ci with proxy_scale=False (target scale). The 9B model is
+# loaded ONCE and each arm resets the LoRA adapter in place (a per-arm reload
+# leaks a second ~5.5GB model and OOMs a 12GB GPU). seq_len defaults to 1024 (the
+# suffix-only per-step fit point); override FREEZE_9B_FLAGS for a smaller smoke.
+# Deposit is honestly reduced-budget (few seeds, short training) — the first
+# target-scale data point, NOT yet the full max_steps=1500 multi-seed §4 verdict.
+# Needs a torch+bnb+GPU interpreter: PYTHON_VENV=/path/to/torch-python make freeze-validloss-ci-9b
+FREEZE_9B_FLAGS ?= --seq-len 1024 --total-steps 20 --warmup-steps 6 --depth 3 --spacing 4 --n-candidate 2 --n-surrogate 2 --train-examples 8 --valid-examples 10 --max-dataset-rows 400
+
+freeze-validloss-ci-9b: ## GOAL §4 REAL 9B target-scale A/B verdict (suffix-only, Dolly; auto CUDA)
+	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_FLAGS) --json --output tests/fixtures/freeze_validloss_ci_9b_surrogate.json
 
 # The apparatus order-resolution diagnostic. Variance-decomposes the proxy's
 # final valid_loss into a Var(order) signal (distinct freeze orders at a fixed

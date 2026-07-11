@@ -1,0 +1,103 @@
+{
+  "verdict": "SURPASSES",
+  "passes": true,
+  "significant_surpasses": true,
+  "is_material": true,
+  "is_thin_evidence": true,
+  "candidate_mean": 1.6246584031730888,
+  "surrogate_mean": 1.7041182734072209,
+  "point_improvement": 0.07945987023413204,
+  "lower": 0.0738613843917848,
+  "upper": 0.08505835607647905,
+  "confidence": 0.95,
+  "n_bootstrap": 10000,
+  "candidate_losses": [
+    1.6249744340777397,
+    1.6243423722684383
+  ],
+  "surrogate_losses": [
+    1.6988358184695245,
+    1.7094007283449173
+  ],
+  "candidate_order": [
+    31,
+    30,
+    29,
+    28,
+    27,
+    26,
+    25,
+    24
+  ],
+  "device": "cuda",
+  "model": "Qwen/Qwen3.5-9B",
+  "dataset": "databricks/databricks-dolly-15k",
+  "total_steps": 20,
+  "warmup_steps": 6,
+  "depth": 3,
+  "spacing": 4,
+  "n_candidate": 2,
+  "n_surrogate": 2,
+  "base_seed": 0,
+  "active_scope": [
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "scope_label": "last_25_percent",
+  "n_active_layers": 8,
+  "scope_trainable_params": 10819584,
+  "seq_len": 1024,
+  "train_examples": 8,
+  "valid_examples": 10,
+  "use_local_loss": true,
+  "proxy_scale": false,
+  "reduced_budget": true,
+  "candidate_provenance": [
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.0005645751953125
+    },
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.000583648681640625
+    }
+  ],
+  "surrogate_provenance": [
+    {
+      "frozen_layers": [
+        25,
+        28,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 9.393692016601562e-05
+    },
+    {
+      "frozen_layers": [
+        26,
+        28,
+        29
+      ],
+      "n_trainable_params": 6687744,
+      "last_train_loss": 0.000499725341796875
+    }
+  ],
+  "citable_as_target_scale": true,
+  "citable_as_full_section4_verdict": false
+}
