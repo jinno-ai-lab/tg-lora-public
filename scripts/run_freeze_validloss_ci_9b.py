@@ -454,6 +454,23 @@ def candidate_order_9b(active_indices: set[int]) -> tuple[int, ...]:
 # ---------------------------------------------------------------------------
 
 
+def _is_reduced_budget(total_steps: int, max_steps: int) -> bool:
+    """A run is reduced-budget unless it trained for the config's full
+    ``max_steps`` (the §4 verdict's intended training length).
+
+    Keeps :data:`reduced_budget` *honest*: a hardcoded ``True`` would silently
+    lie about a future full-length run, and the citation gate
+    (:attr:`citable_as_full_section4_verdict`) that keys off it would stay
+    permanently closed no matter how long a run trained. With this, a run that
+    reaches ``max_steps`` clears the flag (and a non-thin, target-scale one
+    becomes citable). ``max_steps <= 0`` (absent / unparsed config) is treated
+    as reduced — the conservative call, never silently promoting a run.
+    """
+    if max_steps <= 0:
+        return True
+    return total_steps < max_steps
+
+
 def run_ci_9b(
     *,
     cfg,
@@ -514,6 +531,13 @@ def run_ci_9b(
     cand_order = candidate_order_9b(active_indices)
     scope_sorted = sorted(active_indices)
     lr = float(cfg.training.learning_rate)
+    cfg_max_steps = int(cfg.training.get("max_steps", 0))
+    reduced_budget = _is_reduced_budget(total_steps, cfg_max_steps)
+    if not reduced_budget:
+        logger.info(
+            "Full-budget run: total_steps=%d reaches config max_steps=%d "
+            "(reduced_budget=False).", total_steps, cfg_max_steps,
+        )
 
     try:
         candidate_results = [
@@ -571,9 +595,13 @@ def run_ci_9b(
         "dataset": dataset,
         "model": cfg.model.name_or_path,
         "use_local_loss": use_local_loss,
-        # Real 9B + real data, but a deliberately reduced training budget.
+        # Real 9B + real data. ``reduced_budget`` is honest about the step
+        # budget: True unless ``total_steps`` reaches the config's full
+        # ``max_steps`` (the §4 verdict's intended training length). See
+        # :func:`_is_reduced_budget` — never a hardcoded flag.
         "proxy_scale": False,
-        "reduced_budget": True,
+        "reduced_budget": reduced_budget,
+        "cfg_max_steps": cfg_max_steps,
         "candidate_provenance": [p for _, p in candidate_results],
         "surrogate_provenance": [p for _, p in surrogate_results],
     }
@@ -620,13 +648,19 @@ def result_to_json(result: dict) -> dict:
         # GOAL §7 scale + budget honesty.
         "proxy_scale": result["proxy_scale"],
         "reduced_budget": reduced,
+        "cfg_max_steps": result.get("cfg_max_steps"),
         "candidate_provenance": result["candidate_provenance"],
         "surrogate_provenance": result["surrogate_provenance"],
-        # Machine-readable citation gate: real-9B + real-data (not proxy), not a
-        # negative control — but a REDUCED budget, so it is the first target-scale
-        # data point, NOT yet the full §4 max_steps=1500 multi-seed verdict.
+        # Machine-readable citation gate: a run is the full §4 verdict ONLY when
+        # it is target-scale (not proxy), full-budget (reached config max_steps,
+        # not reduced), AND non-thin (enough seeds for the bootstrap to capture
+        # variance). The private ``src.data`` quality filter is a further axis
+        # this gate cannot see (absent on the mirror) — it is noted in the
+        # report, never silently assumed away.
         "citable_as_target_scale": (not result["proxy_scale"]),
-        "citable_as_full_section4_verdict": (not result["proxy_scale"]) and (not reduced),
+        "citable_as_full_section4_verdict": (
+            (not result["proxy_scale"]) and (not reduced) and (not ci.is_thin_evidence)
+        ),
     }
 
 
@@ -649,15 +683,34 @@ def format_report_9b(result: dict) -> str:
         f"  candidate valid_loss samples: {[round(v, 6) for v in result['candidate_losses']]}",
         f"  surrogate valid_loss samples: {[round(v, 6) for v in result['surrogate_losses']]}",
         "  note: REAL_9B_TARGET_SCALE — real Qwen/Qwen3.5-9B + real public Dolly "
-        "data (proxy_scale=False). This is the first target-scale A/B sample; the "
-        "verdict above is grounded in numbers from an actual 9B run, not a proxy.",
-        "  note: REDUCED_BUDGET — few seeds and short training, not the config's "
-        "full max_steps=1500 multi-seed run. Cite as the first real-9B data point, "
-        "NOT as the complete §4 verdict (citable_as_full_section4_verdict=False). "
-        "The private src.data quality filter is also absent (absolute loss levels "
-        "differ from a filtered-data run; the A/B internal validity is unaffected "
-        "since candidate and surrogate share identical data).",
+        "data (proxy_scale=False); the verdict above is grounded in numbers from "
+        "an actual 9B run, not a proxy.",
     ]
+    # Honesty notes are flag-driven so the report never contradicts the
+    # machine-readable labels (a hardcoded "reduced" string would lie about a
+    # full-budget run, exactly the defect _is_reduced_budget fixes).
+    if result["reduced_budget"]:
+        lines.append(
+            f"  note: REDUCED_BUDGET — total_steps={result['total_steps']} is short "
+            f"of the config's full max_steps={result.get('cfg_max_steps')} multi-seed "
+            "run, so this is a target-scale data point, NOT yet the complete §4 "
+            "verdict (citable_as_full_section4_verdict=False)."
+        )
+    else:
+        lines.append(
+            f"  note: FULL_BUDGET — total_steps={result['total_steps']} reaches the "
+            f"config's max_steps={result.get('cfg_max_steps')}."
+        )
+    if ci.is_thin_evidence:
+        lines.append(
+            "  note: THIN_EVIDENCE — fewer than 3 seeds in an arm; the recorded "
+            "verdict is not confirmed (the formatter says so plainly)."
+        )
+    lines.append(
+        "  note: the private src.data quality filter is absent on this mirror "
+        "(absolute loss levels differ from a filtered-data run; the A/B internal "
+        "validity is unaffected since candidate and surrogate share identical data)."
+    )
     return "\n".join(lines)
 
 

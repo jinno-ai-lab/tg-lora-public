@@ -44,6 +44,7 @@ import torch
 from torch import nn
 
 from scripts.run_freeze_validloss_ci_9b import (
+    _is_reduced_budget,
     _reset_lora_for_arm,
     arm_valid_loss_9b,
     build_parser,
@@ -56,7 +57,7 @@ from src.tg_lora.freeze_surrogate_gate import SURPASSES
 
 # The committed real-9B recording: a real RTX 3060 seq1024 suffix-only run of
 # the §4 candidate-vs-surrogate A/B (verdict SURPASSES, candidate_mean≈1.625,
-# surrogate_mean≈1.704, CI[95%]≈[0.074, 0.085], 2 seeds/arm — thin evidence).
+# surrogate_mean≈1.770, CI[95%]≈[0.077, 0.230], 4 seeds/arm — NON-thin evidence).
 # Regenerate with ``make freeze-validloss-ci-9b``.
 FIXTURE_9B_SURROGATE = (
     Path(__file__).resolve().parent
@@ -305,6 +306,7 @@ def _stub_result(**overrides):
         use_local_loss=True,
         proxy_scale=False,
         reduced_budget=True,
+        cfg_max_steps=1500,
         candidate_provenance=[{"frozen_layers": [29, 30, 31], "n_trainable_params": 6787072, "last_train_loss": 0.001}],
         surrogate_provenance=[{"frozen_layers": [25, 28, 31], "n_trainable_params": 6787072, "last_train_loss": 0.001}],
     )
@@ -321,11 +323,27 @@ class TestResultToJson:
         # Reduced budget: NOT yet the full §4 verdict.
         assert out["reduced_budget"] is True
         assert out["citable_as_full_section4_verdict"] is False
+        # cfg_max_steps is surfaced so a reader can see the budget the
+        # reduced-budget flag was judged against (not a mystery boolean).
+        assert out["cfg_max_steps"] == 1500
 
-    def test_full_verdict_only_when_full_budget_and_target_scale(self):
-        # The citation gate opens ONLY for a full-budget target-scale run.
-        out = result_to_json(_stub_result(proxy_scale=False, reduced_budget=False))
+    def test_full_verdict_only_when_full_budget_target_scale_and_non_thin(self):
+        # The citation gate opens ONLY for a full-budget, target-scale,
+        # NON-THIN run — all three honesty axes must clear together.
+        out = result_to_json(_stub_result(
+            proxy_scale=False, reduced_budget=False,
+            ci=_stub_ci(is_thin_evidence=False),
+        ))
         assert out["citable_as_full_section4_verdict"] is True
+
+    def test_thin_evidence_blocks_full_citation_even_at_full_budget(self):
+        # A full-budget target-scale run that is still thin (too few seeds)
+        # must NOT be citable as the complete §4 verdict.
+        out = result_to_json(_stub_result(
+            proxy_scale=False, reduced_budget=False,
+            ci=_stub_ci(is_thin_evidence=True),
+        ))
+        assert out["citable_as_full_section4_verdict"] is False
 
     def test_proxy_scale_never_citable_as_target(self):
         out = result_to_json(_stub_result(proxy_scale=True))
@@ -345,6 +363,32 @@ class TestResultToJson:
             assert key in out
 
 
+# ── _is_reduced_budget: honest (budget-driven) reduced-budget flag ───────────
+
+
+class TestReducedBudgetHonest:
+    """The flag must track the actual step budget vs the config, not be a
+    hardcoded ``True``. A hardcoded flag would lie about a future full-length
+    run and keep the citation gate permanently closed."""
+
+    def test_short_of_max_steps_is_reduced(self):
+        assert _is_reduced_budget(total_steps=40, max_steps=1500) is True
+
+    def test_reaching_max_steps_is_not_reduced(self):
+        assert _is_reduced_budget(total_steps=1500, max_steps=1500) is False
+
+    def test_exceeding_max_steps_is_not_reduced(self):
+        # Over-training past the config also clears "reduced" — the run was at
+        # least the full intended length.
+        assert _is_reduced_budget(total_steps=2000, max_steps=1500) is False
+
+    def test_absent_max_steps_is_reduced(self):
+        # An unparsed / absent config (max_steps <= 0): conservative → reduced,
+        # never silently promoting a run whose intended length is unknown.
+        assert _is_reduced_budget(total_steps=1500, max_steps=0) is True
+        assert _is_reduced_budget(total_steps=1500, max_steps=-1) is True
+
+
 # ── deposit replay faithfulness on the committed real-9B recording ──────────
 
 
@@ -358,6 +402,20 @@ class TestDepositReplayFaithfulness:
         assert data["model"] == "Qwen/Qwen3.5-9B"
         assert data["seq_len"] == 1024
         assert data["device"] == "cuda"
+
+    def test_fixture_is_non_thin_evidence(self):
+        # The load-bearing pin for the non-thin upgrade: the committed deposit
+        # clears the MIN_SAMPLE_FOR_BOOTSTRAP bar (>=3 seeds/arm) so the
+        # recorded SURPASSES is confirmed, not thin-flagged. A regression that
+        # re-deposits a 2-seed run would flip this red.
+        data = json.loads(FIXTURE_9B_SURROGATE.read_text())
+        assert data["is_thin_evidence"] is False
+        assert data["n_candidate"] >= 3
+        assert data["n_surrogate"] >= 3
+        # reduced_budget is judged against a surfaced cfg_max_steps (not a
+        # mystery boolean) — the honesty fix this deposit exercises.
+        assert data["cfg_max_steps"] == 1500
+        assert data["total_steps"] < data["cfg_max_steps"]  # honestly reduced
 
     def test_recorded_losses_earn_the_recorded_verdict(self):
         """The stored floats re-judge to the SURPASSES the file records — the

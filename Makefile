@@ -874,10 +874,11 @@ freeze-validloss-ci-negative-control-surrogate: ## Symmetric sensitivity negativ
 # loaded ONCE and each arm resets the LoRA adapter in place (a per-arm reload
 # leaks a second ~5.5GB model and OOMs a 12GB GPU). seq_len defaults to 1024 (the
 # suffix-only per-step fit point); override FREEZE_9B_FLAGS for a smaller smoke.
-# Deposit is honestly reduced-budget (few seeds, short training) — the first
-# target-scale data point, NOT yet the full max_steps=1500 multi-seed §4 verdict.
+# 4 seeds/arm clears the is_thin_evidence bar (>=3); the deposit is honestly
+# reduced-budget (short training, 20 steps << max_steps=1500) — a target-scale
+# data point, NOT yet the full max_steps=1500 multi-seed §4 verdict.
 # Needs a torch+bnb+GPU interpreter: PYTHON_VENV=/path/to/torch-python make freeze-validloss-ci-9b
-FREEZE_9B_FLAGS ?= --seq-len 1024 --total-steps 20 --warmup-steps 6 --depth 3 --spacing 4 --n-candidate 2 --n-surrogate 2 --train-examples 8 --valid-examples 10 --max-dataset-rows 400
+FREEZE_9B_FLAGS ?= --seq-len 1024 --total-steps 20 --warmup-steps 6 --depth 3 --spacing 4 --n-candidate 4 --n-surrogate 4 --train-examples 8 --valid-examples 10 --max-dataset-rows 400
 
 freeze-validloss-ci-9b: ## GOAL §4 REAL 9B target-scale A/B verdict (suffix-only, Dolly; auto CUDA)
 	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_FLAGS) --json --output tests/fixtures/freeze_validloss_ci_9b_surrogate.json

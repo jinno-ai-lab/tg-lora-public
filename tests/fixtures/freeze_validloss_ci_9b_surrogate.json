@@ -3,21 +3,25 @@
   "passes": true,
   "significant_surpasses": true,
   "is_material": true,
-  "is_thin_evidence": true,
-  "candidate_mean": 1.6246584031730888,
-  "surrogate_mean": 1.7041182734072209,
-  "point_improvement": 0.07945987023413204,
-  "lower": 0.0738613843917848,
-  "upper": 0.08505835607647905,
+  "is_thin_evidence": false,
+  "candidate_mean": 1.625465934164822,
+  "surrogate_mean": 1.769759404659271,
+  "point_improvement": 0.14429347049444896,
+  "lower": 0.07676907926797871,
+  "upper": 0.22956615798175317,
   "confidence": 0.95,
   "n_bootstrap": 10000,
   "candidate_losses": [
-    1.6249744340777397,
-    1.6243423722684383
+    1.6247110389173032,
+    1.6254817828536035,
+    1.624481089413166,
+    1.627189825475216
   ],
   "surrogate_losses": [
-    1.6988358184695245,
-    1.7094007283449173
+    1.696116217970848,
+    1.7090928554534912,
+    1.7704069554805755,
+    1.90342158973217
   ],
   "candidate_order": [
     31,
@@ -36,8 +40,8 @@
   "warmup_steps": 6,
   "depth": 3,
   "spacing": 4,
-  "n_candidate": 2,
-  "n_surrogate": 2,
+  "n_candidate": 4,
+  "n_surrogate": 4,
   "base_seed": 0,
   "active_scope": [
     24,
@@ -58,6 +62,7 @@
   "use_local_loss": true,
   "proxy_scale": false,
   "reduced_budget": true,
+  "cfg_max_steps": 1500,
   "candidate_provenance": [
     {
       "frozen_layers": [
@@ -66,7 +71,7 @@
         31
       ],
       "n_trainable_params": 6787072,
-      "last_train_loss": 0.0005645751953125
+      "last_train_loss": 0.000576019287109375
     },
     {
       "frozen_layers": [
@@ -75,7 +80,25 @@
         31
       ],
       "n_trainable_params": 6787072,
-      "last_train_loss": 0.000583648681640625
+      "last_train_loss": 0.00057220458984375
+    },
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.00057220458984375
+    },
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.000576019287109375
     }
   ],
   "surrogate_provenance": [
@@ -96,6 +119,24 @@
       ],
       "n_trainable_params": 6687744,
       "last_train_loss": 0.000499725341796875
+    },
+    {
+      "frozen_layers": [
+        24,
+        27,
+        28
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.0
+    },
+    {
+      "frozen_layers": [
+        24,
+        29,
+        30
+      ],
+      "n_trainable_params": 6687744,
+      "last_train_loss": 0.0
     }
   ],
   "citable_as_target_scale": true,
