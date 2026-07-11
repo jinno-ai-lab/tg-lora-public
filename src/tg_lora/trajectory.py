@@ -286,7 +286,20 @@ class TrajectoryAnalyzer:
         elif cycles_since_best >= patience and trend >= 0:
             should_stop = True
             reason = f"stagnant: no improvement for {cycles_since_best} cycles with flat/upward trend"
-        elif volatility > abs(best_loss) * 0.1 and cycles_since_best >= patience // 2:
+        elif (
+            # A near-zero best_loss means the run has reached the loss floor
+            # (best_loss == 0.0 is a legitimate signal, e.g. the proxy memorize
+            # task where valid_loss=0.0 — see cycle_monitor.detect_stagnation).
+            # The relative threshold ``abs(best_loss) * 0.1`` collapses to ~0
+            # there, so any nonzero volatility would trip this half-patience
+            # branch and mislabel a converged-at-floor run as "unstable".
+            # Guard the relative test against a near-zero reference (mirrors
+            # detect_divergence's ``prev_train > 1e-6`` near-zero guard) and let
+            # the convergence/marginal branches decide with full-patience gates.
+            abs(best_loss) > 1e-6
+            and volatility > abs(best_loss) * 0.1
+            and cycles_since_best >= patience // 2
+        ):
             should_stop = True
             reason = "unstable: high volatility with no consistent improvement"
         elif estimated_gain < min_improvement and cycles_since_best >= patience:

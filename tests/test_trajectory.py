@@ -356,6 +356,32 @@ class TestEarlyStopAdvice:
         assert advice.should_stop
         assert "unstable" in advice.reason or "stagnant" in advice.reason
 
+    def test_zero_best_loss_does_not_collapse_volatility_threshold(self):
+        # A run that converged to the loss floor — best_loss == 0.0 is a
+        # LEGITIMATE signal here (e.g. the proxy memorize task, where
+        # valid_loss=0.0; see cycle_monitor.detect_stagnation) — and then
+        # oscillates at the floor must NOT be mislabeled "unstable". The
+        # relative threshold ``abs(best_loss) * 0.1`` collapses to 0.0 there,
+        # so any nonzero volatility trips the half-patience branch with a
+        # wrong reason (mirrors detect_divergence's ``prev_train > 1e-6``
+        # near-zero guard against ratio amplification). cycles_since_best (2)
+        # is >= patience//2 (2) but < patience (5), so ONLY the volatility
+        # branch can fire pre-fix.
+        losses = [2.0, 1.0, 0.5, 0.1, 0.01, 0.001, 0.0001, 0.0, 0.00005, 0.0001]
+        a = TrajectoryAnalyzer.from_loss_history(losses)
+        advice = a.early_stop_advice(patience=5)
+        assert "unstable" not in advice.reason
+        assert not advice.should_stop
+
+    def test_above_floor_unstable_still_flags(self):
+        # Non-regression: the near-zero guard must NOT suppress a genuinely
+        # unstable run whose best_loss is meaningfully above the floor.
+        losses = [1.0, 0.6, 0.9, 0.5, 0.85, 0.55, 0.9, 0.5, 0.88, 0.52]
+        a = TrajectoryAnalyzer.from_loss_history(losses)
+        advice = a.early_stop_advice(patience=5)
+        assert advice.should_stop
+        assert "unstable" in advice.reason
+
     def test_insufficient_data_continues(self):
         a = TrajectoryAnalyzer.from_loss_history([2.5, 2.4])
         advice = a.early_stop_advice()
