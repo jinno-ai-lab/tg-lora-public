@@ -20,6 +20,7 @@ from src.tg_lora.freeze_schedule import (
     VALID_POLICIES,
     FreezeSchedule,
     FreezeScheduleConfig,
+    input_first_order,
     random_freeze_order,
 )
 
@@ -498,3 +499,71 @@ class TestRandomFreezeOrder:
         assert sched.frozen_at_epoch[order[0]] == 2
         assert sched.frozen_at_epoch[order[1]] == 3
         assert sched.frozen_at_epoch[order[2]] == 4
+
+
+class TestInputFirstOrder:
+    """The DIRECTION control for the §4 A/B — isolates freeze direction from
+    freeze-set contiguity (constitution P0: rule out a misattributed verdict).
+
+    The candidate freezes a contiguous output-side block; a random surrogate
+    freezes a scattered set, so a candidate ``SURPASSES`` could be the output-side
+    *direction* OR mere *contiguity*. ``input_first_order`` freezes the
+    contiguous INPUT-side block, so candidate-vs-control holds contiguity fixed
+    and varies only direction. It must (a) be ascending, (b) be a contiguous
+    block matching the candidate's shape (same depth, only the side differs),
+    and (c) flow through the same ``convergence_order`` planner path.
+    """
+
+    def test_ascending_over_scope(self):
+        # Input side first = lowest layer index first.
+        assert input_first_order(ACTIVE) == (24, 25, 26, 27, 28, 29, 30, 31)
+
+    def test_input_order_independent_of_input_set_shape(self):
+        # An unsorted input still yields the ascending control order.
+        assert input_first_order([3, 1, 2]) == (1, 2, 3)
+
+    def test_first_depth_layers_are_the_input_side_contiguous_block(self):
+        # The candidate (output_first) freezes the top `depth`; the input_first
+        # control freezes the bottom `depth`. Same depth, same contiguity, only
+        # the side differs — the exact property that isolates direction.
+        depth = 3
+        cand_block = set(ACTIVE[-depth:])  # output_first top-3 = {29,30,31}
+        ctrl_block = set(input_first_order(ACTIVE)[:depth])  # input bottom-3
+        assert ctrl_block == {24, 25, 26}
+        # The two blocks are disjoint and equal in size: contiguity + depth held
+        # fixed, direction (output vs input) is the sole difference.
+        assert len(cand_block) == len(ctrl_block) == depth
+        assert cand_block.isdisjoint(ctrl_block)
+
+    def test_feeds_the_convergence_order_planner_path(self):
+        # Like the random surrogate, the control must reuse the identical
+        # planner/accountant path — no separate branch — so the candidate-vs-
+        # control comparison is apples-to-apples.
+        order = input_first_order(ACTIVE)
+        cfg = FreezeScheduleConfig(
+            active_layer_indices=ACTIVE,
+            num_epochs=20,
+            max_depth=3,
+            start_epoch=2,
+            spacing=1,
+            policy="convergence_order",
+            convergence_order=order,
+        )
+        sched = FreezeSchedule.plan(cfg)
+        assert sched.realized_depth == 3
+        # The input-side bottom-3 freeze, at start_epoch + rank.
+        assert set(sched.frozen_at_epoch) == {24, 25, 26}
+        assert sched.frozen_at_epoch[24] == 2
+        assert sched.frozen_at_epoch[25] == 3
+        assert sched.frozen_at_epoch[26] == 4
+
+    def test_is_not_the_random_surrogate_nor_the_candidate(self):
+        # The control is a third, distinct order: deterministic ascending, not a
+        # shuffle (surrogate) and not descending (candidate). A drift that made
+        # it equal either would collapse the direction isolation.
+        ctrl = input_first_order(ACTIVE)
+        assert ctrl != tuple(reversed(ctrl))  # not the candidate (descending)
+        # Not a random draw: ascending is the unique sorted permutation, so it
+        # cannot coincide with a shuffle of an unsorted set except by the
+        # trivial 1-/2-layer cases — guard against those explicitly here.
+        assert ctrl == tuple(sorted(ACTIVE))

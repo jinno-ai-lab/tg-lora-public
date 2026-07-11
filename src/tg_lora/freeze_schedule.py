@@ -94,6 +94,52 @@ def random_freeze_order(
     return tuple(order)
 
 
+def input_first_order(
+    active_layer_indices: Iterable[int],
+) -> tuple[int, ...]:
+    """Input-side contiguous freeze order — the DIRECTION control for the §4 A/B.
+
+    The candidate (output-first) and the surrogate (:func:`random_freeze_order`)
+    the §4 A/B compares differ in *two* things at once: the candidate freezes a
+    **contiguous output-side block** (the top ``depth`` layers), while a random
+    surrogate almost always freezes a **scattered** set. A candidate ``SURPASSES``
+    verdict therefore cannot tell the output-side *direction* (GOAL §3.1
+    "後段から順にフリーズ") apart from mere freeze-set *contiguity* — a residual
+    stream may tolerate one frozen contiguous sub-block better than frozen
+    layers scattered throughout. The constitution's P0 gate (rule out "通ったよ
+    うに見えるが実は不活性／誤帰属") demands that confound be isolated before
+    the verdict is attributed to direction.
+
+    This order is the isolating control: it freezes the **input-side** ``depth``
+    layers — a contiguous block at the *bottom* of the active scope — so a
+    candidate-vs-control comparison holds contiguity + depth + timing fixed and
+    varies only DIRECTION. ``candidate(output-contiguous) < control(input-
+    contiguous)`` ⇒ the output side is what matters; ``candidate ≈ control`` ⇒
+    contiguity, not direction, earned the original ``SURPASSES``. Either outcome
+    is honest: the run measures it, never pre-decides it.
+
+    Ascending (vs :func:`random_freeze_order`'s shuffle and the candidate's
+    descending ``output_first``): the bottom-of-scope layers freeze first.
+    Returned as a ``convergence_order`` tuple so it flows through the *identical*
+    planner / controller / accountant path as the candidate and surrogate — the
+    apples-to-apples property :func:`random_freeze_order`'s docstring requires
+    (no separate branch).
+
+    Parameters
+    ----------
+    active_layer_indices:
+        Candidate layers eligible for freezing. Input order is irrelevant; the
+        call returns them ascending. Pass a unique set, as for a real schedule.
+
+    Returns
+    -------
+    tuple[int, ...]
+        The active layers ascending — the input-side contiguous freeze sequence,
+        ready for ``FreezeScheduleConfig(convergence_order=...)``.
+    """
+    return tuple(sorted(active_layer_indices))
+
+
 @dataclass(frozen=True)
 class FreezeScheduleConfig:
     """A Phase 2 freeze-schedule request.

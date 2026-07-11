@@ -101,6 +101,7 @@ from src.tg_lora.activation_matching import ActivationMatchingLoss
 from src.tg_lora.freeze_schedule import (
     FreezeSchedule,
     FreezeScheduleConfig,
+    input_first_order,
     random_freeze_order,
 )
 from src.tg_lora.freeze_surrogate_ci import (
@@ -449,6 +450,24 @@ def candidate_order_9b(active_indices: set[int]) -> tuple[int, ...]:
     return tuple(sorted(active_indices, reverse=True))
 
 
+def control_order_9b(active_indices: set[int]) -> tuple[int, ...]:
+    """Input-side contiguous control order over the real active scope.
+
+    The DIRECTION-ISOLATION control for the §4 verdict (constitution P0: rule
+    out a misattributed verdict). The candidate (:func:`candidate_order_9b`)
+    freezes a **contiguous output-side block** while every random surrogate
+    freezes a **scattered** set, so a candidate ``SURPASSES`` could be the
+    output-side direction OR mere freeze-set contiguity. This order freezes the
+    contiguous **input-side** block (lowest layer indices first =
+    :func:`~src.tg_lora.freeze_schedule.input_first_order` over the real scope),
+    so a candidate-vs-control comparison holds contiguity + depth + timing fixed
+    and varies only direction — attributing (or refusing to attribute) the
+    surrogate ``SURPASSES`` to the output side. Feeds the same
+    ``convergence_order`` planner as candidate and surrogate (no separate branch).
+    """
+    return input_first_order(active_indices)
+
+
 # ---------------------------------------------------------------------------
 # Assembly: run candidate + surrogate arms, feed surrogate_valid_loss_ci.
 # ---------------------------------------------------------------------------
@@ -488,6 +507,7 @@ def run_ci_9b(
     dataset: str,
     max_dataset_rows: int,
     use_local_loss: bool = True,
+    n_control: int = 0,
 ) -> dict:
     """Run the real-9B candidate+surrogate sweep and return the §4 verdict dict.
 
@@ -499,6 +519,13 @@ def run_ci_9b(
     reset on the shared model. The resulting real valid_loss samples feed
     :func:`surrogate_valid_loss_ci` with ``proxy_scale=False`` (real 9B + real
     data) — the first such verdict grounded in target-scale numbers.
+
+    ``n_control > 0`` adds an optional DIRECTION-CONTROL arm (input-side
+    contiguous, :func:`control_order_9b`) and a ``direction_ci`` that compares
+    candidate (output-contiguous) vs control (input-contiguous) — contiguity
+    held fixed — to attribute the surrogate verdict to the output-side
+    direction (constitution P0). ``n_control=0`` (default) runs no control and
+    the §4 surrogate verdict is byte-identical to before.
     """
     scope_label = cfg.training.get("trainable_lora_scope", "all")
     logger.info("Loading tokenizer + model for %s ...", cfg.model.name_or_path)
@@ -530,6 +557,7 @@ def run_ci_9b(
 
     cand_order = candidate_order_9b(active_indices)
     scope_sorted = sorted(active_indices)
+    control_order = control_order_9b(active_indices)
     lr = float(cfg.training.learning_rate)
     cfg_max_steps = int(cfg.training.get("max_steps", 0))
     reduced_budget = _is_reduced_budget(total_steps, cfg_max_steps)
@@ -563,6 +591,22 @@ def run_ci_9b(
             for i in range(n_surrogate)
         ]
         surrogate_losses = [v for v, _ in surrogate_results]
+        # DIRECTION-CONTROL arm (constitution P0): the input-side contiguous
+        # control. Only runs when n_control > 0; n_control=0 leaves this list
+        # empty and the §4 surrogate verdict byte-identical to before. Distinct
+        # seed offset (base_seed + 200) so the control's LoRA init never collides
+        # with a candidate (base_seed + i) or surrogate (base_seed + 100 + i) arm.
+        control_results = [
+            arm_valid_loss_9b(
+                model, control_order, base_seed + 200 + i, scope=scope_label,
+                active_indices=active_indices,
+                train_batches=train_batches, valid_batches=valid_batches, device=device,
+                total_steps=total_steps, warmup_steps=warmup_steps, depth=depth,
+                spacing=spacing, lr=lr, use_local_loss=use_local_loss,
+            )
+            for i in range(n_control)
+        ]
+        control_losses = [v for v, _ in control_results]
     finally:
         del model
         gc.collect()
@@ -571,6 +615,16 @@ def run_ci_9b(
 
     ci = surrogate_valid_loss_ci(
         candidate_losses, surrogate_losses, seed=base_seed
+    )
+    # Direction-isolation CI (constitution P0): candidate (output-contiguous)
+    # vs control (input-contiguous) — contiguity + depth + timing held fixed,
+    # only DIRECTION varies. ``surrogate_valid_loss_ci`` is a generic two-sample
+    # bootstrap on ``mean(b) - mean(a)``; the control arm occupies the
+    # "surrogate" slot. None when no control arm ran (n_control=0).
+    direction_ci = (
+        surrogate_valid_loss_ci(candidate_losses, control_losses, seed=base_seed)
+        if control_losses
+        else None
     )
     return {
         "ci": ci,
@@ -604,6 +658,15 @@ def run_ci_9b(
         "cfg_max_steps": cfg_max_steps,
         "candidate_provenance": [p for _, p in candidate_results],
         "surrogate_provenance": [p for _, p in surrogate_results],
+        # Direction-isolation control arm (None-valued / empty when n_control=0,
+        # so the §4 surrogate verdict is unchanged). When present, these plus
+        # ``direction_ci`` attribute the surrogate SURPASSES to direction (or
+        # refuse to, if the control ties) — the P0 confound isolation.
+        "control_losses": control_losses,
+        "control_order": list(control_order),
+        "n_control": n_control,
+        "control_provenance": [p for _, p in control_results],
+        "direction_ci": direction_ci,
     }
 
 
@@ -651,16 +714,55 @@ def result_to_json(result: dict) -> dict:
         "cfg_max_steps": result.get("cfg_max_steps"),
         "candidate_provenance": result["candidate_provenance"],
         "surrogate_provenance": result["surrogate_provenance"],
+        # Direction-isolation control arm (constitution P0). Empty / None-valued
+        # when n_control=0, so a no-control run deposits byte-identically to
+        # before. When present, ``direction`` is the candidate(output-contiguous)
+        # vs control(input-contiguous) CI that attributes the surrogate
+        # SURPASSES to the output-side direction — or refuses to, on a TIES
+        # (which would mean contiguity, not direction, earned the lead).
+        "control_losses": result["control_losses"],
+        "control_order": list(result["control_order"]),
+        "n_control": result["n_control"],
+        "control_provenance": result["control_provenance"],
+        "direction": _direction_ci_to_json(result["direction_ci"]),
         # Machine-readable citation gate: a run is the full §4 verdict ONLY when
         # it is target-scale (not proxy), full-budget (reached config max_steps,
         # not reduced), AND non-thin (enough seeds for the bootstrap to capture
         # variance). The private ``src.data`` quality filter is a further axis
         # this gate cannot see (absent on the mirror) — it is noted in the
-        # report, never silently assumed away.
+        # report, never silently assumed away. The direction-isolation analysis
+        # is an *attribution* caveat on the verdict's interpretation, not a
+        # scale/budget axis, so it never opens or closes this gate by itself.
         "citable_as_target_scale": (not result["proxy_scale"]),
         "citable_as_full_section4_verdict": (
             (not result["proxy_scale"]) and (not reduced) and (not ci.is_thin_evidence)
         ),
+    }
+
+
+def _direction_ci_to_json(direction_ci) -> dict | None:
+    """Serialize the direction-isolation CI (or ``None``) for the deposit.
+
+    ``direction_ci`` reuses :func:`surrogate_valid_loss_ci` with the
+    input-contiguous CONTROL arm in the "surrogate" slot, so its
+    :attr:`~SurrogateValidLossCI.surrogate_mean` is the control (input-side)
+    mean — relabeled ``control_mean`` here so the deposit reads honestly rather
+    than calling an input-side control a "surrogate". ``None`` (no control arm
+    ran) round-trips as JSON ``null``.
+    """
+    if direction_ci is None:
+        return None
+    return {
+        "verdict": direction_ci.significance_verdict,
+        "candidate_mean": direction_ci.candidate_mean,
+        "control_mean": direction_ci.surrogate_mean,
+        "point_improvement": direction_ci.point_improvement,
+        "lower": direction_ci.lower,
+        "upper": direction_ci.upper,
+        "confidence": direction_ci.confidence,
+        "is_thin_evidence": direction_ci.is_thin_evidence,
+        "n_candidate": direction_ci.n_candidate,
+        "n_control": direction_ci.n_surrogate,
     }
 
 
@@ -686,6 +788,35 @@ def format_report_9b(result: dict) -> str:
         "data (proxy_scale=False); the verdict above is grounded in numbers from "
         "an actual 9B run, not a proxy.",
     ]
+    # Direction-isolation block (constitution P0): only when a control arm ran.
+    # Attributes the surrogate SURPASSES above to the output-side direction — or
+    # refuses to (a TIES means contiguity, not direction, earned the lead). The
+    # control occupies the "surrogate" slot of the CI, so its mean is labeled
+    # control_mean here, not surrogate_mean.
+    if result.get("direction_ci") is not None:
+        dci = result["direction_ci"]
+        lines += [
+            "",
+            "  direction_isolation — candidate (output-contiguous) vs control "
+            "(input-contiguous); contiguity + depth + timing held fixed:",
+            f"    candidate_mean={dci.candidate_mean:.6f} vs "
+            f"control_mean={dci.surrogate_mean:.6f}  "
+            f"point={dci.point_improvement:.6f} "
+            f"ci[{dci.confidence:.0%}]=[{dci.lower:.6f}, {dci.upper:.6f}]  "
+            f"verdict={dci.significance_verdict}",
+            f"    control valid_loss samples: "
+            f"{[round(v, 6) for v in result['control_losses']]}",
+        ]
+        if dci.is_thin_evidence:
+            lines.append(
+                "    note: THIN_EVIDENCE — the direction CI has <3 seeds in an "
+                "arm; do not read the direction verdict as confirmed."
+            )
+        lines.append(
+            "    note: this ATTRIBUTES the §4 surrogate SURPASSES above. "
+            "SURPASSES here => the output-side DIRECTION matters (not just "
+            "contiguity); TIES => contiguity, not direction, earned the lead."
+        )
     # Honesty notes are flag-driven so the report never contradicts the
     # machine-readable labels (a hardcoded "reduced" string would lie about a
     # full-budget run, exactly the defect _is_reduced_budget fixes).
@@ -736,6 +867,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--spacing", type=int, default=DEFAULT_SPACING)
     p.add_argument("--n-candidate", type=int, default=DEFAULT_N_CANDIDATE)
     p.add_argument("--n-surrogate", type=int, default=DEFAULT_N_SURROGATE)
+    p.add_argument(
+        "--n-control", type=int, default=0,
+        help=(
+            "DIRECTION-CONTROL arm seeds: run an input-side contiguous control "
+            "(input_first_order) alongside candidate+surrogate and emit a "
+            "direction-isolation CI (candidate output-contiguous vs control "
+            "input-contiguous, contiguity held fixed) that attributes the "
+            "surrogate SURPASSES to the output-side direction. Default 0 = no "
+            "control (the §4 surrogate verdict is unchanged). Set >=3 for a "
+            "non-thin direction verdict."
+        ),
+    )
     p.add_argument("--base-seed", type=int, default=DEFAULT_BASE_SEED)
     p.add_argument("--dataset", default=DEFAULT_DATASET)
     p.add_argument("--max-dataset-rows", type=int, default=DEFAULT_MAX_DATASET_ROWS)
@@ -779,6 +922,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset=args.dataset,
         max_dataset_rows=args.max_dataset_rows,
         use_local_loss=not args.no_local_loss,
+        n_control=args.n_control,
     )
 
     payload = (

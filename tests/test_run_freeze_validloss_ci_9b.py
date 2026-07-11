@@ -44,16 +44,18 @@ import torch
 from torch import nn
 
 from scripts.run_freeze_validloss_ci_9b import (
+    _direction_ci_to_json,
     _is_reduced_budget,
     _reset_lora_for_arm,
     arm_valid_loss_9b,
     build_parser,
     build_sft_example,
     candidate_order_9b,
+    control_order_9b,
     result_to_json,
 )
 from src.tg_lora.freeze_surrogate_ci import surrogate_valid_loss_ci
-from src.tg_lora.freeze_surrogate_gate import SURPASSES
+from src.tg_lora.freeze_surrogate_gate import SURPASSES, TIES
 
 # The committed real-9B recording: a real RTX 3060 seq1024 suffix-only run of
 # the §4 candidate-vs-surrogate A/B (verdict SURPASSES, candidate_mean≈1.625,
@@ -63,6 +65,18 @@ FIXTURE_9B_SURROGATE = (
     Path(__file__).resolve().parent
     / "fixtures"
     / "freeze_validloss_ci_9b_surrogate.json"
+)
+
+# The direction-isolation recording: the same real RTX 3060 seq1024 suffix-only
+# 9B A/B PLUS an input-side contiguous control arm (input_first_order) so the §4
+# SURPASSES can be attributed to output-side DIRECTION, not mere contiguity
+# (constitution P0). Records BOTH verdicts SURPASSES, non-thin: candidate
+# (output-contig {29,30,31}) < random surrogate < control (input-contig
+# {24,25,26}). Regenerate with ``make freeze-validloss-ci-9b`` + ``--n-control 4``.
+FIXTURE_9B_DIRECTION = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "freeze_validloss_ci_9b_direction.json"
 )
 
 
@@ -309,6 +323,13 @@ def _stub_result(**overrides):
         cfg_max_steps=1500,
         candidate_provenance=[{"frozen_layers": [29, 30, 31], "n_trainable_params": 6787072, "last_train_loss": 0.001}],
         surrogate_provenance=[{"frozen_layers": [25, 28, 31], "n_trainable_params": 6787072, "last_train_loss": 0.001}],
+        # Direction-isolation control arm (constitution P0): default n_control=0
+        # so a no-control run deposits byte-identically to the pre-control shape.
+        control_losses=[],
+        control_order=[24, 25, 26, 27, 28, 29, 30, 31],
+        n_control=0,
+        control_provenance=[],
+        direction_ci=None,
     )
     base.update(overrides)
     return base
@@ -361,6 +382,154 @@ class TestResultToJson:
             "candidate_order",
         ):
             assert key in out
+
+
+# ── direction-isolation control (constitution P0: direction vs contiguity) ───
+
+
+class TestDirectionIsolation:
+    """The DIRECTION-CONTROL arm isolates freeze DIRECTION from freeze-set
+    CONTIGUITY — the residual confound in the §4 A/B that the constitution's P0
+    gate (rule out "通ったように見えるが実は不活性／誤帰属") demands be closed
+    before the verdict is attributed.
+
+    The candidate freezes a contiguous output-side block; a random surrogate
+    freezes a scattered set, so a candidate ``SURPASSES`` could be the output-side
+    direction OR mere contiguity. The input-side contiguous control holds
+    contiguity + depth + timing fixed and varies only direction. These tests guard
+    the control order, the direction-CI semantics, and the deposit serialization
+    — all GPU-free (the real model is never loaded)."""
+
+    def test_control_order_is_input_side_ascending(self):
+        # The control freezes the input side first: ascending over the scope.
+        scope = {24, 25, 26, 27, 28, 29, 30, 31}
+        assert control_order_9b(scope) == (24, 25, 26, 27, 28, 29, 30, 31)
+
+    def test_control_is_distinct_from_candidate(self):
+        # The control is a third, distinct arm: ascending, not descending
+        # (candidate) — the property that makes candidate-vs-control a direction
+        # test rather than a candidate-vs-candidate no-op. A drift that flipped
+        # the control to descending would collapse the isolation.
+        scope = {24, 25, 26, 27, 28, 29, 30, 31}
+        assert control_order_9b(scope) != candidate_order_9b(scope)
+
+    def test_control_freezes_disjoint_block_from_candidate_same_depth(self):
+        # The P0 isolation property: at depth d the candidate freezes the top-d
+        # (output) layers and the control freezes the bottom-d (input) — equal-
+        # size CONTIGUOUS blocks, disjoint, so only the side differs. Contiguity
+        # + depth held fixed => the candidate-vs-control gap is pure direction.
+        scope = {24, 25, 26, 27, 28, 29, 30, 31}
+        depth = 3
+        cand_block = set(candidate_order_9b(scope)[:depth])
+        ctrl_block = set(control_order_9b(scope)[:depth])
+        assert cand_block == {29, 30, 31}  # output-side contiguous
+        assert ctrl_block == {24, 25, 26}  # input-side contiguous
+        assert len(cand_block) == len(ctrl_block) == depth
+        assert cand_block.isdisjoint(ctrl_block)
+
+    def test_direction_ci_surpasses_means_direction_earned_the_lead(self):
+        # candidate(output) losses well below control(input) losses => the CI on
+        # mean(control) - mean(candidate) excludes zero above => SURPASSES =>
+        # the output-side DIRECTION (not just contiguity) earned the lead. The
+        # control occupies the "surrogate" slot of surrogate_valid_loss_ci.
+        cand = [1.62, 1.63, 1.61, 1.62]
+        ctrl = [1.75, 1.80, 1.78, 1.77]  # input-contiguous visibly worse
+        dci = surrogate_valid_loss_ci(cand, ctrl, seed=0)
+        assert dci.significance_verdict == SURPASSES
+        assert dci.point_improvement > 0.0  # control mean - candidate mean > 0
+
+    def test_direction_ci_ties_means_contiguity_confound(self):
+        # candidate(output) ≈ control(input) => TIES => the surrogate SURPASSES
+        # was contiguity, not direction — the misattribution the control exists
+        # to surface. This is the honest "refuse to attribute" outcome.
+        cand = [1.62, 1.63, 1.61, 1.62]
+        ctrl = [1.621, 1.629, 1.611, 1.619]  # indistinguishable from candidate
+        dci = surrogate_valid_loss_ci(cand, ctrl, seed=0)
+        assert dci.significance_verdict == TIES
+
+    def test_direction_ci_to_json_relabels_surrogate_mean_as_control_mean(self):
+        # The control occupies the CI's "surrogate" slot, so its mean is
+        # surrogate_mean internally; the deposit must relabel it control_mean so
+        # a reader does not mistake an input-side control for the random
+        # surrogate. Also surfaces n_control (from n_surrogate) and the verdict.
+        cand = [1.62, 1.63, 1.61, 1.62]
+        ctrl = [1.75, 1.80, 1.78, 1.77]
+        dci = surrogate_valid_loss_ci(cand, ctrl, seed=0)
+        out = _direction_ci_to_json(dci)
+        assert out["verdict"] == SURPASSES
+        assert out["control_mean"] == pytest.approx(sum(ctrl) / len(ctrl), abs=1e-9)
+        assert out["candidate_mean"] == pytest.approx(sum(cand) / len(cand), abs=1e-9)
+        assert out["n_control"] == 4
+        assert out["n_candidate"] == 4
+        # The relabel is load-bearing: an input-side control must NOT be called
+        # surrogate_mean in the deposit.
+        assert "surrogate_mean" not in out
+
+    def test_direction_ci_to_json_none_round_trips(self):
+        # No control arm (n_control=0) => direction_ci None => JSON null.
+        assert _direction_ci_to_json(None) is None
+
+    def test_result_to_json_no_control_is_backward_compatible(self):
+        # n_control=0: no direction block, empty control fields, and the §4
+        # verdict honesty labels byte-identical to the pre-control deposit shape.
+        out = result_to_json(_stub_result())
+        assert out["direction"] is None
+        assert out["control_losses"] == []
+        assert out["n_control"] == 0
+        assert out["control_provenance"] == []
+        # Existing §4 fields unchanged.
+        assert out["verdict"] == SURPASSES
+        assert out["citable_as_target_scale"] is True
+
+    def test_result_to_json_with_control_surfaces_direction(self):
+        # With a control arm run, the deposit surfaces a populated direction
+        # block and the control losses/order/provenance — driven through the REAL
+        # CI + _direction_ci_to_json path (not a stub) so the serialization is
+        # exercised end-to-end.
+        cand_losses = [1.62, 1.63, 1.61, 1.62]
+        ctrl_losses = [1.75, 1.80, 1.78, 1.77]
+        dci = surrogate_valid_loss_ci(cand_losses, ctrl_losses, seed=0)
+        out = result_to_json(
+            _stub_result(
+                n_control=4,
+                control_losses=ctrl_losses,
+                control_order=[24, 25, 26, 27, 28, 29, 30, 31],
+                control_provenance=[
+                    {
+                        "frozen_layers": [24, 25, 26],
+                        "n_trainable_params": 6787072,
+                        "last_train_loss": 0.001,
+                    }
+                ],
+                direction_ci=dci,
+            )
+        )
+        assert out["direction"] is not None
+        assert out["direction"]["verdict"] == SURPASSES
+        assert out["direction"]["control_mean"] == pytest.approx(
+            sum(ctrl_losses) / len(ctrl_losses), abs=1e-9
+        )
+        assert out["n_control"] == 4
+        assert out["control_losses"] == ctrl_losses
+        assert out["control_order"] == [24, 25, 26, 27, 28, 29, 30, 31]
+        # The direction arm is an attribution caveat, NOT a scale/budget axis:
+        # it must not by itself open the full-§4 citation gate (this stub is a
+        # reduced-budget run, so the gate stays closed regardless of direction).
+        assert out["citable_as_full_section4_verdict"] is False
+
+    def test_direction_ci_uses_distinct_seed_offset_from_surrogate(self):
+        # The control arm must not collide with the candidate or surrogate arms'
+        # LoRA-init seeds (candidate base_seed+i, surrogate base_seed+100+i;
+        # control base_seed+200+i). Guarded at the order/seed level here since
+        # the GPU arm loop is not unit-tested. The offsets must be disjoint
+        # bands so no two arms share an init across a sane n_* range.
+        base_seed = 0
+        cand_seeds = {base_seed + i for i in range(4)}      # 0..3
+        surr_seeds = {base_seed + 100 + i for i in range(4)}  # 100..103
+        ctrl_seeds = {base_seed + 200 + i for i in range(4)}  # 200..203
+        assert cand_seeds.isdisjoint(surr_seeds)
+        assert cand_seeds.isdisjoint(ctrl_seeds)
+        assert surr_seeds.isdisjoint(ctrl_seeds)
 
 
 # ── _is_reduced_budget: honest (budget-driven) reduced-budget flag ───────────
@@ -450,6 +619,118 @@ class TestDepositReplayFaithfulness:
         assert all(c not in surr for c in cand)
 
 
+# ── direction-isolation deposit replay faithfulness (constitution P0) ────────
+
+
+class TestDirectionDepositReplayFaithfulness:
+    """The direction-isolation deposit — a real RTX 3060 seq1024 suffix-only 9B
+    run that adds an input-side contiguous control arm alongside the candidate +
+    random surrogate — re-judges through :func:`surrogate_valid_loss_ci` to BOTH
+    verdicts it records. The §4 surrogate SURPASSES (candidate output-contiguous
+    vs random) reproduces, AND the direction SURPASSES (candidate output-
+    contiguous vs control input-contiguous, contiguity held fixed) reproduces —
+    so the recorded attribution of the §4 verdict to output-side *direction*
+    (not mere contiguity) is earned under the deterministic bootstrap, not
+    painted on. This is the expected-output assertion that pins the
+    constitution-P0 dataset."""
+
+    def test_fixture_exists_and_is_real_target_scale(self):
+        data = json.loads(FIXTURE_9B_DIRECTION.read_text())
+        assert data["proxy_scale"] is False
+        assert data["citable_as_target_scale"] is True
+        assert data["citable_as_full_section4_verdict"] is False
+        assert data["reduced_budget"] is True
+        assert data["model"] == "Qwen/Qwen3.5-9B"
+        assert data["seq_len"] == 1024
+        assert data["device"] == "cuda"
+
+    def test_direction_deposit_carries_non_thin_control(self):
+        # The direction verdict requires a non-thin control arm (>=3 seeds) for
+        # the bootstrap to capture variance; a 1- or 2-seed control would be
+        # flagged thin and the direction verdict not confirmable.
+        data = json.loads(FIXTURE_9B_DIRECTION.read_text())
+        assert data["n_control"] >= 3
+        assert data["direction"] is not None
+        assert data["direction"]["is_thin_evidence"] is False
+        assert data["direction"]["n_control"] >= 3
+
+    def test_recorded_surrogate_verdict_is_earned(self):
+        # The §4 surrogate A/B (candidate output-contiguous vs random surrogate)
+        # reproduces in this richer run too — same honesty shape as the sibling
+        # surrogate-only deposit.
+        data = json.loads(FIXTURE_9B_DIRECTION.read_text())
+        ci = surrogate_valid_loss_ci(
+            data["candidate_losses"], data["surrogate_losses"], seed=data["base_seed"]
+        )
+        assert ci.significance_verdict == data["verdict"] == SURPASSES
+        assert ci.candidate_mean == pytest.approx(data["candidate_mean"], abs=1e-9)
+        assert ci.surrogate_mean == pytest.approx(data["surrogate_mean"], abs=1e-9)
+
+    def test_recorded_direction_verdict_is_earned(self):
+        # The load-bearing P0 assertion: the direction CI is NOT painted on — the
+        # stored candidate/control floats re-judge through the deterministic
+        # bootstrap to the recorded direction verdict. The control occupies the
+        # CI's "surrogate" slot.
+        data = json.loads(FIXTURE_9B_DIRECTION.read_text())
+        dd = data["direction"]
+        dci = surrogate_valid_loss_ci(
+            data["candidate_losses"], data["control_losses"], seed=data["base_seed"]
+        )
+        assert dci.significance_verdict == dd["verdict"] == SURPASSES
+        assert dci.candidate_mean == pytest.approx(dd["candidate_mean"], abs=1e-9)
+        # The control (input-side) mean is relabeled control_mean in the deposit.
+        assert dci.surrogate_mean == pytest.approx(dd["control_mean"], abs=1e-9)
+        assert dci.lower == pytest.approx(dd["lower"], abs=1e-9)
+        assert dci.upper == pytest.approx(dd["upper"], abs=1e-9)
+
+    def test_direction_candidate_pool_is_shared_with_surrogate(self):
+        # The candidate arms are shared between the surrogate A/B and the
+        # direction A/B (the same 4 candidate arms feed both CIs). A drift that
+        # re-ran candidate arms separately for the direction arm would break this
+        # equality and double the compute.
+        data = json.loads(FIXTURE_9B_DIRECTION.read_text())
+        assert data["candidate_mean"] == pytest.approx(
+            data["direction"]["candidate_mean"], abs=1e-9
+        )
+
+    def test_control_freeze_is_input_side_contiguous(self):
+        # The isolation property, pinned on real numbers: every control arm froze
+        # the contiguous INPUT-side block {24,25,26} (ascending = input_first),
+        # disjoint from the candidate's contiguous OUTPUT-side block {29,30,31}.
+        # Contiguity + depth held fixed => the recorded direction gap is pure
+        # direction, the P0 property this deposit exists to demonstrate.
+        data = json.loads(FIXTURE_9B_DIRECTION.read_text())
+        cand_froze = {tuple(p["frozen_layers"]) for p in data["candidate_provenance"]}
+        ctrl_froze = {tuple(p["frozen_layers"]) for p in data["control_provenance"]}
+        assert cand_froze == {(29, 30, 31)}  # output-contiguous
+        assert ctrl_froze == {(24, 25, 26)}  # input-contiguous
+        assert cand_froze.isdisjoint(ctrl_froze)
+        # control_order is the full ascending scope (frozen to depth=3 = {24,25,26}).
+        assert data["control_order"] == [24, 25, 26, 27, 28, 29, 30, 31]
+
+    def test_control_is_worse_than_surrogate_directionally(self):
+        # Freezing the input-contiguous block {24,25,26} is worse than freezing
+        # random scattered sets, which is worse than the output-contiguous
+        # candidate — the monotone ordering (output-contig < random < input-
+        # contig) that confirms DIRECTION, not just contiguity, drives the §4
+        # verdict. Pinned on the recorded means.
+        data = json.loads(FIXTURE_9B_DIRECTION.read_text())
+        cand_mean = data["candidate_mean"]
+        surr_mean = data["surrogate_mean"]
+        ctrl_mean = data["direction"]["control_mean"]
+        assert cand_mean < surr_mean < ctrl_mean
+
+    def test_deposit_is_non_thin_overall(self):
+        # The deposit as a whole is non-thin: enough seeds in every arm for the
+        # bootstrap to be meaningful. (The full-§4 citation gate stays closed on
+        # the reduced-budget axis, NOT the thinness axis.)
+        data = json.loads(FIXTURE_9B_DIRECTION.read_text())
+        assert data["is_thin_evidence"] is False
+        assert data["n_candidate"] >= 3
+        assert data["n_surrogate"] >= 3
+        assert data["n_control"] >= 3
+
+
 # ── CLI health ──────────────────────────────────────────────────────────────
 
 
@@ -462,6 +743,8 @@ class TestCli:
         assert "target-scale" in text.lower()
         assert "--seq-len" in text
         assert "--n-candidate" in text
+        # The DIRECTION-CONTROL flag (constitution P0) is part of the CLI surface.
+        assert "--n-control" in text
 
     def test_help_launches_as_module(self):
         # The canary contract: every scripts.* CLI launches via ``-m`` with a

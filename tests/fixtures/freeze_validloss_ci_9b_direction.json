@@ -1,0 +1,211 @@
+{
+  "verdict": "SURPASSES",
+  "passes": true,
+  "significant_surpasses": true,
+  "is_material": true,
+  "is_thin_evidence": false,
+  "candidate_mean": 1.6258121265098453,
+  "surrogate_mean": 1.7712618496268988,
+  "point_improvement": 0.1454497231170535,
+  "lower": 0.07890891321003446,
+  "upper": 0.2326453991234303,
+  "confidence": 0.95,
+  "n_bootstrap": 10000,
+  "candidate_losses": [
+    1.6247413992881774,
+    1.6261414252221584,
+    1.6269724026322365,
+    1.6253932788968086
+  ],
+  "surrogate_losses": [
+    1.6985240310430527,
+    1.711618061363697,
+    1.7677506744861602,
+    1.907154631614685
+  ],
+  "candidate_order": [
+    31,
+    30,
+    29,
+    28,
+    27,
+    26,
+    25,
+    24
+  ],
+  "device": "cuda",
+  "model": "Qwen/Qwen3.5-9B",
+  "dataset": "databricks/databricks-dolly-15k",
+  "total_steps": 20,
+  "warmup_steps": 6,
+  "depth": 3,
+  "spacing": 4,
+  "n_candidate": 4,
+  "n_surrogate": 4,
+  "base_seed": 0,
+  "active_scope": [
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "scope_label": "last_25_percent",
+  "n_active_layers": 8,
+  "scope_trainable_params": 10819584,
+  "seq_len": 1024,
+  "train_examples": 8,
+  "valid_examples": 10,
+  "use_local_loss": true,
+  "proxy_scale": false,
+  "reduced_budget": true,
+  "cfg_max_steps": 1500,
+  "candidate_provenance": [
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.000579833984375
+    },
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.000576019287109375
+    },
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.0005645751953125
+    },
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.00057220458984375
+    }
+  ],
+  "surrogate_provenance": [
+    {
+      "frozen_layers": [
+        25,
+        28,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 9.34600830078125e-05
+    },
+    {
+      "frozen_layers": [
+        26,
+        28,
+        29
+      ],
+      "n_trainable_params": 6687744,
+      "last_train_loss": 0.000499725341796875
+    },
+    {
+      "frozen_layers": [
+        24,
+        27,
+        28
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.0
+    },
+    {
+      "frozen_layers": [
+        24,
+        29,
+        30
+      ],
+      "n_trainable_params": 6687744,
+      "last_train_loss": 0.0
+    }
+  ],
+  "control_losses": [
+    1.8888505458831788,
+    1.891115939617157,
+    1.8924081921577454,
+    1.8953170359134675
+  ],
+  "control_order": [
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "n_control": 4,
+  "control_provenance": [
+    {
+      "frozen_layers": [
+        24,
+        25,
+        26
+      ],
+      "n_trainable_params": 6687744,
+      "last_train_loss": 0.0
+    },
+    {
+      "frozen_layers": [
+        24,
+        25,
+        26
+      ],
+      "n_trainable_params": 6687744,
+      "last_train_loss": 0.0
+    },
+    {
+      "frozen_layers": [
+        24,
+        25,
+        26
+      ],
+      "n_trainable_params": 6687744,
+      "last_train_loss": 0.0
+    },
+    {
+      "frozen_layers": [
+        24,
+        25,
+        26
+      ],
+      "n_trainable_params": 6687744,
+      "last_train_loss": 0.0
+    }
+  ],
+  "direction": {
+    "verdict": "SURPASSES",
+    "candidate_mean": 1.6258121265098453,
+    "control_mean": 1.8919229283928871,
+    "point_improvement": 0.2661108018830418,
+    "lower": 0.263767737708986,
+    "upper": 0.2686090076342227,
+    "confidence": 0.95,
+    "is_thin_evidence": false,
+    "n_candidate": 4,
+    "n_control": 4
+  },
+  "citable_as_target_scale": true,
+  "citable_as_full_section4_verdict": false
+}
