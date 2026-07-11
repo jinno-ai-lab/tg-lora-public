@@ -113,6 +113,10 @@ class AdvisorConfig:
     plateau_alpha_factor: float = 1.3
     early_stop_min_cycles: int = 10
     save_checkpoint_on_best: bool = True
+    # Consecutive cycles where extrapolation INCREASED loss (loss_after >
+    # loss_pilot) before the advisor recommends weakening extrapolation. This
+    # is the core TG-LoRA efficacy signal — see TrainingAdvisor.evaluate.
+    extrapolation_harm_patience: int = 3
 
     def __post_init__(self) -> None:
         if self.stagnation_patience < 1:
@@ -125,6 +129,10 @@ class AdvisorConfig:
             raise ValueError(f"convergence_threshold must be > 0, got {self.convergence_threshold}")
         if self.early_stop_min_cycles < 1:
             raise ValueError(f"early_stop_min_cycles must be >= 1, got {self.early_stop_min_cycles}")
+        if self.extrapolation_harm_patience < 1:
+            raise ValueError(
+                f"extrapolation_harm_patience must be >= 1, got {self.extrapolation_harm_patience}"
+            )
 
 
 class TrainingAdvisor:
@@ -157,6 +165,11 @@ class TrainingAdvisor:
         self._cycle_count: int = 0
         self._best_loss: float | None = None
         self._best_cycle: int | None = None
+        # Consecutive cycles where the extrapolation proposal INCREASED loss
+        # (loss_after > loss_pilot). Drives the extrapolation-efficacy action —
+        # the core TG-LoRA signal that the speculative extrapolation step is
+        # overshooting. Any non-harm cycle (loss_after <= loss_pilot) resets it.
+        self._extrap_harm_streak: int = 0
 
     @property
     def monitor(self) -> CycleMonitor:
@@ -273,13 +286,38 @@ class TrainingAdvisor:
                 "early_stop": trajectory_report.early_stop.should_stop,
             }
 
+        # Track extrapolation efficacy — loss_after vs loss_pilot is the core
+        # TG-LoRA signal for whether the speculative extrapolation step reduces
+        # loss. ``loss_pilot`` is the loss after the pilot SGD step
+        # (pre-extrapolation); ``loss_after`` is the loss after the extrapolation
+        # proposal. When ``loss_after > loss_pilot`` the extrapolation increased
+        # loss this cycle; a sustained streak means alpha (extrapolation
+        # strength) is too aggressive for this run. The guard means the default
+        # 0.0 (no pilot/after signal — baseline runs, older fixtures) and any
+        # non-finite value never advance the streak, so callers that don't pass
+        # these get byte-identical behavior. ``loss_pilot`` / ``loss_after`` may
+        # arrive as ``None`` — a real producer full-eval record surfaces them
+        # present-but-None (``dict.get(k, default)`` returns ``None``, not the
+        # default, when the key exists with value ``None``) — so the ``is not
+        # None`` checks come first to avoid ``TypeError`` on the comparison.
+        if (
+            loss_pilot is not None
+            and loss_after is not None
+            and loss_pilot > 0.0
+            and math.isfinite(loss_pilot)
+            and math.isfinite(loss_after)
+        ):
+            if loss_after > loss_pilot:
+                self._extrap_harm_streak += 1
+            else:
+                self._extrap_harm_streak = 0
+
         # Generate actions
         actions = self._generate_actions(
             health=health,
             trajectory=trajectory_report,
             is_new_best=is_new_best,
-            loss_pilot=loss_pilot,
-            loss_after=loss_after,
+            extrap_harm_streak=self._extrap_harm_streak,
             acceptance_rate=acceptance_rate,
         )
 
@@ -304,8 +342,7 @@ class TrainingAdvisor:
         health: HealthReport,
         trajectory: TrajectoryReport | None,
         is_new_best: bool,
-        loss_pilot: float,
-        loss_after: float,
+        extrap_harm_streak: int,
         acceptance_rate: float | None,
     ) -> list[AdvisoryAction]:
         actions: list[AdvisoryAction] = []
@@ -464,7 +501,28 @@ class TrainingAdvisor:
                 )
             )
 
-        # 6. No actions means healthy
+        # 6. Extrapolation efficacy — the core TG-LoRA signal (loss_after vs
+        # loss_pilot). A sustained streak of cycles where the extrapolation
+        # proposal INCREASED loss means the configured alpha (extrapolation
+        # step count/strength) is too aggressive: the speculative updates are
+        # overshooting. Recommend weakening extrapolation. Independent of the
+        # trainer's tolerance-based accept decision — even cycles accepted
+        # within tolerance can be marginally harming, and the advisor receives
+        # the raw pilot->after delta directly.
+        if extrap_harm_streak >= self._config.extrapolation_harm_patience:
+            actions.append(
+                AdvisoryAction(
+                    action_type="adjust_alpha",
+                    priority="medium",
+                    reason=f"Extrapolation increased loss for {extrap_harm_streak} "
+                           f"consecutive cycles (loss_after > loss_pilot); reduce "
+                           f"extrapolation strength (alpha)",
+                    suggested_value=self._config.convergence_alpha_factor,
+                    confidence=0.8,
+                )
+            )
+
+        # 7. No actions means healthy
         if not actions:
             actions.append(
                 AdvisoryAction(
@@ -533,6 +591,7 @@ class TrainingAdvisor:
             "cycle_count": self._cycle_count,
             "best_loss": self._best_loss,
             "best_cycle": self._best_cycle,
+            "extrapolation_harm_streak": self._extrap_harm_streak,
             "monitor_summary": self._monitor.health_summary(),
         }
 

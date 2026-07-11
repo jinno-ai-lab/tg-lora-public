@@ -325,6 +325,131 @@ class TestAdvisorConfig:
         assert config.spike_threshold == 3.0
         assert config.plateau_lr_factor == 0.3
 
+    def test_extrapolation_harm_patience_default_and_validation(self):
+        # Default patience is 3 — enough cycles to rule out a single noisy
+        # overshoot, short enough to surface a mis-tuned alpha promptly.
+        assert AdvisorConfig().extrapolation_harm_patience == 3
+        assert AdvisorConfig(extrapolation_harm_patience=1).extrapolation_harm_patience == 1
+        # A patience < 1 can never fire, so it is rejected at construction.
+        with pytest.raises(ValueError, match="extrapolation_harm_patience"):
+            AdvisorConfig(extrapolation_harm_patience=0)
+
+
+# ---------------------------------------------------------------------------
+# Extrapolation efficacy — the advisor must consume loss_after vs loss_pilot
+# (the core TG-LoRA signal of whether extrapolation reduces loss). These guard
+# against the prior defect where ``_generate_actions`` accepted both values and
+# silently dropped them.
+# ---------------------------------------------------------------------------
+
+
+def _harm_action(report: AdvisoryReport) -> AdvisoryAction | None:
+    """Return the extrapolation-harm ``adjust_alpha`` action if present."""
+    for a in report.actions:
+        if a.action_type == "adjust_alpha" and "loss_after > loss_pilot" in a.reason:
+            return a
+    return None
+
+
+class TestExtrapolationEfficacy:
+    def test_harm_streak_fires_adjust_alpha(self):
+        # loss_after > loss_pilot for `patience` consecutive cycles: the
+        # speculative extrapolation is overshooting every cycle even though
+        # the pilot SGD is driving train_loss down. The advisor must recommend
+        # weakening extrapolation (lower alpha).
+        advisor = TrainingAdvisor(AdvisorConfig(extrapolation_harm_patience=2))
+        last = None
+        for cycle in range(2):
+            last = advisor.evaluate(
+                cycle,
+                train_loss=2.0 - 0.1 * cycle,  # improving pilot baseline
+                loss_pilot=1.0,
+                loss_after=1.2,  # extrapolation increased loss
+            )
+        harm = _harm_action(last)
+        assert harm is not None, (
+            f"expected extrapolation-harm adjust_alpha; got actions="
+            f"{[(a.action_type, a.reason) for a in last.actions]}"
+        )
+        assert harm.suggested_value == AdvisorConfig().convergence_alpha_factor
+
+    def test_help_cycle_resets_harm_streak(self):
+        # Two harm cycles build the streak to the threshold, then a single
+        # cycle where extrapolation actually helps (loss_after <= loss_pilot)
+        # must reset the streak so the action does not linger. Mutation: if the
+        # `else: streak = 0` reset were dropped, the action would persist here.
+        advisor = TrainingAdvisor(AdvisorConfig(extrapolation_harm_patience=2))
+        advisor.evaluate(0, train_loss=2.0, loss_pilot=1.0, loss_after=1.2)
+        advisor.evaluate(1, train_loss=1.9, loss_pilot=1.0, loss_after=1.2)
+        assert advisor._extrap_harm_streak == 2
+        last = advisor.evaluate(2, train_loss=1.8, loss_pilot=1.0, loss_after=0.9)  # helps
+        assert advisor._extrap_harm_streak == 0
+        assert _harm_action(last) is None, (
+            f"harm action should not fire after a reset; got "
+            f"{[(a.action_type, a.reason) for a in last.actions]}"
+        )
+
+    def test_no_signal_when_pilot_absent_is_backward_compatible(self):
+        # Callers that never pass loss_pilot/loss_after (defaults 0.0) — e.g.
+        # a baseline run or an older fixture — must see byte-identical advice:
+        # the harm branch never engages. Also pins the `loss_pilot > 0.0` guard:
+        # a zero pilot is not a real extrapolation baseline.
+        advisor = TrainingAdvisor(AdvisorConfig(extrapolation_harm_patience=2))
+        last = None
+        for cycle in range(5):
+            last = advisor.evaluate(cycle, train_loss=2.0 - 0.1 * cycle)
+        assert advisor._extrap_harm_streak == 0
+        assert _harm_action(last) is None
+        # An explicit zero pilot (no extrapolation baseline this cycle) is the
+        # same no-op even if loss_after is nonzero.
+        last = advisor.evaluate(
+            6, train_loss=1.4, loss_pilot=0.0, loss_after=0.5,
+        )
+        assert advisor._extrap_harm_streak == 0
+        assert _harm_action(last) is None
+
+    def test_harm_signal_flows_through_generate_advice_from_history(self):
+        # End-to-end via the record keys the consumer (_extract_cycle_records)
+        # surfaces from the producer's tg_lora_loss_pilot_eval /
+        # tg_lora_loss_after. Proves the producer -> consumer -> advisor chain
+        # delivers the signal that _generate_actions previously dropped.
+        history = []
+        for cycle in range(3):
+            history.append(
+                {
+                    "cycle": cycle,
+                    "train_loss": 2.0 - 0.1 * cycle,
+                    "loss_pilot": 1.0,
+                    "loss_after": 1.25,  # extrapolation increased loss, every cycle
+                }
+            )
+        report = generate_advice_from_history(history)
+        assert _harm_action(report) is not None, (
+            f"expected extrapolation-harm action from history; got "
+            f"{[(a.action_type, a.reason) for a in report.actions]}"
+        )
+
+    def test_summary_exposes_harm_streak(self):
+        advisor = TrainingAdvisor(AdvisorConfig(extrapolation_harm_patience=2))
+        advisor.evaluate(0, train_loss=2.0, loss_pilot=1.0, loss_after=1.2)
+        assert advisor.summary()["extrapolation_harm_streak"] == 1
+        advisor.evaluate(1, train_loss=1.9, loss_pilot=1.0, loss_after=0.9)
+        assert advisor.summary()["extrapolation_harm_streak"] == 0
+
+    def test_none_pilot_after_does_not_crash(self):
+        # A real producer full-eval record surfaces loss_pilot / loss_after as
+        # present-but-None (``dict.get(k, default)`` returns None when the key
+        # exists with value None). evaluate must not raise TypeError on the
+        # comparison, and the absent signal must not advance the streak.
+        advisor = TrainingAdvisor(AdvisorConfig(extrapolation_harm_patience=1))
+        report = advisor.evaluate(0, train_loss=2.0, loss_pilot=None, loss_after=None)
+        assert advisor._extrap_harm_streak == 0
+        assert _harm_action(report) is None
+        # Mixed (pilot missing, after present) is likewise a no-op, not a crash.
+        report = advisor.evaluate(1, train_loss=1.9, loss_pilot=None, loss_after=1.2)
+        assert advisor._extrap_harm_streak == 0
+        assert _harm_action(report) is None
+
 
 # ---------------------------------------------------------------------------
 # CLI tests
