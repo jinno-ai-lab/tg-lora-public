@@ -1,0 +1,58 @@
+{
+  "probe": "9b_suffix_only_memory_frontier",
+  "date": "2026-07-12",
+  "recorded_by": "scripts/probe_9b_memory_frontier.py (make probe-9b-memory)",
+  "gpu": {
+    "name": "NVIDIA GeForce RTX 3060",
+    "total_mb": 11910.0,
+    "note": "torch.cuda.get_device_properties total; usable capacity reported by the OOM allocator was 11.63 GiB."
+  },
+  "model": "Qwen/Qwen3.5-9B",
+  "method": "Per-step peak of a plain forward+backward+AdamW step (HF-internal CE loss, model(labels=...).loss) with a fully-supervised synthetic batch, under each config's base levers (4-bit nf4, bfloat16 compute, double-quant, gradient checkpointing). The trainer's exact public model-loading path (load_base_model -> apply_lora -> configure_trainable_lora_scope) is reused; only the private src.data data-loading is bypassed. prefix_feature_cache_offload_prefix_to_cpu is NOT exercised (this is an upper bound on per-step GPU memory; the actual config may fit more).",
+  "arms": {
+    "suffix_only_last25": {
+      "config": "configs/9b_baseline_suffix_only_last25.yaml",
+      "trainable_lora_scope": "last_25_percent",
+      "trainable_params": 10819584,
+      "trainable_names": 124,
+      "measurements": [
+        {"seq_len": 256, "fit": true, "peak_alloc_mb": 8476.3, "peak_reserved_mb": 8732.0},
+        {"seq_len": 512, "fit": true, "peak_alloc_mb": 9395.3, "peak_reserved_mb": 9676.0},
+        {"seq_len": 768, "fit": true, "peak_alloc_mb": 10309.9, "peak_reserved_mb": 10620.0},
+        {"seq_len": 1024, "fit": true, "peak_alloc_mb": 11226.0, "peak_reserved_mb": 11536.0},
+        {"seq_len": 1280, "fit": false, "peak_alloc_mb": null, "peak_reserved_mb": null},
+        {"seq_len": 1536, "fit": false, "peak_alloc_mb": null, "peak_reserved_mb": null},
+        {"seq_len": 2048, "fit": false, "peak_alloc_mb": null, "peak_reserved_mb": null}
+      ],
+      "max_fit_seq_len": 1024,
+      "full_section4_producible": true,
+      "seq1024_headroom_mb": 684.0
+    },
+    "standard_all": {
+      "config": "configs/9b_baseline.yaml",
+      "trainable_lora_scope": "all",
+      "trainable_params": 43278336,
+      "trainable_names": 496,
+      "measurements": [
+        {"seq_len": 256, "fit": true, "peak_alloc_mb": 8723.9, "peak_reserved_mb": 9228.0},
+        {"seq_len": 512, "fit": true, "peak_alloc_mb": 9643.0, "peak_reserved_mb": 10172.0},
+        {"seq_len": 768, "fit": true, "peak_alloc_mb": 10557.5, "peak_reserved_mb": 11114.0},
+        {"seq_len": 1024, "fit": false, "peak_alloc_mb": null, "peak_reserved_mb": null}
+      ],
+      "max_fit_seq_len": 768,
+      "full_section4_producible": false
+    }
+  },
+  "controlled_contrast": {
+    "claim": "Holding model + GPU + 4-bit quant + gradient checkpointing fixed, the single lever trainable_lora_scope=last_25_percent (vs all) removes the seq1024 memory block.",
+    "standard_seq1024": "OOM",
+    "suffix_only_seq1024": "FIT (11226.0 MiB / 11910.0 MiB, 684.0 MiB headroom)",
+    "param_reduction": "43278336 -> 10819584 trainable (4.0x fewer); 496 -> 496 LoRA names -> 124"
+  },
+  "verdict": "The suffix-only config (configs/9b_baseline_suffix_only_last25.yaml) makes a real 9B QLoRA forward+backward+step FIT at seq_len=1024 (the full GOAL §4 threshold) on the 12 GB RTX 3060, where the standard config OOMs. The MEMORY block for the full §4 verdict is therefore REMOVED for the suffix-only config. The sole remaining blocker for a real seq1024 verdict is the private src.data data pipeline (absent on this public mirror), NOT GPU memory. seq>=1280 still OOMs even with the suffix-only scope (full 2048-token context needs >12 GB).",
+  "caveats": [
+    "This is a per-step memory frontier (one forward+backward+AdamW), not a full training run; it does not measure eval-time memory (eval batching is a separate OOM axis per the prior standard-config finding).",
+    "prefix_feature_cache_offload_prefix_to_cpu (a config lever) is not exercised; the actual config may fit an even higher seq_len.",
+    "Recorded on the public mirror worktree with the upstream torch+bnb venv (/home/jinno/tg-lora/.venv); the suffix-only config's data train_path (data/train.jsonl) is absent here so a loss-valued verdict still requires private src.data."
+  ]
+}

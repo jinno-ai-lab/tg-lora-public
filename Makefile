@@ -466,6 +466,27 @@ paper-memory-frontier-sweep: ## Stage 3 frontier sweep: run paper-memory at incr
 	MLFLOW_ENABLED=$(or $(MLFLOW_ENABLED),false) \
 	bash scripts/run_frontier_sweep.sh
 
+# (PROBE_* vars avoid colliding with the global CONFIG / SEQS. NB: defaults use
+# ?= rather than $(or ...) because the seq-len list contains commas, which $(or)
+# would split into separate arguments — collapsing the default to its first int.)
+PROBE_CONFIG ?= configs/9b_baseline_suffix_only_last25.yaml
+PROBE_SEQ_LENS ?= 256,512,768,1024,1280,1536,2048
+PROBE_BATCH_SIZE ?= 1
+
+probe-9b-memory: ## Empirical 9B suffix-only GPU memory-frontier probe (real Qwen3.5-9B; data-independent)
+# Needs a torch+bnb+GPU interpreter: PYTHON_VENV=/path/to/torch-python make probe-9b-memory
+# Binds configs/9b_baseline_suffix_only_last25.yaml to the GPU and measures peak
+# per-step VRAM across seq_len via the trainer's exact public model-loading path
+# (load_base_model -> apply_lora -> configure_trainable_lora_scope), bypassing
+# only the private src.data blocker with a synthetic batch. Resolves whether the
+# suffix-only config's memory stack fits seq>=1024 on 12GB (data-independent).
+	$(PYTHON_VENV) -m scripts.probe_9b_memory_frontier \
+		--config $(PROBE_CONFIG) \
+		--seq-lens "$(PROBE_SEQ_LENS)" \
+		--batch-size $(PROBE_BATCH_SIZE) \
+		$(if $(PROBE_OUTPUT),--output $(PROBE_OUTPUT)) \
+		$(if $(PROBE_JSON),--json)
+
 precompute-prefix-cache: ## Offline multi-GPU prefix-cache precompute for the frozen paper config
 	$(PYTHON_VENV) scripts/precompute_prefix_cache_parallel.py \
 		--config $(or $(PREFIX_CACHE_CONFIG),configs/9b_tg_lora_prefix_feature_cache_paper_poc.yaml) \
