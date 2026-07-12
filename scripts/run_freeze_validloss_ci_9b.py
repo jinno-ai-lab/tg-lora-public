@@ -150,6 +150,26 @@ DEFAULT_BASE_SEED = 0
 DEFAULT_DATASET = "databricks/databricks-dolly-15k"
 DEFAULT_MAX_DATASET_ROWS = 4000   # cap the download for a bounded run
 
+# Exit codes main() can return — keep the table explicit so a polling loop /
+# the resumable --ledger workflow can branch on them:
+#   0  success (deposit written)
+#   1  unexpected error (uncaught exception)
+#   2  CUDA unavailable
+#   3  IncompleteResumeError (ledger banked only one side of the A/B; re-run)
+#   75 GPU free-memory tempfail (EX_TEMPFAIL from sysexits.h: "retry later")
+EXIT_GPU_TEMPFAIL = 75
+
+# Free-GPU-memory floor for the pre-flight (GiB). Calibrated to defer only when
+# another process is clearly holding the card — the seq1024 suffix-only peak is
+# ~11.2 GB (probe da4fa4f / TASK-0155), the 12 GB card has ~11 GB free when
+# otherwise idle, and a concurrent run (e.g. the private repo's own ~8.2 GB
+# verdict) drops free to ~4 GB. 10 GiB separates those two regimes without
+# spuriously firing at idle. It sits *below* the run's peak on purpose: this is
+# a "is another big process holding the GPU" check, not a fit-guarantee (the
+# card is fundamentally tight at seq1024 — see probe da4fa4f). --min-free-gib 0
+# disables.
+DEFAULT_MIN_FREE_GIB = 10.0
+
 # ChatML (Qwen2.5/Qwen3.5 share it). Mirrors scripts/prepare_data.CHAT_TEMPLATE.
 _CHATML_USER = "<|im_start|>user\n{body}<|im_end|>\n<|im_start|>assistant\n"
 _CHATML_RESPONSE = "{response}<|im_end|>"
@@ -1636,7 +1656,62 @@ def build_parser() -> argparse.ArgumentParser:
             "None = no ledger (byte-identical to a one-shot run)."
         ),
     )
+    p.add_argument(
+        "--min-free-gib", type=float, default=DEFAULT_MIN_FREE_GIB,
+        help=(
+            "Free-GPU-memory floor in GiB for the pre-flight check. If the card "
+            "has less free memory than this (a concurrent process is holding it), "
+            "the run defers with exit 75 (EX_TEMPFAIL) instead of crashing on "
+            "OOM minutes into the first arm — so a poll-loop / resumable "
+            "--ledger workflow can simply re-run on the next free-GPU window and "
+            "keep the arms it already banked. 0 disables the check. Default "
+            f"{DEFAULT_MIN_FREE_GIB} (sits below the seq1024 suffix-only peak; "
+            "fires only when another big process is clearly holding the card)."
+        ),
+    )
     return p
+
+
+def gpu_free_mib() -> int | None:
+    """Free GPU memory in MiB, or ``None`` if it cannot be read.
+
+    Failing open (returning None) is deliberate: this guard exists to spare a
+    fragmented-GPU workflow a mid-arm OOM crash, not to block runs on cards
+    where ``mem_get_info`` is unavailable (e.g. some driver/WSL setups). The
+    caller treats None as "don't know, don't defer."
+    """
+    if not torch.cuda.is_available():
+        return None
+    try:
+        free_bytes, _total = torch.cuda.mem_get_info()
+    except (RuntimeError, AttributeError):
+        return None
+    return int(free_bytes) // (1024 * 1024)
+
+
+def gpu_free_memory_deferred(min_free_gib: float) -> str | None:
+    """Return a deferral reason string if free GPU memory is below the floor.
+
+    ``None`` means "proceed" (enough free, or the floor is disabled, or free
+    memory could not be read — fail open). A non-None string means "defer":
+    the caller logs it and exits ``EXIT_GPU_TEMPFAIL`` (75).
+    """
+    if min_free_gib <= 0:
+        return None
+    free_mib = gpu_free_mib()
+    if free_mib is None:
+        return None
+    min_free_mib = min_free_gib * 1024.0
+    if free_mib < min_free_mib:
+        return (
+            f"Insufficient free GPU memory: {free_mib} MiB free < "
+            f"{min_free_mib:.0f} MiB floor (--min-free-gib {min_free_gib}). "
+            f"A concurrent process is likely holding the card. Deferring — "
+            f"exit {EXIT_GPU_TEMPFAIL} (EX_TEMPFAIL, retry later). Re-run on "
+            f"the next free-GPU window; completed arms stay banked in the "
+            f"--ledger."
+        )
+    return None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1646,6 +1721,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not torch.cuda.is_available():
         logger.error("CUDA not available — a real 9B run requires a GPU. Aborting.")
         return 2
+
+    deferred = gpu_free_memory_deferred(args.min_free_gib)
+    if deferred is not None:
+        logger.error("%s", deferred)
+        return EXIT_GPU_TEMPFAIL
 
     cfg = OmegaConf.load(args.config)
     device = resolve_device(args.device)
