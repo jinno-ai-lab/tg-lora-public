@@ -44,7 +44,13 @@ import torch
 from torch import nn
 
 from scripts.run_freeze_validloss_ci_9b import (
+    REGIME_GENERALIZATION,
+    REGIME_MEMORIZATION,
+    REGIME_OVERFIT,
+    REGIME_UNKNOWN,
     _baseline_ci_to_json,
+    _candidate_final_ce_mean,
+    _classify_regime,
     _direction_ci_to_json,
     _is_reduced_budget,
     _reset_lora_for_arm,
@@ -397,12 +403,19 @@ class TestResultToJson:
         # reduced-budget flag was judged against (not a mystery boolean).
         assert out["cfg_max_steps"] == 1500
 
-    def test_full_verdict_only_when_full_budget_target_scale_and_non_thin(self):
-        # The citation gate opens ONLY for a full-budget, target-scale,
-        # NON-THIN run — all three honesty axes must clear together.
+    def test_full_verdict_only_when_full_budget_target_scale_non_thin_and_generalizing(self):
+        # The citation gate opens ONLY when FOUR honesty axes clear together:
+        # full-budget + target-scale + non-thin + GENERALIZATION regime. The
+        # candidate arm must have generalized (train CE ≈ valid CE), evidenced by
+        # a finite ``final_ce_train_loss`` in its provenance — without it the
+        # regime reads UNKNOWN and the gate stays shut (see TestRegimeHonestyGate).
         out = result_to_json(_stub_result(
             proxy_scale=False, reduced_budget=False,
             ci=_stub_ci(is_thin_evidence=False),
+            candidate_provenance=[
+                {"frozen_layers": [29, 30, 31], "n_trainable_params": 6787072,
+                 "last_train_loss": 1.5, "final_ce_train_loss": 1.507},
+            ],
         ))
         assert out["citable_as_full_section4_verdict"] is True
 
@@ -451,6 +464,175 @@ class TestResultToJson:
         p = out["candidate_provenance"][0]
         assert p["final_ce_train_loss"] == 1.507
         assert p["last_train_loss"] == 0.0002
+
+
+# ── regime classification (4th honesty axis: generalization vs memorization/overfit)
+
+# The thresholds below are grounded in the committed 9B deposits, not picked from
+# thin air — see the script's ``_classify_regime`` docstring. Candidate-CE values:
+#   generalization arms ≈ 1.507 (valid ≈ 1.515, gap ≈ 0.008)
+#   memorization arms  ≈ 0.0   (8 train x 20 step collapses train CE)
+#   full-backprop baseline ≈ 0.77 (valid ≈ 1.54, gap ≈ 0.77 → OVERFIT)
+
+
+class TestRegimeClassification:
+    """The 4th honesty axis: the citation gate must distinguish a verdict measured
+    on a model that GENERALIZED (train CE ≈ valid CE) from one measured on a model
+    that MEMORIZED (train CE → 0) or OVERFIT (train CE ≪ valid CE)."""
+
+    def test_generalization_when_train_ce_approximates_valid(self):
+        # The committed generalization-regime candidate arms: final_ce ≈ 1.507,
+        # valid ≈ 1.515 → gap ≈ 0.008. Train CE well above the floor, gap well
+        # under the threshold → GENERALIZATION.
+        assert _classify_regime(1.507, 1.515) == REGIME_GENERALIZATION
+
+    def test_memorization_when_train_ce_collapses(self):
+        # The committed memorization-regime arms (8 train × 20 step): train CE
+        # collapses toward 0. ce < 0.5 → MEMORIZATION regardless of valid.
+        assert _classify_regime(0.001, 1.6) == REGIME_MEMORIZATION
+        assert _classify_regime(0.0, 1.0) == REGIME_MEMORIZATION
+
+    def test_overfit_when_train_valid_gap_is_large(self):
+        # The committed full-backprop BASELINE arm: final_ce 0.77 ≪ valid 1.54
+        # → gap 0.77 > 0.5 → OVERFIT (train CE above the memorization floor, but
+        # the model fit train far better than it generalized).
+        assert _classify_regime(0.77, 1.54) == REGIME_OVERFIT
+
+    def test_unknown_when_train_ce_missing(self):
+        # A deposit recorded before the final_ce_train_loss diagnostic existed
+        # carries no train CE. Conservative: UNKNOWN — never opens the full-§4
+        # gate on a regime it cannot verify.
+        assert _classify_regime(None, 1.5) == REGIME_UNKNOWN
+        assert _classify_regime("", 1.5) == REGIME_UNKNOWN
+
+    def test_unknown_when_train_ce_non_finite(self):
+        # NaN / inf (e.g. a diverged run) classifies UNKNOWN rather than being
+        # silently compared as a real number.
+        assert _classify_regime(float("nan"), 1.5) == REGIME_UNKNOWN
+        assert _classify_regime(1.5, float("inf")) == REGIME_UNKNOWN
+        assert _classify_regime(float("inf"), 1.5) == REGIME_UNKNOWN
+
+    def test_memorization_floor_boundary(self):
+        # ce < 0.5 → memorization; ce == 0.5 is NOT memorization (strict <).
+        # At ce=0.5, vl=1.0: gap 0.5 is NOT > 0.5 → GENERALIZATION.
+        assert _classify_regime(0.499, 1.0) == REGIME_MEMORIZATION
+        assert _classify_regime(0.5, 1.0) == REGIME_GENERALIZATION
+
+    def test_overfit_gap_boundary(self):
+        # (vl - ce) > 0.5 → overfit; gap == 0.5 is NOT overfit (strict >).
+        # 1.5 - 1.0 == 0.5 exactly (both exactly representable), so the boundary
+        # is clean rather than at the mercy of float rounding.
+        assert _classify_regime(1.0, 1.5) == REGIME_GENERALIZATION     # gap 0.5
+        assert _classify_regime(1.0, 1.5001) == REGIME_OVERFIT         # gap 0.5001
+
+    def test_candidate_final_ce_mean_ignores_unrecorded_arms(self):
+        # Arms without final_ce_train_loss are skipped — NOT counted as 0 (which
+        # would falsely label a real generalization run as memorization).
+        result = {"candidate_provenance": [
+            {"final_ce_train_loss": 1.507},
+            {},  # pre-diagnostic arm — no field
+            {"final_ce_train_loss": 1.509},
+        ]}
+        assert _candidate_final_ce_mean(result) == pytest.approx(1.508)
+
+    def test_candidate_final_ce_mean_none_when_all_unrecorded(self):
+        assert _candidate_final_ce_mean({"candidate_provenance": [{}, {}]}) is None
+        assert _candidate_final_ce_mean({"candidate_provenance": []}) is None
+
+    def test_candidate_final_ce_mean_skips_non_finite(self):
+        result = {"candidate_provenance": [
+            {"final_ce_train_loss": float("nan")},
+            {"final_ce_train_loss": 1.507},
+        ]}
+        assert _candidate_final_ce_mean(result) == pytest.approx(1.507)
+
+
+class TestRegimeHonestyGate:
+    """The defect this axis closes: a future ``--total-steps 1500`` run clears
+    ``reduced_budget`` (full budget), and paired with the default small
+    ``--train-examples`` it does tens of epochs and MEMORIZES — yet without the
+    regime conjunct the gate would flip ``citable_as_full_section4_verdict=True``
+    on a memorization artifact. These tests pin the 4th gate axis and are
+    mutation-proven against removal of the ``regime == REGIME_GENERALIZATION``
+    conjunct (each blocking case flips to True under that mutation)."""
+
+    @staticmethod
+    def _full_budget_non_thin_result(final_ce_train_loss):
+        # Full budget + target scale + non-thin — clears the first THREE axes, so
+        # the gate outcome is decided SOLELY by the regime axis (the 4th). Vary
+        # only ``final_ce_train_loss`` to drive the regime.
+        return _stub_result(
+            proxy_scale=False,
+            reduced_budget=False,
+            ci=_stub_ci(is_thin_evidence=False),
+            candidate_provenance=[
+                {"frozen_layers": [29, 30, 31], "n_trainable_params": 6787072,
+                 "final_ce_train_loss": final_ce_train_loss},
+            ],
+        )
+
+    def test_generalization_regime_opens_full_citation(self):
+        # Full budget + target + non-thin + train CE ≈ valid → the ONLY shape
+        # that earns the complete-§4 label.
+        out = result_to_json(self._full_budget_non_thin_result(1.507))
+        assert out["regime"] == REGIME_GENERALIZATION
+        assert out["citable_as_full_section4_verdict"] is True
+
+    def test_memorization_regime_blocks_full_citation_at_full_budget(self):
+        # THE DEFECT CLOSURE: full budget + non-thin + target, but the model
+        # memorized (train CE → 0). The SURPASSES read off a memorized model is
+        # an artifact, not the §4 question, so the gate must stay shut.
+        out = result_to_json(self._full_budget_non_thin_result(0.001))
+        assert out["regime"] == REGIME_MEMORIZATION
+        assert out["citable_as_full_section4_verdict"] is False
+
+    def test_overfit_regime_blocks_full_citation(self):
+        # Full budget + non-thin + target, but the model overfit (train ≪ valid).
+        # A distinct failure of the §4 question; the gate stays shut.
+        out = result_to_json(self._full_budget_non_thin_result(0.77))
+        assert out["regime"] == REGIME_OVERFIT
+        assert out["citable_as_full_section4_verdict"] is False
+
+    def test_unknown_regime_blocks_full_citation(self):
+        # No final_ce recorded (pre-diagnostic deposit shape) → regime UNKNOWN →
+        # the conservative call: never open the full-§4 gate on an unverifiable
+        # regime. A pre-diagnostic full-budget run does NOT auto-pass.
+        result = _stub_result(
+            proxy_scale=False,
+            reduced_budget=False,
+            ci=_stub_ci(is_thin_evidence=False),
+            candidate_provenance=[
+                {"frozen_layers": [29, 30, 31], "n_trainable_params": 6787072},
+            ],
+        )
+        out = result_to_json(result)
+        assert out["regime"] == REGIME_UNKNOWN
+        assert out["citable_as_full_section4_verdict"] is False
+
+    def test_regime_axis_independent_of_other_three(self):
+        # The four axes are conjuncts: even generalization-regime cannot rescue a
+        # reduced-budget run. Pins that the regime conjunct was ADDED, not swapped
+        # in for one of the other three.
+        out = result_to_json(_stub_result(
+            proxy_scale=False,
+            reduced_budget=True,  # reduced — blocked on THIS axis
+            ci=_stub_ci(is_thin_evidence=False),
+            candidate_provenance=[
+                {"frozen_layers": [29, 30, 31], "n_trainable_params": 6787072,
+                 "final_ce_train_loss": 1.507},
+            ],
+        ))
+        assert out["regime"] == REGIME_GENERALIZATION
+        assert out["citable_as_full_section4_verdict"] is False
+
+    def test_regime_fields_surfaced_for_audit(self):
+        # The deposit surfaces the regime + the two numbers it was derived from,
+        # so a reader can audit the 4th axis without re-deriving it.
+        out = result_to_json(self._full_budget_non_thin_result(1.507))
+        assert out["regime"] == REGIME_GENERALIZATION
+        assert out["candidate_final_ce_train_loss_mean"] == pytest.approx(1.507)
+        # candidate_train_valid_gap = candidate_mean − ce_mean = 1.625 − 1.507
+        assert out["candidate_train_valid_gap"] == pytest.approx(1.625 - 1.507)
 
 
 # ── direction-isolation control (constitution P0: direction vs contiguity) ───

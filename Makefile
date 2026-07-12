@@ -2,7 +2,7 @@
        smoke smoke-tg smoke-bl \
        train-baseline train-tg-lora train-tg-lora-optreuse train-tg-lora-prefix \
        eval eval-lora eval-downstream eval-downstream-mlx eval-llm-jp-eval-mlx eval-mlx eval-base eval-35b-base eval-35b-ckpt \
-       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize freeze-validloss-ci-9b freeze-validloss-ci-9b-generalization freeze-validloss-ci-9b-baseline freeze-replay \
+       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize freeze-validloss-ci-9b freeze-validloss-ci-9b-generalization freeze-validloss-ci-9b-baseline freeze-validloss-ci-9b-full freeze-replay \
 
 	compare compare-prefix compare-prefix-cold compare-prefix-warm compare-prefix-coldwarm compare-report paper-memory paper-memory-dry-run paper-memory-one-shot paper-memory-compare-modes paper-memory-all-modes paper-memory-evaluate-gates paper-memory-external-eval paper-memory-frontier-sweep paper-memory-cache-ablation cosine-n-ablation cosine-n-ablation-dry-run cosine-n-skip-ablation cosine-n-skip-ablation-dry-run precompute-prefix-cache ablation sweep accel-sweep \
 	bench-optimizer bench-prefix-cache bench-prefix-cache-one-shot analyze-prefix-break-even analyze-prefix-break-even-ci bench-velocity-ops bench-velocity-ops-ci bench-velocity-ops-save-baseline \
@@ -925,6 +925,22 @@ FREEZE_9B_BASELINE_FLAGS ?= --seq-len 1024 --total-steps 96 --warmup-steps 12 --
 
 freeze-validloss-ci-9b-baseline: ## GOAL §4 real-9B A/B + FULL-BACKPROP baseline (candidate vs no-freeze; §4 line-247 axis)
 	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_BASELINE_FLAGS) --json --output tests/fixtures/freeze_validloss_ci_9b_baseline.json
+
+# The FULL-BUDGET real-9B §4 A/B — the path to the first citable_as_full_section4_verdict=True
+# deposit. total_steps=1500 reaches the config's max_steps (so reduced_budget=False), and
+# train_examples=600 keeps a 1500-step run at ~2.5 epochs = GENERALIZATION regime (the 4th
+# honesty axis: a naive --total-steps 1500 --train-examples 48 would do ~31 epochs, memorize,
+# and _classify_regime would correctly block the full-verdict gate). candidate+surrogate+baseline
+# at 3 seeds/arm gives the headline A/B (surrogate), the §4-line-247 axis (baseline), all non-thin.
+# HONEST CAVEAT: ~hours of 9B GPU (3 arms x 3 seeds x 1500 steps); run as a long background job
+# on a free GPU. The private src.data quality filter is still absent on this mirror, so absolute
+# loss levels differ from a filtered run (A/B internal validity is unaffected — same data both arms).
+# Needs a torch+bnb+GPU interpreter: PYTHON_VENV=/path/to/torch-python make freeze-validloss-ci-9b-full
+FREEZE_9B_FULL_FLAGS ?= --seq-len 1024 --total-steps 1500 --warmup-steps 150 --depth 3 --spacing 450 --n-candidate 3 --n-surrogate 3 --n-baseline 3 --train-examples 600 --valid-examples 64 --max-dataset-rows 2000
+
+freeze-validloss-ci-9b-full: ## GOAL §4 real-9B FULL-BUDGET A/B verdict (1500 steps; generalization regime; ~hours GPU)
+	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_FULL_FLAGS) --json --output tests/fixtures/freeze_validloss_ci_9b_full.json
+
 
 # The apparatus order-resolution diagnostic. Variance-decomposes the proxy's
 # final valid_loss into a Var(order) signal (distinct freeze orders at a fixed

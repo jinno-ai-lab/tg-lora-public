@@ -55,6 +55,16 @@ real-9B real-data A/B sample; whatever the bootstrap CI says
 (``SURPASSES`` / ``TIES`` / ``UNDERSHOOTS``) is the measurement, never
 pre-decided.
 
+The citation gate ``citable_as_full_section4_verdict`` opens only when FOUR
+honesty axes clear together: target-scale (not proxy), full-budget (reached
+``max_steps``), non-thin (≥3 seeds/arm), AND generalization-regime (the
+candidate arm generalized rather than memorized — see :func:`_classify_regime`).
+The regime axis is load-bearing: a ``--total-steps 1500`` run paired with the
+default small ``--train-examples`` would clear the budget axis but do tens of
+epochs and memorize, so without the regime check it would be mislabeled as the
+complete §4 verdict. ``make freeze-validloss-ci-9b-full`` sizes the train set
+(~600 examples) so a full 1500-step run stays at ~2.5 epochs — generalizing.
+
 Usage::
 
     # The one-shot real-9B A/B (auto CUDA, suffix-only config, Dolly data).
@@ -501,6 +511,88 @@ def _is_reduced_budget(total_steps: int, max_steps: int) -> bool:
     return total_steps < max_steps
 
 
+# ── training-regime honesty ─────────────────────────────────────────────────
+#
+# The 9th-iteration generalization-regime verdict established that the §4 A/B is
+# only externally valid when measured on a GENERALIZING model: in the
+# memorization regime (few train examples × many epochs) the adapter drives train
+# cross-entropy toward 0 and the held-out valid_loss is dominated by the frozen
+# base, so a "SURPASSES" read off a memorized model is an artifact, not the §4
+# question. The per-arm ``final_ce_train_loss`` diagnostic (mean full-CE over the
+# train set under the final adapter) makes that regime machine-readable.
+#
+# The citation gate (:func:`result_to_json`) therefore needs a REGIME axis in
+# addition to scale / budget / thin-ness: without it, a future ``--total-steps
+# 1500`` run (which clears ``reduced_budget``) paired with the default small
+# ``--train-examples`` would do tens of epochs, memorize, and STILL flip
+# ``citable_as_full_section4_verdict=True`` — silently mislabeling a
+# memorization artifact as the complete §4 verdict. The thresholds below are
+# grounded in the committed 9B deposits, not picked from thin air:
+#   * generalization-regime candidate arms (freeze_validloss_ci_9b_generalization
+#     / _baseline) have final_ce_train_loss ≈ 1.507 with valid ≈ 1.515 → gap
+#     ≈ 0.008;
+#   * the full-backprop BASELINE arm overfits with final_ce 0.77 ≪ valid 1.54
+#     → gap 0.77;
+#   * memorization-regime arms (8 train × 20 step) collapse train CE toward 0.
+# So a train-CE floor of 0.5 separates memorization (~0) from generalization
+# (~1.5) with margin, and a train-valid gap threshold of 0.5 separates
+# generalization (~0.01) from overfit (~0.77) with margin.
+REGIME_GENERALIZATION = "generalization"
+REGIME_MEMORIZATION = "memorization"
+REGIME_OVERFIT = "overfit"
+REGIME_UNKNOWN = "unknown"
+
+_MEMORIZATION_TRAIN_CE_FLOOR = 0.5
+_OVERFIT_GAP_THRESHOLD = 0.5
+
+
+def _classify_regime(final_ce_train_loss, valid_loss):
+    """Classify a run's training regime from the candidate arm's train/valid CE.
+
+    ``final_ce_train_loss`` is the candidate arm's mean full cross-entropy over
+    the *train* set under the final adapter; ``valid_loss`` is the candidate
+    arm's mean held-out valid_loss (:attr:`SurrogateValidLossCI.candidate_mean`).
+    Returns one of the :data:`REGIME_*` constants. Anything missing or
+    non-finite (e.g. a deposit recorded before the ``final_ce_train_loss``
+    diagnostic existed) classifies as :data:`REGIME_UNKNOWN` — the conservative
+    call, which never opens the full-§4 citation gate on a regime it cannot
+    verify.
+    """
+    try:
+        ce = float(final_ce_train_loss)
+        vl = float(valid_loss)
+    except (TypeError, ValueError):
+        return REGIME_UNKNOWN
+    if not (math.isfinite(ce) and math.isfinite(vl)):
+        return REGIME_UNKNOWN
+    if ce < _MEMORIZATION_TRAIN_CE_FLOOR:
+        return REGIME_MEMORIZATION
+    if (vl - ce) > _OVERFIT_GAP_THRESHOLD:
+        return REGIME_OVERFIT
+    return REGIME_GENERALIZATION
+
+
+def _candidate_final_ce_mean(result: dict):
+    """Mean candidate-arm ``final_ce_train_loss``, ignoring unrecorded arms.
+
+    Arms recorded before the diagnostic existed carry no ``final_ce_train_loss``
+    (or a non-finite one); they are skipped rather than counted as 0 (which
+    would falsely label a real generalization run as memorization). Returns
+    ``None`` when no candidate arm recorded a finite train CE.
+    """
+    fces = []
+    for prov in result.get("candidate_provenance", []):
+        try:
+            fv = float(prov.get("final_ce_train_loss"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fv):
+            fces.append(fv)
+    if not fces:
+        return None
+    return sum(fces) / len(fces)
+
+
 def run_ci_9b(
     *,
     cfg,
@@ -745,6 +837,17 @@ def result_to_json(result: dict) -> dict:
     """JSON-deposit shape: verdict + real samples + full provenance + honesty."""
     ci = result["ci"]
     reduced = bool(result["reduced_budget"])
+    # Training-regime honesty (GOAL §7): the candidate arm's mean train CE vs its
+    # held-out valid_loss. A full-budget run that memorized (train CE → 0) must
+    # NOT be citable as the complete §4 verdict even though it cleared the budget
+    # axis — see :func:`_classify_regime`.
+    candidate_ce_mean = _candidate_final_ce_mean(result)
+    candidate_valid = ci.candidate_mean
+    regime = _classify_regime(candidate_ce_mean, candidate_valid)
+    candidate_train_valid_gap = (
+        candidate_valid - candidate_ce_mean
+        if candidate_ce_mean is not None else None
+    )
     return {
         "verdict": ci.significance_verdict,
         "passes": ci.passes,
@@ -783,6 +886,12 @@ def result_to_json(result: dict) -> dict:
         "proxy_scale": result["proxy_scale"],
         "reduced_budget": reduced,
         "cfg_max_steps": result.get("cfg_max_steps"),
+        # GOAL §7 regime honesty: the candidate arm's train CE and the
+        # train-valid gap that classifies the run's regime. ADDITIVE — legacy
+        # deposits (pre-diagnostic) simply lack these and read as REGIME_UNKNOWN.
+        "candidate_final_ce_train_loss_mean": candidate_ce_mean,
+        "candidate_train_valid_gap": candidate_train_valid_gap,
+        "regime": regime,
         "candidate_provenance": result["candidate_provenance"],
         "surrogate_provenance": result["surrogate_provenance"],
         # Direction-isolation control arm (constitution P0). Empty / None-valued
@@ -808,15 +917,21 @@ def result_to_json(result: dict) -> dict:
         "baseline": _baseline_ci_to_json(result["baseline_ci"]),
         # Machine-readable citation gate: a run is the full §4 verdict ONLY when
         # it is target-scale (not proxy), full-budget (reached config max_steps,
-        # not reduced), AND non-thin (enough seeds for the bootstrap to capture
-        # variance). The private ``src.data`` quality filter is a further axis
-        # this gate cannot see (absent on the mirror) — it is noted in the
+        # not reduced), non-thin (enough seeds for the bootstrap to capture
+        # variance), AND in the generalization regime (the candidate generalized
+        # rather than memorized — without this axis a full-budget run on the
+        # default small train set would do tens of epochs, memorize, and still
+        # claim the crown). The private ``src.data`` quality filter is a further
+        # axis this gate cannot see (absent on the mirror) — it is noted in the
         # report, never silently assumed away. The direction-isolation analysis
         # is an *attribution* caveat on the verdict's interpretation, not a
         # scale/budget axis, so it never opens or closes this gate by itself.
         "citable_as_target_scale": (not result["proxy_scale"]),
         "citable_as_full_section4_verdict": (
-            (not result["proxy_scale"]) and (not reduced) and (not ci.is_thin_evidence)
+            (not result["proxy_scale"])
+            and (not reduced)
+            and (not ci.is_thin_evidence)
+            and (regime == REGIME_GENERALIZATION)
         ),
     }
 
@@ -977,6 +1092,21 @@ def format_report_9b(result: dict) -> str:
             f"  note: FULL_BUDGET — total_steps={result['total_steps']} reaches the "
             f"config's max_steps={result.get('cfg_max_steps')}."
         )
+    # Regime honesty (GOAL §7): flag-driven so the report never contradicts the
+    # machine-readable ``regime`` label. A full-budget run that memorized still
+    # fails ``citable_as_full_section4_verdict`` on this axis — the report says
+    # so plainly rather than letting a 1500-step memorization run claim the crown.
+    _ce_mean = _candidate_final_ce_mean(result)
+    _gap = (ci.candidate_mean - _ce_mean) if _ce_mean is not None else None
+    _regime = _classify_regime(_ce_mean, ci.candidate_mean)
+    _ce_str = f"{_ce_mean:.4f}" if _ce_mean is not None else "n/a"
+    _gap_str = f"{_gap:.4f}" if _gap is not None else "n/a"
+    lines.append(
+        f"  note: REGIME={_regime} — candidate train_CE={_ce_str} vs valid="
+        f"{ci.candidate_mean:.4f} (gap={_gap_str}); the complete §4 verdict "
+        "requires GENERALIZATION (memorization/overfit/unknown block it even at "
+        "full budget)."
+    )
     if ci.is_thin_evidence:
         lines.append(
             "  note: THIN_EVIDENCE — fewer than 3 seeds in an arm; the recorded "
