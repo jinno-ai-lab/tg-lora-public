@@ -2,7 +2,7 @@
        smoke smoke-tg smoke-bl \
        train-baseline train-tg-lora train-tg-lora-optreuse train-tg-lora-prefix \
        eval eval-lora eval-downstream eval-downstream-mlx eval-llm-jp-eval-mlx eval-mlx eval-base eval-35b-base eval-35b-ckpt \
-       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize freeze-validloss-ci-9b freeze-replay \
+       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize freeze-validloss-ci-9b freeze-validloss-ci-9b-generalization freeze-validloss-ci-9b-baseline freeze-replay \
 
 	compare compare-prefix compare-prefix-cold compare-prefix-warm compare-prefix-coldwarm compare-report paper-memory paper-memory-dry-run paper-memory-one-shot paper-memory-compare-modes paper-memory-all-modes paper-memory-evaluate-gates paper-memory-external-eval paper-memory-frontier-sweep paper-memory-cache-ablation cosine-n-ablation cosine-n-ablation-dry-run cosine-n-skip-ablation cosine-n-skip-ablation-dry-run precompute-prefix-cache ablation sweep accel-sweep \
 	bench-optimizer bench-prefix-cache bench-prefix-cache-one-shot analyze-prefix-break-even analyze-prefix-break-even-ci bench-velocity-ops bench-velocity-ops-ci bench-velocity-ops-save-baseline \
@@ -904,6 +904,27 @@ FREEZE_9B_GEN_FLAGS ?= --seq-len 1024 --total-steps 96 --warmup-steps 12 --depth
 
 freeze-validloss-ci-9b-generalization: ## GOAL §4 real-9B A/B in a GENERALIZATION regime (2-epoch; memorization-robustness arm)
 	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_GEN_FLAGS) --json --output tests/fixtures/freeze_validloss_ci_9b_generalization.json
+
+# FULL-BACKPROP BASELINE arm of the real 9B §4 A/B — GOAL §4 line 247's OTHER
+# success axis. The surrogate/direction/generalization deposits above are all
+# freeze-vs-freeze (candidate output-first vs random surrogate vs input-side
+# control); none compares against a NO-FREEZE full-backprop baseline. §4 line
+# 247 requires "valid_loss degradation within tolerance of FULL backprop" — a
+# condition the freeze-vs-freeze verdicts cannot speak to. This target adds a
+# depth=0 baseline arm (every active-scope layer trained on full CE throughout;
+# max_depth=0 plans zero freezes) alongside candidate+surrogate+control in the
+# SAME generalization regime (48 train / 96 step / 2 epoch), so the deposit
+# carries a single-session candidate-vs-baseline CI (the §4 line-247 axis) PLUS
+# the existing candidate-vs-surrogate and direction verdicts for a complete
+# 4-arm ranking. Verdict reading: SURPASSES (candidate < baseline — method beats
+# full backprop) / TIES (within tolerance — quality maintained, the §4 target) /
+# UNDERSHOOTS (candidate > baseline — freezing cost quality at this budget).
+# Still reduced-budget (96 < max_steps=1500) and honest about it.
+# Needs a torch+bnb+GPU interpreter: PYTHON_VENV=/path/to/torch-python make freeze-validloss-ci-9b-baseline
+FREEZE_9B_BASELINE_FLAGS ?= --seq-len 1024 --total-steps 96 --warmup-steps 12 --depth 3 --spacing 10 --n-candidate 3 --n-surrogate 3 --n-control 3 --n-baseline 3 --train-examples 48 --valid-examples 32 --max-dataset-rows 600
+
+freeze-validloss-ci-9b-baseline: ## GOAL §4 real-9B A/B + FULL-BACKPROP baseline (candidate vs no-freeze; §4 line-247 axis)
+	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_BASELINE_FLAGS) --json --output tests/fixtures/freeze_validloss_ci_9b_baseline.json
 
 # The apparatus order-resolution diagnostic. Variance-decomposes the proxy's
 # final valid_loss into a Var(order) signal (distinct freeze orders at a fixed

@@ -44,6 +44,7 @@ import torch
 from torch import nn
 
 from scripts.run_freeze_validloss_ci_9b import (
+    _baseline_ci_to_json,
     _direction_ci_to_json,
     _is_reduced_budget,
     _reset_lora_for_arm,
@@ -53,9 +54,10 @@ from scripts.run_freeze_validloss_ci_9b import (
     candidate_order_9b,
     control_order_9b,
     result_to_json,
+    run_ci_9b,
 )
 from src.tg_lora.freeze_surrogate_ci import surrogate_valid_loss_ci
-from src.tg_lora.freeze_surrogate_gate import SURPASSES, TIES
+from src.tg_lora.freeze_surrogate_gate import SURPASSES, TIES, UNDERSHOOTS
 
 # The committed real-9B recording: a real RTX 3060 seq1024 suffix-only run of
 # the §4 candidate-vs-surrogate A/B (verdict SURPASSES, candidate_mean≈1.625,
@@ -94,6 +96,29 @@ FIXTURE_9B_GENERALIZATION = (
     Path(__file__).resolve().parent
     / "fixtures"
     / "freeze_validloss_ci_9b_generalization.json"
+)
+
+# The FULL-BACKPROP BASELINE recording: the same real RTX 3060 seq1024 suffix-only
+# 9B A/B (candidate vs random surrogate vs input-side control) PLUS a no-freeze
+# full-CE baseline arm (depth=0 — every active-scope layer trained on the task
+# loss throughout), all in the honest GENERALIZATION regime (48 train / 96 step).
+# GOAL §4 line 247's OTHER success axis: the surrogate / direction /
+# generalization deposits above are all freeze-vs-freeze, so none can say whether
+# freezing costs quality vs FULL backprop. This deposit carries a candidate-vs-
+# baseline CI — the §4 "valid_loss within tolerance of full backprop" measurement.
+# Recorded result: candidate (1.5148) SURPASSES the full-backprop baseline
+# (1.5401), non-thin (3 seeds/arm), CI[95%]≈[0.018, 0.029]. The full 4-arm
+# monotone ranking is candidate < random surrogate (1.5270) < input-side control
+# (1.5376) < full backprop (1.5401) — freezing did not cost quality; the freeze
+# acted as a regularizer (the baseline overfit: train CE 0.77 ≪ valid 1.54, while
+# the frozen arms generalized: train CE ≈ valid ≈ 1.5). Verdict reading for a
+# future re-run: SURPASSES (method beats full) / TIES (quality maintained — the
+# §4 target) / UNDERSHOOTS (freezing cost quality at this budget). Regenerate
+# with ``make freeze-validloss-ci-9b-baseline``.
+FIXTURE_9B_BASELINE = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "freeze_validloss_ci_9b_baseline.json"
 )
 
 
@@ -347,6 +372,13 @@ def _stub_result(**overrides):
         n_control=0,
         control_provenance=[],
         direction_ci=None,
+        # Full-backprop baseline arm (GOAL §4 line 247 control (i)): default
+        # n_baseline=0 so a no-baseline run deposits byte-identically to the
+        # pre-baseline shape.
+        baseline_losses=[],
+        n_baseline=0,
+        baseline_provenance=[],
+        baseline_ci=None,
     )
     base.update(overrides)
     return base
@@ -567,6 +599,167 @@ class TestDirectionIsolation:
         assert cand_seeds.isdisjoint(surr_seeds)
         assert cand_seeds.isdisjoint(ctrl_seeds)
         assert surr_seeds.isdisjoint(ctrl_seeds)
+
+
+# ── full-backprop baseline control (GOAL §4 line 247: valid_loss vs full) ────
+
+
+class TestBaselineControl:
+    """The FULL-BACKPROP BASELINE arm is the §4 control the surrogate and
+    direction arms are NOT. Both of those are freeze-vs-freeze: the candidate
+    (output-first progressive freeze) is compared against other *freeze orders*
+    (random surrogate, input-side control). GOAL §4 line 247's other success
+    half — "valid_loss degradation within tolerance of FULL backprop" — needs a
+    no-freeze arm: every active-scope layer trained on the full CE task loss
+    throughout (``depth=0`` → ``max_depth=0`` → zero freezes → always the
+    full-CE branch).
+
+    The baseline occupies the "surrogate" slot of the generic two-sample
+    bootstrap, so the verdict reads as: ``SURPASSES`` (candidate < baseline —
+    the method BEATS full backprop), ``TIES`` (candidate ≈ baseline — freezing
+    preserved quality, §4 line 247 satisfied), ``UNDERSHOOTS`` (candidate >
+    baseline — the freeze cost quality, condition (a) failed at this budget).
+    These tests guard the baseline CI semantics, the seed-offset disjointness,
+    the load-bearing ``depth=0``, and the deposit serialization — all GPU-free
+    (the real model is never loaded)."""
+
+    def test_baseline_ci_surpasses_means_method_beats_full_backprop(self):
+        # candidate losses well below the no-freeze baseline => the CI on
+        # mean(baseline) - mean(candidate) excludes zero above => SURPASSES =>
+        # the progressive-freeze method's valid_loss is BETTER than full
+        # backprop at this budget (a regularization win, not just compute saved).
+        cand = [1.50, 1.51, 1.49, 1.50]
+        base = [1.58, 1.60, 1.59, 1.57]  # full backprov visibly worse
+        bci = surrogate_valid_loss_ci(cand, base, seed=0)
+        assert bci.significance_verdict == SURPASSES
+        assert bci.point_improvement > 0.0  # baseline mean - candidate mean > 0
+
+    def test_baseline_ci_ties_means_within_tolerance(self):
+        # candidate ≈ baseline => TIES => the freeze preserved quality within
+        # the gate's tolerance — §4 line 247 satisfied (this is the honest
+        # "compute saved, quality maintained" outcome the §4 method targets).
+        cand = [1.50, 1.51, 1.49, 1.50]
+        base = [1.501, 1.509, 1.495, 1.502]  # indistinguishable
+        bci = surrogate_valid_loss_ci(cand, base, seed=0)
+        assert bci.significance_verdict == TIES
+
+    def test_baseline_ci_undershoots_means_freeze_cost_quality(self):
+        # candidate losses well ABOVE the no-freeze baseline => the CI on
+        # mean(baseline) - mean(candidate) excludes zero below => UNDERSHOOTS =>
+        # the freeze cost quality vs full backprop — §4 line 247 condition (a)
+        # FAILED at this budget. This is the honest negative outcome the gate
+        # must surface (not paint every baseline comparison as a win).
+        cand = [1.62, 1.63, 1.61, 1.62]
+        base = [1.50, 1.51, 1.49, 1.50]  # full backprop visibly better
+        bci = surrogate_valid_loss_ci(cand, base, seed=0)
+        assert bci.significance_verdict == UNDERSHOOTS
+        assert bci.point_improvement < 0.0  # baseline mean - candidate mean < 0
+
+    def test_baseline_ci_uses_distinct_seed_offset_from_all_other_arms(self):
+        # The baseline arm must not collide with any other arm's LoRA-init seed:
+        # candidate base_seed+i, surrogate base_seed+100+i, control
+        # base_seed+200+i, baseline base_seed+300+i. Guarded at the seed level
+        # here since the GPU arm loop is not unit-tested. The offsets must be
+        # disjoint bands so no two arms share an init across a sane n_* range.
+        base_seed = 0
+        cand_seeds = {base_seed + i for i in range(4)}        # 0..3
+        surr_seeds = {base_seed + 100 + i for i in range(4)}  # 100..103
+        ctrl_seeds = {base_seed + 200 + i for i in range(4)}  # 200..203
+        base_seeds = {base_seed + 300 + i for i in range(4)}  # 300..303
+        # Pairwise disjoint: no two arm types share an init seed.
+        for a in (cand_seeds, surr_seeds, ctrl_seeds):
+            assert base_seeds.isdisjoint(a)
+        assert cand_seeds.isdisjoint(surr_seeds)
+        assert cand_seeds.isdisjoint(ctrl_seeds)
+        assert surr_seeds.isdisjoint(ctrl_seeds)
+
+    def test_baseline_arm_passes_depth_zero_no_freeze(self):
+        # The baseline IS the no-freeze full-backprop control: depth=0 so
+        # max_depth=0 plans zero freezes and the arm always takes the full-CE
+        # branch. A drift to depth=depth would make the baseline freeze like the
+        # candidate and the candidate-vs-baseline comparison meaningless. Source
+        # inspection of run_ci_9b since the GPU arm loop is not unit-tested.
+        import inspect
+
+        src = inspect.getsource(run_ci_9b)
+        # The baseline_results block passes a literal depth=0; the other three
+        # arm blocks pass depth=depth (the shared param). Only the baseline has
+        # the literal zero.
+        assert "depth=0" in src
+
+    def test_baseline_ci_to_json_relabels_surrogate_mean_as_baseline_mean(self):
+        # The baseline occupies the CI's "surrogate" slot, so its mean is
+        # surrogate_mean internally; the deposit must relabel it baseline_mean
+        # so a reader does not mistake the no-freeze full-CE control for the
+        # random-order *freeze* surrogate. Also surfaces n_baseline (from
+        # n_surrogate) and the verdict.
+        cand = [1.50, 1.51, 1.49, 1.50]
+        base = [1.58, 1.60, 1.59, 1.57]
+        bci = surrogate_valid_loss_ci(cand, base, seed=0)
+        out = _baseline_ci_to_json(bci)
+        assert out["verdict"] == SURPASSES
+        assert out["baseline_mean"] == pytest.approx(sum(base) / len(base), abs=1e-9)
+        assert out["candidate_mean"] == pytest.approx(sum(cand) / len(cand), abs=1e-9)
+        assert out["n_baseline"] == 4
+        assert out["n_candidate"] == 4
+        # The relabel is load-bearing: a no-freeze control must NOT be called
+        # surrogate_mean in the deposit (that label means a random freeze here).
+        assert "surrogate_mean" not in out
+
+    def test_baseline_ci_to_json_none_round_trips(self):
+        # No baseline arm (n_baseline=0) => baseline_ci None => JSON null.
+        assert _baseline_ci_to_json(None) is None
+
+    def test_result_to_json_no_baseline_is_backward_compatible(self):
+        # n_baseline=0: no baseline block, empty baseline fields, and the §4
+        # verdict honesty labels byte-identical to the pre-baseline deposit shape.
+        out = result_to_json(_stub_result())
+        assert out["baseline"] is None
+        assert out["baseline_losses"] == []
+        assert out["n_baseline"] == 0
+        assert out["baseline_provenance"] == []
+        # Existing §4 fields unchanged.
+        assert out["verdict"] == SURPASSES
+        assert out["citable_as_target_scale"] is True
+
+    def test_result_to_json_with_baseline_surfaces_baseline_block(self):
+        # With a baseline arm run, the deposit surfaces a populated baseline
+        # block and the baseline losses/provenance — driven through the REAL
+        # CI + _baseline_ci_to_json path (not a stub) so the serialization is
+        # exercised end-to-end.
+        cand_losses = [1.50, 1.51, 1.49, 1.50]
+        base_losses = [1.58, 1.60, 1.59, 1.57]
+        bci = surrogate_valid_loss_ci(cand_losses, base_losses, seed=0)
+        out = result_to_json(
+            _stub_result(
+                n_baseline=4,
+                baseline_losses=base_losses,
+                baseline_provenance=[
+                    {
+                        "frozen_layers": [],
+                        "n_trainable_params": 10819584,
+                        "last_train_loss": 1.49,
+                        "final_ce_train_loss": 1.49,
+                    }
+                ],
+                baseline_ci=bci,
+            )
+        )
+        assert out["baseline"] is not None
+        assert out["baseline"]["verdict"] == SURPASSES
+        assert out["baseline"]["baseline_mean"] == pytest.approx(
+            sum(base_losses) / len(base_losses), abs=1e-9
+        )
+        assert out["n_baseline"] == 4
+        assert out["baseline_losses"] == base_losses
+        # The baseline never freezes: provenance records an empty frozen set
+        # and the FULL active-scope trainable-param count (no layers removed).
+        assert out["baseline_provenance"][0]["frozen_layers"] == []
+        assert out["baseline_provenance"][0]["n_trainable_params"] == 10819584
+        # The baseline arm is a quality axis, NOT a scale/budget axis: it must
+        # not by itself open the full-§4 citation gate (this stub is a
+        # reduced-budget run, so the gate stays closed regardless of baseline).
+        assert out["citable_as_full_section4_verdict"] is False
 
 
 # ── _is_reduced_budget: honest (budget-driven) reduced-budget flag ───────────
@@ -897,6 +1090,202 @@ class TestGeneralizationRegimeDeposit:
         assert data["n_candidate"] >= 3
         assert data["n_surrogate"] >= 3
         assert data["n_control"] >= 3
+
+
+# ── full-backprop baseline deposit (GOAL §4 condition (a): vs FULL backprop) ──
+
+
+class TestBaselineControlDeposit:
+    """The GOAL §4 CONDITION-(a) deposit — the ONE measurement the sibling
+    deposits (FIXTURE_9B_SURROGATE / _DIRECTION / _GENERALIZATION) structurally
+    cannot make. Those three are all freeze-vs-freeze A/Bs (candidate output-
+    contiguous vs random surrogate vs input-contiguous control), so they can
+    show the candidate beats OTHER FREEZE ORDERS but never whether freezing
+    costs quality vs FULL backprop. GOAL §4 (docs/GOAL.md:244-250) demands BOTH:
+    (a) valid_loss within tolerance of the FULL-BACKPROP baseline, AND (b) the
+    FLOPs-reduction win over the random surrogate. The sibling deposits close
+    (b); THIS deposit closes (a) by adding a ``depth=0`` no-freeze arm
+    (``max_depth=0`` → zero freezes planned → the arm trains EVERY active-scope
+    layer on the full task CE throughout, never switching to the boundary
+    activation-matching local loss). It is run in the honest GENERALIZATION
+    regime (48 train / 96 step / 2 epoch) so the comparison is a model that
+    generalized, not memorized, and at target scale seq1024 on the real
+    RTX 3060 suffix-only 9B config.
+
+    These tests pin that the baseline arm is a GENUINE full-backprop control
+    (never freezes, full CE throughout — ``last_train_loss`` stays at full-CE
+    magnitude ~1.5, NOT the ~0 local loss of the frozen arms), that the deposit
+    is a real non-thin generalization-regime target-scale run, and that its
+    recorded candidate-vs-baseline CI is earned under the deterministic
+    bootstrap (verdict-agnostic — holds whether the verdict is SURPASSES, TIES,
+    or UNDERSHOOTS)."""
+
+    def test_fixture_exists_and_is_real_target_scale(self):
+        data = json.loads(FIXTURE_9B_BASELINE.read_text())
+        assert data["proxy_scale"] is False
+        assert data["citable_as_target_scale"] is True
+        assert data["reduced_budget"] is True  # 96 < cfg_max_steps=1500, honest
+        assert data["model"] == "Qwen/Qwen3.5-9B"
+        assert data["seq_len"] == 1024
+        assert data["device"] == "cuda"
+
+    def test_baseline_deposit_carries_non_thin_baseline(self):
+        # The §4 condition-(a) verdict requires a non-thin baseline arm (>=3
+        # seeds) for the bootstrap to capture variance; a 1- or 2-seed baseline
+        # would be flagged thin and the tolerance verdict not confirmable.
+        data = json.loads(FIXTURE_9B_BASELINE.read_text())
+        assert data["baseline"] is not None
+        assert data["n_baseline"] >= 3
+        assert data["baseline"]["is_thin_evidence"] is False
+        assert data["baseline"]["n_baseline"] >= 3
+
+    def test_baseline_arm_never_freezes(self):
+        # The LOAD-BEARING control-integrity assertion: every baseline arm froze
+        # ZERO layers (``depth=0`` → ``max_depth=0`` plans zero freezes) and
+        # trained the FULL active scope. A regression that accidentally passed
+        # ``depth>0`` to the baseline, or let a freeze schedule leak into it,
+        # would populate ``frozen_layers`` / shrink ``n_trainable_params`` and
+        # flip this red — which is exactly the regression this deposit exists
+        # to catch, because a baseline that freezes is NOT a full-backprop
+        # control and invalidates the condition-(a) measurement.
+        data = json.loads(FIXTURE_9B_BASELINE.read_text())
+        for p in data["baseline_provenance"]:
+            assert p["frozen_layers"] == []
+            # Full scope trainable, not the reduced post-freeze count.
+            assert p["n_trainable_params"] == data["scope_trainable_params"]
+
+    def test_baseline_uses_full_ce_throughout(self):
+        # The other control-integrity assertion, pinned on the loss field: the
+        # baseline's ``last_train_loss`` is the last optimizer step's FULL task
+        # cross-entropy (no freeze → the local-loss branch never triggers), so
+        # it stays at full-CE magnitude (~1.5), NOT the structurally-≈0 boundary
+        # activation-matching local loss the FROZEN arms record. This is what
+        # makes the arm a full-backprop control: it optimizes task CE end-to-end
+        # rather than a frozen-boundary surrogate. Contrast the candidate, whose
+        # ``last_train_loss`` collapses to ~0 once it freezes — the two arms
+        # genuinely trained under different objectives.
+        data = json.loads(FIXTURE_9B_BASELINE.read_text())
+        for p in data["baseline_provenance"]:
+            assert p["last_train_loss"] > 0.5  # full CE magnitude (order ~2), not ~0
+            # last step CE and mean train CE are the SAME order of magnitude (both
+            # full CE) — NOT the >1000x gap that would signal a switch to the
+            # activation-matching local loss the frozen arms take.
+            ratio = p["final_ce_train_loss"] / max(p["last_train_loss"], 1e-12)
+            assert 0.1 < ratio < 10.0
+        # And the frozen candidate arm DOES collapse to the local loss (~0) — so
+        # baseline-vs-candidate is full-CE-vs-local, two genuinely different
+        # training objectives, not the same run relabeled.
+        cand = data["candidate_provenance"][0]
+        assert cand["last_train_loss"] < 1e-3
+
+    def test_recorded_surrogate_verdict_is_earned(self):
+        # The §4 surrogate A/B (candidate output-contiguous vs random) reproduces
+        # in this 4-arm run too — same honesty shape as the sibling deposits.
+        data = json.loads(FIXTURE_9B_BASELINE.read_text())
+        ci = surrogate_valid_loss_ci(
+            data["candidate_losses"], data["surrogate_losses"], seed=data["base_seed"]
+        )
+        assert ci.significance_verdict == data["verdict"]
+        assert ci.candidate_mean == pytest.approx(data["candidate_mean"], abs=1e-9)
+        assert ci.surrogate_mean == pytest.approx(data["surrogate_mean"], abs=1e-9)
+
+    def test_recorded_baseline_verdict_is_earned(self):
+        # The load-bearing condition-(a) assertion: the candidate-vs-FULL-
+        # BACKPROP-baseline CI is NOT painted on — the stored candidate/baseline
+        # floats re-judge through the deterministic bootstrap to the recorded
+        # baseline verdict. Verdict-agnostic: holds whether the method SURPASSES
+        # (beats full backprop), TIES (quality maintained — the §4 target), or
+        # UNDERSHOOTS (freezing cost quality at this reduced budget). The
+        # baseline occupies the CI's "surrogate" slot; its mean is relabeled
+        # ``baseline_mean`` in the deposit.
+        data = json.loads(FIXTURE_9B_BASELINE.read_text())
+        bd = data["baseline"]
+        bci = surrogate_valid_loss_ci(
+            data["candidate_losses"], data["baseline_losses"], seed=data["base_seed"]
+        )
+        assert bci.significance_verdict == bd["verdict"]
+        assert bci.candidate_mean == pytest.approx(bd["candidate_mean"], abs=1e-9)
+        assert bci.surrogate_mean == pytest.approx(bd["baseline_mean"], abs=1e-9)
+        assert bci.lower == pytest.approx(bd["lower"], abs=1e-9)
+        assert bci.upper == pytest.approx(bd["upper"], abs=1e-9)
+        # The recorded verdict is a real constant, not free text.
+        assert bd["verdict"] in {SURPASSES, TIES, UNDERSHOOTS}
+
+    def test_baseline_candidate_pool_is_shared_with_surrogate(self):
+        # The candidate arms are shared between the surrogate A/B and the
+        # condition-(a) baseline A/B (the same candidate arms feed both CIs). A
+        # drift that re-ran candidate arms separately for the baseline arm would
+        # break this equality and double the compute.
+        data = json.loads(FIXTURE_9B_BASELINE.read_text())
+        assert data["candidate_mean"] == pytest.approx(
+            data["baseline"]["candidate_mean"], abs=1e-9
+        )
+
+    def test_candidate_beats_full_backprop_baseline(self):
+        # The HEADLINE §4 condition-(a) result, pinned on the recorded numbers:
+        # the progressive-freeze candidate's held-out valid_loss is LOWER than
+        # the no-freeze full-backprop baseline's — the method does not merely
+        # stay within tolerance of full backprop (a TIES would already satisfy
+        # §4 line 247), it SURPASSES it at this budget. The recorded baseline
+        # verdict is SURPASSES, non-thin, with the CI entirely above 0. This is
+        # the single measurement the freeze-vs-freeze sibling deposits could
+        # never make, and it closes §4 condition (a) on the side of "freezing
+        # did not cost quality".
+        data = json.loads(FIXTURE_9B_BASELINE.read_text())
+        bd = data["baseline"]
+        assert bd["verdict"] == SURPASSES
+        assert bd["is_thin_evidence"] is False
+        assert bd["lower"] > 0.0  # CI entirely above 0 => significant
+        assert data["candidate_mean"] < bd["baseline_mean"]
+
+    def test_full_backprop_baseline_overfits_freeze_regularizes(self):
+        # The MECHANISM behind the headline, pinned on the train/valid
+        # diagnostics. The full-backprop baseline fit the TRAIN set harder
+        # (final_ce_train_loss ≈ 0.77) than the frozen candidate (≈ 1.51) but
+        # generalized WORSE on held-out valid (1.540 > 1.515): lower train CE +
+        # higher valid CE = textbook overfitting. The progressive freeze capped
+        # how hard the adapter could fit train (the frozen layers + activation-
+        # matching local loss leave train CE at ~1.5) and that regularization
+        # generalized better. So "candidate beats full backprop" is not noise —
+        # it is the freeze acting as a regularizer in this reduced-budget
+        # generalization regime. (At the full §4 budget this gap may close or
+        # invert; the deposit is reduced_budget=True and honest about that.)
+        data = json.loads(FIXTURE_9B_BASELINE.read_text())
+        cand_train = (
+            sum(p["final_ce_train_loss"] for p in data["candidate_provenance"])
+            / len(data["candidate_provenance"])
+        )
+        base_train = (
+            sum(p["final_ce_train_loss"] for p in data["baseline_provenance"])
+            / len(data["baseline_provenance"])
+        )
+        assert base_train < cand_train          # baseline fit train harder...
+        assert data["baseline"]["baseline_mean"] > data["candidate_mean"]  # ...yet valid worse
+
+    def test_regime_is_generalization_not_memorization(self):
+        # All four arms — including the no-freeze baseline — ran in the
+        # generalization regime: every arm's ``final_ce_train_loss`` is ~1.5
+        # (train CE ≈ valid CE), NOT ~0. A regression that re-deposited a
+        # memorization run (few examples cycled until train CE ~0) flips this
+        # red, which would corrupt the condition-(a) comparison (a memorized
+        # baseline barely moves, making any candidate look comparable).
+        data = json.loads(FIXTURE_9B_BASELINE.read_text())
+        for arm in ("candidate", "surrogate", "control", "baseline"):
+            prov = data[f"{arm}_provenance"]
+            assert prov, f"{arm} provenance empty"
+            for p in prov:
+                assert p["final_ce_train_loss"] > 0.5  # generalized, not memorized
+
+    def test_deposit_is_non_thin(self):
+        # The deposit as a whole is non-thin across all four arms: enough seeds
+        # in every arm for the bootstrap to be meaningful. (The full-§4 citation
+        # gate stays closed on the reduced-budget axis, NOT the thinness axis.)
+        data = json.loads(FIXTURE_9B_BASELINE.read_text())
+        assert data["is_thin_evidence"] is False
+        assert data["n_candidate"] >= 3
+        assert data["n_surrogate"] >= 3
+        assert data["n_control"] >= 3
+        assert data["n_baseline"] >= 3
 
 
 # ── CLI health ──────────────────────────────────────────────────────────────

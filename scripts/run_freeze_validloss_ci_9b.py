@@ -519,6 +519,7 @@ def run_ci_9b(
     max_dataset_rows: int,
     use_local_loss: bool = True,
     n_control: int = 0,
+    n_baseline: int = 0,
 ) -> dict:
     """Run the real-9B candidate+surrogate sweep and return the §4 verdict dict.
 
@@ -537,6 +538,21 @@ def run_ci_9b(
     held fixed — to attribute the surrogate verdict to the output-side
     direction (constitution P0). ``n_control=0`` (default) runs no control and
     the §4 surrogate verdict is byte-identical to before.
+
+    ``n_baseline > 0`` adds the GOAL §4 **full-backprop baseline** arm and a
+    ``baseline_ci`` that compares candidate (output-first progressive freeze +
+    activation-matching boundary loss) vs baseline (no freeze at all — every
+    active-scope layer trained on the full CE task loss throughout). This is
+    §4's other success axis: the surrogate verdict above is "the output-side
+    order beats a random order" (does the schedule matter?); the baseline
+    verdict is "the method's valid_loss stays within tolerance of full
+    backprop" (GOAL §4 line 247 — does freezing cost quality?). The baseline
+    arm reuses :func:`arm_valid_loss_9b` with ``depth=0`` (``max_depth=0`` →
+    the schedule plans zero freezes → ``frozen_layers`` stays empty → the arm
+    always takes the full-CE branch), so the full-backprop control runs through
+    the identical training path as the candidate, varying only the freeze.
+    ``n_baseline=0`` (default) runs no baseline and the deposit is byte-identical
+    to before.
     """
     scope_label = cfg.training.get("trainable_lora_scope", "all")
     logger.info("Loading tokenizer + model for %s ...", cfg.model.name_or_path)
@@ -618,6 +634,28 @@ def run_ci_9b(
             for i in range(n_control)
         ]
         control_losses = [v for v, _ in control_results]
+        # FULL-BACKPROP BASELINE arm (GOAL §4 line 247 control (i)): no freeze
+        # at all — ``depth=0`` so ``max_depth=0`` plans zero freezes and the arm
+        # always takes the full-CE branch. Every active-scope layer trains on the
+        # task loss throughout. This is the "valid_loss vs full backprop"
+        # success axis the surrogate verdict does NOT measure (the surrogate is a
+        # random-order freeze, itself a freeze). Distinct seed offset
+        # (base_seed + 300) so the baseline's LoRA init never collides with
+        # candidate (base_seed + i) / surrogate (base_seed + 100 + i) / control
+        # (base_seed + 200 + i). The ``order`` arg is inert at depth=0 (nothing
+        # is scheduled to freeze); the scope order is passed for a valid,
+        # non-empty convergence_order vector the config validator accepts.
+        baseline_results = [
+            arm_valid_loss_9b(
+                model, tuple(scope_sorted), base_seed + 300 + i, scope=scope_label,
+                active_indices=active_indices,
+                train_batches=train_batches, valid_batches=valid_batches, device=device,
+                total_steps=total_steps, warmup_steps=warmup_steps, depth=0,
+                spacing=spacing, lr=lr, use_local_loss=use_local_loss,
+            )
+            for i in range(n_baseline)
+        ]
+        baseline_losses = [v for v, _ in baseline_results]
     finally:
         del model
         gc.collect()
@@ -635,6 +673,17 @@ def run_ci_9b(
     direction_ci = (
         surrogate_valid_loss_ci(candidate_losses, control_losses, seed=base_seed)
         if control_losses
+        else None
+    )
+    # Full-backprop baseline CI (GOAL §4 line 247): candidate (progressive
+    # freeze + activation matching) vs baseline (no freeze, full CE). The
+    # baseline occupies the "surrogate" slot of the generic two-sample
+    # bootstrap, so its mean is ``surrogate_mean`` internally and relabeled
+    # ``baseline_mean`` in the deposit (mirrors the direction arm's
+    # control_mean relabel). None when no baseline arm ran (n_baseline=0).
+    baseline_ci = (
+        surrogate_valid_loss_ci(candidate_losses, baseline_losses, seed=base_seed)
+        if baseline_losses
         else None
     )
     return {
@@ -678,6 +727,17 @@ def run_ci_9b(
         "n_control": n_control,
         "control_provenance": [p for _, p in control_results],
         "direction_ci": direction_ci,
+        # Full-backprop baseline arm (GOAL §4 line 247 control (i)). Empty /
+        # None-valued when n_baseline=0, so a no-baseline run deposits
+        # byte-identically to before. When present, ``baseline`` is the
+        # candidate (progressive freeze) vs baseline (no freeze, full CE) CI —
+        # §4's "valid_loss within tolerance of full backprop" axis. The baseline
+        # never freezes, so there is no freeze order to record (baseline_order
+        # is the empty list, not a meaningful vector).
+        "baseline_losses": baseline_losses,
+        "n_baseline": n_baseline,
+        "baseline_provenance": [p for _, p in baseline_results],
+        "baseline_ci": baseline_ci,
     }
 
 
@@ -736,6 +796,16 @@ def result_to_json(result: dict) -> dict:
         "n_control": result["n_control"],
         "control_provenance": result["control_provenance"],
         "direction": _direction_ci_to_json(result["direction_ci"]),
+        # Full-backprop baseline arm (GOAL §4 line 247 control (i)): the
+        # candidate-vs-full-backprop CI. Empty / None-valued when n_baseline=0,
+        # so a no-baseline run deposits byte-identically to before. When
+        # present, ``baseline`` is the §4 "valid_loss within tolerance of full
+        # backprop" axis — the success half the surrogate/direction verdicts
+        # (themselves freeze-vs-freeze) do not measure.
+        "baseline_losses": result["baseline_losses"],
+        "n_baseline": result["n_baseline"],
+        "baseline_provenance": result["baseline_provenance"],
+        "baseline": _baseline_ci_to_json(result["baseline_ci"]),
         # Machine-readable citation gate: a run is the full §4 verdict ONLY when
         # it is target-scale (not proxy), full-budget (reached config max_steps,
         # not reduced), AND non-thin (enough seeds for the bootstrap to capture
@@ -774,6 +844,39 @@ def _direction_ci_to_json(direction_ci) -> dict | None:
         "is_thin_evidence": direction_ci.is_thin_evidence,
         "n_candidate": direction_ci.n_candidate,
         "n_control": direction_ci.n_surrogate,
+    }
+
+
+def _baseline_ci_to_json(baseline_ci) -> dict | None:
+    """Serialize the full-backprop baseline CI (or ``None``) for the deposit.
+
+    ``baseline_ci`` reuses :func:`surrogate_valid_loss_ci` with the no-freeze
+    full-CE baseline arm in the "surrogate" slot, so its
+    :attr:`~SurrogateValidLossCI.surrogate_mean` is the baseline mean — relabeled
+    ``baseline_mean`` here so the deposit reads honestly (a full-backprop
+    control must not be called a "surrogate", which on this deposit means a
+    random-order *freeze*). ``None`` (no baseline arm ran, ``n_baseline=0``)
+    round-trips as JSON ``null``.
+
+    Verdict reading for §4 line 247 (valid_loss within tolerance of full
+    backprop): ``SURPASSES`` (candidate < baseline) or ``TIES`` (candidate ≈
+    baseline) satisfies "within tolerance"; ``UNDERSHOOTS`` (candidate > baseline
+    beyond tolerance) means the freeze cost quality — condition (a) failed at
+    this budget.
+    """
+    if baseline_ci is None:
+        return None
+    return {
+        "verdict": baseline_ci.significance_verdict,
+        "candidate_mean": baseline_ci.candidate_mean,
+        "baseline_mean": baseline_ci.surrogate_mean,
+        "point_improvement": baseline_ci.point_improvement,
+        "lower": baseline_ci.lower,
+        "upper": baseline_ci.upper,
+        "confidence": baseline_ci.confidence,
+        "is_thin_evidence": baseline_ci.is_thin_evidence,
+        "n_candidate": baseline_ci.n_candidate,
+        "n_baseline": baseline_ci.n_surrogate,
     }
 
 
@@ -827,6 +930,37 @@ def format_report_9b(result: dict) -> str:
             "    note: this ATTRIBUTES the §4 surrogate SURPASSES above. "
             "SURPASSES here => the output-side DIRECTION matters (not just "
             "contiguity); TIES => contiguity, not direction, earned the lead."
+        )
+    # Full-backprop baseline block (GOAL §4 line 247): only when a baseline arm
+    # ran. The candidate (progressive freeze + activation matching) vs the
+    # no-freeze full-CE baseline — the "valid_loss within tolerance of full
+    # backprop" success axis. The baseline occupies the CI's "surrogate" slot,
+    # so its mean is labeled baseline_mean here.
+    if result.get("baseline_ci") is not None:
+        bci = result["baseline_ci"]
+        lines += [
+            "",
+            "  full_backprop_baseline — candidate (progressive freeze) vs "
+            "baseline (no freeze, full CE); the §4 line-247 "
+            "'valid_loss within tolerance of full backprop' axis:",
+            f"    candidate_mean={bci.candidate_mean:.6f} vs "
+            f"baseline_mean={bci.surrogate_mean:.6f}  "
+            f"point={bci.point_improvement:.6f} "
+            f"ci[{bci.confidence:.0%}]=[{bci.lower:.6f}, {bci.upper:.6f}]  "
+            f"verdict={bci.significance_verdict}",
+            f"    baseline valid_loss samples: "
+            f"{[round(v, 6) for v in result['baseline_losses']]}",
+        ]
+        if bci.is_thin_evidence:
+            lines.append(
+                "    note: THIN_EVIDENCE — the baseline CI has <3 seeds in an "
+                "arm; do not read the baseline verdict as confirmed."
+            )
+        lines.append(
+            "    note: this is the OTHER §4 axis from the surrogate/direction "
+            "verdicts above (those are freeze-vs-freeze). SURPASSES or TIES "
+            "here => freezing did NOT cost quality vs full backprop (§4 line "
+            "247 satisfied); UNDERSHOOTS => it did, at this budget."
         )
     # Honesty notes are flag-driven so the report never contradicts the
     # machine-readable labels (a hardcoded "reduced" string would lie about a
@@ -890,6 +1024,18 @@ def build_parser() -> argparse.ArgumentParser:
             "non-thin direction verdict."
         ),
     )
+    p.add_argument(
+        "--n-baseline", type=int, default=0,
+        help=(
+            "FULL-BACKPROP BASELINE arm seeds: run a no-freeze full-CE baseline "
+            "(depth=0) alongside candidate+surrogate+control and emit a "
+            "candidate-vs-baseline CI (the §4 line-247 'valid_loss within "
+            "tolerance of full backprop' axis — the success half the "
+            "freeze-vs-freeze surrogate/direction verdicts do not measure). "
+            "Default 0 = no baseline (the §4 surrogate verdict is unchanged). "
+            "Set >=3 for a non-thin baseline verdict."
+        ),
+    )
     p.add_argument("--base-seed", type=int, default=DEFAULT_BASE_SEED)
     p.add_argument("--dataset", default=DEFAULT_DATASET)
     p.add_argument("--max-dataset-rows", type=int, default=DEFAULT_MAX_DATASET_ROWS)
@@ -934,6 +1080,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_dataset_rows=args.max_dataset_rows,
         use_local_loss=not args.no_local_loss,
         n_control=args.n_control,
+        n_baseline=args.n_baseline,
     )
 
     payload = (
