@@ -426,10 +426,21 @@ def arm_valid_loss_9b(
         last_loss = float(loss.item())
 
     valid_loss = eval_loss_9b(model, valid_batches)
+    # Mean full-CE over the TRAIN set under the final adapter — the
+    # memorization-vs-generalization diagnostic for the regime the arm ran in.
+    # ``last_train_loss`` above is the last *optimizer step's* loss, which is the
+    # boundary activation-matching local loss once layers are frozen
+    # (structurally ≈0 and not comparable across arms); ``final_ce_train_loss``
+    # is the honest full cross-entropy on the train examples that reveals whether
+    # the regime memorized (train_CE ≈ 0 ≪ valid_loss) or generalized
+    # (train_CE well above 0, comparable to valid_loss). Without it the deposit
+    # cannot tell a memorization-regime verdict from a generalization-regime one.
+    final_ce_train_loss = eval_loss_9b(model, train_batches)
     provenance = {
         "frozen_layers": sorted(ctrl.frozen_layers),
         "n_trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
         "last_train_loss": last_loss,
+        "final_ce_train_loss": final_ce_train_loss,
     }
     # Clear per-arm transient state; the shared model stays loaded for the next arm.
     del opt, trainable, ctrl, loss_fn

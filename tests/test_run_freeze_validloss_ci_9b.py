@@ -79,6 +79,23 @@ FIXTURE_9B_DIRECTION = (
     / "freeze_validloss_ci_9b_direction.json"
 )
 
+# The GENERALIZATION-REGIME recording: the same real RTX 3060 seq1024 suffix-only
+# 9B A/B (candidate vs random surrogate vs input-side control) but run in a
+# regime the LoRA CANNOT memorize — 48 train examples over 96 steps (2 epochs),
+# vs the 8-examples/20-steps MEMORIZATION regime of the two deposits above (whose
+# train CE collapsed to ~0). Here every arm's final_ce_train_loss is ~1.5 (train
+# CE ≈ valid CE), so the verdict is measured on a model that generalized, not
+# memorized. Records BOTH verdicts SURPASSES, non-thin (3 seeds/arm): candidate
+# (1.5152) < random surrogate (1.5270) < input-side control (1.5375) — the same
+# monotone ranking as the memorization regime, so the verdict SURVIVES the regime
+# change (effect size shrinks ~12x; honest regime-dependence, not a re-run).
+# Regenerate with ``make freeze-validloss-ci-9b-generalization``.
+FIXTURE_9B_GENERALIZATION = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "freeze_validloss_ci_9b_generalization.json"
+)
+
 
 # ── stubs ───────────────────────────────────────────────────────────────────
 
@@ -382,6 +399,26 @@ class TestResultToJson:
             "candidate_order",
         ):
             assert key in out
+
+    def test_final_ce_train_loss_passes_through_provenance(self):
+        # The generalization-regime diagnostic (mean full-CE over the train set
+        # under the final adapter) rides in the per-arm provenance dict;
+        # ``result_to_json`` passes provenance through verbatim, so the field
+        # surfaces in the deposit without explicit wiring. It is ADDITIVE — the
+        # legacy ``last_train_loss`` (last optimizer step's loss = boundary local
+        # loss once frozen, structurally ~0) still rides through alongside it, so
+        # the two disambiguate rather than one replacing the other.
+        out = result_to_json(_stub_result(
+            candidate_provenance=[{
+                "frozen_layers": [29, 30, 31],
+                "n_trainable_params": 6787072,
+                "last_train_loss": 0.0002,
+                "final_ce_train_loss": 1.507,
+            }],
+        ))
+        p = out["candidate_provenance"][0]
+        assert p["final_ce_train_loss"] == 1.507
+        assert p["last_train_loss"] == 0.0002
 
 
 # ── direction-isolation control (constitution P0: direction vs contiguity) ───
@@ -725,6 +762,137 @@ class TestDirectionDepositReplayFaithfulness:
         # bootstrap to be meaningful. (The full-§4 citation gate stays closed on
         # the reduced-budget axis, NOT the thinness axis.)
         data = json.loads(FIXTURE_9B_DIRECTION.read_text())
+        assert data["is_thin_evidence"] is False
+        assert data["n_candidate"] >= 3
+        assert data["n_surrogate"] >= 3
+        assert data["n_control"] >= 3
+
+
+# ── generalization-regime deposit (memorization-robustness of the §4 verdict) ─
+
+
+class TestGeneralizationRegimeDeposit:
+    """The §4 verdict's MEMORIZATION-ROBUSTNESS deposit. The sibling deposits
+    (FIXTURE_9B_SURROGATE / _DIRECTION) run in a regime where 8 train examples
+    cycled over 20 steps drive the LoRA's train CE to ~0 — i.e. the model
+    MEMORIZED, so the held-out valid_loss is dominated by the frozen base barely
+    perturbed by an overfit adapter. This deposit re-runs the SAME A/B (candidate
+    vs random surrogate vs input-side control) in a GENERALIZATION regime — 48
+    train examples over 96 steps (2 epochs), where each arm's
+    ``final_ce_train_loss`` is ~1.5 (train CE ≈ valid CE, not ~0) — and asks
+    whether the SURPASSES verdict survives the regime change or was a
+    memorization artifact. The recorded answer: SURVIVES (both verdicts SURPASSES,
+    non-thin, same monotone candidate < surrogate < control ranking), with an
+    honest ~12x smaller effect size. These tests pin that the deposit is a genuine
+    generalization run (the load-bearing ``final_ce_train_loss`` diagnostic) and
+    that its recorded verdicts are earned under the deterministic bootstrap."""
+
+    def test_fixture_exists_and_is_real_target_scale(self):
+        data = json.loads(FIXTURE_9B_GENERALIZATION.read_text())
+        assert data["proxy_scale"] is False
+        assert data["citable_as_target_scale"] is True
+        assert data["citable_as_full_section4_verdict"] is False
+        assert data["reduced_budget"] is True  # 96 < cfg_max_steps=1500, honest
+        assert data["model"] == "Qwen/Qwen3.5-9B"
+        assert data["seq_len"] == 1024
+        assert data["device"] == "cuda"
+
+    def test_regime_is_generalization_not_memorization(self):
+        # The load-bearing regime assertion. ``final_ce_train_loss`` per arm is
+        # the mean full-CE over the TRAIN set under the final adapter — ~1.5
+        # here, NOT ~0. In the memorization-regime deposits the LoRA drove train
+        # CE to ~5e-4 (candidate) / 0.0 (control). A regression that re-deposits
+        # a memorization run (few examples cycled until train CE ~0) flips this
+        # red — which is exactly the regression this deposit exists to catch.
+        data = json.loads(FIXTURE_9B_GENERALIZATION.read_text())
+        for arm in ("candidate", "surrogate", "control"):
+            prov = data[f"{arm}_provenance"]
+            assert prov, f"{arm} provenance empty"
+            for p in prov:
+                assert p["final_ce_train_loss"] > 0.5  # generalized, not memorized
+        # And train CE ≈ valid CE (small train-valid gap) — the signature of
+        # generalization. Memorization would show train ≪ valid (gap ~1.6).
+        cand_train = (
+            sum(p["final_ce_train_loss"] for p in data["candidate_provenance"])
+            / len(data["candidate_provenance"])
+        )
+        assert cand_train == pytest.approx(data["candidate_mean"], abs=0.05)
+
+    def test_final_ce_disambiguates_from_local_last_train_loss(self):
+        # The honesty fix this deposit exercises: ``last_train_loss`` (the last
+        # optimizer step's loss = boundary activation-matching LOCAL loss once
+        # frozen, structurally ~0) reads ~0.0002 while ``final_ce_train_loss``
+        # (the full cross-entropy on train) reads ~1.5. Without the new field a
+        # reader would misread the near-zero ``last_train_loss`` as memorization.
+        data = json.loads(FIXTURE_9B_GENERALIZATION.read_text())
+        p = data["candidate_provenance"][0]
+        assert p["last_train_loss"] < 1e-3        # local loss ~0 (post-freeze)
+        assert p["final_ce_train_loss"] > 1.0     # true train CE ~1.5
+        # The two fields differ by >1000x — they measure different things, so
+        # both must be carried to read the regime correctly.
+        assert p["final_ce_train_loss"] / max(p["last_train_loss"], 1e-12) > 1e3
+
+    def test_recorded_surrogate_verdict_is_earned(self):
+        # The stored floats re-judge to the recorded SURPASSES under the
+        # deterministic bootstrap — the verdict is earned, not painted on.
+        data = json.loads(FIXTURE_9B_GENERALIZATION.read_text())
+        ci = surrogate_valid_loss_ci(
+            data["candidate_losses"], data["surrogate_losses"], seed=data["base_seed"]
+        )
+        assert ci.significance_verdict == data["verdict"] == SURPASSES
+        assert ci.candidate_mean == pytest.approx(data["candidate_mean"], abs=1e-9)
+        assert ci.surrogate_mean == pytest.approx(data["surrogate_mean"], abs=1e-9)
+        assert ci.lower == pytest.approx(data["lower"], abs=1e-9)
+        assert ci.upper == pytest.approx(data["upper"], abs=1e-9)
+
+    def test_recorded_direction_verdict_is_earned(self):
+        data = json.loads(FIXTURE_9B_GENERALIZATION.read_text())
+        dd = data["direction"]
+        dci = surrogate_valid_loss_ci(
+            data["candidate_losses"], data["control_losses"], seed=data["base_seed"]
+        )
+        assert dci.significance_verdict == dd["verdict"] == SURPASSES
+        # The control (input-side) mean is relabeled control_mean in the deposit.
+        assert dci.surrogate_mean == pytest.approx(dd["control_mean"], abs=1e-9)
+
+    def test_monotone_ranking_survives_the_regime_change(self):
+        # The regime-robustness result: the same output-contig < random <
+        # input-contig ordering as the memorization-regime deposit holds in the
+        # generalization regime too — the §4 verdict is NOT a memorization
+        # artifact. Pinned on the recorded means.
+        data = json.loads(FIXTURE_9B_GENERALIZATION.read_text())
+        assert (
+            data["candidate_mean"]
+            < data["surrogate_mean"]
+            < data["direction"]["control_mean"]
+        )
+
+    def test_effect_size_shrank_vs_memorization_regime(self):
+        # Honest regime-dependence: the candidate-vs-surrogate effect is much
+        # smaller in the generalization regime than the memorization regime.
+        # This is NOT a failure — it is the measurement: the verdict's DIRECTION
+        # is robust, its MAGNITUDE is regime-dependent. Cross-deposit comparison.
+        gen = json.loads(FIXTURE_9B_GENERALIZATION.read_text())
+        mem = json.loads(FIXTURE_9B_SURROGATE.read_text())
+        assert gen["point_improvement"] < mem["point_improvement"]
+        # Both still SURPASSES (direction robust); only magnitude differs.
+        assert gen["verdict"] == SURPASSES
+        assert mem["verdict"] == SURPASSES
+
+    def test_direction_isolation_holds_in_generalization_regime(self):
+        # The P0 contiguity-isolation property reproduces in this regime too:
+        # candidate froze the contiguous OUTPUT block {29,30,31}, control froze
+        # the contiguous INPUT block {24,25,26} — so the candidate<control gap is
+        # pure direction, not contiguity.
+        data = json.loads(FIXTURE_9B_GENERALIZATION.read_text())
+        cand = {tuple(p["frozen_layers"]) for p in data["candidate_provenance"]}
+        ctrl = {tuple(p["frozen_layers"]) for p in data["control_provenance"]}
+        assert cand == {(29, 30, 31)}  # output-contiguous
+        assert ctrl == {(24, 25, 26)}  # input-contiguous
+        assert cand.isdisjoint(ctrl)
+
+    def test_deposit_is_non_thin(self):
+        data = json.loads(FIXTURE_9B_GENERALIZATION.read_text())
         assert data["is_thin_evidence"] is False
         assert data["n_candidate"] >= 3
         assert data["n_surrogate"] >= 3

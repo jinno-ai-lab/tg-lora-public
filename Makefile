@@ -883,6 +883,28 @@ FREEZE_9B_FLAGS ?= --seq-len 1024 --total-steps 20 --warmup-steps 6 --depth 3 --
 freeze-validloss-ci-9b: ## GOAL §4 REAL 9B target-scale A/B verdict (suffix-only, Dolly; auto CUDA)
 	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_FLAGS) --json --output tests/fixtures/freeze_validloss_ci_9b_surrogate.json
 
+# GENERALIZATION-REGIME robustness arm of the real 9B §4 A/B. The default
+# freeze-validloss-ci-9b above runs in a MEMORIZATION regime — 8 train examples
+# cycled over 20 steps, so the LoRA drives train CE to ~0 (verified in its
+# deposit provenance: candidate last_train_loss≈5e-4, control = 0.0). The
+# held-out valid_loss is then dominated by the frozen base, barely perturbed by
+# an overfit adapter — so the headline SURPASSES is measured on a model that has
+# memorized, not generalized. This target re-runs the SAME A/B (candidate vs
+# surrogate vs direction-control) in a GENERALIZATION regime: 48 train examples
+# over 96 steps (2 epochs — each example seen ~2x, realistic SFT, train CE stays
+# well above 0), 3 seeds/arm + 3-arm direction isolation. The deposit carries
+# final_ce_train_loss per arm (mean full-CE over the train set) so the
+# memorization-vs-generalization regime is machine-readable, not asserted. The
+# research question: does the SURPASSES verdict SURVIVE moving out of the
+# memorization regime, or was it a memorization artifact? Still reduced-budget
+# (96 < max_steps=1500) and honest about it — this is a REGIME-ROBUSTNESS data
+# point, NOT the full §4 verdict (which needs private src.data + >12GB).
+# Needs a torch+bnb+GPU interpreter: PYTHON_VENV=/path/to/torch-python make freeze-validloss-ci-9b-generalization
+FREEZE_9B_GEN_FLAGS ?= --seq-len 1024 --total-steps 96 --warmup-steps 12 --depth 3 --spacing 10 --n-candidate 3 --n-surrogate 3 --n-control 3 --train-examples 48 --valid-examples 32 --max-dataset-rows 600
+
+freeze-validloss-ci-9b-generalization: ## GOAL §4 real-9B A/B in a GENERALIZATION regime (2-epoch; memorization-robustness arm)
+	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_GEN_FLAGS) --json --output tests/fixtures/freeze_validloss_ci_9b_generalization.json
+
 # The apparatus order-resolution diagnostic. Variance-decomposes the proxy's
 # final valid_loss into a Var(order) signal (distinct freeze orders at a fixed
 # seed) vs a Var(seed) noise floor (a fixed order across seeds) and reports their
