@@ -97,6 +97,8 @@ os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
 )
 
+from pathlib import Path
+
 import torch
 from omegaconf import OmegaConf
 
@@ -593,6 +595,342 @@ def _candidate_final_ce_mean(result: dict):
     return sum(fces) / len(fces)
 
 
+# ── resumable per-arm ledger ─────────────────────────────────────────────────
+#
+# The full-budget verdict run (`make freeze-validloss-ci-9b-full`) is ~hours of
+# 9B GPU (3 candidate + 3 surrogate + 3 baseline arms × 1500 steps). On the
+# shared 12 GB card it is routinely preempted — a concurrent private-repo run
+# holds the GPU, the OS OOM-killer can claim the process mid-arm, or the session
+# can end. ``run_ci_9b`` below collects every arm's result in memory and
+# serializes the deposit only at the very end, so a single interruption deep in
+# the run discards ALL completed arms and the verdict stays blocked indefinitely
+# — the next free-GPU window starts again from zero.
+#
+# This ledger turns each free-GPU window into banked progress. Each completed
+# arm streams to a JSONL ledger keyed by ``(role, index)``; a re-run loads the
+# ledger, skips arms whose run-config fingerprint matches, and executes only the
+# missing ones — so an interrupted run RESUMES rather than restarts. The ledger
+# is opt-in (``--ledger PATH``): with no ledger the run is byte-identical to
+# before, so the committed reduced-budget deposits and their replay tests are
+# unaffected. The ledger lives under ``runs/`` (gitignored run state), never the
+# committed ``tests/fixtures/`` deposit.
+
+LEDGER_VERSION = 1
+
+
+class IncompleteResumeError(RuntimeError):
+    """The resumed ledger lacks a runnable candidate/surrogate pair.
+
+    Raised after loading the ledger when either the candidate or surrogate arm
+    set is empty: the headline §4 A/B (:func:`surrogate_valid_loss_ci`) needs at
+    least one sample in each arm, so a ledger that banked only candidate arms
+    cannot assemble a verdict yet. The completed arms are safe in the ledger —
+    the fix is to re-run the same command so the missing arms execute.
+    """
+
+
+def _config_fingerprint(
+    *,
+    total_steps: int,
+    warmup_steps: int,
+    depth: int,
+    spacing: int,
+    seq_len: int,
+    train_examples: int,
+    valid_examples: int,
+    model: str,
+    scope_label: str,
+    active_scope,
+    dataset: str,
+    use_local_loss: bool,
+    base_seed: int,
+) -> dict:
+    """The run-config identity that defines an arm's result.
+
+    Two arms are interchangeable across runs ONLY when every field matches: the
+    same model + scope + data, trained under the same step/depth/spacing/seq-len
+    /loss regime, with the same per-arm seed base. A change to any field (e.g.
+    bumping ``total_steps`` from a 96-step smoke to the 1500-step full run)
+    produces a different fingerprint, so a stale ledger from the old config is
+    ignored rather than silently seeding wrong arms. ``active_scope`` (the sorted
+    real layer indices) is included — not just its size — so two scopes that
+    happen to share a layer count do not collide. ``ledger_version`` gates the
+    whole shape: a future schema change reads as a stale ledger.
+    """
+    return {
+        "ledger_version": LEDGER_VERSION,
+        "total_steps": int(total_steps),
+        "warmup_steps": int(warmup_steps),
+        "depth": int(depth),
+        "spacing": int(spacing),
+        "seq_len": int(seq_len),
+        "train_examples": int(train_examples),
+        "valid_examples": int(valid_examples),
+        "model": str(model),
+        "scope_label": str(scope_label),
+        "active_scope": list(active_scope),
+        "dataset": str(dataset),
+        "use_local_loss": bool(use_local_loss),
+        "base_seed": int(base_seed),
+    }
+
+
+def _arm_specs(
+    *,
+    active_indices,
+    scope_sorted,
+    base_seed: int,
+    depth: int,
+    n_candidate: int,
+    n_surrogate: int,
+    n_control: int,
+    n_baseline: int,
+) -> list[dict]:
+    """The ordered list of A/B arms a run must execute.
+
+    Each spec is ``{role, index, order, seed, depth}`` — a complete description
+    of one arm, independent of the shared model/batches the runner closes over.
+    The ``(role, index)`` pair is the stable resume key; ``order`` is recomputed
+    deterministically from ``base_seed``/scope so a resumed arm matches the arm
+    that originally banked it. The role/seed/depth assignments mirror the inline
+    comprehensions in :func:`run_ci_9b` EXACTLY (candidate: same output-first
+    order, seed ``base_seed + i``; surrogate: per-arm random order
+    ``random_freeze_order(scope_sorted, base_seed + 1000 + i)``, seed
+    ``base_seed + 100 + i``; control: same input-first order, seed
+    ``base_seed + 200 + i``; baseline: depth-0 no-freeze, seed
+    ``base_seed + 300 + i``) so a fresh run with no ledger is identical to before.
+    """
+    cand_order = candidate_order_9b(active_indices)
+    control_order = control_order_9b(active_indices)
+    specs: list[dict] = []
+    for i in range(n_candidate):
+        specs.append({"role": "candidate", "index": i, "order": tuple(cand_order),
+                      "seed": base_seed + i, "depth": depth})
+    for i in range(n_surrogate):
+        specs.append({"role": "surrogate", "index": i,
+                      "order": tuple(random_freeze_order(scope_sorted, base_seed + 1000 + i)),
+                      "seed": base_seed + 100 + i, "depth": depth})
+    for i in range(n_control):
+        specs.append({"role": "control", "index": i, "order": tuple(control_order),
+                      "seed": base_seed + 200 + i, "depth": depth})
+    for i in range(n_baseline):
+        specs.append({"role": "baseline", "index": i, "order": tuple(scope_sorted),
+                      "seed": base_seed + 300 + i, "depth": 0})
+    return specs
+
+
+def _ledger_header(fingerprint: dict) -> dict:
+    return {"type": "header", "fingerprint": fingerprint}
+
+
+def _fingerprint_matches(stored, fingerprint: dict) -> bool:
+    """True iff the stored fingerprint dict equals the requested one exactly."""
+    if not isinstance(stored, dict):
+        return False
+    return stored == fingerprint
+
+
+def _ledger_has_matching_header(path, fingerprint: dict) -> bool:
+    """True iff ``path`` exists and its first line is a matching header.
+
+    A missing file, an unreadable first line, a non-header first line, or a
+    header whose fingerprint differs (incl. ``ledger_version``) all return
+    False — the caller then (re)writes a fresh ledger.
+    """
+    p = Path(path)
+    if not p.exists():
+        return False
+    try:
+        with p.open("r", encoding="utf-8") as fh:
+            first = fh.readline().strip()
+        rec = json.loads(first)
+    except (json.JSONDecodeError, OSError):
+        return False
+    return rec.get("type") == "header" and _fingerprint_matches(
+        rec.get("fingerprint"), fingerprint
+    )
+
+
+def load_ledger(path, fingerprint: dict) -> dict:
+    """Read a ledger, returning ``{(role, index): (valid_loss, provenance)}``.
+
+    Returns ``{}`` when the file is absent. The first JSONL line is the header;
+    if its ``fingerprint`` does not match, the whole file is treated as stale (a
+    previous config's run) and ``{}`` is returned — the run then executes every
+    arm fresh and rewrites the ledger with the new header. Malformed lines (a
+    partially-flushed trailing line from a crashed append) are skipped with a
+    warning rather than aborting the resume, so a torn write cannot brick the
+    ledger.
+    """
+    p = Path(path)
+    if not p.exists():
+        return {}
+    cached: dict = {}
+    header_seen = False
+    with p.open("r", encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Ledger %s:%d: skipping malformed line — likely a torn "
+                    "write from a crashed run; the resume continues.",
+                    p, lineno,
+                )
+                continue
+            if not header_seen:
+                header_seen = True
+                if rec.get("type") != "header" or not _fingerprint_matches(
+                    rec.get("fingerprint"), fingerprint
+                ):
+                    logger.info(
+                        "Ledger %s: fingerprint mismatch (stale config) — "
+                        "ignoring cached arms and rewriting.", p,
+                    )
+                    return {}
+                continue
+            if rec.get("type") == "arm":
+                cached[(rec.get("role"), int(rec.get("index")))] = (
+                    float(rec["valid_loss"]), rec.get("provenance"),
+                )
+    return cached
+
+
+def append_arm_to_ledger(path, fingerprint: dict, spec: dict,
+                         valid_loss: float, provenance) -> None:
+    """Append one completed arm to the ledger, (re)writing the header first.
+
+    When the file is absent or its header fingerprint is stale (a previous
+    config), the file is truncated and a fresh header is written before this
+    arm — so a config change never orphans old arms under a new header. When the
+    header already matches, only this arm's record is appended. A single
+    ``write`` + ``flush`` per arm is the durability unit: an arm is only
+    considered banked once its line is on disk, so a crash after the runner
+    returns loses at most the in-flight arm.
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if _ledger_has_matching_header(path, fingerprint):
+        mode = "a"
+        write_header = False
+    else:
+        mode = "w"
+        write_header = True
+    rec = {
+        "type": "arm",
+        "role": spec["role"],
+        "index": int(spec["index"]),
+        "seed": int(spec["seed"]),
+        "order": list(spec["order"]),
+        "valid_loss": float(valid_loss),
+        "provenance": provenance,
+    }
+    with p.open(mode, encoding="utf-8") as fh:
+        if write_header:
+            fh.write(json.dumps(_ledger_header(fingerprint)) + "\n")
+        fh.write(json.dumps(rec) + "\n")
+        fh.flush()
+
+
+def _collect_arms(
+    specs,
+    runner,
+    *,
+    ledger_path=None,
+    fingerprint=None,
+):
+    """Execute the arm specs, banking each to / replaying each from the ledger.
+
+    ``runner`` is a ``callable(spec) -> (valid_loss, provenance)``; the real run
+    passes a closure over :func:`arm_valid_loss_9b` (GPU), tests pass a stub.
+    Returns ``(collected, n_resumed)`` where ``collected`` maps each role to its
+    ordered ``[(valid_loss, provenance), ...]`` list and ``n_resumed`` counts the
+    arms served from the ledger (0 when no ledger). With ``ledger_path=None`` no
+    ledger is read or written and every spec is executed — the byte-identical
+    legacy path.
+    """
+    cached = load_ledger(ledger_path, fingerprint) if ledger_path is not None else {}
+    collected: dict = {"candidate": [], "surrogate": [], "control": [], "baseline": []}
+    n_resumed = 0
+    for spec in specs:
+        role = spec["role"]
+        key = (role, spec["index"])
+        if key in cached:
+            collected[role].append(cached[key])
+            n_resumed += 1
+            logger.info(
+                "Ledger hit: %s[%d] cached (valid_loss=%.6f) — skipping GPU arm.",
+                role, spec["index"], cached[key][0],
+            )
+            continue
+        valid_loss, prov = runner(spec)
+        collected[role].append((valid_loss, prov))
+        if ledger_path is not None:
+            append_arm_to_ledger(ledger_path, fingerprint, spec, valid_loss, prov)
+            logger.info(
+                "Ledger banked: %s[%d] (valid_loss=%.6f).",
+                role, spec["index"], valid_loss,
+            )
+    return collected, n_resumed
+
+
+def _require_runnable_arms(candidate_losses, surrogate_losses) -> None:
+    """Raise :class:`IncompleteResumeError` unless both headline arms exist.
+
+    The §4 A/B needs ≥1 candidate and ≥1 surrogate to compute the bootstrap CI.
+    A resumed ledger that banked only one side cannot assemble a verdict yet;
+    the completed arms stay banked and the user re-runs to fill the gap.
+    """
+    if not candidate_losses or not surrogate_losses:
+        raise IncompleteResumeError(
+            f"Resume incomplete: candidate arms={len(candidate_losses)}, "
+            f"surrogate arms={len(surrogate_losses)} (need >=1 each for the "
+            "headline A/B). Completed arms are banked in the ledger; re-run the "
+            "same command to execute the missing arms."
+        )
+
+
+def _make_arm_runner(
+    model,
+    *,
+    scope_label,
+    active_indices,
+    train_batches,
+    valid_batches,
+    device,
+    total_steps,
+    warmup_steps,
+    spacing,
+    lr,
+    use_local_loss,
+):
+    """Build the per-spec GPU arm runner closure for :func:`_collect_arms`.
+
+    The shared ``model`` is bound as a parameter of this factory (rather than a
+    free variable of a closure defined inside :func:`run_ci_9b`) so the binding
+    is statically unambiguous — ``run_ci_9b`` later ``del``s the model in its
+    ``finally`` to release GPU memory, and a closure capturing that same name in
+    the same scope is a false-positive ``F821`` trap. Here ``model`` is a plain
+    parameter (never deleted in this scope), and the returned ``runner(spec)``
+    dispatches each spec's ``order``/``seed``/``depth`` to
+    :func:`arm_valid_loss_9b` on that one shared model — identical to the legacy
+    inline comprehensions.
+    """
+    def _runner(spec):
+        return arm_valid_loss_9b(
+            model, spec["order"], spec["seed"], scope=scope_label,
+            active_indices=active_indices,
+            train_batches=train_batches, valid_batches=valid_batches, device=device,
+            total_steps=total_steps, warmup_steps=warmup_steps,
+            depth=spec["depth"], spacing=spacing, lr=lr,
+            use_local_loss=use_local_loss,
+        )
+    return _runner
+
+
 def run_ci_9b(
     *,
     cfg,
@@ -612,6 +950,7 @@ def run_ci_9b(
     use_local_loss: bool = True,
     n_control: int = 0,
     n_baseline: int = 0,
+    ledger_path=None,
 ) -> dict:
     """Run the real-9B candidate+surrogate sweep and return the §4 verdict dict.
 
@@ -645,6 +984,13 @@ def run_ci_9b(
     the identical training path as the candidate, varying only the freeze.
     ``n_baseline=0`` (default) runs no baseline and the deposit is byte-identical
     to before.
+
+    ``ledger_path`` (default ``None``) opts into the RESUMABLE per-arm ledger:
+    each completed arm streams to that JSONL file, and a re-run skips arms whose
+    run-config fingerprint matches — so a multi-hour full-budget run interrupted
+    by GPU preemption / OOM resumes instead of restarting from zero. ``None``
+    (the default, and what every committed reduced-budget deposit uses) reads
+    and writes no ledger and is byte-identical to a one-shot run.
     """
     scope_label = cfg.training.get("trainable_lora_scope", "all")
     logger.info("Loading tokenizer + model for %s ...", cfg.model.name_or_path)
@@ -686,68 +1032,52 @@ def run_ci_9b(
             "(reduced_budget=False).", total_steps, cfg_max_steps,
         )
 
+    # Build the full arm spec list up front (the same candidate/surrogate/
+    # control/baseline assignments the inline comprehensions used to make) and
+    # the run-config fingerprint that keys the resume ledger. With no ledger
+    # these flow straight into the runner and the result is byte-identical to
+    # the legacy one-shot path; with a ledger, completed arms replay and only
+    # the missing ones hit the GPU.
+    specs = _arm_specs(
+        active_indices=active_indices, scope_sorted=scope_sorted,
+        base_seed=base_seed, depth=depth,
+        n_candidate=n_candidate, n_surrogate=n_surrogate,
+        n_control=n_control, n_baseline=n_baseline,
+    )
+    fingerprint = _config_fingerprint(
+        total_steps=total_steps, warmup_steps=warmup_steps, depth=depth,
+        spacing=spacing, seq_len=seq_len, train_examples=train_examples,
+        valid_examples=valid_examples, model=cfg.model.name_or_path,
+        scope_label=scope_label, active_scope=sorted(active_indices),
+        dataset=dataset, use_local_loss=use_local_loss, base_seed=base_seed,
+    )
+    if ledger_path is not None:
+        logger.info(
+            "Resume ledger enabled: %s (%d arms planned).", ledger_path, len(specs),
+        )
+
+    _runner = _make_arm_runner(
+        model,
+        scope_label=scope_label, active_indices=active_indices,
+        train_batches=train_batches, valid_batches=valid_batches, device=device,
+        total_steps=total_steps, warmup_steps=warmup_steps,
+        spacing=spacing, lr=lr, use_local_loss=use_local_loss,
+    )
+
+    n_resumed = 0
     try:
-        candidate_results = [
-            arm_valid_loss_9b(
-                model, cand_order, base_seed + i, scope=scope_label,
-                active_indices=active_indices,
-                train_batches=train_batches, valid_batches=valid_batches, device=device,
-                total_steps=total_steps, warmup_steps=warmup_steps, depth=depth,
-                spacing=spacing, lr=lr, use_local_loss=use_local_loss,
-            )
-            for i in range(n_candidate)
-        ]
+        collected, n_resumed = _collect_arms(
+            specs, _runner, ledger_path=ledger_path, fingerprint=fingerprint,
+        )
+        candidate_results = collected["candidate"]
+        surrogate_results = collected["surrogate"]
+        control_results = collected["control"]
+        baseline_results = collected["baseline"]
         candidate_losses = [v for v, _ in candidate_results]
-        surrogate_results = [
-            arm_valid_loss_9b(
-                model, random_freeze_order(scope_sorted, base_seed + 1000 + i),
-                base_seed + 100 + i, scope=scope_label,
-                active_indices=active_indices,
-                train_batches=train_batches, valid_batches=valid_batches, device=device,
-                total_steps=total_steps, warmup_steps=warmup_steps, depth=depth,
-                spacing=spacing, lr=lr, use_local_loss=use_local_loss,
-            )
-            for i in range(n_surrogate)
-        ]
         surrogate_losses = [v for v, _ in surrogate_results]
-        # DIRECTION-CONTROL arm (constitution P0): the input-side contiguous
-        # control. Only runs when n_control > 0; n_control=0 leaves this list
-        # empty and the §4 surrogate verdict byte-identical to before. Distinct
-        # seed offset (base_seed + 200) so the control's LoRA init never collides
-        # with a candidate (base_seed + i) or surrogate (base_seed + 100 + i) arm.
-        control_results = [
-            arm_valid_loss_9b(
-                model, control_order, base_seed + 200 + i, scope=scope_label,
-                active_indices=active_indices,
-                train_batches=train_batches, valid_batches=valid_batches, device=device,
-                total_steps=total_steps, warmup_steps=warmup_steps, depth=depth,
-                spacing=spacing, lr=lr, use_local_loss=use_local_loss,
-            )
-            for i in range(n_control)
-        ]
         control_losses = [v for v, _ in control_results]
-        # FULL-BACKPROP BASELINE arm (GOAL §4 line 247 control (i)): no freeze
-        # at all — ``depth=0`` so ``max_depth=0`` plans zero freezes and the arm
-        # always takes the full-CE branch. Every active-scope layer trains on the
-        # task loss throughout. This is the "valid_loss vs full backprop"
-        # success axis the surrogate verdict does NOT measure (the surrogate is a
-        # random-order freeze, itself a freeze). Distinct seed offset
-        # (base_seed + 300) so the baseline's LoRA init never collides with
-        # candidate (base_seed + i) / surrogate (base_seed + 100 + i) / control
-        # (base_seed + 200 + i). The ``order`` arg is inert at depth=0 (nothing
-        # is scheduled to freeze); the scope order is passed for a valid,
-        # non-empty convergence_order vector the config validator accepts.
-        baseline_results = [
-            arm_valid_loss_9b(
-                model, tuple(scope_sorted), base_seed + 300 + i, scope=scope_label,
-                active_indices=active_indices,
-                train_batches=train_batches, valid_batches=valid_batches, device=device,
-                total_steps=total_steps, warmup_steps=warmup_steps, depth=0,
-                spacing=spacing, lr=lr, use_local_loss=use_local_loss,
-            )
-            for i in range(n_baseline)
-        ]
         baseline_losses = [v for v, _ in baseline_results]
+        _require_runnable_arms(candidate_losses, surrogate_losses)
     finally:
         del model
         gc.collect()
@@ -830,6 +1160,13 @@ def run_ci_9b(
         "n_baseline": n_baseline,
         "baseline_provenance": [p for _, p in baseline_results],
         "baseline_ci": baseline_ci,
+        # Resume-ledger provenance (GOAL §7): how many arms replayed from the
+        # ledger vs ran fresh, and the ledger path (None when no ledger). 0 /
+        # None for every one-shot run — the committed reduced-budget deposits —
+        # so a resumed full-budget run carries an honest trace of which arms
+        # were banked across interruptions rather than recomputed this session.
+        "resumed_arm_count": n_resumed,
+        "ledger_path": (str(ledger_path) if ledger_path is not None else None),
     }
 
 
@@ -933,6 +1270,11 @@ def result_to_json(result: dict) -> dict:
             and (not ci.is_thin_evidence)
             and (regime == REGIME_GENERALIZATION)
         ),
+        # Resume-ledger trace (GOAL §7). ADDITIVE — legacy deposits (and any
+        # result dict built without the ledger) default to 0 resumed arms and no
+        # ledger path, so this never changes a one-shot deposit's verdict.
+        "resumed_arm_count": int(result.get("resumed_arm_count", 0) or 0),
+        "ledger_path": result.get("ledger_path"),
     }
 
 
@@ -1179,6 +1521,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--json", action="store_true", help="emit JSON evidence to stdout.")
     p.add_argument("--output", default=None, help="write the report/JSON to this path.")
+    p.add_argument(
+        "--ledger", default=None,
+        help=(
+            "Resume ledger path (JSONL). Each completed arm streams to this "
+            "file; a re-run skips arms whose run-config fingerprint matches and "
+            "executes only the missing ones — so a multi-hour full-budget run "
+            "interrupted by GPU preemption / OOM RESUMES instead of restarting "
+            "from zero. Recommended for ``--total-steps 1500``: "
+            "--ledger runs/freeze_validloss_ci_9b_full_ledger.jsonl. Default "
+            "None = no ledger (byte-identical to a one-shot run)."
+        ),
+    )
     return p
 
 
@@ -1193,25 +1547,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg = OmegaConf.load(args.config)
     device = resolve_device(args.device)
 
-    result = run_ci_9b(
-        cfg=cfg,
-        device=device,
-        seq_len=args.seq_len,
-        train_examples=args.train_examples,
-        valid_examples=args.valid_examples,
-        total_steps=args.total_steps,
-        warmup_steps=args.warmup_steps,
-        depth=args.depth,
-        spacing=args.spacing,
-        n_candidate=args.n_candidate,
-        n_surrogate=args.n_surrogate,
-        base_seed=args.base_seed,
-        dataset=args.dataset,
-        max_dataset_rows=args.max_dataset_rows,
-        use_local_loss=not args.no_local_loss,
-        n_control=args.n_control,
-        n_baseline=args.n_baseline,
-    )
+    try:
+        result = run_ci_9b(
+            cfg=cfg,
+            device=device,
+            seq_len=args.seq_len,
+            train_examples=args.train_examples,
+            valid_examples=args.valid_examples,
+            total_steps=args.total_steps,
+            warmup_steps=args.warmup_steps,
+            depth=args.depth,
+            spacing=args.spacing,
+            n_candidate=args.n_candidate,
+            n_surrogate=args.n_surrogate,
+            base_seed=args.base_seed,
+            dataset=args.dataset,
+            max_dataset_rows=args.max_dataset_rows,
+            use_local_loss=not args.no_local_loss,
+            n_control=args.n_control,
+            n_baseline=args.n_baseline,
+            ledger_path=args.ledger,
+        )
+    except IncompleteResumeError as exc:
+        # The resumed ledger banked only one side of the A/B, so no verdict can
+        # assemble yet. The completed arms are safe in the ledger; exit nonzero
+        # WITHOUT writing a deposit (an honest "not done yet") so the user knows
+        # to re-run the same command and fill the gap.
+        logger.error("%s", exc)
+        return 3
 
     payload = (
         json.dumps(result_to_json(result), indent=2)

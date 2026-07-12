@@ -936,7 +936,13 @@ freeze-validloss-ci-9b-baseline: ## GOAL §4 real-9B A/B + FULL-BACKPROP baselin
 # on a free GPU. The private src.data quality filter is still absent on this mirror, so absolute
 # loss levels differ from a filtered run (A/B internal validity is unaffected — same data both arms).
 # Needs a torch+bnb+GPU interpreter: PYTHON_VENV=/path/to/torch-python make freeze-validloss-ci-9b-full
-FREEZE_9B_FULL_FLAGS ?= --seq-len 1024 --total-steps 1500 --warmup-steps 150 --depth 3 --spacing 450 --n-candidate 3 --n-surrogate 3 --n-baseline 3 --train-examples 600 --valid-examples 64 --max-dataset-rows 2000
+# --ledger turns this multi-hour run RESUMABLE: each completed arm streams to the
+# JSONL ledger, so an interruption (GPU preemption by a concurrent run, OOM,
+# session end) banks its progress and the next invocation skips the done arms
+# and executes only the missing ones — the difference between the verdict
+# landing incrementally across free-GPU windows vs. every interruption
+# restarting all 9 arms from zero. The ledger lives under runs/ (gitignored).
+FREEZE_9B_FULL_FLAGS ?= --seq-len 1024 --total-steps 1500 --warmup-steps 150 --depth 3 --spacing 450 --n-candidate 3 --n-surrogate 3 --n-baseline 3 --train-examples 600 --valid-examples 64 --max-dataset-rows 2000 --ledger runs/freeze_validloss_ci_9b_full_ledger.jsonl
 
 freeze-validloss-ci-9b-full: ## GOAL §4 real-9B FULL-BUDGET A/B verdict (1500 steps; generalization regime; ~hours GPU)
 	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_FULL_FLAGS) --json --output tests/fixtures/freeze_validloss_ci_9b_full.json
