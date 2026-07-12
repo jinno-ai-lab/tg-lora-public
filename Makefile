@@ -2,7 +2,7 @@
        smoke smoke-tg smoke-bl \
        train-baseline train-tg-lora train-tg-lora-optreuse train-tg-lora-prefix \
        eval eval-lora eval-downstream eval-downstream-mlx eval-llm-jp-eval-mlx eval-mlx eval-base eval-35b-base eval-35b-ckpt \
-       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize freeze-validloss-ci-9b freeze-validloss-ci-9b-generalization freeze-validloss-ci-9b-baseline freeze-validloss-ci-9b-full freeze-replay \
+       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize freeze-validloss-ci-9b freeze-validloss-ci-9b-generalization freeze-validloss-ci-9b-baseline freeze-validloss-ci-9b-full freeze-validloss-ci-9b-full-bg freeze-replay \
 
 	compare compare-prefix compare-prefix-cold compare-prefix-warm compare-prefix-coldwarm compare-report paper-memory paper-memory-dry-run paper-memory-one-shot paper-memory-compare-modes paper-memory-all-modes paper-memory-evaluate-gates paper-memory-external-eval paper-memory-frontier-sweep paper-memory-cache-ablation cosine-n-ablation cosine-n-ablation-dry-run cosine-n-skip-ablation cosine-n-skip-ablation-dry-run precompute-prefix-cache ablation sweep accel-sweep \
 	bench-optimizer bench-prefix-cache bench-prefix-cache-one-shot analyze-prefix-break-even analyze-prefix-break-even-ci bench-velocity-ops bench-velocity-ops-ci bench-velocity-ops-save-baseline \
@@ -960,6 +960,29 @@ FREEZE_9B_FULL_FLAGS ?= --seq-len 1024 --total-steps 1500 --warmup-steps 150 --d
 
 freeze-validloss-ci-9b-full: ## GOAL §4 real-9B FULL-BUDGET A/B verdict (1500 steps; generalization regime; ~hours GPU)
 	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_FULL_FLAGS) --json --output tests/fixtures/freeze_validloss_ci_9b_full.json
+
+# Self-retrying background launcher for freeze-validloss-ci-9b-full above. The
+# direct target defers a held GPU with exit 75 (EX_TEMPFAIL) and banks completed
+# arms in the --ledger, BUT the comment above documents the gap: GNU make
+# flattens every non-zero recipe exit to make-exit 2, so a poll loop around
+# `make freeze-validloss-ci-9b-full` cannot tell tempfail (75, retry) from
+# CUDA-down (2, fatal) or torn-ledger (3, re-run) — they all look identical, so
+# the documented "polite retryable background citizen" never actually had a way
+# to be launched as one. This target closes that: scripts/launch_freeze_ci_9b_full
+# bypasses make for the worker step (it subprocess-invokes the module directly so
+# the exit codes survive), retries 75/3 with backoff, stops on 0/1/2, and is
+# bounded (--max-attempts / --deadline-seconds) so a persistently-held GPU cannot
+# spin forever. The worker flags are identical to the direct target — only the
+# retry wrapper differs — so the SAME deposit (tests/fixtures/freeze_validloss_ci_9b_full.json)
+# and SAME ledger (runs/freeze_validloss_ci_9b_full_ledger.jsonl) land either way.
+# Run detached, e.g.:
+#   nohup env PYTHON_VENV=/torch/venv/bin/python \
+#     make freeze-validloss-ci-9b-full-bg >runs/full_bg.log 2>&1 &
+# Override the retry policy via LAUNCH_FLAGS, e.g. LAUNCH_FLAGS="--max-attempts 200 --tempfail-sleep 90".
+# Needs a torch+bnb+GPU interpreter: PYTHON_VENV=/path/to/torch-python make freeze-validloss-ci-9b-full-bg
+LAUNCH_FLAGS ?=
+freeze-validloss-ci-9b-full-bg: ## Self-retrying background launcher for the full-budget 9B verdict (polls a busy GPU, banks via --ledger)
+	$(PYTHON_VENV) -m scripts.launch_freeze_ci_9b_full $(LAUNCH_FLAGS) -- $(FREEZE_9B_FULL_FLAGS) --json --output tests/fixtures/freeze_validloss_ci_9b_full.json
 
 
 # The apparatus order-resolution diagnostic. Variance-decomposes the proxy's
