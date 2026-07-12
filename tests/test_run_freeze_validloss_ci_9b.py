@@ -36,11 +36,13 @@ used only to build tiny synthetic tensors / modules.
 from __future__ import annotations
 
 import json
+import re
 import types
 from pathlib import Path
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 from torch import nn
 
 from scripts.run_freeze_validloss_ci_9b import (
@@ -1091,6 +1093,92 @@ class TestReducedBudgetHonest:
         # never silently promoting a run whose intended length is unknown.
         assert _is_reduced_budget(total_steps=1500, max_steps=0) is True
         assert _is_reduced_budget(total_steps=1500, max_steps=-1) is True
+
+
+# ── full-run gate liveness: the shipped Make flags + bound config must clear ─
+# ── the two config-determined citation-gate axes BEFORE any GPU is spent ─────
+
+
+class TestFullRunGateLiveness:
+    """``make freeze-validloss-ci-9b-full`` is hours of 9B GPU banking 9 arms.
+    Its deposit opens the full-§4 citation gate only when FOUR honesty axes clear
+    together; TWO of them are *config-determined* (fixed by the Makefile flags +
+    the bound config, not by the run's outcome) and are therefore guardable
+    BEFORE any GPU is spent:
+
+    * **reduced_budget** — the run's ``--total-steps`` must reach the bound
+      config's ``training.max_steps`` (:func:`_is_reduced_budget`). The Makefile
+      ships ``--total-steps 1500`` and the config ships ``max_steps: 1500``, so
+      the coupling holds — but it is *implicit*. The ``TestReducedBudgetHonest``
+      cases above pin the function with hardcoded ``1500`` literals, so a future
+      edit that bumps the config's ``max_steps`` (or trims the flag) would leave
+      every existing test green while the real multi-hour run lands with
+      ``reduced_budget=True`` → ``citable_as_full_section4_verdict=False``:
+      hours of GPU silently wasted on a deposit that can never be cited.
+    * **is_thin_evidence** — each headline arm must bank ≥
+      :data:`MIN_SAMPLE_FOR_BOOTSTRAP` seeds. The Makefile ships
+      ``--n-candidate/surrogate 3``; a trim to 2 would make every arm thin and
+      the gate stays shut on this axis instead.
+
+    The other two axes (``proxy_scale``, ``regime``) are *outcome-determined*
+    (a real 9B run is never a proxy; regime depends on the candidate arm's
+    recorded ``final_ce_train_loss``) and stay gated at deposit time — this guard
+    locks only what the shipped config already guarantees. It reads the LIVE
+    Makefile flag and the LIVE bound config, so a drift in either file fails loud
+    here, in a GPU-free second, not after a multi-hour run.
+    """
+
+    BOUND_CONFIG = "configs/9b_baseline_suffix_only_last25.yaml"
+
+    def _full_flags(self) -> str:
+        repo_root = Path(__file__).resolve().parents[1]
+        text = (repo_root / "Makefile").read_text(encoding="utf-8")
+        m = re.search(r"^FREEZE_9B_FULL_FLAGS\s*\?=\s*(.+)$", text, re.MULTILINE)
+        # Assert (not return None) so a renamed Make var can't make this guard
+        # silently pass by matching nothing.
+        assert m, "FREEZE_9B_FULL_FLAGS missing from Makefile — guard cannot run"
+        return m.group(1)
+
+    def _flag_int(self, flags: str, token: str) -> int:
+        m = re.search(rf"{re.escape(token)}\s+(\d+)", flags)
+        assert m, f"{token} missing from FREEZE_9B_FULL_FLAGS — guard cannot run"
+        return int(m.group(1))
+
+    def test_guard_anchored_to_the_script_default_config(self):
+        # The config this guard reads must be the one the run actually binds, so a
+        # future DEFAULT_CONFIG switch reanchors (or fails) this guard rather than
+        # reading a stale path.
+        from scripts.run_freeze_validloss_ci_9b import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG == self.BOUND_CONFIG
+
+    def test_full_run_clears_reduced_budget_axis(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        cfg = OmegaConf.load(repo_root / self.BOUND_CONFIG)
+        cfg_max_steps = int(cfg.training.max_steps)
+        total_steps = self._flag_int(self._full_flags(), "--total-steps")
+        assert not _is_reduced_budget(total_steps, cfg_max_steps), (
+            f"FREEZE_9B_FULL_FLAGS --total-steps {total_steps} < bound-config "
+            f"training.max_steps {cfg_max_steps}: the multi-hour full run would "
+            f"land with reduced_budget=True and never open the full-§4 citation "
+            f"gate. Raise --total-steps to >= the config's training.max_steps "
+            f"(or lower the config's max_steps)."
+        )
+
+    def test_full_run_clears_thin_evidence_axis(self):
+        from src.tg_lora.freeze_surrogate_ci import MIN_SAMPLE_FOR_BOOTSTRAP
+
+        flags = self._full_flags()
+        # The headline candidate-vs-surrogate CI's is_thin_evidence keys the
+        # full-verdict gate, so it is these two arm counts that must clear the bar.
+        for token in ("--n-candidate", "--n-surrogate"):
+            n = self._flag_int(flags, token)
+            assert n >= MIN_SAMPLE_FOR_BOOTSTRAP, (
+                f"FREEZE_9B_FULL_FLAGS {token}={n} < MIN_SAMPLE_FOR_BOOTSTRAP="
+                f"{MIN_SAMPLE_FOR_BOOTSTRAP}: every arm banks a thin sample and "
+                f"the full-§4 citation gate stays shut on is_thin_evidence. "
+                f"Raise {token} to >= {MIN_SAMPLE_FOR_BOOTSTRAP}."
+            )
 
 
 # ── deposit replay faithfulness on the committed real-9B recording ──────────
