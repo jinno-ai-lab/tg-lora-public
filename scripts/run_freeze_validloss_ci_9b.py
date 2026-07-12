@@ -110,6 +110,12 @@ from src.model.lora_utils import (
 )
 from src.model.load_model import apply_lora, load_base_model, load_tokenizer
 from src.tg_lora.activation_matching import ActivationMatchingLoss
+from src.tg_lora.freeze_cost import (
+    LEVEL1_REALIZED_REDUCTION_CEILING,
+    FreezeCostAccountant,
+    LayerBackwardCost,
+    realizable_reduction,
+)
 from src.tg_lora.freeze_schedule import (
     FreezeSchedule,
     FreezeScheduleConfig,
@@ -593,6 +599,94 @@ def _candidate_final_ce_mean(result: dict):
     if not fces:
         return None
     return sum(fces) / len(fces)
+
+
+def _candidate_cost_reduction(result: dict, *, level: int = 1) -> dict | None:
+    """Backward-FLOPs reduction the candidate arm's freeze schedule achieves.
+
+    GOAL §4 success is TWO-HEADED — (a) quality preserved (the valid_loss A/B
+    the deposit already carries) AND (b) cost reduced vs full backprop (SYSTEM_
+    CONSTITUTION condition (b) / the P3 cost gate). This closes the second head:
+    it replans the candidate arm's EXACT freeze schedule — the same
+    :class:`FreezeScheduleConfig` :func:`arm_valid_loss_9b` builds from
+    ``candidate_order`` / ``depth`` / ``warmup_steps`` / ``spacing`` /
+    ``total_steps`` — and feeds the realized ``frozen_at_epoch`` to a
+    :class:`FreezeCostAccountant` with uniform per-layer cost. That is P3's
+    "削減率 = 1 − progressive / full" in model-free first-order arithmetic: the
+    reduction is a ratio, so uniform costs give the exact first-order figure,
+    and real per-layer costs (DeltaNet vs. Attention, GOAL §1.5/§8) are the
+    [UNVERIFIED] model-specific refinement that does not change it.
+
+    Level-1 honesty (§6.2 / constitution verifiability): the candidate arm runs
+    Level 1 (weight-grad stop; the activation gradient still traverses the frozen
+    layer), so the accountant's arithmetic ``reduction_rate`` OVERSTATES what is
+    realized in vivo. ``realized_reduction_rate`` caps it at the validated
+    :data:`LEVEL1_REALIZED_REDUCTION_CEILING` (0.0) via
+    :func:`realizable_reduction`, so the deposit never presents the arithmetic
+    figure as a realized saving — the same realizability correction the §7 speed
+    gate applies.
+
+    Returns ``None`` only when the result lacks the candidate-arm schedule keys
+    (a partial / legacy result); a plannable schedule always yields a dict
+    (depth 0 → reduction 0.0, i.e. full backprop). A present-but-malformed
+    schedule raises loudly (a deposit must not silently serialize a broken
+    candidate cost axis).
+    """
+    try:
+        order = list(result["candidate_order"])
+        active_scope = list(result["active_scope"])
+        depth = int(result["depth"])
+        warmup_steps = int(result["warmup_steps"])
+        spacing = int(result["spacing"])
+        total_steps = int(result["total_steps"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not active_scope or total_steps < 1 or spacing < 1:
+        return None
+    # Same config the candidate arm trains under (arm_valid_loss_9b), so the
+    # cost axis is measured on the schedule that actually produced the A/B, not
+    # a re-derivation with different timing.
+    schedule_cfg = FreezeScheduleConfig(
+        active_layer_indices=sorted(active_scope),
+        num_epochs=total_steps,
+        max_depth=depth,
+        start_epoch=warmup_steps,
+        spacing=spacing,
+        policy="convergence_order",
+        convergence_order=tuple(order),
+    )
+    schedule = FreezeSchedule.plan(schedule_cfg)
+    layer_costs = {
+        idx: LayerBackwardCost(weight_grad_flops=1.0, act_grad_flops=1.0)
+        for idx in sorted(active_scope)
+    }
+    accountant = FreezeCostAccountant(
+        layer_costs=layer_costs,
+        steps_per_epoch=1,
+        num_epochs=total_steps,
+        frozen_at_epoch=schedule.frozen_at_epoch,
+    )
+    summary = accountant.summary(level)
+    realized = realizable_reduction(accountant, level)
+    return {
+        "level": level,
+        # P3 headline: the arithmetic backward-FLOPs reduction.
+        "reduction_rate": summary.reduction_rate,
+        "progressive_backward_flops": summary.progressive_backward_flops,
+        "full_backward_flops": summary.full_backward_flops,
+        # §6.2: the arithmetic figure corrected for what Level 1 realizes in
+        # vivo (~0 under the validated ceiling). This — not reduction_rate — is
+        # the realized saving a reader may quote.
+        "realized_reduction_rate": realized.realized_reduction,
+        "level1_realization_ceiling": LEVEL1_REALIZED_REDUCTION_CEILING,
+        "realized_depth": schedule.realized_depth,
+        "frozen_at_epoch": {
+            str(idx): epoch for idx, epoch in schedule.frozen_at_epoch.items()
+        },
+        # Flags the uniform first-order model so a reader does not mistake the
+        # ratio for measured per-layer FLOPs (the [UNVERIFIED] refinement).
+        "cost_model": "uniform_per_layer",
+    }
 
 
 # ── resumable per-arm ledger ─────────────────────────────────────────────────
@@ -1229,6 +1323,15 @@ def result_to_json(result: dict) -> dict:
         "candidate_final_ce_train_loss_mean": candidate_ce_mean,
         "candidate_train_valid_gap": candidate_train_valid_gap,
         "regime": regime,
+        # GOAL §4 cost-reduction head (SYSTEM_CONSTITUTION condition (b) / the
+        # P3 "削減率 = 1 − progressive / full" cost gate): the backward-FLOPs
+        # reduction the candidate arm's freeze schedule achieves vs full
+        # backprop, replanned from the SAME schedule the arm ran under. ADDITIVE
+        # — ``None`` only when the result lacks the candidate-arm schedule keys
+        # (a partial / legacy result). Level-1 honesty: the realized saving is
+        # ``realized_reduction_rate`` (~0 under the validated ceiling), NOT the
+        # arithmetic ``reduction_rate``.
+        "candidate_cost_reduction": _candidate_cost_reduction(result),
         "candidate_provenance": result["candidate_provenance"],
         "surrogate_provenance": result["surrogate_provenance"],
         # Direction-isolation control arm (constitution P0). Empty / None-valued

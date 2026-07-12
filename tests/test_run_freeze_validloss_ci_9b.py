@@ -49,6 +49,7 @@ from scripts.run_freeze_validloss_ci_9b import (
     REGIME_OVERFIT,
     REGIME_UNKNOWN,
     _baseline_ci_to_json,
+    _candidate_cost_reduction,
     _candidate_final_ce_mean,
     _classify_regime,
     _direction_ci_to_json,
@@ -464,6 +465,128 @@ class TestResultToJson:
         p = out["candidate_provenance"][0]
         assert p["final_ce_train_loss"] == 1.507
         assert p["last_train_loss"] == 0.0002
+
+
+# ── candidate cost-reduction axis (GOAL §4 condition (b) / P3 cost gate) ──────
+#
+# The §4 verdict is TWO-HEADED: (a) quality preserved (the valid_loss A/B the
+# deposit already carries) and (b) cost reduced vs full backprop. This class pins
+# the second head — ``_candidate_cost_reduction`` replans the candidate arm's
+# EXACT freeze schedule and feeds it to ``FreezeCostAccountant`` for P3's
+# "削減率 = 1 − progressive / full". Values are hand-computed (uniform per-layer
+# cost; the reduction is a ratio, so uniform costs give the exact first-order
+# figure). The Level-1 honesty test (§6.2) is the load-bearing one: the
+# candidate runs Level 1 (weight-grad stop), which realizes ~0 backward reduction
+# in vivo, so ``realized_reduction_rate`` — not ``reduction_rate`` — is the
+# realized saving a reader may quote.
+
+
+class TestCandidateCostReduction:
+    def _sched(self, **over):
+        # Minimal result dict carrying only the candidate-arm schedule keys the
+        # helper reads (hand-computed cases use a 4-layer scope for clarity).
+        base = dict(
+            candidate_order=[3, 2, 1, 0],
+            active_scope=[0, 1, 2, 3],
+            depth=2,
+            warmup_steps=0,
+            spacing=1,
+            total_steps=4,
+        )
+        base.update(over)
+        return base
+
+    def test_known_value_two_of_four_layers(self):
+        # 4 active layers, freeze the 2 output-side first (order [3, 2, ..]),
+        # warmup 0, spacing 1, 4 steps. Layer 3 freezes at epoch 0, layer 2 at
+        # epoch 1. Full backprop = 4 layers × (1+1) × 4 steps = 32; progressive
+        # (Level 1) = 25; reduction = 1 − 25/32 = 0.21875. Hand-computed.
+        out = _candidate_cost_reduction(self._sched())
+        assert out is not None
+        assert out["reduction_rate"] == pytest.approx(0.21875)
+        assert out["full_backward_flops"] == 32.0
+        assert out["progressive_backward_flops"] == 25.0
+        assert out["realized_depth"] == 2
+        assert out["frozen_at_epoch"] == {"3": 0, "2": 1}
+
+    def test_depth_zero_is_full_backprop(self):
+        # depth=0 freezes nothing: progressive == full, reduction 0.0.
+        out = _candidate_cost_reduction(self._sched(depth=0))
+        assert out is not None
+        assert out["reduction_rate"] == 0.0
+        assert out["progressive_backward_flops"] == out["full_backward_flops"]
+        assert out["realized_depth"] == 0
+        assert out["frozen_at_epoch"] == {}
+
+    def test_reduction_monotone_in_depth(self):
+        # Deeper freeze only ever removes backward work (the frontier invariant):
+        # reduction is non-decreasing in depth. depth=4 (freeze all) → 0.3125.
+        rates = [
+            _candidate_cost_reduction(self._sched(depth=d))["reduction_rate"]
+            for d in range(5)
+        ]
+        assert rates == sorted(rates)
+        assert rates[-1] == pytest.approx(0.3125)
+
+    def test_level1_realized_reduction_is_zero_under_validated_ceiling(self):
+        # §6.2 honesty (constitution verifiability): the candidate arm runs
+        # Level 1 (weight-grad stop; the activation gradient still traverses the
+        # frozen layer), so the arithmetic reduction_rate OVERSTATES what is
+        # realized in vivo. realized_reduction_rate is capped at the validated
+        # Level-1 ceiling (0.0): the deposit must not present the arithmetic
+        # figure as a realized saving. reduction_rate stays the arithmetic bound.
+        out = _candidate_cost_reduction(self._sched())
+        assert out["reduction_rate"] == pytest.approx(0.21875)
+        assert out["realized_reduction_rate"] == 0.0
+        assert out["level1_realization_ceiling"] == 0.0
+        assert out["level"] == 1
+
+    def test_tracks_candidate_schedule_not_a_constant(self):
+        # Identity/mutation proof: the field is wired to the candidate's ACTUAL
+        # schedule. depth=0 (no freezes) collapses to 0.0, distinct from the
+        # 0.21875 a depth-2 schedule earns — so changing the candidate arm's
+        # freeze depth moves the reported cost, as it must.
+        full = _candidate_cost_reduction(self._sched(depth=2))["reduction_rate"]
+        none_ = _candidate_cost_reduction(self._sched(depth=0))["reduction_rate"]
+        assert full == pytest.approx(0.21875)
+        assert none_ == 0.0
+        assert full != none_
+
+    def test_deposit_surfaces_candidate_cost_reduction(self):
+        # result_to_json surfaces the axis additively. The stub default mirrors
+        # the committed surrogate/direction deposit shape (8-layer suffix scope,
+        # depth 3, warmup 6, spacing 4, 20 steps) → reduction 0.09375,
+        # realized_depth 3, uniform-cost model.
+        out = result_to_json(_stub_result())
+        cr = out["candidate_cost_reduction"]
+        assert cr is not None
+        assert cr["reduction_rate"] == pytest.approx(0.09375)
+        assert cr["realized_reduction_rate"] == 0.0
+        assert cr["realized_depth"] == 3
+        assert cr["frozen_at_epoch"] == {"31": 6, "30": 10, "29": 14}
+        assert cr["cost_model"] == "uniform_per_layer"
+        assert cr["level"] == 1
+
+    def test_real_generalization_deposit_candidate_schedule(self):
+        # Real-data coverage on the committed §4 generalization-regime recording:
+        # recompute the candidate cost reduction from the deposit's OWN schedule
+        # fields and assert the hand-computed constant (depth 3, warmup 12,
+        # spacing 10, 96 steps over the 8-layer suffix scope → 0.14453125). The
+        # committed fixture predates this field (additive), so this proves the
+        # helper reads a real candidate schedule, not a synthetic one.
+        data = json.loads(FIXTURE_9B_GENERALIZATION.read_text())
+        out = _candidate_cost_reduction(data)
+        assert out is not None
+        assert out["reduction_rate"] == pytest.approx(0.14453125)
+        assert out["realized_depth"] == 3
+        assert out["frozen_at_epoch"] == {"31": 12, "30": 22, "29": 32}
+        assert out["realized_reduction_rate"] == 0.0
+
+    def test_none_when_schedule_keys_absent(self):
+        # A result missing the candidate-arm schedule keys (e.g. a partial /
+        # legacy result) yields None rather than raising — the additive contract.
+        assert _candidate_cost_reduction({}) is None
+        assert _candidate_cost_reduction({"candidate_order": [3, 2, 1, 0]}) is None
 
 
 # ── regime classification (4th honesty axis: generalization vs memorization/overfit)
