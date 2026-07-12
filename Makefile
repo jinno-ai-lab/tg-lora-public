@@ -14,7 +14,14 @@
 PYTHON ?= python
 VENV ?= .venv
 PIP := $(VENV)/bin/pip
-PYTHON_VENV := $(VENV)/bin/python
+# `?=` (not `:=`) on purpose: the GPU targets are driven as
+# `PYTHON_VENV=/path/to/torch-python make <target>` (env-var form, see the 8
+# "Needs a torch+bnb+GPU interpreter" comments below) and a makefile `:=` would
+# silently clobber that override back to .venv/bin/python (exit 127 when no
+# .venv exists, e.g. in a worktree). `?=` lets an env/command-line PYTHON_VENV
+# win while still defaulting to $(VENV)/bin/python. Verify any change with both
+# `PYTHON_VENV=/x make -n <tgt>` and plain `make -n <tgt>`.
+PYTHON_VENV ?= $(VENV)/bin/python
 NOW_STAMP := $(shell date +%Y%m%d_%H%M%S)
 
 # Default config
@@ -942,6 +949,13 @@ freeze-validloss-ci-9b-baseline: ## GOAL §4 real-9B A/B + FULL-BACKPROP baselin
 # and executes only the missing ones — the difference between the verdict
 # landing incrementally across free-GPU windows vs. every interruption
 # restarting all 9 arms from zero. The ledger lives under runs/ (gitignored).
+# Background-citizen caveat: the script defers a held GPU with exit 75
+# (EX_TEMPFAIL), but GNU make flattens EVERY non-zero recipe exit to make-exit
+# 2 — so a poll-loop wrapper around `make` cannot see the 75 (it looks identical
+# to the script's exit-2 CUDA-down and exit-3 torn-ledger). A background job
+# that retries on tempfail must therefore bypass make and run the module
+# directly (or sniff "Deferring — exit 75" in the output); the exit codes are
+# only honored when the interpreter is invoked without a make wrapper.
 FREEZE_9B_FULL_FLAGS ?= --seq-len 1024 --total-steps 1500 --warmup-steps 150 --depth 3 --spacing 450 --n-candidate 3 --n-surrogate 3 --n-baseline 3 --train-examples 600 --valid-examples 64 --max-dataset-rows 2000 --ledger runs/freeze_validloss_ci_9b_full_ledger.jsonl
 
 freeze-validloss-ci-9b-full: ## GOAL §4 real-9B FULL-BUDGET A/B verdict (1500 steps; generalization regime; ~hours GPU)

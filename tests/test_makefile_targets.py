@@ -413,6 +413,93 @@ class TestPrefixTarget:
         assert (REPO_ROOT / "src/training/train_tg_lora.py").is_file()
 
 
+# ── PYTHON_VENV override resolution (launch-path exit-127 regression) ────────
+
+
+class TestPythonVenvOverride:
+    """``PYTHON_VENV=/path make <gpu-target>`` — the env-var override form
+    prescribed by all 8 "Needs a torch+bnb+GPU interpreter" Makefile comments
+    and the verdict-run launcher — must actually override the interpreter.
+
+    Regression: ``PYTHON_VENV := $(VENV)/bin/python`` (a makefile ``:=``)
+    silently clobbered the env-var override back to ``.venv/bin/python``, which
+    exits 127 on any checkout with no ``.venv`` (worktrees, fresh clones, CI).
+    The first launch of ``freeze-validloss-ci-9b-full`` hit exactly this — the
+    documented GPU launch form never fired. Same exit-127-on-fresh-checkout
+    family as ``TestPaperMemoryDryRun`` (TASK-0154). The ``?=`` fix lets an
+    env/command-line ``PYTHON_VENV`` win while preserving the default.
+    """
+
+    _TARGET = "freeze-validloss-ci-9b-full"
+    _OVERRIDE = "/opt/torch-bnb-venv/bin/python"
+
+    def test_assignment_is_conditional_not_immediate(
+        self, makefile_lines: list[str]
+    ) -> None:
+        """``?=`` is load-bearing: ``:=`` would clobber the env-var override."""
+        line = next(
+            (ln for ln in makefile_lines if ln.startswith("PYTHON_VENV")), None
+        )
+        assert line is not None, "PYTHON_VENV assignment missing from Makefile"
+        assert line.startswith("PYTHON_VENV ?="), (
+            "PYTHON_VENV must use ?= (not :=) so 'PYTHON_VENV=/path make ...' "
+            f"overrides the interpreter; got: {line!r}"
+        )
+
+    def test_env_var_override_resolves(self) -> None:
+        """``PYTHON_VENV=/path make -n`` must invoke /path (was silently ignored)."""
+        if shutil.which("make") is None:
+            pytest.skip("make unavailable")
+        result = subprocess.run(
+            ["make", "-n", self._TARGET],
+            cwd=REPO_ROOT,
+            env={**os.environ, "PYTHON_VENV": self._OVERRIDE},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr + result.stdout
+        assert self._OVERRIDE in result.stdout
+        # The default must NOT leak through when the override is set.
+        assert ".venv/bin/python" not in result.stdout
+
+    def test_command_line_override_resolves(self) -> None:
+        """``make PYTHON_VENV=/path -n`` must invoke /path."""
+        if shutil.which("make") is None:
+            pytest.skip("make unavailable")
+        env = {k: v for k, v in os.environ.items() if k != "PYTHON_VENV"}
+        result = subprocess.run(
+            ["make", "-n", f"PYTHON_VENV={self._OVERRIDE}", self._TARGET],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr + result.stdout
+        assert self._OVERRIDE in result.stdout
+
+    def test_default_interpreter_unchanged(self) -> None:
+        """With no override the interpreter stays ``.venv/bin/python``."""
+        if shutil.which("make") is None:
+            pytest.skip("make unavailable")
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("PYTHON_VENV", "VENV", "MAKEFLAGS")
+        }
+        result = subprocess.run(
+            ["make", "-n", self._TARGET],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr + result.stdout
+        assert ".venv/bin/python" in result.stdout
+
+
 # ── GPU-free dry-run validation (TASK-0154) ─────────────────────────────────
 
 
