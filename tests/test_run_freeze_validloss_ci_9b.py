@@ -36,6 +36,7 @@ used only to build tiny synthetic tensors / modules.
 from __future__ import annotations
 
 import json
+import math
 import re
 import types
 from pathlib import Path
@@ -55,6 +56,7 @@ from scripts.run_freeze_validloss_ci_9b import (
     _candidate_final_ce_mean,
     _classify_regime,
     _direction_ci_to_json,
+    _full_section4_verdict_gate,
     _is_reduced_budget,
     _reset_lora_for_arm,
     arm_valid_loss_9b,
@@ -128,6 +130,17 @@ FIXTURE_9B_BASELINE = (
     Path(__file__).resolve().parent
     / "fixtures"
     / "freeze_validloss_ci_9b_baseline.json"
+)
+
+# The FULL-BUDGET recording: the only deposit generated with ``reduced_budget=
+# False`` (``--total-steps 1500`` reaches config ``max_steps``), so it is the
+# FIRST committed deposit where the gate's regime conjunct is load-bearing —
+# target-scale + non-thin + full-budget clear, the verdict turns on whether the
+# run generalized. Lands only when ``make freeze-validloss-ci-9b-full-bg``
+# finishes banking the 9 arms; absent until then (the tests below skip, not
+# fail). Regenerate with ``make freeze-validloss-ci-9b-full``.
+FIXTURE_9B_FULL = (
+    Path(__file__).resolve().parent / "fixtures" / "freeze_validloss_ci_9b_full.json"
 )
 
 
@@ -1179,6 +1192,124 @@ class TestFullRunGateLiveness:
                 f"the full-§4 citation gate stays shut on is_thin_evidence. "
                 f"Raise {token} to >= {MIN_SAMPLE_FOR_BOOTSTRAP}."
             )
+
+
+# ── deposit gate self-consistency (the "inert green" guard) ───────────────────
+#
+# Every deposit-faithfulness test below hard-codes the EXPECTED gate boolean
+# (``is False`` / ``is True``); none recomputes the 4-conjunct gate from the
+# deposit's OWN fields. So a serializer/formula drift (a future conjunct added
+# to :func:`_full_section4_verdict_gate` without re-depositing), a hand-edited
+# file, or — the load-bearing case — the FULL-budget deposit landing with a
+# train-CE diagnostic that silently failed to record (regime → UNKNOWN → the
+# gate closes) would all pass green. The full verdict is the FIRST committed
+# deposit with ``reduced_budget=False``, so the regime conjunct decides the gate
+# for the first time; this class recomputes the gate from each deposit's own
+# provenance/fields and asserts the stored boolean matches, and for the full
+# verdict asserts the train-CE was actually recorded (the regime conjunct
+# evaluated on real data, not silently defaulted to None/UNKNOWN).
+
+_REAL_9B_DEPOSIT_FIXTURES = [
+    pytest.param(FIXTURE_9B_SURROGATE, id="surrogate"),
+    pytest.param(FIXTURE_9B_DIRECTION, id="direction"),
+    pytest.param(FIXTURE_9B_GENERALIZATION, id="generalization"),
+    pytest.param(FIXTURE_9B_BASELINE, id="baseline"),
+    pytest.param(FIXTURE_9B_FULL, id="full"),
+]
+
+
+class TestDepositGateSelfConsistency:
+    """The stored ``citable_as_full_section4_verdict`` must equal the 4-conjunct
+    gate recomputed from the deposit's own fields, and the regime conjunct must
+    have evaluated on real data for the one deposit where it is load-bearing."""
+
+    @pytest.mark.parametrize("path", _REAL_9B_DEPOSIT_FIXTURES)
+    def test_gate_boolean_matches_recomputed_gate(self, path):
+        # Recompute the gate from the deposit's OWN provenance + fields (the same
+        # ``_candidate_final_ce_mean`` / ``_classify_regime`` /
+        # ``_full_section4_verdict_gate`` the serializer uses) and assert the
+        # stored boolean matches. Catches serializer↔committed-file drift,
+        # hand-edits, and stale deposits — a single source of truth for the gate
+        # means any future conjunct is checked against every committed deposit.
+        if not path.exists():
+            pytest.skip(f"{path.name} not landed yet")
+        data = json.loads(path.read_text())
+        # Regime from the deposit's own provenance rollup so LEGACY deposits
+        # (lacking the top-level ``candidate_final_ce_train_loss_mean`` key) still
+        # classify consistently rather than KeyError / misread as UNKNOWN.
+        ce_mean = _candidate_final_ce_mean(data)
+        recomputed_regime = _classify_regime(ce_mean, data["candidate_mean"])
+        recomputed_gate = _full_section4_verdict_gate(
+            proxy_scale=data["proxy_scale"],
+            reduced_budget=data["reduced_budget"],
+            is_thin_evidence=data["is_thin_evidence"],
+            regime=recomputed_regime,
+        )
+        assert data["citable_as_full_section4_verdict"] is recomputed_gate
+
+    @pytest.mark.parametrize("path", _REAL_9B_DEPOSIT_FIXTURES)
+    def test_regime_field_matches_own_floats_when_present(self, path):
+        # When the deposit carries the top-level train-CE rollup, the stored
+        # ``regime`` string must be faithful to recomputation from the deposit's
+        # own floats — guards a deposit that ships ``regime="generalization"``
+        # while its provenance classifies otherwise. Legacy deposits predate the
+        # diagnostic (no top-level key) and skip, not fail.
+        if not path.exists():
+            pytest.skip(f"{path.name} not landed yet")
+        data = json.loads(path.read_text())
+        if "candidate_final_ce_train_loss_mean" not in data:
+            pytest.skip(f"{path.name} predates the regime diagnostic (legacy)")
+        recomputed = _classify_regime(
+            data["candidate_final_ce_train_loss_mean"], data["candidate_mean"]
+        )
+        assert data.get("regime") == recomputed
+
+    def test_full_deposit_top_level_ce_matches_provenance_rollup(self):
+        # The top-level ``candidate_final_ce_train_loss_mean`` must equal the mean
+        # of the candidate provenance ``final_ce_train_loss`` values (the same
+        # ``_candidate_final_ce_mean`` that produced it) — pins the rollup to the
+        # per-arm data so a deposit can't ship a stale/edited headline number.
+        if not FIXTURE_9B_FULL.exists():
+            pytest.skip("full-budget deposit not landed yet (run still banking)")
+        data = json.loads(FIXTURE_9B_FULL.read_text())
+        assert data["candidate_final_ce_train_loss_mean"] == pytest.approx(
+            _candidate_final_ce_mean(data)
+        )
+
+    def test_full_deposit_regime_conjunct_evaluated_on_real_data(self):
+        # THE LOAD-BEARING GUARD. The full-budget verdict is the FIRST committed
+        # deposit with ``reduced_budget=False``, so the gate's regime conjunct
+        # decides ``citable_as_full_section4_verdict`` for the first time. If the
+        # train-CE diagnostic silently failed to record (None), the regime would
+        # default to UNKNOWN and close the gate — with no other test surfacing
+        # the surprise. This asserts the train-CE was recorded as a finite
+        # number, so the gate's decision rests on real data, not a silent
+        # default. (Function-level closure: ``test_unknown_regime_blocks_full_
+        # citation``; this is its landing-time enforcement on the real deposit.)
+        if not FIXTURE_9B_FULL.exists():
+            pytest.skip("full-budget deposit not landed yet (run still banking)")
+        data = json.loads(FIXTURE_9B_FULL.read_text())
+        assert "candidate_final_ce_train_loss_mean" in data
+        ce = data["candidate_final_ce_train_loss_mean"]
+        assert isinstance(ce, (int, float)) and math.isfinite(ce)
+
+    def test_full_deposit_is_structurally_full_budget(self):
+        # The ``make freeze-validloss-ci-9b-full`` config GUARANTEES: full-budget
+        # (``total_steps`` reaches ``cfg_max_steps``, not reduced), non-thin
+        # (>=3 seeds per arm set), target-scale (not proxy). These are
+        # config-determined, so they pin that the landed run was not silently
+        # reduced/thin — independent of the empirical SURPASSES/TIES outcome,
+        # which the gate-consistency test above handles honestly either way.
+        if not FIXTURE_9B_FULL.exists():
+            pytest.skip("full-budget deposit not landed yet (run still banking)")
+        data = json.loads(FIXTURE_9B_FULL.read_text())
+        assert data["proxy_scale"] is False
+        assert data["reduced_budget"] is False
+        assert data["total_steps"] == data["cfg_max_steps"]
+        assert data["is_thin_evidence"] is False
+        assert data["n_candidate"] >= 3
+        assert data["n_surrogate"] >= 3
+        assert data["n_baseline"] >= 3
 
 
 # ── deposit replay faithfulness on the committed real-9B recording ──────────

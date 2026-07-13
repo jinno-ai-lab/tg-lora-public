@@ -600,6 +600,33 @@ def _classify_regime(final_ce_train_loss, valid_loss):
     return REGIME_GENERALIZATION
 
 
+def _full_section4_verdict_gate(
+    *, proxy_scale: bool, reduced_budget: bool, is_thin_evidence: bool, regime: str
+) -> bool:
+    """The 4-conjunct citation gate, as one source of truth.
+
+    A run is citable as the COMPLETE §4 verdict ONLY when it clears all four
+    axes: target-scale (not a proxy), full-budget (reached config ``max_steps``,
+    not reduced), non-thin (enough seeds for the bootstrap to capture variance),
+    AND in the generalization regime (the candidate generalized rather than
+    memorized — see :func:`_classify_regime`). Extracted from
+    :func:`result_to_json` so the gate is a single testable expression: the
+    serializer and the deposit self-consistency test
+    (``TestDepositGateSelfConsistency``) both call this, so a future conjunct
+    added here is the ONE place it must change, and any committed deposit whose
+    stored boolean predates the change is flagged by that test — the gate
+    definition cannot drift from the committed deposits unnoticed. The private
+    ``src.data`` quality filter is a further axis this gate cannot see on the
+    mirror; it is noted in the report, never silently assumed away.
+    """
+    return (
+        (not proxy_scale)
+        and (not reduced_budget)
+        and (not is_thin_evidence)
+        and (regime == REGIME_GENERALIZATION)
+    )
+
+
 def _candidate_final_ce_mean(result: dict):
     """Mean candidate-arm ``final_ce_train_loss``, ignoring unrecorded arms.
 
@@ -1387,11 +1414,11 @@ def result_to_json(result: dict) -> dict:
         # is an *attribution* caveat on the verdict's interpretation, not a
         # scale/budget axis, so it never opens or closes this gate by itself.
         "citable_as_target_scale": (not result["proxy_scale"]),
-        "citable_as_full_section4_verdict": (
-            (not result["proxy_scale"])
-            and (not reduced)
-            and (not ci.is_thin_evidence)
-            and (regime == REGIME_GENERALIZATION)
+        "citable_as_full_section4_verdict": _full_section4_verdict_gate(
+            proxy_scale=result["proxy_scale"],
+            reduced_budget=reduced,
+            is_thin_evidence=ci.is_thin_evidence,
+            regime=regime,
         ),
         # Resume-ledger trace (GOAL §7). ADDITIVE — legacy deposits (and any
         # result dict built without the ledger) default to 0 resumed arms and no
