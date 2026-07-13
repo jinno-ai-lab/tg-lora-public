@@ -28,6 +28,7 @@ checked before the GPU gates so it is never mislabeled as the retryable tempfail
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 import scripts.run_freeze_validloss_ci_9b as mod
@@ -220,37 +221,174 @@ class TestOutputGuardMainIntegration:
             raise AssertionError(f"{name} must not be reached on an unwritable output")
         return _boom
 
-    def test_dead_output_aborts_before_training(self, monkeypatch, tmp_path):
-        """The dead-CWD promise: an unwritable --output is FATAL (exit 1) BEFORE
-        the config is loaded or an arm trained — so no GPU is burned on a result
-        that can't be persisted. Mirrors the busy-GPU integration test; the GPU
-        stubs are 'fine' so the only thing that can stop the run is the guard."""
+    def test_dead_cwd_aborts_before_training(self, monkeypatch, tmp_path):
+        """The dead-CWD promise: a removed worktree is FATAL (exit 1) BEFORE the
+        config is loaded or an arm trained — so no GPU is burned on a result that
+        can't be persisted. ``cwd_is_alive()`` is the robust signal (a recreated
+        ``runs/`` subdir would fool ``parent.is_dir()``, but the CWD path itself
+        is never recreated); stubbed False here to exercise the exact branch a
+        host that deleted the worktree hits. The GPU stubs are 'fine', so the
+        only thing that can stop the run is the dead-CWD gate."""
         _mem(monkeypatch, available=True, free_gib=12.0)
 
+        monkeypatch.setattr(mod, "cwd_is_alive", lambda: False)
         monkeypatch.setattr(mod, "run_ci_9b", self._boom_if("run_ci_9b"))
         monkeypatch.setattr(mod.OmegaConf, "load", self._boom_if("OmegaConf.load"))
 
         rc = mod.main([
             "--min-free-gib", "0",
-            "--output", str(tmp_path / "no_such_dir" / "out.json"),
+            "--output", str(tmp_path / "out.json"),
         ])
 
         assert rc == 1  # FATAL, not the retryable tempfail (75)
 
-    def test_dead_output_not_masked_by_busy_gpu(self, monkeypatch, tmp_path):
-        """Precedence (the load-bearing one): a dead --output is FATAL (1) EVEN
-        on a busy card. It must NOT surface as the retryable tempfail (75), or
-        the self-retrying launcher would re-spawn the worker into the same dead
-        CWD forever. The output gate therefore runs before the GPU-memory gate."""
+    def test_dead_cwd_not_masked_by_busy_gpu(self, monkeypatch, tmp_path):
+        """Precedence (the load-bearing one): a dead CWD is FATAL (1) EVEN on a
+        busy card. It must NOT surface as the retryable tempfail (75), or the
+        self-retrying launcher would re-spawn the worker into the same dead CWD
+        forever. The dead-CWD gate therefore runs before the GPU-memory gate."""
         _mem(monkeypatch, available=True, free_gib=4.0)  # below the 10 GiB floor
 
+        monkeypatch.setattr(mod, "cwd_is_alive", lambda: False)
         monkeypatch.setattr(mod, "run_ci_9b", self._boom_if("run_ci_9b"))
         monkeypatch.setattr(mod.OmegaConf, "load", self._boom_if("OmegaConf.load"))
 
         rc = mod.main([
             "--min-free-gib", "10",  # the floor WOULD defer (75) if reached first
-            "--output", str(tmp_path / "no_such_dir" / "out.json"),
+            "--output", str(tmp_path / "out.json"),
         ])
 
         assert rc == 1
         assert rc != EXIT_GPU_TEMPFAIL
+
+    def test_live_cwd_missing_runs_dir_is_created_not_fatal(self, monkeypatch, tmp_path):
+        """A fresh worktree (live CWD, no ``runs/``) must NOT be mistaken for the
+        dead-CWD trap: ``append_arm_to_ledger`` already ``mkdir()``s at write
+        time, so a missing parent is a trivial setup step the pre-flight now
+        performs. This is the fix for the fresh-worktree FATAL that blocked
+        ``make freeze-validloss-ci-9b-full-bg`` outright (the worker aborted on a
+        ``runs/`` it would have created anyway). Proves main() reaches
+        ``run_ci_9b`` (past every pre-flight) and created the dir."""
+        _mem(monkeypatch, available=True, free_gib=12.0)
+        monkeypatch.chdir(tmp_path)
+        assert not (tmp_path / "runs").exists()
+
+        class _GotPastPreflight(RuntimeError):
+            pass
+
+        def _past(**kw):  # noqa: ARG001
+            raise _GotPastPreflight("reached run_ci_9b — pre-flight passed")
+
+        monkeypatch.setattr(mod, "run_ci_9b", _past)
+        # Config lives under the repo root, not tmp_path; the pre-flight under
+        # test is upstream of the load, so stub the load to a dummy cfg.
+        monkeypatch.setattr(mod.OmegaConf, "load", lambda *a, **k: {})  # noqa: ARG001
+
+        with pytest.raises(_GotPastPreflight):
+            mod.main([
+                "--min-free-gib", "0",
+                "--ledger", "runs/sub/ledger.jsonl",
+                "--output", "runs/sub/out.json",
+            ])
+
+        # The fresh-worktree fix: the parent dirs were created, not rejected.
+        assert (tmp_path / "runs" / "sub").is_dir()
+
+
+class TestCwdIsAlive:
+    """``cwd_is_alive`` is the robust mid-run dead-CWD signal: ``Path.cwd()``
+    raises once the worktree is unlinked, and a recreated ``runs/`` subdir cannot
+    fool it (it checks the CWD path itself). Pinned live/deleted so the per-arm
+    and startup gates can't silently degrade to always-True."""
+
+    def test_true_on_live_cwd(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert mod.cwd_is_alive() is True
+
+    def test_false_after_cwd_removed(self, tmp_path, monkeypatch):
+        # Sit in a subdir of tmp_path, unlink it, assert the death is detected —
+        # without leaving the test process in a broken CWD (monkeypatch restores
+        # the original live CWD on teardown).
+        nest = tmp_path / "nest"
+        nest.mkdir()
+        monkeypatch.chdir(nest)
+        nest.rmdir()
+        assert mod.cwd_is_alive() is False
+
+
+class TestOutputsAreAbsolute:
+    """The escape hatch: absolute ``--output``/``--ledger`` survive the run's CWD
+    being removed (writes never resolve against CWD), so the per-arm dead-CWD
+    check is skipped for them — the robust fire for a worktree-recycling host."""
+
+    def test_none_is_unconstrained(self):
+        assert mod._outputs_are_absolute(None, None) is True
+
+    def test_relative_output_is_false(self):
+        assert mod._outputs_are_absolute("runs/out.json", None) is False
+
+    def test_relative_ledger_is_false(self):
+        assert mod._outputs_are_absolute(None, "runs/x.jsonl") is False
+
+    def test_absolute_is_true(self):
+        assert mod._outputs_are_absolute("/abs/out.json", "/abs/x.jsonl") is True
+
+    def test_mixed_absolute_and_relative_is_false(self):
+        # One relative path makes the whole run CWD-dependent.
+        assert mod._outputs_are_absolute("/abs/out.json", "runs/x.jsonl") is False
+
+
+class TestPerArmDeadCwdCheck:
+    """The mid-run dead-CWD trap: a worktree removed BETWEEN arms is caught at
+    the next arm boundary for relative paths (bounding wasted GPU to <=1 arm),
+    and skipped for absolute paths (they outlive the CWD). Exercises
+    ``_collect_arms`` directly with a stub runner — no GPU, no model."""
+
+    @staticmethod
+    def _spec(role, index):
+        return {"role": role, "index": index}
+
+    def test_relative_paths_raise_before_first_arm(self, monkeypatch):
+        # CWD dies before any arm runs: the check fires at the first non-cached
+        # arm, so the GPU runner is never reached.
+        monkeypatch.setattr(mod, "cwd_is_alive", lambda: False)
+        monkeypatch.setattr(mod, "load_ledger", lambda path, fp: {})  # noqa: ARG001
+
+        def _boom(spec):  # noqa: ARG001
+            raise AssertionError("runner must not be reached; cwd died before arm 0")
+
+        with pytest.raises(mod.OutputPathDiedDuringRun):
+            mod._collect_arms(
+                [self._spec("candidate", 0), self._spec("candidate", 1)],
+                _boom,
+                ledger_path="runs/x.jsonl",
+                output="runs/out.json",
+            )
+
+    def test_absolute_output_survives_cwd_death(self, monkeypatch):
+        # Absolute --output: writes don't depend on CWD, so a dead CWD is
+        # harmless and the run proceeds (per-arm check skipped).
+        monkeypatch.setattr(mod, "cwd_is_alive", lambda: False)
+        specs = [self._spec("candidate", 0), self._spec("surrogate", 0)]
+
+        collected, n_resumed = mod._collect_arms(
+            specs, lambda s: (0.5, {}), output="/abs/out.json"
+        )  # ledger_path=None -> no load/append
+
+        assert len(collected["candidate"]) == 1
+        assert len(collected["surrogate"]) == 1
+        assert n_resumed == 0
+
+    def test_live_cwd_never_raises_even_for_relative(self, monkeypatch):
+        # CWD alive -> the per-arm check is a no-op; relative paths are fine.
+        monkeypatch.setattr(mod, "cwd_is_alive", lambda: True)
+        monkeypatch.setattr(mod, "load_ledger", lambda path, fp: {})  # noqa: ARG001
+        monkeypatch.setattr(mod, "append_arm_to_ledger", lambda *a, **k: None)  # noqa: ARG001
+
+        collected, _ = mod._collect_arms(
+            [self._spec("candidate", 0)],
+            lambda s: (0.5, {}),
+            ledger_path="runs/x.jsonl",
+            output="runs/out.json",
+        )
+        assert len(collected["candidate"]) == 1

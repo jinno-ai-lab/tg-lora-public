@@ -770,6 +770,23 @@ class IncompleteResumeError(RuntimeError):
     """
 
 
+class OutputPathDiedDuringRun(RuntimeError):
+    """The run's CWD vanished mid-run and the output paths can't survive it.
+
+    Raised at an arm boundary when :func:`cwd_is_alive` is False AND at least one
+    of ``--output`` / ``--ledger`` is relative. The host removing the run's
+    worktree (e.g. AI Hub recycling a per-instruction worktree while a multi-hour
+    ``--total-steps 1500`` run is still on the card) leaves the process training
+    — its model/data live in memory — but relative writes resolve to a deleted
+    directory, so every remaining arm banks to an unrecoverable void and the
+    deposit crashes at the end. Failing loud at the next arm boundary bounds the
+    wasted GPU to the arm in progress instead of the whole run. Absolute
+    ``--output`` / ``--ledger`` survive CWD death (their writes don't depend on
+    it), so the check is skipped for them — the robust fire for a host that
+    recycles worktrees faster than a full-budget run completes.
+    """
+
+
 def _config_fingerprint(
     *,
     total_steps: int,
@@ -982,6 +999,7 @@ def _collect_arms(
     *,
     ledger_path=None,
     fingerprint=None,
+    output=None,
 ):
     """Execute the arm specs, banking each to / replaying each from the ledger.
 
@@ -1007,6 +1025,22 @@ def _collect_arms(
                 role, spec["index"], cached[key][0],
             )
             continue
+        # Dead-CWD trap, mid-run: if the host removed this run's worktree since
+        # startup (cwd_is_alive() was True at pre-flight) and a relative
+        # --output/--ledger can't survive it, stop NOW rather than spend GPU on
+        # an arm that banks to an unrecoverable void. Binds the waste to the arm
+        # in progress instead of the whole multi-hour run. Absolute paths skip
+        # the check — their writes outlive the CWD (the robust fire).
+        if not cwd_is_alive() and not _outputs_are_absolute(output, ledger_path):
+            raise OutputPathDiedDuringRun(
+                "CWD removed mid-run (the worktree was deleted by the host) and "
+                "--output / --ledger are relative, so the remaining arms would "
+                "bank to an unrecoverable directory and the deposit would never "
+                "land. Stopping at this arm boundary to spare the GPU. The arms "
+                "already banked in the --ledger survive a re-fire. Re-fire from "
+                "a live worktree, or with absolute --output / --ledger to "
+                "survive worktree recycling."
+            )
         valid_loss, prov = runner(spec)
         collected[role].append((valid_loss, prov))
         if ledger_path is not None:
@@ -1092,6 +1126,7 @@ def run_ci_9b(
     n_control: int = 0,
     n_baseline: int = 0,
     ledger_path=None,
+    output=None,
 ) -> dict:
     """Run the real-9B candidate+surrogate sweep and return the §4 verdict dict.
 
@@ -1209,6 +1244,7 @@ def run_ci_9b(
     try:
         collected, n_resumed = _collect_arms(
             specs, _runner, ledger_path=ledger_path, fingerprint=fingerprint,
+            output=output,
         )
         candidate_results = collected["candidate"]
         surrogate_results = collected["surrogate"]
@@ -1784,15 +1820,87 @@ def output_paths_writable(output: str | None, ledger: str | None) -> str | None:
     return None
 
 
+def cwd_is_alive() -> bool:
+    """True iff the process working directory still exists on disk.
+
+    A background run whose worktree was removed by the host (AI Hub recycling a
+    per-instruction worktree mid-run) keeps training — model/data live in memory
+    / absolute HF-cache paths — but ``Path.cwd()`` raises ``FileNotFoundError``
+    once the directory is unlinked. That is the robust *mid-run* signal for the
+    dead-CWD trap: a recreated ``runs/`` subdir would fool a ``parent.is_dir()``
+    check (``append_arm_to_ledger`` mkdir()s at write time, so it can resurrect
+    ``runs/`` inside the unlinked inode), but the CWD path itself is never
+    recreated, so this stays honest after the trap fires.
+    """
+    try:
+        Path.cwd()
+        return True
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def _outputs_are_absolute(output: str | None, ledger: str | None) -> bool:
+    """True when every given output path is absolute.
+
+    Absolute ``--output`` / ``--ledger`` survive the run's CWD being removed
+    (their writes never resolve against CWD), so a mid-run dead CWD is harmless
+    for them — the check in :func:`_collect_arms` is skipped. A single relative
+    path makes the run CWD-dependent, so this returns False. ``None`` paths
+    impose no constraint.
+    """
+    for path in (output, ledger):
+        if path and not Path(path).is_absolute():
+            return False
+    return True
+
+
+def _ensure_output_parent_dirs(output: str | None, ledger: str | None) -> None:
+    """Create the ``--output`` / ``--ledger`` parent dirs up front.
+
+    ``append_arm_to_ledger`` already ``mkdir(parents=True, exist_ok=True)`` at
+    write time, so a missing parent (a fresh worktree with no ``runs/``) is a
+    trivial setup step — NOT the dead-CWD trap. Doing it at pre-flight (after
+    the :func:`cwd_is_alive` gate, so a truly dead CWD is still caught first)
+    makes a fresh-worktree ``make freeze-validloss-ci-9b-full-bg`` proceed
+    instead of FATALing on a ``runs/`` that the run would have created anyway.
+    Silently best-effort: a path whose parent cannot be created is left for
+    :func:`output_paths_writable` to report.
+    """
+    for path in (output, ledger):
+        if path:
+            try:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
     # Output integrity is the most fundamental pre-flight: the deposit is the
-    # entire point of a multi-hour run. A dead/unwritable output CWD is FATAL
-    # (exit 1), checked before CUDA/GPU-memory so it is never mislabeled as the
-    # retryable tempfail (75) the launcher would loop on forever. No-op when no
-    # --output/--ledger is given.
+    # entire point of a multi-hour run, checked before CUDA/GPU-memory so it is
+    # never mislabeled as the retryable tempfail (75) the launcher would loop on
+    # forever. The dead-CWD trap has two faces, disambiguated here:
+    #   (1) the CWD itself is gone (worktree removed by the host) — FATAL, the
+    #       run can persist NOTHING relative; re-fire live or with absolute
+    #       paths. cwd_is_alive() is the robust signal (a recreated runs/ subdir
+    #       cannot fool it).
+    #   (2) the CWD is live but a parent dir is missing (fresh worktree, no
+    #       runs/) — trivially created, NOT fatal; append_arm_to_ledger mkdir()s
+    #       at write time anyway.
+    if not cwd_is_alive():
+        logger.error(
+            "CWD has been removed (the process working directory no longer "
+            "exists on disk). A background run launched from a worktree the "
+            "host has since deleted cannot persist any relative --output / "
+            "--ledger, so the verdict deposit can never land (the dead-CWD "
+            "trap). Re-fire from a live working directory, or with absolute "
+            "--output / --ledger to survive worktree recycling. Aborting "
+            "(fatal, not a retryable tempfail)."
+        )
+        return 1
+    _ensure_output_parent_dirs(args.output, args.ledger)
     unwritable = output_paths_writable(args.output, args.ledger)
     if unwritable is not None:
         logger.error("%s", unwritable)
@@ -1830,6 +1938,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             n_control=args.n_control,
             n_baseline=args.n_baseline,
             ledger_path=args.ledger,
+            output=args.output,
         )
     except IncompleteResumeError as exc:
         # The resumed ledger banked only one side of the A/B, so no verdict can
@@ -1838,6 +1947,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         # to re-run the same command and fill the gap.
         logger.error("%s", exc)
         return 3
+    except OutputPathDiedDuringRun as exc:
+        # The worktree was removed mid-run; remaining arms can't persist. FATAL
+        # (1) — NOT retryable: the self-retrying launcher would otherwise respawn
+        # the worker into the same dead state forever. The arms already banked
+        # in the --ledger survive a re-fire from a live CWD.
+        logger.error("%s", exc)
+        return 1
 
     payload = (
         json.dumps(result_to_json(result), indent=2)
