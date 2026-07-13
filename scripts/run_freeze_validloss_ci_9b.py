@@ -1741,9 +1741,62 @@ def gpu_free_memory_deferred(min_free_gib: float) -> str | None:
     return None
 
 
+def output_paths_writable(output: str | None, ledger: str | None) -> str | None:
+    """Return a fatal reason if ``--output`` or ``--ledger`` can't be written.
+
+    ``None`` means "both writable, proceed". A non-None string means "abort":
+    the parent directory of the given path either does not exist or is not
+    writable. This catches the *dead-CWD trap*: a background run launched from
+    a worktree that has since been removed keeps training (its model and data
+    live in memory / absolute HF-cache paths) but its *relative* output paths
+    — ``runs/...ledger.jsonl``, ``tests/fixtures/...json`` — resolve to a
+    deleted, now-empty working directory, so the ledger append (first arm
+    completion) and the final deposit write both raise ``FileNotFoundError``
+    hours later and the verdict never lands. Checking at pre-flight makes that
+    failure loud and immediate instead of surfacing only after GPU has been
+    spent.
+
+    A missing/unwritable parent is FATAL (the caller exits 1), NOT a tempfail
+    (75): waiting on a free GPU does not resurrect a deleted directory, so the
+    operator must re-fire from a live worktree. Deliberately checked in main()
+    BEFORE the CUDA / GPU-memory gates so a dead CWD is never mislabeled as a
+    retryable tempfail and retried forever.
+
+    ``Path.is_dir`` / ``os.access`` resolve the (relative) parent against the
+    process CWD; on a removed CWD both return False (ENOENT is swallowed), so
+    the trap is detected without a fragile ``os.getcwd()`` that would itself
+    raise.
+    """
+    for flag, path in (("--output", output), ("--ledger", ledger)):
+        if not path:
+            continue
+        parent = Path(path).parent
+        if not parent.is_dir() or not os.access(parent, os.W_OK):
+            return (
+                f"{flag} path {path!r} is not writable: its parent directory "
+                f"{parent} does not exist or is not writable. If this run was "
+                f"launched from a worktree that has since been removed, every "
+                f"relative output path resolves to a deleted directory and the "
+                f"verdict deposit can never land (the dead-CWD trap). Re-fire "
+                f"this command from a live working directory. Aborting (fatal, "
+                f"not a retryable tempfail)."
+            )
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+    # Output integrity is the most fundamental pre-flight: the deposit is the
+    # entire point of a multi-hour run. A dead/unwritable output CWD is FATAL
+    # (exit 1), checked before CUDA/GPU-memory so it is never mislabeled as the
+    # retryable tempfail (75) the launcher would loop on forever. No-op when no
+    # --output/--ledger is given.
+    unwritable = output_paths_writable(args.output, args.ledger)
+    if unwritable is not None:
+        logger.error("%s", unwritable)
+        return 1
 
     if not torch.cuda.is_available():
         logger.error("CUDA not available — a real 9B run requires a GPU. Aborting.")

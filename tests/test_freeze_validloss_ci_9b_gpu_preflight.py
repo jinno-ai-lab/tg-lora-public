@@ -17,6 +17,13 @@ These tests pin the guard's pure logic without CUDA: the fail-open contract
 free → None; below floor → reason citing exit 75), the exported constants that
 the poll-loop contract depends on, and the main() integration — on a busy card
 main() returns 75 and never reaches ``run_ci_9b`` (so no model load, no OOM).
+
+They also pin the sibling output-writability guard (``output_paths_writable``),
+which catches the *dead-CWD trap*: a run launched from a worktree that has since
+been removed trains fine but its relative ``--output``/``--ledger`` resolve to a
+deleted directory, so the deposit never lands. That guard is FATAL (exit 1) and
+checked before the GPU gates so it is never mislabeled as the retryable tempfail
+(75) the launcher would loop on forever.
 """
 
 from __future__ import annotations
@@ -29,6 +36,7 @@ from scripts.run_freeze_validloss_ci_9b import (
     EXIT_GPU_TEMPFAIL,
     gpu_free_mib,
     gpu_free_memory_deferred,
+    output_paths_writable,
 )
 
 _GIB = 1024 * 1024 * 1024
@@ -152,3 +160,97 @@ class TestMainIntegration:
             raise AssertionError("mem_get_info must not be called when CUDA is absent")
         monkeypatch.setattr(torch.cuda, "mem_get_info", _boom)
         assert mod.main(["--min-free-gib", "10"]) == 2
+
+
+class TestOutputPathsWritable:
+    """The dead-CWD trap: a run launched from a since-removed worktree cannot
+    write its relative --output/--ledger, so the deposit never lands. The guard
+    refuses to burn GPU up front. ``Path.is_dir`` / ``os.access`` return False on
+    a removed CWD (ENOENT is swallowed), so a missing-parent path exercises the
+    exact branch a dead CWD hits — these tests pin that branch without rmdir'ing
+    the process CWD (which would leave the test process in a broken state)."""
+
+    def test_no_output_no_ledger_is_a_noop(self):
+        # main() with neither flag (the existing pre-flight tests) must be
+        # unaffected — the guard only fires on a given path.
+        assert output_paths_writable(None, None) is None
+
+    def test_writable_output_and_ledger_proceed(self, tmp_path):
+        assert output_paths_writable(
+            str(tmp_path / "out.json"), str(tmp_path / "ledger.jsonl")
+        ) is None
+
+    def test_bare_filename_in_live_cwd_proceeds(self, tmp_path, monkeypatch):
+        # A bare filename's parent is "." — must read as the (live) CWD and pass.
+        monkeypatch.chdir(tmp_path)
+        assert output_paths_writable("out.json", None) is None
+
+    def test_missing_output_parent_is_fatal(self, tmp_path):
+        reason = output_paths_writable(
+            str(tmp_path / "no_such_dir" / "out.json"), None
+        )
+        assert reason is not None
+        assert "not writable" in reason
+        assert "dead-CWD" in reason
+        assert "fatal" in reason
+        # The offending flag + path must be named so the operator can act.
+        assert "--output" in reason
+
+    def test_missing_ledger_parent_is_fatal(self, tmp_path):
+        reason = output_paths_writable(
+            None, str(tmp_path / "no_such_dir" / "ledger.jsonl")
+        )
+        assert reason is not None
+        assert "--ledger" in reason
+        assert "dead-CWD" in reason
+
+    def test_output_reported_when_both_broken(self, tmp_path):
+        # Both broken: the first-checked flag (--output) is the one surfaced.
+        reason = output_paths_writable(
+            str(tmp_path / "missing_out" / "out.json"),
+            str(tmp_path / "missing_ledger" / "ledger.jsonl"),
+        )
+        assert reason is not None
+        assert "--output" in reason
+
+
+class TestOutputGuardMainIntegration:
+    def _boom_if(self, name):
+        def _boom(*a, **k):  # noqa: ARG001
+            raise AssertionError(f"{name} must not be reached on an unwritable output")
+        return _boom
+
+    def test_dead_output_aborts_before_training(self, monkeypatch, tmp_path):
+        """The dead-CWD promise: an unwritable --output is FATAL (exit 1) BEFORE
+        the config is loaded or an arm trained — so no GPU is burned on a result
+        that can't be persisted. Mirrors the busy-GPU integration test; the GPU
+        stubs are 'fine' so the only thing that can stop the run is the guard."""
+        _mem(monkeypatch, available=True, free_gib=12.0)
+
+        monkeypatch.setattr(mod, "run_ci_9b", self._boom_if("run_ci_9b"))
+        monkeypatch.setattr(mod.OmegaConf, "load", self._boom_if("OmegaConf.load"))
+
+        rc = mod.main([
+            "--min-free-gib", "0",
+            "--output", str(tmp_path / "no_such_dir" / "out.json"),
+        ])
+
+        assert rc == 1  # FATAL, not the retryable tempfail (75)
+
+    def test_dead_output_not_masked_by_busy_gpu(self, monkeypatch, tmp_path):
+        """Precedence (the load-bearing one): a dead --output is FATAL (1) EVEN
+        on a busy card. It must NOT surface as the retryable tempfail (75), or
+        the self-retrying launcher would re-spawn the worker into the same dead
+        CWD forever. The output gate therefore runs before the GPU-memory gate."""
+        _mem(monkeypatch, available=True, free_gib=4.0)  # below the 10 GiB floor
+
+        monkeypatch.setattr(mod, "run_ci_9b", self._boom_if("run_ci_9b"))
+        monkeypatch.setattr(mod.OmegaConf, "load", self._boom_if("OmegaConf.load"))
+
+        rc = mod.main([
+            "--min-free-gib", "10",  # the floor WOULD defer (75) if reached first
+            "--output", str(tmp_path / "no_such_dir" / "out.json"),
+        ])
+
+        assert rc == 1
+        assert rc != EXIT_GPU_TEMPFAIL
