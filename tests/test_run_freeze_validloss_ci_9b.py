@@ -136,9 +136,21 @@ FIXTURE_9B_BASELINE = (
 # False`` (``--total-steps 1500`` reaches config ``max_steps``), so it is the
 # FIRST committed deposit where the gate's regime conjunct is load-bearing —
 # target-scale + non-thin + full-budget clear, the verdict turns on whether the
-# run generalized. Lands only when ``make freeze-validloss-ci-9b-full-bg``
-# finishes banking the 9 arms; absent until then (the tests below skip, not
-# fail). Regenerate with ``make freeze-validloss-ci-9b-full``.
+# run generalized. Recorded on a real RTX 3060 (Qwen3.5-9B, seq1024, suffix-only
+# last-25% scope, 600 train / 1500 step ≈ 2.5 epoch, 3 seeds × 3 arms = 9 arms,
+# ~3 h GPU via ``make freeze-validloss-ci-9b-full-bg``; resumed_arm_count=0, a
+# clean single-session run). The candidate arm generalized
+# (final_ce_train_loss_mean=1.366 ≈ valid 1.695; gap 0.33 — not memorization
+# (ce≈0) nor overfit (gap>0.5)) → ``regime="generalization"`` → the 4-conjunct
+# gate opens: ``citable_as_full_section4_verdict=True``. Headline verdict:
+# **TIES** (candidate 1.6947 vs random-order surrogate 1.6960, CI[95%]≈[-0.0001,
+# +0.0027] straddles 0) — at full budget the output-first freeze order does NOT
+# beat a random order on the homogeneous (single-scope) leg; the order effect
+# seen at reduced budget does not survive full-budget generalization. The §4
+# condition (a) arm reproduces at full budget: candidate **SURPASSES** full
+# backprop (1.6947 vs 1.8794, CI[0.164, 0.201]) — the freeze acts as a
+# regularizer (baseline overfit: train CE 0.78 ≪ valid 1.88; frozen arms
+# generalized). Regenerate with ``make freeze-validloss-ci-9b-full``.
 FIXTURE_9B_FULL = (
     Path(__file__).resolve().parent / "fixtures" / "freeze_validloss_ci_9b_full.json"
 )

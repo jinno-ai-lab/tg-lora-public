@@ -1,0 +1,202 @@
+{
+  "verdict": "TIES",
+  "passes": false,
+  "significant_surpasses": false,
+  "is_material": true,
+  "is_thin_evidence": false,
+  "candidate_mean": 1.6947166467580246,
+  "surrogate_mean": 1.6960347842638537,
+  "point_improvement": 0.0013181375058290978,
+  "lower": -9.042031403305728e-05,
+  "upper": 0.002726695325691253,
+  "confidence": 0.95,
+  "n_bootstrap": 10000,
+  "candidate_losses": [
+    1.6958548979600891,
+    1.6939530560775893,
+    1.6943419862363953
+  ],
+  "surrogate_losses": [
+    1.6957994417170994,
+    1.6973143713257741,
+    1.6949905397486873
+  ],
+  "candidate_order": [
+    31,
+    30,
+    29,
+    28,
+    27,
+    26,
+    25,
+    24
+  ],
+  "device": "cuda",
+  "model": "Qwen/Qwen3.5-9B",
+  "dataset": "databricks/databricks-dolly-15k",
+  "total_steps": 1500,
+  "warmup_steps": 150,
+  "depth": 3,
+  "spacing": 450,
+  "n_candidate": 3,
+  "n_surrogate": 3,
+  "base_seed": 0,
+  "active_scope": [
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "scope_label": "last_25_percent",
+  "n_active_layers": 8,
+  "scope_trainable_params": 10819584,
+  "seq_len": 1024,
+  "train_examples": 600,
+  "valid_examples": 64,
+  "use_local_loss": true,
+  "proxy_scale": false,
+  "reduced_budget": false,
+  "cfg_max_steps": 1500,
+  "candidate_final_ce_train_loss_mean": 1.365735017889076,
+  "candidate_train_valid_gap": 0.32898162886894866,
+  "regime": "generalization",
+  "candidate_cost_reduction": {
+    "level": 1,
+    "reduction_rate": 0.11250000000000004,
+    "progressive_backward_flops": 21300.0,
+    "full_backward_flops": 24000.0,
+    "realized_reduction_rate": 0.0,
+    "level1_realization_ceiling": 0.0,
+    "realized_depth": 3,
+    "frozen_at_epoch": {
+      "31": 150,
+      "30": 600,
+      "29": 1050
+    },
+    "cost_model": "uniform_per_layer"
+  },
+  "candidate_provenance": [
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.0001544952392578125,
+      "final_ce_train_loss": 1.3663499884214252
+    },
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.00016117095947265625,
+      "final_ce_train_loss": 1.3654463815006117
+    },
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.000152587890625,
+      "final_ce_train_loss": 1.3654086837451904
+    }
+  ],
+  "surrogate_provenance": [
+    {
+      "frozen_layers": [
+        25,
+        28,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 1.233816146850586e-05,
+      "final_ce_train_loss": 1.3668027837357173
+    },
+    {
+      "frozen_layers": [
+        26,
+        28,
+        29
+      ],
+      "n_trainable_params": 6687744,
+      "last_train_loss": 3.886222839355469e-05,
+      "final_ce_train_loss": 1.3661067722924054
+    },
+    {
+      "frozen_layers": [
+        24,
+        27,
+        28
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.0,
+      "final_ce_train_loss": 1.3637806474665801
+    }
+  ],
+  "control_losses": [],
+  "control_order": [
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "n_control": 0,
+  "control_provenance": [],
+  "direction": null,
+  "baseline_losses": [
+    1.895976397645427,
+    1.8838221537153004,
+    1.8584223150392063
+  ],
+  "n_baseline": 3,
+  "baseline_provenance": [
+    {
+      "frozen_layers": [],
+      "n_trainable_params": 10819584,
+      "last_train_loss": 0.9358483552932739,
+      "final_ce_train_loss": 0.7801043835250312
+    },
+    {
+      "frozen_layers": [],
+      "n_trainable_params": 10819584,
+      "last_train_loss": 0.9200277328491211,
+      "final_ce_train_loss": 0.721246064832958
+    },
+    {
+      "frozen_layers": [],
+      "n_trainable_params": 10819584,
+      "last_train_loss": 0.8670011758804321,
+      "final_ce_train_loss": 0.7196591024061976
+    }
+  ],
+  "baseline": {
+    "verdict": "SURPASSES",
+    "candidate_mean": 1.6947166467580246,
+    "baseline_mean": 1.8794069554666446,
+    "point_improvement": 0.18469030870862002,
+    "lower": 0.16383531166745047,
+    "upper": 0.20125975088740233,
+    "confidence": 0.95,
+    "is_thin_evidence": false,
+    "n_candidate": 3,
+    "n_baseline": 3
+  },
+  "citable_as_target_scale": true,
+  "citable_as_full_section4_verdict": true,
+  "resumed_arm_count": 0,
+  "ledger_path": null
+}
