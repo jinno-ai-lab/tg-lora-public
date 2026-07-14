@@ -234,7 +234,10 @@ def load_tokenizer(cfg: DictConfig):
     return tokenizer
 
 
-def apply_lora(model, cfg: DictConfig):
+def apply_lora(
+    model, cfg: DictConfig, *, rank_pattern: dict | None = None,
+    alpha_pattern: dict | None = None,
+):
     if cfg.model.get("load_in_4bit", False):
         use_gradient_checkpointing = bool(
             cfg.get("training", {}).get("gradient_checkpointing", True)
@@ -244,9 +247,20 @@ def apply_lora(model, cfg: DictConfig):
             use_gradient_checkpointing=use_gradient_checkpointing,
         )
 
+    # rank_pattern / alpha_pattern realize the heterogeneous (per-layer asymmetric
+    # rank) architecture: a regex->{rank} and regex->{alpha} dict that PEFT
+    # matches against each target module name and uses to size that layer's LoRA
+    # adapter. Empty (the default, ``None``) is PEFT's own default — every layer
+    # gets ``cfg.lora.r`` / ``cfg.lora.alpha`` — so the production path
+    # (``train_tg_lora`` / ``train_baseline``, which never passes a pattern) is
+    # byte-identical to before. ``alpha_pattern`` is set alongside ``rank_pattern``
+    # to hold ``alpha / rank`` constant, so the only thing that varies across
+    # layers is adapter *capacity* (rank), not the LoRA scaling magnitude.
     lora_cfg = LoraConfig(
         r=cfg.lora.r,
+        rank_pattern=rank_pattern or {},
         lora_alpha=cfg.lora.alpha,
+        alpha_pattern=alpha_pattern or {},
         lora_dropout=cfg.lora.dropout,
         target_modules=cfg.lora.target_modules,
         bias="none",

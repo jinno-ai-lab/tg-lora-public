@@ -249,7 +249,9 @@ def test_apply_lora_creates_config_and_calls_get_peft_model(
 
     mock_lora_cfg_cls.assert_called_once_with(
         r=8,
+        rank_pattern={},
         lora_alpha=16,
+        alpha_pattern={},
         lora_dropout=0.05,
         target_modules=["q_proj", "v_proj"],
         bias="none",
@@ -258,6 +260,30 @@ def test_apply_lora_creates_config_and_calls_get_peft_model(
     mock_get_peft.assert_called_once_with(mock_model, mock_lora_cfg_instance)
     mock_lora_model.print_trainable_parameters.assert_called_once()
     assert result is mock_lora_model
+
+
+@patch("src.model.load_model.get_peft_model")
+@patch("src.model.load_model._prepare_model_for_qlora_training")
+@patch("src.model.load_model.LoraConfig")
+def test_apply_lora_forwards_heterogeneous_rank_pattern(
+    mock_lora_cfg_cls, mock_prepare_kbit, mock_get_peft
+):
+    # The heterogeneous (per-layer asymmetric rank) contract: rank_pattern /
+    # alpha_pattern passed to apply_lora are forwarded verbatim into LoraConfig,
+    # so an asymmetric schedule reaches peft's get_peft_model. The default-empty
+    # case is pinned by the sibling test above; this pins the forwarded case so a
+    # regression that drops the kwargs (e.g. hard-coding {}) flips it red.
+    mock_prepare_kbit.return_value = MagicMock()
+    mock_get_peft.return_value = MagicMock()
+
+    cfg = _full_cfg(load_in_4bit=True)
+    rank_pattern = {r"layers\.0\..*": 4}
+    alpha_pattern = {r"layers\.0\..*": 8}
+    apply_lora(MagicMock(), cfg, rank_pattern=rank_pattern, alpha_pattern=alpha_pattern)
+
+    forwarded = mock_lora_cfg_cls.call_args
+    assert forwarded.kwargs["rank_pattern"] is rank_pattern
+    assert forwarded.kwargs["alpha_pattern"] is alpha_pattern
 
 
 # ---------------------------------------------------------------------------

@@ -518,6 +518,119 @@ def control_order_9b(active_indices: set[int]) -> tuple[int, ...]:
 
 
 # ---------------------------------------------------------------------------
+# Heterogeneous architecture (per-layer asymmetric LoRA rank) — the target-scale
+# realization of the proxy's discriminating positive control. At proxy scale the
+# order-sensitivity diagnosis proved freeze ORDER is structurally non-resolvable
+# (Var(order)=0.000) because a uniform-rank stack + full-rank learnable head is
+# robust to WHICH layer froze; resolving an order effect needs real per-layer
+# specialization. Heterogeneous ranks inject exactly that asymmetry — output-side
+# active layers carry higher adapter capacity — so an output-first freeze
+# structurally changes which capacity survives, the condition under which the
+# homogeneous §4 verdict's TIES could resolve. Same public-Dolly data path as
+# every homogeneous leg (architecture-independent); same verdict gate + cost
+# accounting (architecture-independent). NOT harness plumbing — the one remaining
+# open §4 research leg, now wired to target scale.
+# ---------------------------------------------------------------------------
+HOMOGENEOUS = "homogeneous"
+HETEROGENEOUS = "heterogeneous"
+ARCHITECTURES = (HOMOGENEOUS, HETEROGENEOUS)
+
+
+def heterogeneous_ranks_9b(active_layers, base_rank: int) -> tuple[int, ...]:
+    """Per-layer LoRA rank rising geometrically toward the output side.
+
+    The target-scale mirror of the proxy harness's ``heterogeneous_ranks``: a
+    geometric schedule ``base_rank ** (i / (n - 1))`` over the ``n`` active
+    layers (sorted ascending), so the output-most layer carries ``base_rank``
+    (the config's homogeneous ``r``, keeping the total adapter budget
+    comparable) and earlier active layers carry progressively less capacity.
+    This realizes the GOAL §1.5/§8 non-uniform per-layer-cost asymmetry as
+    per-layer adapter *capacity* — the specialization signal a uniform-rank
+    stack lacks and the order-sensitivity diagnosis identified as the missing
+    condition for a freeze-order effect to resolve at target scale.
+    """
+    layers = sorted(active_layers)
+    n = len(layers)
+    if n <= 1:
+        return (base_rank,) if n == 1 else ()
+    return tuple(
+        max(1, int(round(base_rank ** (i / (n - 1))))) for i in range(n)
+    )
+
+
+def _decoder_layer_count(model) -> int:
+    """Number of decoder layers on a HF decoder model, read pre-LoRA.
+
+    Heterogeneous ranks must be set at ``get_peft_model`` time (rank is
+    structural), which is BEFORE :func:`configure_trainable_lora_scope` derives
+    the active set from the applied LoRA params — so the active scope has to be
+    computable from the base model itself. The CausalLM wraps its base in
+    ``.model`` and the base exposes ``.layers`` (an ``nn.ModuleList``); the
+    config's ``num_hidden_layers`` is the fallback. :func:`run_ci_9b` asserts
+    this pre-LoRA scope matches the post-LoRA one so a model-structure surprise
+    fails loud rather than seeding wrong ranks.
+    """
+    base = getattr(model, "model", model)
+    layers = getattr(base, "layers", None)
+    if isinstance(layers, torch.nn.ModuleList):
+        return len(layers)
+    n = getattr(getattr(model, "config", None), "num_hidden_layers", None)
+    if n:
+        return int(n)
+    raise ValueError(
+        "Cannot determine decoder-layer count for heterogeneous ranks "
+        "(model has no .model.layers ModuleList and no config.num_hidden_layers)."
+    )
+
+
+def _active_scope_pre_lora(model, scope_label: str) -> list[int]:
+    """Active decoder-layer indices read from the base model, pre-LoRA.
+
+    Mirrors :func:`src.model.lora_utils.get_last_fraction_lora_layer_indices`
+    exactly (``ceil`` of the fraction, the LAST layers) but over the base
+    model's layer count instead of the post-LoRA LoRA-param indices — so the
+    rank pattern can be built for exactly the layers that will be trainable.
+    """
+    n = _decoder_layer_count(model)
+    if scope_label == "all":
+        return list(range(n))
+    if scope_label == "last_25_percent":
+        target = max(1, math.ceil(n * 0.25))
+        return list(range(n - target, n))
+    raise ValueError(f"Unsupported trainable_lora_scope: {scope_label}")
+
+
+def build_rank_pattern(
+    active_layers, architecture: str, base_rank: int
+) -> tuple[dict, dict, dict]:
+    """PEFT ``rank_pattern`` / ``alpha_pattern`` for the active layers.
+
+    Returns ``(rank_pattern, alpha_pattern, layer_ranks)``: for ``HETEROGENEOUS``
+    a per-layer geometric rank schedule over the active layers (each layer's
+    regex keys ``alpha`` to ``2 * rank`` so ``alpha / rank`` stays the constant
+    LoRA scaling and the only varying factor is capacity), plus a human-readable
+    ``{layer: rank}`` dict for deposit provenance. For ``HOMOGENEOUS`` (the
+    default) both patterns are empty — every layer takes ``base_rank`` from the
+    config, byte-identical to before. The regex form ``layers\\.{i}\\..*`` is the
+    full-match form PEFT's :func:`peft.utils.other.get_pattern_key` requires.
+    """
+    if architecture == HOMOGENEOUS:
+        return {}, {}, {}
+    if architecture != HETEROGENEOUS:
+        raise ValueError(f"Unsupported architecture: {architecture}")
+    ranks = heterogeneous_ranks_9b(active_layers, base_rank)
+    rank_pattern: dict[str, int] = {}
+    alpha_pattern: dict[str, int] = {}
+    layer_ranks: dict[str, int] = {}
+    for layer, rank in zip(sorted(active_layers), ranks):
+        key = rf"layers\.{layer}\..*"
+        rank_pattern[key] = rank
+        alpha_pattern[key] = 2 * rank
+        layer_ranks[str(layer)] = rank
+    return rank_pattern, alpha_pattern, layer_ranks
+
+
+# ---------------------------------------------------------------------------
 # Assembly: run candidate + surrogate arms, feed surrogate_valid_loss_ci.
 # ---------------------------------------------------------------------------
 
@@ -802,6 +915,7 @@ def _config_fingerprint(
     dataset: str,
     use_local_loss: bool,
     base_seed: int,
+    architecture: str = HOMOGENEOUS,
 ) -> dict:
     """The run-config identity that defines an arm's result.
 
@@ -812,8 +926,10 @@ def _config_fingerprint(
     produces a different fingerprint, so a stale ledger from the old config is
     ignored rather than silently seeding wrong arms. ``active_scope`` (the sorted
     real layer indices) is included — not just its size — so two scopes that
-    happen to share a layer count do not collide. ``ledger_version`` gates the
-    whole shape: a future schema change reads as a stale ledger.
+    happen to share a layer count do not collide. ``architecture`` is included
+    so a heterogeneous run never reuses a homogeneous arm banked in a ledger
+    (or vice versa). ``ledger_version`` gates the whole shape: a future schema
+    change reads as a stale ledger.
     """
     return {
         "ledger_version": LEDGER_VERSION,
@@ -830,6 +946,7 @@ def _config_fingerprint(
         "dataset": str(dataset),
         "use_local_loss": bool(use_local_loss),
         "base_seed": int(base_seed),
+        "architecture": str(architecture),
     }
 
 
@@ -1127,6 +1244,7 @@ def run_ci_9b(
     n_baseline: int = 0,
     ledger_path=None,
     output=None,
+    architecture: str = HOMOGENEOUS,
 ) -> dict:
     """Run the real-9B candidate+surrogate sweep and return the §4 verdict dict.
 
@@ -1173,8 +1291,30 @@ def run_ci_9b(
     tokenizer = load_tokenizer(cfg)
     torch.manual_seed(base_seed)
     model = load_base_model(cfg)
-    model = apply_lora(model, cfg)
+    # Heterogeneous per-layer ranks are structural — they must be set at
+    # ``get_peft_model`` time, BEFORE ``configure_trainable_lora_scope`` derives
+    # the active set from the applied LoRA params. So the active scope is read
+    # pre-LoRA from the base model and (under heterogeneous) asserted to match
+    # the post-LoRA scope, so a model-structure surprise fails loud rather than
+    # seeding ranks on the wrong layers.
+    pre_scope = set(_active_scope_pre_lora(model, scope_label))
+    rank_pattern, alpha_pattern, layer_ranks = build_rank_pattern(
+        pre_scope, architecture, base_rank=int(cfg.lora.r),
+    )
+    if architecture == HETEROGENEOUS:
+        logger.info(
+            "Heterogeneous architecture: per-layer ranks %s over active scope %s",
+            layer_ranks, sorted(pre_scope),
+        )
+    model = apply_lora(
+        model, cfg, rank_pattern=rank_pattern, alpha_pattern=alpha_pattern,
+    )
     _scope_names, active_indices = configure_trainable_lora_scope(model, scope_label)
+    if architecture == HETEROGENEOUS and active_indices != pre_scope:
+        raise RuntimeError(
+            "Pre-LoRA active scope drifted from the post-LoRA scope under "
+            f"heterogeneous ranks: {sorted(pre_scope)} != {sorted(active_indices)}"
+        )
     scope_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(
         "Active scope (%s): %d layers %s (%d trainable params)",
@@ -1226,6 +1366,7 @@ def run_ci_9b(
         valid_examples=valid_examples, model=cfg.model.name_or_path,
         scope_label=scope_label, active_scope=sorted(active_indices),
         dataset=dataset, use_local_loss=use_local_loss, base_seed=base_seed,
+        architecture=architecture,
     )
     if ledger_path is not None:
         logger.info(
@@ -1308,6 +1449,13 @@ def run_ci_9b(
         "dataset": dataset,
         "model": cfg.model.name_or_path,
         "use_local_loss": use_local_loss,
+        # Architecture (homogeneous default = uniform rank, the byte-identical
+        # legacy path; heterogeneous = per-layer asymmetric rank, the one open §4
+        # leg). ``lora_rank_pattern`` is the {layer: rank} provenance of that
+        # asymmetry — None for homogeneous, present for heterogeneous so the
+        # deposit is machine-readable about WHICH layers carried which capacity.
+        "architecture": architecture,
+        "lora_rank_pattern": layer_ranks or None,
         # Real 9B + real data. ``reduced_budget`` is honest about the step
         # budget: True unless ``total_steps`` reaches the config's full
         # ``max_steps`` (the §4 verdict's intended training length). See
@@ -1380,6 +1528,13 @@ def result_to_json(result: dict) -> dict:
         "candidate_order": list(result["candidate_order"]),
         "device": result["device"],
         "model": result["model"],
+        # Architecture provenance (ADDITIVE — legacy homogeneous deposits simply
+        # lack these and read as the homogeneous default). ``lora_rank_pattern``
+        # is None for the uniform-rank homogeneous leg and a {layer: rank} dict
+        # for heterogeneous, so the deposit is explicit about which layers
+        # carried which adapter capacity.
+        "architecture": result.get("architecture", HOMOGENEOUS),
+        "lora_rank_pattern": result.get("lora_rank_pattern"),
         "dataset": result["dataset"],
         "total_steps": result["total_steps"],
         "warmup_steps": result["warmup_steps"],
@@ -1698,6 +1853,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dataset", default=DEFAULT_DATASET)
     p.add_argument("--max-dataset-rows", type=int, default=DEFAULT_MAX_DATASET_ROWS)
     p.add_argument(
+        "--architecture", default=HOMOGENEOUS, choices=ARCHITECTURES,
+        help=(
+            "LoRA architecture: homogeneous (default — uniform rank, the "
+            "byte-identical legacy path) or heterogeneous (per-layer "
+            "asymmetric rank over the active scope — the target-scale "
+            "realization of the proxy's discriminating positive control; "
+            "the one open §4 research leg). Architecture-independent data "
+            "path, verdict gate, and cost accounting."
+        ),
+    )
+    p.add_argument(
         "--no-local-loss", action="store_true",
         help=(
             "Disable the boundary activation-matching local loss on frozen steps "
@@ -1939,6 +2105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             n_baseline=args.n_baseline,
             ledger_path=args.ledger,
             output=args.output,
+            architecture=args.architecture,
         )
     except IncompleteResumeError as exc:
         # The resumed ledger banked only one side of the A/B, so no verdict can

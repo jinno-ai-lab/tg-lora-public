@@ -2,7 +2,7 @@
        smoke smoke-tg smoke-bl \
        train-baseline train-tg-lora train-tg-lora-optreuse train-tg-lora-prefix \
        eval eval-lora eval-downstream eval-downstream-mlx eval-llm-jp-eval-mlx eval-mlx eval-base eval-35b-base eval-35b-ckpt \
-       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize freeze-validloss-ci-9b freeze-validloss-ci-9b-generalization freeze-validloss-ci-9b-baseline freeze-validloss-ci-9b-full freeze-validloss-ci-9b-full-bg freeze-replay \
+       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize freeze-validloss-ci-9b freeze-validloss-ci-9b-generalization freeze-validloss-ci-9b-heterogeneous-generalization freeze-validloss-ci-9b-baseline freeze-validloss-ci-9b-full freeze-validloss-ci-9b-full-bg freeze-replay \
 
 	compare compare-prefix compare-prefix-cold compare-prefix-warm compare-prefix-coldwarm compare-report paper-memory paper-memory-dry-run paper-memory-one-shot paper-memory-compare-modes paper-memory-all-modes paper-memory-evaluate-gates paper-memory-external-eval paper-memory-frontier-sweep paper-memory-cache-ablation cosine-n-ablation cosine-n-ablation-dry-run cosine-n-skip-ablation cosine-n-skip-ablation-dry-run precompute-prefix-cache ablation sweep accel-sweep \
 	bench-optimizer bench-prefix-cache bench-prefix-cache-one-shot analyze-prefix-break-even analyze-prefix-break-even-ci bench-velocity-ops bench-velocity-ops-ci bench-velocity-ops-save-baseline \
@@ -911,6 +911,26 @@ FREEZE_9B_GEN_FLAGS ?= --seq-len 1024 --total-steps 96 --warmup-steps 12 --depth
 
 freeze-validloss-ci-9b-generalization: ## GOAL §4 real-9B A/B in a GENERALIZATION regime (2-epoch; memorization-robustness arm)
 	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_GEN_FLAGS) --json --output tests/fixtures/freeze_validloss_ci_9b_generalization.json
+
+# The HETEROGENEOUS (per-layer asymmetric rank) arm of the real-9B §4 A/B — the
+# one §4 research task that was open at target scale. Every committed 9B verdict
+# above runs on a HOMOGENEOUS LoRA (every active layer shares cfg.lora.r=16); the
+# open question is whether the surrogate/direction/baseline verdicts hold when the
+# adapter itself is asymmetric — output-side layers given more CAPACITY (higher
+# rank) than input-side ones, via peft rank_pattern + alpha_pattern (alpha=2*rank
+# held constant so only capacity, not magnitude, varies). This target re-runs the
+# SAME generalization-regime A/B (FREEZE_9B_GEN_FLAGS — candidate output-first
+# freeze vs random surrogate vs input-contig direction control, 48 train / 96 step
+# / 2 epoch, 3 seeds/arm) with --architecture heterogeneous, so the deposit is a
+# clean apples-to-apples comparison with freeze_validloss_ci_9b_generalization.json
+# (architecture is the ONLY difference). Under heterogeneous ranks the candidate's
+# output-first freeze naturally targets the HIGHEST-rank (highest-capacity) active
+# layers — the architectural interaction this leg exists to probe. Still
+# reduced-budget (96 < max_steps=1500) and honest about it: a target-scale
+# heterogeneous data point, NOT the full §4 verdict.
+# Needs a torch+bnb+GPU interpreter: PYTHON_VENV=/path/to/torch-python make freeze-validloss-ci-9b-heterogeneous-generalization
+freeze-validloss-ci-9b-heterogeneous-generalization: ## GOAL §4 real-9B A/B on a HETEROGENEOUS (per-layer rank) stack, generalization regime
+	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_GEN_FLAGS) --architecture heterogeneous --json --output tests/fixtures/freeze_validloss_ci_9b_heterogeneous_generalization.json
 
 # FULL-BACKPROP BASELINE arm of the real 9B §4 A/B — GOAL §4 line 247's OTHER
 # success axis. The surrogate/direction/generalization deposits above are all

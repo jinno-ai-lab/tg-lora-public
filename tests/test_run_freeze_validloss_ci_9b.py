@@ -47,10 +47,14 @@ from omegaconf import OmegaConf
 from torch import nn
 
 from scripts.run_freeze_validloss_ci_9b import (
+    ARCHITECTURES,
+    HETEROGENEOUS,
+    HOMOGENEOUS,
     REGIME_GENERALIZATION,
     REGIME_MEMORIZATION,
     REGIME_OVERFIT,
     REGIME_UNKNOWN,
+    _active_scope_pre_lora,
     _baseline_ci_to_json,
     _candidate_cost_reduction,
     _candidate_final_ce_mean,
@@ -61,9 +65,11 @@ from scripts.run_freeze_validloss_ci_9b import (
     _reset_lora_for_arm,
     arm_valid_loss_9b,
     build_parser,
+    build_rank_pattern,
     build_sft_example,
     candidate_order_9b,
     control_order_9b,
+    heterogeneous_ranks_9b,
     result_to_json,
     run_ci_9b,
 )
@@ -153,6 +159,32 @@ FIXTURE_9B_BASELINE = (
 # generalized). Regenerate with ``make freeze-validloss-ci-9b-full``.
 FIXTURE_9B_FULL = (
     Path(__file__).resolve().parent / "fixtures" / "freeze_validloss_ci_9b_full.json"
+)
+
+# The HETEROGENEOUS (per-layer asymmetric rank) recording — the one §4 research
+# task that was open at target scale. Every sibling deposit above runs on a
+# HOMOGENEOUS LoRA (every active layer shares r=16); this deposit re-runs the
+# SAME generalization-regime A/B (FREEZE_9B_GEN_FLAGS — candidate output-first
+# vs random surrogate vs input-contig control, 48 train / 96 step / 2 epoch,
+# 3 seeds/arm) on an ASYMMETRIC adapter via peft rank_pattern: output-side layers
+# get more CAPACITY (geometric ranks {24:1,25:1,26:2,27:3,28:5,29:7,30:11,31:16};
+# alpha=2*rank held constant so only capacity, not magnitude, varies). Recorded
+# result: headline **SURVIVES the architecture change** — candidate (output-first,
+# 1.5424) SURPASSES random surrogate (1.5566), CI[95%]≈[0.012, 0.017], non-thin,
+# with the SAME monotone candidate < surrogate < control (1.5589) ranking as the
+# homogeneous generalization deposit. The load-bearing heterogeneous signature:
+# the output-first candidate froze layers {29,30,31} = ranks (7,11,16) — the
+# THREE HIGHEST-CAPACITY active layers — so it removed the MOST adapter params
+# (n_trainable_params 1.014M, the fewest of any arm) yet STILL won; the input-side
+# control froze {24,25,26} = ranks (1,1,2) — the lowest-capacity layers — leaving
+# the MOST params (3.497M). Output-first freeze sacrifices the most capacity and
+# still wins: the §4 verdict is not an artifact of a uniform-rank stack. Still
+# reduced-budget (96 < max_steps=1500) and honest about it (NOT the full verdict).
+# Regenerate with ``make freeze-validloss-ci-9b-heterogeneous-generalization``.
+FIXTURE_9B_HETEROGENEOUS = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "freeze_validloss_ci_9b_heterogeneous_generalization.json"
 )
 
 
@@ -1227,6 +1259,7 @@ _REAL_9B_DEPOSIT_FIXTURES = [
     pytest.param(FIXTURE_9B_GENERALIZATION, id="generalization"),
     pytest.param(FIXTURE_9B_BASELINE, id="baseline"),
     pytest.param(FIXTURE_9B_FULL, id="full"),
+    pytest.param(FIXTURE_9B_HETEROGENEOUS, id="heterogeneous"),
 ]
 
 
@@ -1946,6 +1979,160 @@ class TestBaselineControlDeposit:
         assert data["n_baseline"] >= 3
 
 
+# ── heterogeneous (per-layer rank) deposit — the target-scale leg ────────────
+
+
+class TestHeterogeneousTargetScaleDeposit:
+    """The HETEROGENEOUS (per-layer asymmetric rank) §4 deposit — the one §4
+    research task that was open at target scale. Every sibling deposit runs on a
+    HOMOGENEOUS LoRA (uniform r=16 on every active layer); this deposit re-runs
+    the SAME generalization-regime A/B on an ASYMMETRIC adapter (output-side
+    layers given more CAPACITY via peft rank_pattern). These tests pin:
+
+    * the recorded rank schedule (the geometric ``lora_rank_pattern``) is the one
+      :func:`heterogeneous_ranks_9b` builds;
+    * the SURPASSES verdict + the direction SURPASSES are EARNED (replay-faithful);
+    * the load-bearing heterogeneous signature: output-first freeze removes the
+      MOST capacity (highest-rank layers → fewest trainable params) yet STILL wins;
+    * the verdict SURVIVES the homogeneous→heterogeneous architecture change
+      (cross-deposit vs FIXTURE_9B_GENERALIZATION) — it is not a uniform-rank
+      artifact.
+    """
+
+    def test_fixture_exists_and_is_real_target_scale(self):
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        assert data["proxy_scale"] is False
+        assert data["citable_as_target_scale"] is True
+        assert data["citable_as_full_section4_verdict"] is False  # honestly reduced
+        assert data["reduced_budget"] is True  # 96 < cfg_max_steps=1500
+        assert data["model"] == "Qwen/Qwen3.5-9B"
+        assert data["seq_len"] == 1024
+        assert data["device"] == "cuda"
+
+    def test_architecture_field_is_heterogeneous(self):
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        assert data["architecture"] == "heterogeneous"
+        # Every sibling deposit omits the field (defaults to homogeneous); only
+        # this deposit carries it, and it carries the per-layer schedule.
+        assert data["lora_rank_pattern"] is not None
+
+    def test_rank_pattern_is_the_predicted_geometric_schedule(self):
+        # The committed lora_rank_pattern must equal what heterogeneous_ranks_9b
+        # builds for this active scope + base rank — pins the schedule to the code
+        # path rather than a hand-written dict, and asserts the geometric shape
+        # (monotone ascending, output layer caps at base_rank=r=16).
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        scope = sorted(data["active_scope"])
+        # base_rank is the config's cfg.lora.r (=16); the schedule's max == it.
+        expected = dict(
+            zip((str(i) for i in scope), heterogeneous_ranks_9b(set(scope), 16))
+        )
+        assert data["lora_rank_pattern"] == expected
+        ranks = [data["lora_rank_pattern"][str(i)] for i in scope]
+        assert ranks == sorted(ranks)   # monotone non-decreasing toward output
+        assert ranks[-1] == 16           # output-most layer caps at base_rank
+        assert ranks[0] == 1             # input-most layer is the floor
+
+    def test_candidate_freezes_highest_rank_layers(self):
+        # Under asymmetric ranks the output-first candidate freezes layers
+        # {29,30,31} = ranks (7,11,16) — the THREE highest-capacity active layers;
+        # the input-side control freezes {24,25,26} = ranks (1,1,2) — the lowest.
+        # Direction isolation (output-contiguous vs input-contiguous) is preserved,
+        # now coupled to capacity rather than uniform.
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        rp = data["lora_rank_pattern"]
+        cand = {tuple(p["frozen_layers"]) for p in data["candidate_provenance"]}
+        ctrl = {tuple(p["frozen_layers"]) for p in data["control_provenance"]}
+        assert cand == {(29, 30, 31)}            # output-contiguous
+        assert ctrl == {(24, 25, 26)}             # input-contiguous
+        assert cand.isdisjoint(ctrl)
+        # Candidate froze the highest-rank layers; control the lowest.
+        assert sum(rp[str(i)] for i in (29, 30, 31)) > sum(rp[str(i)] for i in (24, 25, 26))
+
+    def test_output_first_freeze_removes_most_capacity(self):
+        # THE heterogeneous signature. Freezing a higher-rank layer removes more
+        # trainable params, so the output-first candidate (highest-rank layers)
+        # ends up with the FEWEST trainable params of any arm — yet it still wins
+        # (test below). The input-side control (lowest-rank layers) has the MOST.
+        # This is the finding the uniform-rank sibling deposits structurally
+        # cannot show: the verdict holds even when output-first means sacrificing
+        # the most capacity.
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        cand_params = data["candidate_provenance"][0]["n_trainable_params"]
+        surr_params = [p["n_trainable_params"] for p in data["surrogate_provenance"]]
+        ctrl_params = data["control_provenance"][0]["n_trainable_params"]
+        assert cand_params < min(surr_params) < max(surr_params) < ctrl_params
+        # And params track rank monotonically: candidate (3 highest-rank) removed
+        # the most, control (3 lowest-rank) the least.
+        assert cand_params < ctrl_params
+
+    def test_recorded_surrogate_verdict_is_earned(self):
+        # The stored floats re-judge to the recorded SURPASSES under the
+        # deterministic bootstrap — the verdict is earned, not painted on.
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        ci = surrogate_valid_loss_ci(
+            data["candidate_losses"], data["surrogate_losses"], seed=data["base_seed"]
+        )
+        assert ci.significance_verdict == data["verdict"] == SURPASSES
+        assert data["lower"] > 0.0  # CI entirely above zero => significant
+        assert ci.candidate_mean == pytest.approx(data["candidate_mean"], abs=1e-9)
+        assert ci.surrogate_mean == pytest.approx(data["surrogate_mean"], abs=1e-9)
+        assert ci.lower == pytest.approx(data["lower"], abs=1e-9)
+        assert ci.upper == pytest.approx(data["upper"], abs=1e-9)
+
+    def test_recorded_direction_verdict_is_earned(self):
+        # The direction CI (candidate output-contiguous vs control input-
+        # contiguous, contiguity held fixed) reproduces — the attribution to
+        # output-side DIRECTION survives the asymmetric-rank stack.
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        dd = data["direction"]
+        dci = surrogate_valid_loss_ci(
+            data["candidate_losses"], data["control_losses"], seed=data["base_seed"]
+        )
+        assert dci.significance_verdict == dd["verdict"] == SURPASSES
+        assert dd["lower"] > 0.0
+        assert dci.surrogate_mean == pytest.approx(dd["control_mean"], abs=1e-9)
+
+    def test_monotone_ranking_matches_homogeneous_sibling(self):
+        # Same candidate < surrogate < control ordering as the homogeneous
+        # generalization deposit — the ranking is not a uniform-rank artifact.
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        assert data["candidate_mean"] < data["surrogate_mean"] < data["direction"]["control_mean"]
+
+    def test_verdict_survives_homogeneous_to_heterogeneous(self):
+        # The load-bearing cross-deposit result: the §4 surrogate verdict is
+        # SURPASSES on BOTH the homogeneous AND the heterogeneous (asymmetric-rank)
+        # stack — the output-first freeze order beats a random order regardless of
+        # whether the adapter is uniform-rank or output-heavy. A future re-run that
+        # flips the heterogeneous verdict would make this red, surfacing the
+        # architecture-dependence as a reviewable change rather than silent drift.
+        het = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        hom = json.loads(FIXTURE_9B_GENERALIZATION.read_text())
+        assert het["verdict"] == SURPASSES
+        assert hom["verdict"] == SURPASSES
+
+    def test_regime_is_generalization_not_memorization(self):
+        # The honest regime: final_ce_train_loss ~1.58 (train CE ≈ valid CE),
+        # NOT ~0 (memorization). A regression that re-deposits a memorization
+        # run flips this red — the deposit's headline must rest on a generalizing
+        # model, not an overfit adapter.
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        for arm in ("candidate", "surrogate", "control"):
+            for p in data[f"{arm}_provenance"]:
+                assert p["final_ce_train_loss"] > 0.5
+        assert data["regime"] == "generalization"
+
+    def test_deposit_is_non_thin_and_honestly_reduced(self):
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        assert data["is_thin_evidence"] is False
+        assert data["n_candidate"] >= 3
+        assert data["n_surrogate"] >= 3
+        assert data["n_control"] >= 3
+        # Honest reduced-budget: NOT the full §4 verdict (96 < 1500), stated.
+        assert data["reduced_budget"] is True
+        assert data["total_steps"] < data["cfg_max_steps"]
+
+
 # ── CLI health ──────────────────────────────────────────────────────────────
 
 
@@ -1975,3 +2162,131 @@ class TestCli:
         )
         assert proc.returncode == 0, proc.stderr
         assert "usage" in (proc.stdout + proc.stderr).lower()
+
+
+# ── Heterogeneous architecture (per-layer rank) — the target-scale leg ──────
+
+
+def _homogeneous_lora_cfg():
+    """Minimal float32 LoRA cfg for the CPU apply_lora smoke (no bnb / no GPU)."""
+    return OmegaConf.create({
+        "model": {"load_in_4bit": False},
+        "training": {"gradient_checkpointing": False},
+        "lora": {"r": 16, "alpha": 32, "dropout": 0.0, "target_modules": "all-linear"},
+    })
+
+
+def _tiny_llama(num_layers: int = 8):
+    """A tiny randomly-initialized Llama (no download, no GPU) with the
+    ``model.layers.{i}.*_proj`` naming the 9B Qwen stack uses, so the
+    heterogeneous rank_pattern regex and the suffix-scope logic exercise the
+    real module-name contract."""
+    transformers = pytest.importorskip("transformers")
+    return transformers.LlamaForCausalLM(
+        transformers.LlamaConfig(
+            num_hidden_layers=num_layers, hidden_size=16, intermediate_size=32,
+            num_attention_heads=2, num_key_value_heads=2, vocab_size=32,
+        )
+    )
+
+
+class TestHeterogeneousRankPattern:
+    """The CPU-runnable core of the heterogeneous (per-layer asymmetric rank)
+    §4 leg — the one open research task now wired to target scale. Rank
+    construction, pattern form, alpha scaling, and the architecture-independent
+    scope/apply path. The real 9B verdict is a GPU smoke
+    (``make freeze-validloss-ci-9b-heterogeneous-generalization``), not this
+    suite — these guard the GPU-free core that makes that verdict honest."""
+
+    def test_architectures_constant(self):
+        assert HOMOGENEOUS == "homogeneous"
+        assert HETEROGENEOUS == "heterogeneous"
+        assert ARCHITECTURES == ("homogeneous", "heterogeneous")
+
+    def test_ranks_geometric_ascending_to_output(self):
+        # base_rank caps the output-most active layer; ranks rise geometrically
+        # toward it so the output side carries the most adapter capacity.
+        ranks = heterogeneous_ranks_9b({24, 25, 26, 27, 28, 29, 30, 31}, 16)
+        assert ranks == (1, 1, 2, 3, 5, 7, 11, 16)
+        assert ranks[0] >= 1          # never below 1
+        assert ranks[-1] == 16        # output layer caps at base_rank
+        assert list(ranks) == sorted(ranks)  # monotone non-decreasing
+
+    def test_ranks_single_and_empty_layer_sets(self):
+        assert heterogeneous_ranks_9b({5}, 16) == (16,)
+        assert heterogeneous_ranks_9b(set(), 16) == ()
+
+    def test_build_rank_pattern_heterogeneous_keys_and_scaling(self):
+        rp, ap, lr = build_rank_pattern({29, 30, 31}, HETEROGENEOUS, 16)
+        # human-readable per-layer provenance, output layer == base_rank
+        assert lr == {"29": 1, "30": 4, "31": 16}
+        # regex keys are the full-match form peft get_pattern_key requires
+        assert set(rp) == {r"layers\.29\..*", r"layers\.30\..*", r"layers\.31\..*"}
+        # alpha == 2 * rank so alpha/rank scaling stays constant (=2): the only
+        # thing that varies across layers is capacity (rank), not magnitude.
+        for key, rank in rp.items():
+            assert ap[key] == 2 * rank
+
+    def test_build_rank_pattern_homogeneous_is_empty(self):
+        # homogeneous => no per-layer pattern: every layer takes cfg.lora.r,
+        # byte-identical to the legacy path (prod apply_lora passes {}).
+        rp, ap, lr = build_rank_pattern({29, 30, 31}, HOMOGENEOUS, 16)
+        assert rp == {} and ap == {} and lr == {}
+
+    def test_build_rank_pattern_rejects_unknown(self):
+        with pytest.raises(ValueError):
+            build_rank_pattern({0}, "semi-heterogeneous", 16)
+
+    def test_active_scope_pre_lora_mirrors_suffix_scope(self):
+        # The pre-LoRA active scope must match what configure_trainable_lora_scope
+        # derives post-LoRA, so heterogeneous ranks land on exactly the trainable
+        # layers. Built from a tiny Llama (no GPU).
+        from src.model.lora_utils import configure_trainable_lora_scope
+        from src.model.load_model import apply_lora
+
+        model = _tiny_llama(8)
+        pre = set(_active_scope_pre_lora(model, "last_25_percent"))
+        assert pre == {6, 7}  # ceil(8 * 0.25) = 2 last layers
+        pm = apply_lora(model, _homogeneous_lora_cfg())
+        _, post = configure_trainable_lora_scope(pm, "last_25_percent")
+        assert post == pre
+
+    def test_apply_lora_heterogeneous_varies_per_layer_rank(self):
+        # end-to-end: apply_lora with a heterogeneous rank_pattern produces
+        # per-layer LoRA ranks on the ACTIVE layers (non-active keep the default
+        # r). The load-bearing contract — rank_pattern actually changes adapter
+        # capacity, not just passes through.
+        from src.model.load_model import apply_lora
+
+        model = _tiny_llama(8)
+        pre = set(_active_scope_pre_lora(model, "last_25_percent"))
+        rp, ap, _ = build_rank_pattern(pre, HETEROGENEOUS, 16)
+        pm = apply_lora(
+            model, _homogeneous_lora_cfg(), rank_pattern=rp, alpha_pattern=ap,
+        )
+        ranks: dict[int, set[int]] = {}
+        for name, p in pm.named_parameters():
+            if "lora_A" in name:
+                m = re.search(r"layers\.(\d+)\.", name)
+                if m:
+                    ranks.setdefault(int(m.group(1)), set()).add(p.shape[0])
+        # active layers get the geometric schedule (2-layer scope -> 1, 16)
+        assert ranks[6] == {1}
+        assert ranks[7] == {16}
+        # non-active layers keep the default uniform rank
+        assert ranks[0] == {16}
+
+    def test_apply_lora_default_is_uniform_rank(self):
+        # prod path (no rank_pattern) is byte-identical: every layer rank == r.
+        from src.model.load_model import apply_lora
+
+        model = _tiny_llama(8)
+        pm = apply_lora(model, _homogeneous_lora_cfg())
+        ranks: dict[int, set[int]] = {}
+        for name, p in pm.named_parameters():
+            if "lora_A" in name:
+                m = re.search(r"layers\.(\d+)\.", name)
+                if m:
+                    ranks.setdefault(int(m.group(1)), set()).add(p.shape[0])
+        assert all(v == {16} for v in ranks.values())
+
