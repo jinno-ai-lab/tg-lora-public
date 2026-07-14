@@ -1324,6 +1324,128 @@ class TestDepositGateSelfConsistency:
         assert data["n_baseline"] >= 3
 
 
+# ── full-budget §4 deposit: literal verdict pin + replay faithfulness ────────
+#
+# The full-budget deposit (``citable_as_full_section4_verdict=True``, commit
+# ``4b88ca8``) is the FIRST committed deposit to clear all four citation-gate
+# axes and the culmination of the §4 verdict effort. ``TestDepositGateSelfConsis
+# tency`` above pins the gate BOOLEAN and the structural axes — but its own
+# docstring notes it is "independent of the empirical SURPASSES/TIES outcome".
+# So a coordinated float+verdict repaint (the exact hazard the seq256 deposit's
+# ``test_real_verdict_pins_literal_ties_and_ci_bounds`` was built for) would
+# silently flip this deposit's headline result while every existing test stays
+# green. The full deposit was the ONLY one of the five real deposits without a
+# replay-faithfulness + literal-verdict pin; this class closes that asymmetric
+# gap on the repo's most citable result — pinning BOTH load-bearing verdicts
+# literally AND re-deriving them from the stored floats.
+
+
+class TestFullBudgetDepositVerdictPin:
+    """Pin the landed full-budget §4 verdict (``4b88ca8``) as a durable
+    regression invariant.
+
+    Two load-bearing scientific claims live in this deposit, and BOTH are pinned
+    as literals AND re-derived from the stored floats through the deterministic
+    bootstrap (so a painted-on verdict, or a coordinated float+verdict repaint,
+    fails red):
+
+    * **Headline A/B (candidate output-first vs random surrogate) = TIES.** The
+      reduced-budget SURPASSES (sibling deposits) does NOT survive full-budget
+      generalization — the output-first *order* effect evaporates at the real §4
+      budget. The CI straddles zero (``lower < 0 < upper``), the structural
+      reason a bootstrap CI reads TIES.
+    * **§4 condition (a) (candidate vs no-freeze FULL-backprop baseline) =
+      SURPASSES, and SURVIVES the full budget.** Freezing did not merely stay
+      within tolerance of full backprop — it BEAT it, exactly as at reduced
+      budget. The baseline CI excludes zero above (``lower > 0``).
+
+    The divergence — headline TIES while condition (a) SURPASSES — IS the
+    scientific finding: the output-first *order* effect is budget-fragile, but
+    *freeze-vs-full-backprop* quality preservation is not. Pinning both
+    literally makes any future re-deposit that flips either a visible,
+    reviewable change rather than a silent drift.
+    """
+
+    def test_full_deposit_is_citable_as_full_section4_verdict(self):
+        # The steering success criterion itself, pinned on the landed artifact:
+        # the gate is OPEN (True) and the run was FRESH — not a resumed/partial
+        # banking (``resumed_arm_count == 0``). No existing test asserts the gate
+        # is True directly; self-consistency only checks ``stored == recomputed``
+        # (which holds for True OR False), and the structural test pins the axes
+        # but never the assembled boolean. This is the deposit the whole §4
+        # effort was building toward — assert it landed.
+        data = json.loads(FIXTURE_9B_FULL.read_text())
+        assert data["citable_as_full_section4_verdict"] is True
+        assert data["resumed_arm_count"] == 0  # fresh run, not a resumed bank
+        # All four gate conjuncts clear, on the deposit's own fields:
+        assert data["proxy_scale"] is False
+        assert data["reduced_budget"] is False
+        assert data["is_thin_evidence"] is False
+        assert data["regime"] == "generalization"
+
+    def test_headline_verdict_is_ties_and_earned(self):
+        # THE coordinated-drift guard. The headline A/B verdict is TIES, pinned
+        # as a LITERAL (not ``data["verdict"]`` — reading the field back is the
+        # coordinated-drift escape hatch the seq256 literal pin closed: a repaint
+        # that moves both the floats and the verdict field to SURPASSES would
+        # pass a ``== data["verdict"]`` check). The stored floats re-judge
+        # through the deterministic bootstrap to TIES (the verdict is earned, not
+        # painted), and the CI straddles zero — the structural reason it is TIES.
+        data = json.loads(FIXTURE_9B_FULL.read_text())
+        assert data["verdict"] == TIES
+        ci = surrogate_valid_loss_ci(
+            data["candidate_losses"],
+            data["surrogate_losses"],
+            seed=data["base_seed"],
+        )
+        assert ci.significance_verdict == TIES
+        assert ci.significance_verdict == data["verdict"]  # replay-faithful
+        # CI straddles zero => TIES, not a one-sided call.
+        assert data["lower"] < 0.0 < data["upper"]
+        assert ci.lower == pytest.approx(data["lower"], abs=1e-9)
+        assert ci.upper == pytest.approx(data["upper"], abs=1e-9)
+        assert ci.candidate_mean == pytest.approx(data["candidate_mean"], abs=1e-9)
+        assert ci.surrogate_mean == pytest.approx(data["surrogate_mean"], abs=1e-9)
+
+    def test_condition_a_survives_full_budget(self):
+        # §4 condition (a) at the FULL budget: candidate SURPASSES no-freeze full
+        # backprop. This is the one measurement the freeze-vs-freeze sibling
+        # deposits could never make, and it SURVIVES the budget increase
+        # (reduced-budget deposit SURPASSES -> full-budget deposit SURPASSES). The
+        # baseline occupies the CI's "surrogate" slot, so its mean is stored as
+        # ``baseline_mean``. Pinned literally + re-derived from the floats.
+        data = json.loads(FIXTURE_9B_FULL.read_text())
+        bd = data["baseline"]
+        assert bd["verdict"] == SURPASSES
+        bci = surrogate_valid_loss_ci(
+            data["candidate_losses"],
+            data["baseline_losses"],
+            seed=data["base_seed"],
+        )
+        assert bci.significance_verdict == SURPASSES
+        assert bci.significance_verdict == bd["verdict"]  # replay-faithful
+        assert bd["lower"] > 0.0  # CI entirely above zero => significant
+        assert bci.lower == pytest.approx(bd["lower"], abs=1e-9)
+        assert bci.upper == pytest.approx(bd["upper"], abs=1e-9)
+        assert bci.candidate_mean == pytest.approx(bd["candidate_mean"], abs=1e-9)
+        assert bci.surrogate_mean == pytest.approx(bd["baseline_mean"], abs=1e-9)
+        # The candidate's held-out valid_loss is lower than full backprop's.
+        assert data["candidate_mean"] < bd["baseline_mean"]
+
+    def test_order_effect_does_not_survive_but_freeze_vs_full_backprop_does(self):
+        # The headline scientific finding, pinned as a cross-verdict invariant:
+        # at the full §4 budget the two A/Bs DIVERGE — the output-first ORDER
+        # effect (candidate vs random surrogate) is TIES (budget-fragile), while
+        # FREEZE-vs-FULL-BACKPROP quality preservation (candidate vs baseline) is
+        # SURPASSES (budget-robust). A future re-run that "recovers" a headline
+        # SURPASSES would flip this red — making the regime/budget-dependent
+        # result change a visible, reviewable event instead of a silent drift.
+        data = json.loads(FIXTURE_9B_FULL.read_text())
+        assert data["verdict"] == TIES
+        assert data["baseline"]["verdict"] == SURPASSES
+        assert data["verdict"] != data["baseline"]["verdict"]
+
+
 # ── deposit replay faithfulness on the committed real-9B recording ──────────
 
 
