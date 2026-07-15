@@ -81,6 +81,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import logging
 import math
@@ -1495,6 +1496,57 @@ def run_ci_9b(
     }
 
 
+# GOAL §7 reproducibility provenance. The deposit's verdict, gate, and regime
+# are all DERIVED from the raw measurements; the verdict-replay tests
+# (``TestDepositReplayFaithfulness`` / ``TestFullBudgetDepositVerdictPin`` /
+# ``TestHeterogeneousTargetScaleDeposit``) guard that derivation — a verdict
+# painted on that disagrees with the stored floats fails red. What those tests
+# cannot catch is a COORDINATED repaint: editing the committed floats, their CI
+# bounds, the verdict label, and the per-arm provenance TOGETHER so every
+# derived check still passes. :func:`_evidence_hash` freezes the EVIDENCE
+# bytes (the raw measurements a real run produced, never the self-declared
+# verdict/gate/regime labels) behind a content hash pinned in the test suite,
+# so any such repaint — or any accidental byte drift — becomes a visible,
+# reviewable test change instead of silent source-of-truth erosion.
+#
+# This is the "attach a content hash so the verdict is independently
+# reproducible" guard. It does NOT certify that a GPU produced the bytes (only
+# a run log / a fresh independent reproduction can — the heterogeneous run has
+# no surviving log and the GPU was contended this iteration, recorded openly as
+# the next action); it certifies the COMMITTED bytes are the immutable,
+# auditable record every derived claim rests on.
+EVIDENCE_HASH_KEYS = (
+    # Raw held-out measurements + the freeze orders they were taken under.
+    "candidate_losses", "surrogate_losses", "control_losses", "baseline_losses",
+    "candidate_order", "control_order",
+    # Per-arm provenance: which layers froze, how many params trained, and the
+    # train-CE diagnostics that classify the regime — all run-determined.
+    "candidate_provenance", "surrogate_provenance",
+    "control_provenance", "baseline_provenance",
+    # Run-determining config: identifies WHICH run produced these measurements.
+    "model", "architecture", "lora_rank_pattern", "dataset",
+    "total_steps", "warmup_steps", "depth", "spacing",
+    "active_scope", "seq_len", "train_examples", "valid_examples",
+    "n_candidate", "n_surrogate", "n_control", "n_baseline", "base_seed",
+)
+
+
+def _evidence_hash(deposit: dict) -> str:
+    """SHA-256 hex over the deposit's evidence bytes, for reproducibility pinning.
+
+    Canonicalizes a fixed, ordered subset of EVIDENCE keys (see
+    :data:`EVIDENCE_HASH_KEYS`) — the raw measurements and run-determining
+    config, never the derived verdict/gate/regime labels — to a stable JSON
+    encoding (sorted keys, compact separators) and returns the SHA-256 hex.
+    ``evidence_hash`` is itself absent from :data:`EVIDENCE_HASH_KEYS`, so
+    stamping it is idempotent: a key missing from an older deposit contributes
+    ``None`` and the hash never includes itself.
+    """
+    payload = {k: deposit.get(k) for k in EVIDENCE_HASH_KEYS}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def result_to_json(result: dict) -> dict:
     """JSON-deposit shape: verdict + real samples + full provenance + honesty."""
     ci = result["ci"]
@@ -1510,7 +1562,7 @@ def result_to_json(result: dict) -> dict:
         candidate_valid - candidate_ce_mean
         if candidate_ce_mean is not None else None
     )
-    return {
+    deposit = {
         "verdict": ci.significance_verdict,
         "passes": ci.passes,
         "significant_surpasses": ci.significant_surpasses,
@@ -1617,6 +1669,11 @@ def result_to_json(result: dict) -> dict:
         "resumed_arm_count": int(result.get("resumed_arm_count", 0) or 0),
         "ledger_path": result.get("ledger_path"),
     }
+    # GOAL §7 reproducibility provenance — see :func:`_evidence_hash`. Computed
+    # last, over the evidence keys only (never the verdict/gate/regime it would
+    # be circular to hash), so the stamp is honest about the bytes that follow.
+    deposit["evidence_hash"] = _evidence_hash(deposit)
+    return deposit
 
 
 def _direction_ci_to_json(direction_ci) -> dict | None:

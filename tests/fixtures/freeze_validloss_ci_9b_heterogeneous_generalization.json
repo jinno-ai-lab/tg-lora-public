@@ -221,5 +221,6 @@
   "citable_as_target_scale": true,
   "citable_as_full_section4_verdict": false,
   "resumed_arm_count": 0,
-  "ledger_path": null
+  "ledger_path": null,
+  "evidence_hash": "5fc3e1d4313091994f12e4db8fad974f46361de29a99dff68dc6c085dcdbf9ca"
 }

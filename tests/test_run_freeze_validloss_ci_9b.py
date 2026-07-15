@@ -60,6 +60,7 @@ from scripts.run_freeze_validloss_ci_9b import (
     _candidate_final_ce_mean,
     _classify_regime,
     _direction_ci_to_json,
+    _evidence_hash,
     _full_section4_verdict_gate,
     _is_reduced_budget,
     _reset_lora_for_arm,
@@ -1355,6 +1356,92 @@ class TestDepositGateSelfConsistency:
         assert data["n_candidate"] >= 3
         assert data["n_surrogate"] >= 3
         assert data["n_baseline"] >= 3
+
+
+class TestDepositEvidenceHash:
+    """Content-hash reproducibility provenance (GOAL §7) for every committed
+    real-9B deposit — the "attach a content hash so the verdict is independently
+    reproducible" guard the §4 effort's source of truth rests on.
+
+    The verdict-replay tests pin that the recorded verdict is EARNED from the
+    stored floats; the gate self-consistency tests pin the DERIVED boolean.
+    NEITHER catches a coordinated repaint — editing the committed floats, their
+    CI bounds, the verdict label, and the per-arm provenance TOGETHER so every
+    derived check still passes. ``evidence_hash`` stamps a SHA-256 over the
+    EVIDENCE bytes (raw measurements + run-determining config, NEVER the derived
+    verdict/gate/regime labels), and these tests pin it two ways:
+
+    * self-consistency — the stamped hash equals the hash recomputed from the
+      committed bytes (the stamp is honest, not stale / hand-edited / mis-rolled);
+    * literal — the stamped hash equals a FROZEN literal per deposit, so any byte
+      change to the evidence (coordinated repaint OR accidental drift) is a
+      reviewable RED until the literal is deliberately updated on a real re-run.
+
+    What this does NOT certify: that a GPU produced the bytes. Only a run log or
+    a fresh independent reproduction can. The heterogeneous deposit has no
+    surviving run log and the GPU was contended the iteration it landed — that
+    limitation is recorded openly as the next action, not papered over here.
+    """
+
+    # Frozen per-deposit evidence hashes. Update ONLY on a deliberate re-deposit
+    # (a real re-run that legitimately changes the recorded measurements); that
+    # update is itself the reviewable change this guard exists to force.
+    _EXPECTED = {
+        FIXTURE_9B_SURROGATE: "9c3bd56c6f05f4c059a29b01816fbe59cb1cddd128ab70e2cc2c8d08cab6d7bc",
+        FIXTURE_9B_DIRECTION: "96026bfd3b93073847989939708816487ce202843fc14252c3ada858852dfab4",
+        FIXTURE_9B_GENERALIZATION: "efa596745ca7346dca4d10d0c916fff504c64142f6aabfad13cf8c5cb9abfcd8",
+        FIXTURE_9B_BASELINE: "d0090d0740ac2ab8f93ac77eb4a55921fdd640ff08c44779d625e5559e48e8d3",
+        FIXTURE_9B_FULL: "785d9cfae66fbf20fb0b9c3349dacbfd3ec5caf7cd9b046610d78f4e2bcf8577",
+        FIXTURE_9B_HETEROGENEOUS: "5fc3e1d4313091994f12e4db8fad974f46361de29a99dff68dc6c085dcdbf9ca",
+    }
+
+    @pytest.mark.parametrize("path", _REAL_9B_DEPOSIT_FIXTURES)
+    def test_stamp_matches_recomputed_hash(self, path):
+        # The stamped ``evidence_hash`` must equal the hash recomputed from the
+        # deposit's own committed bytes — guards a stale stamp (serializer rolled
+        # but the field was not refreshed) or a hand-edit that touched the bytes
+        # and not the stamp.
+        if not path.exists():
+            pytest.skip(f"{path.name} not landed yet")
+        data = json.loads(path.read_text())
+        assert "evidence_hash" in data
+        assert data["evidence_hash"] == _evidence_hash(data)
+
+    @pytest.mark.parametrize("path", _REAL_9B_DEPOSIT_FIXTURES)
+    def test_stamp_is_pinned_to_frozen_literal(self, path):
+        # THE coordinated-drift guard. The stamped hash must equal the frozen
+        # literal for this deposit — so a byte change to ANY evidence field
+        # (losses, orders, provenance, run config) flips this red until the
+        # literal is deliberately updated. This is the one test a coordinated
+        # repaint (which passes every DERIVED check) cannot pass silently: it
+        # forces the repaint to also edit the frozen literal, a visible change.
+        if not path.exists():
+            pytest.skip(f"{path.name} not landed yet")
+        data = json.loads(path.read_text())
+        assert data["evidence_hash"] == self._EXPECTED[path]
+
+    def test_hash_is_over_evidence_not_derived_labels(self):
+        # The hash must be over the EVIDENCE, not the derived labels — otherwise
+        # it is circular (auditing the verdict by hashing the verdict). Mutating
+        # any derived label (verdict / passes / gate / regime / CI statistics)
+        # must NOT move the hash; only the raw measurements and run config may.
+        data = json.loads(FIXTURE_9B_SURROGATE.read_text())
+        base = _evidence_hash(data)
+        for label_key in (
+            "verdict", "passes", "significant_surpasses", "is_material",
+            "citable_as_full_section4_verdict", "citable_as_target_scale",
+            "regime", "point_improvement", "lower", "upper",
+            "candidate_mean", "surrogate_mean",
+        ):
+            mutated = dict(data)
+            current = data.get(label_key)
+            mutated[label_key] = (
+                "ZZZ_NEVER_REAL" if isinstance(current, str) else (not current)
+            )
+            assert _evidence_hash(mutated) == base, (
+                f"evidence_hash leaked the derived label '{label_key}' into the "
+                f"payload — the hash must cover only raw evidence, never labels."
+            )
 
 
 # ── full-budget §4 deposit: literal verdict pin + replay faithfulness ────────
