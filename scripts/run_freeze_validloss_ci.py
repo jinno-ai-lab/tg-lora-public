@@ -111,7 +111,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.model.lora_utils import set_trainable_lora_layers
+from src.model.lora_utils import geometric_rank_schedule, set_trainable_lora_layers
 from src.tg_lora.activation_matching import ActivationMatchingLoss
 from src.tg_lora.freeze_schedule import (
     FreezeSchedule,
@@ -158,21 +158,19 @@ ARCHITECTURES = (HOMOGENEOUS, HETEROGENEOUS)
 def heterogeneous_ranks(num_layers: int, hidden: int) -> tuple[int, ...]:
     """Per-layer LoRA rank rising geometrically toward the output side.
 
-    The faithful proxy of GOAL §1.5/§8 non-uniform per-layer cost (DeltaNet vs
-    Attention, in this tiny model realized as per-layer adapter *capacity*):
-    output-side layers carry higher rank, so the freeze ORDER structurally
-    changes which capacity survives into the final epochs — exactly the
-    asymmetry the homogeneous TIES verdict cannot resolve. The geometric
-    schedule concentrates capacity at the output so an injected order effect
-    sits above the n=5 bootstrap detection floor rather than being drowned by
-    seed noise.
+    Thin delegate over the canonical
+    :func:`src.model.lora_utils.geometric_rank_schedule` (Constitution Rule #3
+    single source of truth — the proxy apparatus verdict and the 9B target
+    verdict must test the *same* heterogeneous schedule). The faithful proxy of
+    GOAL §1.5/§8 non-uniform per-layer cost (DeltaNet vs Attention, in this tiny
+    model realized as per-layer adapter *capacity*): output-side layers carry
+    higher rank, so the freeze ORDER structurally changes which capacity
+    survives into the final epochs — exactly the asymmetry the homogeneous TIES
+    verdict cannot resolve. The geometric schedule concentrates capacity at the
+    output so an injected order effect sits above the n=5 bootstrap detection
+    floor rather than being drowned by seed noise.
     """
-    if num_layers <= 1:
-        return (hidden,)
-    return tuple(
-        max(1, int(round(hidden ** (i / (num_layers - 1)))))
-        for i in range(num_layers)
-    )
+    return geometric_rank_schedule(num_layers, hidden)
 
 
 def output_first_order(num_layers: int) -> tuple[int, ...]:

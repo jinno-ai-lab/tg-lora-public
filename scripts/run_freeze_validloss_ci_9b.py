@@ -107,6 +107,7 @@ from omegaconf import OmegaConf
 from scripts.run_freeze_validloss_ci import resolve_device
 from src.model.lora_utils import (
     configure_trainable_lora_scope,
+    geometric_rank_schedule,
     iter_all_lora_params,
 )
 from src.model.load_model import apply_lora, load_base_model, load_tokenizer
@@ -553,23 +554,21 @@ ARCHITECTURES = (HOMOGENEOUS, HETEROGENEOUS)
 def heterogeneous_ranks_9b(active_layers, base_rank: int) -> tuple[int, ...]:
     """Per-layer LoRA rank rising geometrically toward the output side.
 
-    The target-scale mirror of the proxy harness's ``heterogeneous_ranks``: a
-    geometric schedule ``base_rank ** (i / (n - 1))`` over the ``n`` active
-    layers (sorted ascending), so the output-most layer carries ``base_rank``
-    (the config's homogeneous ``r``, keeping the total adapter budget
-    comparable) and earlier active layers carry progressively less capacity.
-    This realizes the GOAL §1.5/§8 non-uniform per-layer-cost asymmetry as
-    per-layer adapter *capacity* — the specialization signal a uniform-rank
-    stack lacks and the order-sensitivity diagnosis identified as the missing
-    condition for a freeze-order effect to resolve at target scale.
+    Thin delegate over the canonical
+    :func:`src.model.lora_utils.geometric_rank_schedule` (Constitution Rule #3
+    single source of truth — the target-scale verdict and the proxy apparatus
+    verdict must test the *same* heterogeneous schedule). The target-scale
+    mirror of the proxy harness's ``heterogeneous_ranks``: a geometric schedule
+    ``base_rank ** (i / (n - 1))`` over the ``n`` active layers (sorted
+    ascending), so the output-most layer carries ``base_rank`` (the config's
+    homogeneous ``r``, keeping the total adapter budget comparable) and earlier
+    active layers carry progressively less capacity. This realizes the GOAL
+    §1.5/§8 non-uniform per-layer-cost asymmetry as per-layer adapter
+    *capacity* — the specialization signal a uniform-rank stack lacks and the
+    order-sensitivity diagnosis identified as the missing condition for a
+    freeze-order effect to resolve at target scale.
     """
-    layers = sorted(active_layers)
-    n = len(layers)
-    if n <= 1:
-        return (base_rank,) if n == 1 else ()
-    return tuple(
-        max(1, int(round(base_rank ** (i / (n - 1))))) for i in range(n)
-    )
+    return geometric_rank_schedule(len(sorted(active_layers)), base_rank)
 
 
 def _decoder_layer_count(model) -> int:

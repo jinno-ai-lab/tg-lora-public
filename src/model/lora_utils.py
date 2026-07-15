@@ -125,3 +125,34 @@ def configure_trainable_lora_scope(
 
 def count_lora_params(model: torch.nn.Module) -> int:
     return sum(p.numel() for _, p in iter_lora_params(model))
+
+
+def geometric_rank_schedule(n_layers: int, base_rank: int) -> tuple[int, ...]:
+    """Per-layer LoRA rank rising geometrically toward the output side.
+
+    The single canonical source of the heterogeneous (per-layer asymmetric)
+    rank schedule: a geometric progression ``base_rank ** (i / (n - 1))`` over
+    ``n_layers`` entries, so the output-most layer carries ``base_rank``
+    (keeping the total adapter budget comparable to a uniform-``base_rank``
+    stack) and earlier layers carry progressively less capacity. This realizes
+    GOAL §1.5/§8 non-uniform per-layer cost as per-layer adapter *capacity* —
+    the specialization signal a uniform-rank stack lacks.
+
+    Constitution Rule #3 (single source of truth): this formula is consumed by
+    THREE call sites — the proxy CI harness
+    (:func:`scripts.run_freeze_validloss_ci.heterogeneous_ranks`), the
+    order-sensitivity diagnosis, and the real-9B target-scale CI harness
+    (:func:`scripts.run_freeze_validloss_ci_9b.heterogeneous_ranks_9b`) — so a
+    silent drift here would make the proxy apparatus verdict and the 9B target
+    verdict test *different* architectures. Both harness wrappers delegate to
+    this function; ``tests/test_heterogeneous_rank_single_source.py`` pins the
+    delegation and the cross-harness byte-equality.
+    """
+    if n_layers <= 0:
+        return ()
+    if n_layers == 1:
+        return (base_rank,)
+    return tuple(
+        max(1, int(round(base_rank ** (i / (n_layers - 1)))))
+        for i in range(n_layers)
+    )
