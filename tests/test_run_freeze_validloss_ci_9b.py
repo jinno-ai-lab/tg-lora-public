@@ -211,6 +211,23 @@ FIXTURE_9B_HETEROGENEOUS = (
     / "freeze_validloss_ci_9b_heterogeneous_generalization.json"
 )
 
+# The committed RUN-LOG (loss-curve) WITNESS for the heterogeneous deposit — the
+# per-arm loss trajectory the real 9B run produced, checked in so the verdict is
+# independently reproducible from committed bytes (the content-hash axis of iter
+# `65073bb`, here given a real committed artifact). 9 arms (3 candidate / 3
+# surrogate / 3 control), each carrying a 96-step ``loss_curve`` + the arm's
+# exact ``final_valid_loss`` (which reconstructs the deposit's loss vectors).
+# Stamped into the heterogeneous deposit as ``run_log_path`` /
+# ``run_log_sha256`` (canonical SHA-256 over the parsed payload, recomputable
+# via ``_run_log_sha256``). Regenerate with
+# ``make freeze-validloss-ci-9b-heterogeneous-generalization`` (the target now
+# writes this committed witness directly).
+FIXTURE_9B_HETEROGENEOUS_RUNLOG = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "freeze_validloss_ci_9b_heterogeneous_generalization_runlog.json"
+)
+
 
 # ── stubs ───────────────────────────────────────────────────────────────────
 
@@ -1573,7 +1590,7 @@ class TestDepositEvidenceHash:
         FIXTURE_9B_GENERALIZATION: "efa596745ca7346dca4d10d0c916fff504c64142f6aabfad13cf8c5cb9abfcd8",
         FIXTURE_9B_BASELINE: "d0090d0740ac2ab8f93ac77eb4a55921fdd640ff08c44779d625e5559e48e8d3",
         FIXTURE_9B_FULL: "785d9cfae66fbf20fb0b9c3349dacbfd3ec5caf7cd9b046610d78f4e2bcf8577",
-        FIXTURE_9B_HETEROGENEOUS: "5fc3e1d4313091994f12e4db8fad974f46361de29a99dff68dc6c085dcdbf9ca",
+        FIXTURE_9B_HETEROGENEOUS: "c07b1de1e8f3692b4e99ee7a20fcef6ce3c3a6e955de4a672e62838d17288a49",
     }
 
     @pytest.mark.parametrize("path", _REAL_9B_DEPOSIT_FIXTURES)
@@ -1926,6 +1943,140 @@ class TestCommittedLedgerWitness:
         assert _evidence_hash(mutated) == base, (
             "ledger_witness_* leaked into evidence_hash — the witness must be "
             "additive provenance, not evidence."
+        )
+
+
+# ── committed run-log witness: independent reproducibility of the het deposit ─
+#
+# Where the full-budget deposit's ledger witness (``TestCommittedLedgerWitness``
+# above) certifies the resumability ledger, this certifies the LOSS-CURVE run-log
+# artifact (``_write_run_log`` / ``--run-log``, iter ``65073bb``) for the
+# heterogeneous deposit — the per-arm loss trajectory the real 9B run produced.
+# This is the artifact the run-log infra was built to persist; a fresh real-9B
+# run (``make freeze-validloss-ci-9b-heterogeneous-generalization``) reproduced
+# the recorded SURPASSES verdict, so the finding is not an artifact of a single
+# noisy run, and the loss curves behind it are now committed + content-hashed.
+
+
+class TestCommittedRunLogWitness:
+    """Independent reproducibility provenance for the heterogeneous §4 deposit
+    via its committed RUN-LOG (loss-curve) WITNESS.
+
+    A skeptic re-reads the 9 committed arms (each with a 96-step ``loss_curve``
+    + exact ``final_valid_loss``), recomputes the canonical SHA-256 via
+    ``_run_log_sha256``, and reconstructs the deposit's three loss-vectors
+    byte-for-byte — the verdict's dynamics are reproducible from committed
+    bytes, not just its endpoint. The witness is additive (NOT in
+    ``EVIDENCE_HASH_KEYS``, so it cannot perturb ``evidence_hash``).
+    """
+
+    # Frozen witness hash over the canonical encoding of the committed run log
+    # (``_run_log_sha256`` — sort_keys + compact separators over the parsed
+    # payload). Update ONLY on a deliberate re-run; that update is itself the
+    # reviewable change this guard exists to force.
+    _FROZEN_RUNLOG_HASH = (
+        "eb1da4cdac69c663ab6e858a7efa831578ceebd5821d6ca8c43ea37127b76269"
+    )
+
+    def test_witness_file_is_committed_and_deposit_points_at_it(self):
+        # The witness is a committed repo file and the deposit's ``run_log_path``
+        # is a RELATIVE repo-root path that resolves to it.
+        assert FIXTURE_9B_HETEROGENEOUS_RUNLOG.exists(), (
+            "the heterogeneous deposit's run-log witness is missing from "
+            "tests/fixtures/ — loss-curve reproducibility is broken."
+        )
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        wit = data["run_log_path"]
+        assert wit is not None
+        assert not Path(wit).is_absolute(), (
+            f"run_log_path must be relative, got absolute {wit!r}"
+        )
+        assert (Path(__file__).resolve().parent.parent / wit).exists()
+
+    def test_witness_hash_is_self_consistent(self):
+        # The stamped ``run_log_sha256`` must equal the hash recomputed from the
+        # committed run-log bytes (via the source ``_run_log_sha256`` primitive).
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        witness = json.loads(FIXTURE_9B_HETEROGENEOUS_RUNLOG.read_text())
+        assert data["run_log_sha256"] == _run_log_sha256(witness)
+
+    def test_witness_hash_is_pinned_to_frozen_literal(self):
+        # THE coordinated-drift guard for the run-log witness. The stamped hash
+        # must equal BOTH the recomputed value (self-consistency) AND the frozen
+        # literal — so a re-run, accidental edit, or truncated hash flips red.
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        assert data["run_log_sha256"] == self._FROZEN_RUNLOG_HASH
+        witness = json.loads(FIXTURE_9B_HETEROGENEOUS_RUNLOG.read_text())
+        assert self._FROZEN_RUNLOG_HASH == _run_log_sha256(witness)
+
+    def test_runlog_arms_reconstruct_deposit_loss_vectors_exactly(self):
+        # THE independent-reproducibility link: each run-log arm's
+        # ``final_valid_loss`` (role+index) reconstructs the deposit's three
+        # loss vectors EXACTLY (float ==).
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        witness = json.loads(FIXTURE_9B_HETEROGENEOUS_RUNLOG.read_text())
+        arms = {(a["role"], a["index"]): a for a in witness["arms"]}
+        for role, key in (
+            ("candidate", "candidate_losses"),
+            ("surrogate", "surrogate_losses"),
+            ("control", "control_losses"),
+        ):
+            losses = data[key]
+            n_log = sum(1 for r, _ in arms if r == role)
+            assert len(losses) == n_log, (
+                f"{role}: deposit has {len(losses)} losses but run-log has "
+                f"{n_log} arms — reconstruction shape mismatch."
+            )
+            for i, expected in enumerate(losses):
+                assert arms[(role, i)]["final_valid_loss"] == expected, (
+                    f"{role}[{i}]: run-log {arms[(role, i)]['final_valid_loss']!r}"
+                    f" != deposit {expected!r} — reconstruction is NOT exact."
+                )
+
+    def test_runlog_arms_carry_real_loss_curves(self):
+        # The point of the run-log (vs the ledger endpoint witness): the per-step
+        # LOSS CURVES — the dynamics behind the verdict. Every arm carries a
+        # non-empty, genuinely-decreasing trajectory covering the full training
+        # (a real learning curve, not a fabricated flat line).
+        witness = json.loads(FIXTURE_9B_HETEROGENEOUS_RUNLOG.read_text())
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        for arm in witness["arms"]:
+            curve = arm["loss_curve"]
+            assert len(curve) == data["total_steps"], (
+                f"{arm['role']}[{arm['index']}] loss_curve has {len(curve)} "
+                f"steps, expected {data['total_steps']} — does not cover the "
+                f"full training run."
+            )
+            assert curve[0] > curve[-1], (
+                f"{arm['role']}[{arm['index']}] loss_curve does not decrease "
+                f"({curve[0]} -> {curve[-1]}) — not a real learning trajectory."
+            )
+
+    def test_runlog_run_config_matches_deposit_config(self):
+        # The run-log's recorded run_config must match the deposit's — so the
+        # witness is from THIS run, not a stale carry-over.
+        witness = json.loads(FIXTURE_9B_HETEROGENEOUS_RUNLOG.read_text())
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        rc = witness["run_config"]
+        for key in (
+            "total_steps", "warmup_steps", "depth", "spacing", "seq_len",
+            "train_examples", "valid_examples", "base_seed", "architecture",
+            "n_candidate", "n_surrogate", "n_control",
+        ):
+            assert rc[key] == data[key], (
+                f"run_config {key}={rc[key]!r} != deposit {data[key]!r}"
+            )
+        assert rc["lora_rank_pattern"] == data["lora_rank_pattern"]
+
+    def test_run_log_fields_do_not_perturb_evidence_hash(self):
+        # Additivity guard: the run_log_* fields must NOT enter evidence_hash.
+        data = json.loads(FIXTURE_9B_HETEROGENEOUS.read_text())
+        base = _evidence_hash(data)
+        mutated = dict(data)
+        mutated["run_log_sha256"] = "ZZZ_NEVER_REAL"
+        mutated["run_log_path"] = "ZZZ_NEVER_REAL"
+        assert _evidence_hash(mutated) == base, (
+            "run_log_* leaked into evidence_hash — the witness must be additive."
         )
 
 
