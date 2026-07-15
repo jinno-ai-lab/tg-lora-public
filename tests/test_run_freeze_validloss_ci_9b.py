@@ -35,6 +35,7 @@ used only to build tiny synthetic tensors / modules.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -164,6 +165,24 @@ FIXTURE_9B_BASELINE = (
 # generalized). Regenerate with ``make freeze-validloss-ci-9b-full``.
 FIXTURE_9B_FULL = (
     Path(__file__).resolve().parent / "fixtures" / "freeze_validloss_ci_9b_full.json"
+)
+
+# The committed LEDGER WITNESS for the citable full-budget deposit — a
+# byte-identical copy of the run's resumability ledger
+# (``runs/..._ledger.jsonl``), checked in under ``tests/fixtures/`` so the
+# citable verdict is independently reproducible from committed bytes alone (no
+# gitignored ``runs/`` path, no private stable dir). 10 JSONL lines: 1 header
+# (run-config fingerprint) + 9 arms (3 candidate / 3 surrogate / 3 baseline),
+# each carrying the arm's exact ``valid_loss`` — so the deposit's three
+# loss-vectors reconstruct byte-for-byte from this witness. Stamped into the
+# full deposit as ``ledger_witness_path`` / ``ledger_witness_sha256`` (a HARVEST
+# field, distinct from the runtime ``ledger_path`` which stays ``null`` for the
+# one-shot full run — the witness is the committed verification copy, not the
+# incrementally-written runtime resumability path).
+FIXTURE_9B_FULL_LEDGER = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "freeze_validloss_ci_9b_full_ledger.jsonl"
 )
 
 # The HETEROGENEOUS (per-layer asymmetric rank) recording — the one §4 research
@@ -1726,6 +1745,188 @@ class TestFullBudgetDepositVerdictPin:
         assert data["verdict"] == TIES
         assert data["baseline"]["verdict"] == SURPASSES
         assert data["verdict"] != data["baseline"]["verdict"]
+
+
+# ── committed ledger witness: independent reproducibility of the full deposit ─
+#
+# The citable full-budget deposit (``citable_as_full_section4_verdict=True``) is
+# the repo's most load-bearing result. ``evidence_hash`` pins its committed bytes
+# against a coordinated repaint; the verdict pins pin the EARNED outcome. NEITHER
+# answers the verifier's outside question — "given this committed JSON alone,
+# can I reconstruct the recorded losses?" The committed LEDGER WITNESS
+# (``freeze_validloss_ci_9b_full_ledger.jsonl``) closes that: a byte-identical
+# copy of the run's resumability ledger, stamped into the deposit as
+# ``ledger_witness_path`` / ``ledger_witness_sha256``. These tests pin that the
+# witness is present, hashes to its stamped value, and reconstructs every loss
+# vector EXACTLY — so the verdict is reproducible from committed bytes with no
+# gitignored ``runs/`` dependency and no private stable dir.
+
+
+class TestCommittedLedgerWitness:
+    """Independent reproducibility provenance for the citable full-budget §4
+    deposit via its committed LEDGER WITNESS.
+
+    The full-budget verdict (commit ``4b88ca8``) cleared all four citation-gate
+    axes; attaching the run's ledger as a committed, content-hashed witness is
+    the "independently reproducible" half of GOAL §7 — a skeptic re-reads the 10
+    committed JSONL lines, recomputes the canonical SHA-256, and reconstructs
+    the deposit's three loss-vectors byte-for-byte, with no private stable dir
+    or gitignored ``runs/`` path. The witness is additive (NOT in
+    ``EVIDENCE_HASH_KEYS``, so it cannot perturb ``evidence_hash``) and distinct
+    from the runtime ``ledger_path`` (``null`` here — the full run completed in
+    one shot; the witness is the committed VERIFICATION copy, not the
+    incrementally-written resumability path a fresh ``make`` run would write).
+    """
+
+    # Frozen witness hash over the canonical encoding of the committed ledger
+    # (sort_keys + compact separators over the parsed JSONL lines — the same
+    # canonicalization discipline as ``_run_log_sha256`` / ``_evidence_hash``).
+    # Update ONLY on a deliberate re-deposit (a real full-budget re-run); that
+    # update is itself the reviewable change this guard exists to force.
+    _FROZEN_WITNESS_HASH = (
+        "dfdf22f44f988e8f1ce46300c5e060aff3585d6911c952e56c10aebdb5db86aa"
+    )
+
+    @staticmethod
+    def _ledger_witness_sha256(ledger_path):
+        # Canonical SHA-256 over the committed JSONL witness: parse every
+        # non-empty line, then sort_keys + compact-encode the list. Whitespace-
+        # and key-order-invariant, recomputable from the committed bytes.
+        parsed = [
+            json.loads(line)
+            for line in Path(ledger_path).read_text().splitlines()
+            if line.strip()
+        ]
+        canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def test_witness_file_is_committed_and_deposit_points_at_it(self):
+        # The witness is a committed repo file (not a gitignored runs/ path) and
+        # the deposit's ``ledger_witness_path`` is a RELATIVE repo-root path that
+        # resolves to it — a committed deposit must never carry an absolute,
+        # worktree-specific path.
+        assert FIXTURE_9B_FULL_LEDGER.exists(), (
+            "the citable full-budget deposit's ledger witness is missing from "
+            "tests/fixtures/ — reproducibility from committed bytes is broken."
+        )
+        data = json.loads(FIXTURE_9B_FULL.read_text())
+        wit = data["ledger_witness_path"]
+        assert wit is not None
+        assert not Path(wit).is_absolute(), (
+            f"ledger_witness_path must be relative, got absolute {wit!r}"
+        )
+        assert (Path(__file__).resolve().parent.parent / wit).exists()
+
+    def test_witness_hash_is_self_consistent(self):
+        # The stamped ``ledger_witness_sha256`` must equal the hash recomputed
+        # from the committed ledger bytes — guards a stale stamp, a hand-edit
+        # that touched the witness but not the stamp, or a truncated hash.
+        data = json.loads(FIXTURE_9B_FULL.read_text())
+        recomputed = self._ledger_witness_sha256(FIXTURE_9B_FULL_LEDGER)
+        assert data["ledger_witness_sha256"] == recomputed, (
+            f"deposit stamp {data['ledger_witness_sha256']!r} != "
+            f"recomputed {recomputed!r}"
+        )
+
+    def test_witness_hash_is_pinned_to_frozen_literal(self):
+        # THE coordinated-drift guard for the witness. The stamped hash must
+        # equal the frozen literal — so any byte change to the committed ledger
+        # (a re-run, an accidental edit, a re-harvest) flips this red until the
+        # literal is deliberately updated. Pinning the literal as well as the
+        # recompute means a truncated/typo'd hash (which self-consistency would
+        # rubber-stamp so long as the stamp matched the truncated recompute)
+        # cannot pass: the stamp must equal BOTH the bytes AND the frozen value.
+        data = json.loads(FIXTURE_9B_FULL.read_text())
+        assert data["ledger_witness_sha256"] == self._FROZEN_WITNESS_HASH
+        # Belt + braces: the frozen literal is itself the recomputed value, so a
+        # frozen literal that drifted from the bytes can only pass if the stamp
+        # drifted identically — two independent fields must agree.
+        assert self._FROZEN_WITNESS_HASH == self._ledger_witness_sha256(
+            FIXTURE_9B_FULL_LEDGER
+        )
+
+    def test_ledger_reconstructs_deposit_loss_vectors_exactly(self):
+        # THE independent-reproducibility link: each ledger arm's ``valid_loss``
+        # (keyed by role + index) must reconstruct the deposit's three loss
+        # vectors EXACTLY (float ==), not approximately. A skeptic reading only
+        # the committed ledger reproduces the citable verdict's raw evidence.
+        data = json.loads(FIXTURE_9B_FULL.read_text())
+        parsed = [
+            json.loads(line)
+            for line in FIXTURE_9B_FULL_LEDGER.read_text().splitlines()
+            if line.strip()
+        ]
+        arms = [rec for rec in parsed if rec.get("type") == "arm"]
+        by_role_index = {(a["role"], a["index"]): a for a in arms}
+        for role, key in (
+            ("candidate", "candidate_losses"),
+            ("surrogate", "surrogate_losses"),
+            ("baseline", "baseline_losses"),
+        ):
+            losses = data[key]
+            n_ledger = sum(1 for r, _ in by_role_index if r == role)
+            assert len(losses) == n_ledger, (
+                f"{role}: deposit has {len(losses)} losses but ledger has "
+                f"{n_ledger} arms — reconstruction shape mismatch."
+            )
+            for i, expected in enumerate(losses):
+                arm = by_role_index[(role, i)]
+                assert arm["valid_loss"] == expected, (
+                    f"{role}[{i}]: ledger {arm['valid_loss']!r} != "
+                    f"deposit {expected!r} — reconstruction is NOT exact."
+                )
+
+    def test_ledger_header_fingerprint_matches_deposit_run_config(self):
+        # The witness's header fingerprint (the resumability config-gate) must
+        # match the deposit's run config — so the ledger is from THIS run, not a
+        # stale carry-over from a different config (the exact invariant the live
+        # ``load_ledger`` fingerprint check enforces at resume time).
+        data = json.loads(FIXTURE_9B_FULL.read_text())
+        header = json.loads(FIXTURE_9B_FULL_LEDGER.read_text().splitlines()[0])
+        assert header["type"] == "header"
+        fp = header["fingerprint"]
+        for fp_key, deposit_key in (
+            ("total_steps", "total_steps"),
+            ("warmup_steps", "warmup_steps"),
+            ("depth", "depth"),
+            ("spacing", "spacing"),
+            ("seq_len", "seq_len"),
+            ("train_examples", "train_examples"),
+            ("valid_examples", "valid_examples"),
+            ("base_seed", "base_seed"),
+            ("scope_label", "scope_label"),
+        ):
+            assert fp[fp_key] == data[deposit_key], (
+                f"fingerprint {fp_key}={fp[fp_key]!r} != deposit "
+                f"{deposit_key}={data[deposit_key]!r}"
+            )
+        assert fp["active_scope"] == data["active_scope"]
+
+    def test_runtime_ledger_path_stays_null_for_one_shot_harvest(self):
+        # Semantic guard: ``ledger_path`` (the RUNTIME resumability path a fresh
+        # ``make`` run would write) is ``null`` on the committed harvest, while
+        # ``ledger_witness_path`` (the committed VERIFICATION copy) is set. The
+        # two fields must not be conflated: ``ledger_path`` reflects how the run
+        # was invoked (null ⟺ the deposit was harvested from a one-shot run),
+        # the witness reflects what a verifier can read.
+        data = json.loads(FIXTURE_9B_FULL.read_text())
+        assert data["ledger_path"] is None
+        assert data["ledger_witness_path"] is not None
+
+    def test_witness_is_not_in_evidence_hash_keys(self):
+        # Additivity guard: the witness fields must NOT enter ``evidence_hash``
+        # (they are provenance, not evidence), so attaching them cannot perturb
+        # the pinned evidence hash — a coordinated repaint cannot reach the
+        # evidence hash through the witness, and vice-versa.
+        data = json.loads(FIXTURE_9B_FULL.read_text())
+        base = _evidence_hash(data)
+        mutated = dict(data)
+        mutated["ledger_witness_sha256"] = "ZZZ_NEVER_REAL"
+        mutated["ledger_witness_path"] = "ZZZ_NEVER_REAL"
+        assert _evidence_hash(mutated) == base, (
+            "ledger_witness_* leaked into evidence_hash — the witness must be "
+            "additive provenance, not evidence."
+        )
 
 
 # ── deposit replay faithfulness on the committed real-9B recording ──────────

@@ -199,5 +199,7 @@
   "citable_as_full_section4_verdict": true,
   "resumed_arm_count": 0,
   "ledger_path": null,
+  "ledger_witness_path": "tests/fixtures/freeze_validloss_ci_9b_full_ledger.jsonl",
+  "ledger_witness_sha256": "dfdf22f44f988e8f1ce46300c5e060aff3585d6911c952e56c10aebdb5db86aa",
   "evidence_hash": "785d9cfae66fbf20fb0b9c3349dacbfd3ec5caf7cd9b046610d78f4e2bcf8577"
 }
