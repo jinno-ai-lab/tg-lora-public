@@ -29,6 +29,7 @@ from scripts.run_freeze_validloss_ci_9b import (
     _arm_specs,
     _collect_arms,
     _config_fingerprint,
+    _gather_arm_curves,
     _require_runnable_arms,
     append_arm_to_ledger,
     load_ledger,
@@ -276,6 +277,80 @@ def test_collect_arms_stale_ledger_runs_everything(tmp_path):
     assert len(call_log) == 6                     # nothing reused from the stale ledger
     # the ledger now holds arms under the NEW fingerprint
     assert len(load_ledger(ledger, full_fp)) == 6
+
+
+# --- loss-curve capture pipeline (run-log artifact) --------------------------
+
+
+def test_collect_arms_loss_curve_capture_pipelines_through():
+    """The run-log capture pipeline end-to-end with the real ``_collect_arms``:
+    the orchestrator seeds each spec with an empty ``_loss_curve``, the runner
+    (``arm_valid_loss_9b`` in production) appends each step's loss to it,
+    ``_collect_arms`` drives the runner, and ``_gather_arm_curves`` pairs the
+    captured curves with results in plan order. Only the GPU model is stubbed —
+    the seed → capture → gather glue is exercised, not just the writer.
+    """
+    specs = _full_specs()
+    # Orchestrator seeding (mirrors run_ci_9b when --run-log is set): every
+    # planned arm carries an empty _loss_curve the runner forwards as the sink.
+    for spec in specs:
+        spec["_loss_curve"] = []
+
+    def _runner(spec):
+        # Stand-in for arm_valid_loss_9b's per-step append: a short synthetic
+        # trajectory so each arm's captured curve is a distinguishable, ordered list.
+        spec["_loss_curve"].extend([2.0, 1.8, 1.6])
+        return (
+            1.5 + spec["index"] * 0.01,
+            {"frozen_layers": [14], "n_trainable_params": 1,
+             "last_train_loss": 0.0, "final_ce_train_loss": 1.5},
+        )
+
+    collected, n_resumed = _collect_arms(specs, _runner)
+    assert n_resumed == 0
+    arms = _gather_arm_curves(specs, collected)
+    # Plan order (candidate block then surrogate block, matching _arm_specs).
+    assert [a["role"] for a in arms] == [
+        "candidate", "candidate", "candidate",
+        "surrogate", "surrogate", "surrogate",
+    ]
+    # Every planned arm captured its 3-step trajectory through the real loop glue.
+    assert all(a["loss_curve"] == [2.0, 1.8, 1.6] for a in arms)
+    # The valid_loss is paired from collected (the run result), not the curve stub.
+    assert arms[0]["final_valid_loss"] == 1.5
+    assert arms[3]["final_valid_loss"] == 1.5  # surrogate index 0
+
+
+def test_collect_arms_resumed_arm_leaves_empty_curve(tmp_path):
+    """A resumed arm (replayed from the ledger, never re-run) keeps the empty
+    ``_loss_curve`` the orchestrator seeded — the run log records an honest
+    "dynamics unavailable for this arm", never a fabricated trajectory."""
+    ledger = tmp_path / "ledger.jsonl"
+    fp = _fp()
+    specs = _full_specs()
+    for spec in specs:
+        spec["_loss_curve"] = []
+    # Bank candidate[0] up front; the runner never touches it on resume.
+    by_key = {(s["role"], s["index"]): s for s in specs}
+    append_arm_to_ledger(ledger, fp, by_key[("candidate", 0)], 1.9, {"pre": True})
+
+    def _runner(spec):
+        spec["_loss_curve"].extend([2.0, 1.8])
+        return (1.5, {"frozen_layers": [14], "n_trainable_params": 1,
+                      "last_train_loss": 0.0, "final_ce_train_loss": 1.5})
+
+    collected, n_resumed = _collect_arms(
+        specs, _runner, ledger_path=ledger, fingerprint=fp,
+    )
+    assert n_resumed == 1
+    arms = _gather_arm_curves(specs, collected)
+    resumed = next(a for a in arms if a["role"] == "candidate" and a["index"] == 0)
+    # Replayed from the ledger: valid_loss banked (1.9), but no curve captured.
+    assert resumed["final_valid_loss"] == 1.9
+    assert resumed["loss_curve"] == []
+    # A freshly-run arm DID capture its curve.
+    fresh = next(a for a in arms if a["role"] == "candidate" and a["index"] == 1)
+    assert fresh["loss_curve"] == [2.0, 1.8]
 
 
 # --- incomplete-resume guard -------------------------------------------------

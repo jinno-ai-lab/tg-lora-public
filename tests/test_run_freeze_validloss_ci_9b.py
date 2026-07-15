@@ -62,8 +62,12 @@ from scripts.run_freeze_validloss_ci_9b import (
     _direction_ci_to_json,
     _evidence_hash,
     _full_section4_verdict_gate,
+    _gather_arm_curves,
     _is_reduced_budget,
     _reset_lora_for_arm,
+    _run_log_payload,
+    _run_log_sha256,
+    _write_run_log,
     arm_valid_loss_9b,
     build_parser,
     build_rank_pattern,
@@ -379,6 +383,18 @@ class TestArmSignature:
         assert "model" in params
         assert "scope" in params
         assert "cfg" not in params  # no per-arm reload
+
+    def test_loss_curve_sink_is_opt_in(self):
+        # The per-step loss-curve capture is an opt-in side channel: a
+        # ``loss_curve_sink`` kwarg defaulting to None (no capture, byte-identical
+        # to the pre-run-log path). It must NEVER be positional / required — the
+        # capture is a pure side effect on the verdict.
+        import inspect
+
+        sig = inspect.signature(arm_valid_loss_9b)
+        param = sig.parameters["loss_curve_sink"]
+        assert param.default is None
+        assert param.kind == inspect.Parameter.KEYWORD_ONLY
 
 
 # ── result_to_json: GOAL §7 honesty labels ───────────────────────────────────
@@ -1358,6 +1374,152 @@ class TestDepositGateSelfConsistency:
         assert data["n_baseline"] >= 3
 
 
+class TestRunLogArtifact:
+    """Loss-curve run-log artifact (GOAL §7 reproducibility) — the "attach a run
+    log / loss-curve artifact and a content hash so the verdict is independently
+    reproducible" path ``evidence_hash`` alone cannot cover. ``evidence_hash``
+    freezes the terminal measurements; it cannot certify a GPU produced the
+    *dynamics* behind them (only a surviving loss curve or a fresh reproduction
+    can — the heterogeneous run landed without one, recorded openly by the
+    evidence-hash commit). The run log is that companion artifact: per-step
+    training-loss trajectories + run config, content-hashed over canonical bytes
+    and linked into the deposit via ``run_log_sha256``.
+
+    These tests pin the writer, the hash, the deposit linkage, and the capture
+    pipeline WITHOUT a GPU: the writer + gatherer are pure functions, and the
+    per-step append is pinned by :class:`TestArmSignature` above + the
+    ``_collect_arms`` capture-pipeline test in the resume suite.
+    """
+
+    def _curves(self):
+        return [
+            {"role": "candidate", "index": 0, "seed": 0, "order": [31, 30],
+             "frozen_layers": [31], "n_trainable_params": 1014336,
+             "final_valid_loss": 1.543, "last_train_loss": 0.0001,
+             "final_ce_train_loss": 1.576, "loss_curve": [2.0, 1.8, 1.5]},
+            {"role": "surrogate", "index": 0, "seed": 100, "order": [25, 28],
+             "frozen_layers": [25], "n_trainable_params": 2047296,
+             "final_valid_loss": 1.555, "last_train_loss": 0.0002,
+             "final_ce_train_loss": 1.597, "loss_curve": [2.1, 1.9, 1.6]},
+        ]
+
+    # Frozen literal for the fixed _curves()/_stub_result() input — the
+    # coordinated-drift guard analog: any byte change to a curve or config field
+    # flips this RED until the literal is deliberately updated on a real re-run.
+    _EXPECTED_HASH = (
+        "f1e25dc756bdb6b684b836557e0ce07e49e296a0f1e17058358053acd164dea5"
+    )
+
+    def test_frozen_literal_hash(self):
+        payload = _run_log_payload(_stub_result(), self._curves())
+        assert _run_log_sha256(payload) == self._EXPECTED_HASH
+
+    def test_writer_self_consistency(self, tmp_path):
+        # The returned hash must equal the hash recomputed from the WRITTEN file's
+        # parsed content — so a verifier reading the on-disk artifact recomputes
+        # the same stamp the deposit carries (guards a stale/rolled serializer
+        # AND proves the indented on-disk format hashes the same as the canonical
+        # form the stamp is over).
+        path = tmp_path / "runs" / "runlog.json"
+        sha = _write_run_log(path, _stub_result(), self._curves())
+        loaded = json.loads(path.read_text())
+        assert sha == _run_log_sha256(loaded)
+        assert loaded["schema_version"] == 1
+        assert loaded["run_config"]["model"] == "Qwen/Qwen3.5-9B"
+        assert [a["role"] for a in loaded["arms"]] == ["candidate", "surrogate"]
+        assert loaded["arms"][0]["loss_curve"] == [2.0, 1.8, 1.5]
+
+    def test_curve_change_moves_hash(self):
+        # Mutating a single per-step loss flips the hash — the curve is
+        # load-bearing evidence the stamp certifies (mutation proof, curve axis).
+        curves = self._curves()
+        base = _run_log_sha256(_run_log_payload(_stub_result(), curves))
+        curves[0]["loss_curve"][0] = 9.999
+        assert _run_log_sha256(_run_log_payload(_stub_result(), curves)) != base
+
+    def test_config_change_moves_hash(self):
+        # Mutating run-determining config (total_steps) flips the hash — the
+        # artifact is self-identifying, not just an opaque blob of curves.
+        curves = self._curves()
+        base = _run_log_sha256(_run_log_payload(_stub_result(), curves))
+        moved = _run_log_sha256(_run_log_payload(_stub_result(total_steps=999), curves))
+        assert moved != base
+
+    def test_hash_is_whitespace_invariant(self):
+        # The stamp is over canonical COMPACT bytes; serializing the same payload
+        # compact vs indented and re-parsing must yield the same hash — a verifier
+        # is never sensitive to the file's indentation.
+        payload = _run_log_payload(_stub_result(), self._curves())
+        compact = json.loads(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        indented = json.loads(json.dumps(payload, sort_keys=True, indent=2))
+        assert _run_log_sha256(compact) == _run_log_sha256(indented)
+
+    def test_deposit_carries_run_log_fields_additively(self):
+        # result_to_json surfaces run_log_path + run_log_sha256 additively: set
+        # when the run wrote a log, None when it did not (byte-identical to the
+        # pre-run-log deposit shape for a one-shot run).
+        with_log = result_to_json(_stub_result(
+            run_log_path="runs/x.json", run_log_sha256="abc123"))
+        assert with_log["run_log_path"] == "runs/x.json"
+        assert with_log["run_log_sha256"] == "abc123"
+        without = result_to_json(_stub_result())
+        assert without["run_log_path"] is None
+        assert without["run_log_sha256"] is None
+
+    def test_run_log_fields_do_not_perturb_evidence_hash(self):
+        # The run-log is a PARALLEL provenance channel: it must never enter
+        # EVIDENCE_HASH_KEYS, so attaching/detaching a run log leaves the pinned
+        # evidence hash byte-identical (independence — the two hashes certify
+        # different things and must not be circular).
+        without = _evidence_hash(result_to_json(_stub_result()))
+        with_log = _evidence_hash(result_to_json(_stub_result(
+            run_log_path="runs/x.json", run_log_sha256="abc123")))
+        assert without == with_log
+
+    def test_gather_pairs_specs_with_results_in_plan_order(self):
+        # _gather_arm_curves walks specs in plan order, pairing each with its
+        # (loss, provenance) from collected, and reads the seeded _loss_curve.
+        specs = [
+            {"role": "candidate", "index": 0, "seed": 0, "order": (31, 30),
+             "depth": 2, "_loss_curve": [2.0, 1.5]},
+            {"role": "candidate", "index": 1, "seed": 1, "order": (31, 30),
+             "depth": 2, "_loss_curve": [2.1, 1.6]},
+            {"role": "surrogate", "index": 0, "seed": 100, "order": (25, 28),
+             "depth": 2, "_loss_curve": [2.2, 1.7]},
+        ]
+        collected = {
+            "candidate": [
+                (1.543, {"frozen_layers": [31], "n_trainable_params": 1014336,
+                         "last_train_loss": 0.0001, "final_ce_train_loss": 1.576}),
+                (1.544, {"frozen_layers": [31], "n_trainable_params": 1014336,
+                         "last_train_loss": 0.0001, "final_ce_train_loss": 1.577}),
+            ],
+            "surrogate": [
+                (1.555, {"frozen_layers": [25], "n_trainable_params": 2047296,
+                         "last_train_loss": 0.0002, "final_ce_train_loss": 1.597}),
+            ],
+            "control": [], "baseline": [],
+        }
+        arms = _gather_arm_curves(specs, collected)
+        assert [a["role"] for a in arms] == ["candidate", "candidate", "surrogate"]
+        assert arms[0]["final_valid_loss"] == 1.543
+        assert arms[0]["loss_curve"] == [2.0, 1.5]
+        assert arms[2]["loss_curve"] == [2.2, 1.7]
+        assert arms[1]["n_trainable_params"] == 1014336
+
+    def test_gather_honest_empty_curve_for_resumed_arm(self):
+        # A resumed arm (replayed from the ledger, never re-run) has no captured
+        # curve: _gather_arm_curves reads an empty _loss_curve (the orchestrator
+        # seeded []) rather than fabricating a trajectory.
+        specs = [{"role": "candidate", "index": 0, "seed": 0, "order": (31,),
+                  "depth": 1, "_loss_curve": []}]
+        collected = {"candidate": [(1.543, {"frozen_layers": [31]})],
+                     "surrogate": [], "control": [], "baseline": []}
+        arms = _gather_arm_curves(specs, collected)
+        assert arms[0]["loss_curve"] == []
+        assert arms[0]["final_valid_loss"] == 1.543
+
+
 class TestDepositEvidenceHash:
     """Content-hash reproducibility provenance (GOAL §7) for every committed
     real-9B deposit — the "attach a content hash so the verdict is independently
@@ -2234,6 +2396,17 @@ class TestCli:
         assert "--n-candidate" in text
         # The DIRECTION-CONTROL flag (constitution P0) is part of the CLI surface.
         assert "--n-control" in text
+        # The run-log / loss-curve artifact flag (GOAL §7 reproducibility) is
+        # part of the CLI surface — the "attach a run log so the verdict is
+        # independently reproducible" path.
+        assert "--run-log" in text
+
+    def test_run_log_flag_defaults_none(self):
+        # ``--run-log`` unset → None (no run log, byte-identical deposit). The
+        # mechanism is strictly opt-in: a citable run turns it on, every other
+        # run is unaffected.
+        args = build_parser().parse_args([])
+        assert args.run_log is None
 
     def test_help_launches_as_module(self):
         # The canary contract: every scripts.* CLI launches via ``-m`` with a

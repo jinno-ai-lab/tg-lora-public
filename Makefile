@@ -930,7 +930,7 @@ freeze-validloss-ci-9b-generalization: ## GOAL §4 real-9B A/B in a GENERALIZATI
 # heterogeneous data point, NOT the full §4 verdict.
 # Needs a torch+bnb+GPU interpreter: PYTHON_VENV=/path/to/torch-python make freeze-validloss-ci-9b-heterogeneous-generalization
 freeze-validloss-ci-9b-heterogeneous-generalization: ## GOAL §4 real-9B A/B on a HETEROGENEOUS (per-layer rank) stack, generalization regime
-	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_GEN_FLAGS) --architecture heterogeneous --json --output tests/fixtures/freeze_validloss_ci_9b_heterogeneous_generalization.json
+	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_GEN_FLAGS) --architecture heterogeneous --json --output tests/fixtures/freeze_validloss_ci_9b_heterogeneous_generalization.json --run-log runs/freeze_validloss_ci_9b_heterogeneous_generalization_runlog.json
 
 # FULL-BACKPROP BASELINE arm of the real 9B §4 A/B — GOAL §4 line 247's OTHER
 # success axis. The surrogate/direction/generalization deposits above are all

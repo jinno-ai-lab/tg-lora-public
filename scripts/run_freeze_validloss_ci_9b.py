@@ -383,6 +383,7 @@ def arm_valid_loss_9b(
     spacing: int,
     lr: float,
     use_local_loss: bool = True,
+    loss_curve_sink: list[float] | None = None,
 ) -> tuple[float, dict]:
     """One real-9B A/B arm on the shared model: reset, freeze under ``order``.
 
@@ -402,6 +403,13 @@ def arm_valid_loss_9b(
 
     Returns ``(valid_loss, provenance)`` where provenance records the frozen
     layer set and trainable-param count for honest deposit.
+
+    ``loss_curve_sink`` is the opt-in per-step training-loss capture: when a
+    list is passed, each optimizer step's loss is appended to it in order, so
+    the caller can persist the full loss trajectory as a reproducible run-log
+    artifact (see :func:`_write_run_log`). ``None`` (default) captures nothing
+    and the arm is byte-identical to the pre-run-log path — the capture is a
+    pure side effect that never touches the returned verdict or provenance.
     """
     resolved_indices = _reset_lora_for_arm(model, scope, seed)
     if resolved_indices != active_indices:
@@ -463,6 +471,11 @@ def arm_valid_loss_9b(
         loss.backward()
         opt.step()
         last_loss = float(loss.item())
+        # Opt-in per-step loss-curve capture for the reproducible run-log artifact
+        # (see :func:`_write_run_log`). ``None`` → no-op, so an arm run without a
+        # sink is byte-identical to the pre-run-log path.
+        if loss_curve_sink is not None:
+            loss_curve_sink.append(last_loss)
 
     valid_loss = eval_loss_9b(model, valid_batches)
     # Mean full-CE over the TRAIN set under the final adapter — the
@@ -1199,6 +1212,7 @@ def _make_arm_runner(
     spacing,
     lr,
     use_local_loss,
+    capture_loss_curve: bool = False,
 ):
     """Build the per-spec GPU arm runner closure for :func:`_collect_arms`.
 
@@ -1211,8 +1225,16 @@ def _make_arm_runner(
     dispatches each spec's ``order``/``seed``/``depth`` to
     :func:`arm_valid_loss_9b` on that one shared model — identical to the legacy
     inline comprehensions.
+
+    ``capture_loss_curve`` enables the per-step loss-curve capture for the
+    reproducible run-log artifact: the orchestrator seeds each spec with an
+    empty ``_loss_curve`` list and this closure forwards it to
+    :func:`arm_valid_loss_9b` as the ``loss_curve_sink``. ``False`` (default)
+    forwards ``None`` and the arm is byte-identical to the pre-run-log path —
+    specs carry no ``_loss_curve`` key and no capture occurs.
     """
     def _runner(spec):
+        sink = spec.get("_loss_curve") if capture_loss_curve else None
         return arm_valid_loss_9b(
             model, spec["order"], spec["seed"], scope=scope_label,
             active_indices=active_indices,
@@ -1220,6 +1242,7 @@ def _make_arm_runner(
             total_steps=total_steps, warmup_steps=warmup_steps,
             depth=spec["depth"], spacing=spacing, lr=lr,
             use_local_loss=use_local_loss,
+            loss_curve_sink=sink,
         )
     return _runner
 
@@ -1246,6 +1269,7 @@ def run_ci_9b(
     ledger_path=None,
     output=None,
     architecture: str = HOMOGENEOUS,
+    run_log_path=None,
 ) -> dict:
     """Run the real-9B candidate+surrogate sweep and return the §4 verdict dict.
 
@@ -1373,6 +1397,15 @@ def run_ci_9b(
         logger.info(
             "Resume ledger enabled: %s (%d arms planned).", ledger_path, len(specs),
         )
+    # Seed the per-spec loss-curve sink when a run log was requested, so every
+    # planned arm — including ones later replayed from the ledger, which stay
+    # empty as an honest "dynamics unavailable for this resumed arm" — carries a
+    # ``_loss_curve`` key the runner forwards to ``arm_valid_loss_9b``. No
+    # ``run_log_path`` → no seeding → specs carry no key → the runner forwards
+    # ``None`` → byte-identical to the pre-run-log path.
+    if run_log_path is not None:
+        for spec in specs:
+            spec["_loss_curve"] = []
 
     _runner = _make_arm_runner(
         model,
@@ -1380,6 +1413,7 @@ def run_ci_9b(
         train_batches=train_batches, valid_batches=valid_batches, device=device,
         total_steps=total_steps, warmup_steps=warmup_steps,
         spacing=spacing, lr=lr, use_local_loss=use_local_loss,
+        capture_loss_curve=bool(run_log_path),
     )
 
     n_resumed = 0
@@ -1427,7 +1461,7 @@ def run_ci_9b(
         if baseline_losses
         else None
     )
-    return {
+    result = {
         "ci": ci,
         "candidate_losses": candidate_losses,
         "surrogate_losses": surrogate_losses,
@@ -1494,6 +1528,21 @@ def run_ci_9b(
         "resumed_arm_count": n_resumed,
         "ledger_path": (str(ledger_path) if ledger_path is not None else None),
     }
+    # Persist the per-step loss-curve run-log artifact (GOAL §7 reproducibility)
+    # when ``--run-log`` was given. Built from the captured per-spec curves AFTER
+    # the result dict is assembled (so the run-config header reflects the run
+    # that actually executed), then the content hash + path are stamped onto the
+    # result for ``result_to_json`` to surface in the deposit. Skipped entirely
+    # (no key set) when ``run_log_path`` is None — the deposit stays byte-identical.
+    if run_log_path is not None:
+        arm_curves = _gather_arm_curves(specs, collected)
+        result["run_log_sha256"] = _write_run_log(run_log_path, result, arm_curves)
+        result["run_log_path"] = str(run_log_path)
+        logger.info(
+            "Wrote run log %s (sha256=%s) — %d arm trajectories persisted.",
+            run_log_path, result["run_log_sha256"], len(arm_curves),
+        )
+    return result
 
 
 # GOAL §7 reproducibility provenance. The deposit's verdict, gate, and regime
@@ -1545,6 +1594,107 @@ def _evidence_hash(deposit: dict) -> str:
     payload = {k: deposit.get(k) for k in EVIDENCE_HASH_KEYS}
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# GOAL §7 reproducibility — the run-log / loss-curve artifact. ``evidence_hash``
+# freezes the deposit's terminal measurements; it cannot certify a GPU produced
+# them (only a surviving run log or a fresh reproduction can — the heterogeneous
+# run landed without one). The run log is that companion artifact: it carries
+# each arm's full per-step training-loss trajectory (the loss curve) plus the
+# run-determining config, so an independent reproduction can be checked against
+# the recorded *dynamics*, not just the terminal valid_loss samples. Its own
+# content hash (``_run_log_sha256``, over canonical bytes — independent of file
+# indentation, mirroring :func:`_evidence_hash`) is what the deposit links via
+# ``run_log_sha256``: a verifier fetches the artifact, recomputes the hash, and
+# confirms the loss curve behind a verdict is the recorded one. Opt-in
+# (``--run-log``); unset, the deposit carries ``run_log_sha256: null`` and is
+# byte-identical to the pre-run-log shape.
+RUN_LOG_SCHEMA_VERSION = 1
+
+# Run-determining config recorded once in the artifact header so the per-arm
+# curves are self-identifying independent of the deposit. Mirrors the
+# run-config subset of :data:`EVIDENCE_HASH_KEYS`; the per-arm measurements
+# (losses, frozen layers) live in each arm entry rather than the header.
+_RUN_LOG_CONFIG_KEYS = (
+    "model", "architecture", "lora_rank_pattern", "dataset",
+    "total_steps", "warmup_steps", "depth", "spacing",
+    "active_scope", "seq_len", "train_examples", "valid_examples",
+    "n_candidate", "n_surrogate", "n_control", "n_baseline", "base_seed",
+)
+
+
+def _run_log_sha256(payload: dict) -> str:
+    """SHA-256 hex over the canonical compact encoding of a run-log payload.
+
+    The artifact is written human-readable (``indent=2, sort_keys=True``) but
+    the hash is over the sorted-key compact form, so it is stable across
+    whitespace changes and recomputable from the parsed bytes — a verifier
+    reads the file, re-canonicalizes, and checks the stamp. Same canonicalization
+    discipline as :func:`_evidence_hash`.
+    """
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _gather_arm_curves(specs, collected) -> list[dict]:
+    """Pair each planned spec with its result + captured loss curve.
+
+    Walks ``specs`` in plan order, consuming each role's ``(valid_loss,
+    provenance)`` results from ``collected`` in the same order
+    :func:`_collect_arms` appended them (so spec ↔ result correspondence holds
+    even under resume), and reads the per-step ``_loss_curve`` the orchestrator
+    seeded on the spec. A resumed arm (replayed from the ledger, never re-run)
+    carries an empty curve — an honest "dynamics unavailable for this arm",
+    never a fabricated trajectory. Returns the per-arm entry list the run log
+    serializes; pure (no I/O), so it is unit-testable without a GPU.
+    """
+    role_results = {role: list(seq) for role, seq in collected.items()}
+    role_cursor = {role: 0 for role in role_results}
+    arms: list[dict] = []
+    for spec in specs:
+        role = spec["role"]
+        cursor = role_cursor[role]
+        valid_loss, prov = role_results[role][cursor]
+        role_cursor[role] = cursor + 1
+        arms.append({
+            "role": role,
+            "index": int(spec["index"]),
+            "seed": int(spec["seed"]),
+            "order": list(spec["order"]),
+            "frozen_layers": list(prov.get("frozen_layers", [])),
+            "n_trainable_params": prov.get("n_trainable_params"),
+            "final_valid_loss": float(valid_loss),
+            "last_train_loss": prov.get("last_train_loss"),
+            "final_ce_train_loss": prov.get("final_ce_train_loss"),
+            "loss_curve": [float(x) for x in spec.get("_loss_curve", [])],
+        })
+    return arms
+
+
+def _run_log_payload(result: dict, arm_curves: list[dict]) -> dict:
+    """Build the run-log artifact body: schema version + run config + arms."""
+    return {
+        "schema_version": RUN_LOG_SCHEMA_VERSION,
+        "run_config": {k: result.get(k) for k in _RUN_LOG_CONFIG_KEYS},
+        "arms": arm_curves,
+    }
+
+
+def _write_run_log(path, result: dict, arm_curves: list[dict]) -> str:
+    """Write the loss-curve run-log artifact; return its content hash.
+
+    Returns ``_run_log_sha256`` over the canonical payload (independent of the
+    indented on-disk formatting), so the deposit's ``run_log_sha256`` certifies
+    the artifact *content* the verifier recomputes from the file, not its
+    whitespace. The parent directory is created best-effort (the pre-flight
+    :func:`output_paths_writable` already fail-loud on a dead/unwritable path).
+    """
+    payload = _run_log_payload(result, arm_curves)
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return _run_log_sha256(payload)
 
 
 def result_to_json(result: dict) -> dict:
@@ -1668,6 +1818,18 @@ def result_to_json(result: dict) -> dict:
         # ledger path, so this never changes a one-shot deposit's verdict.
         "resumed_arm_count": int(result.get("resumed_arm_count", 0) or 0),
         "ledger_path": result.get("ledger_path"),
+        # Loss-curve run-log artifact (GOAL §7 reproducibility). ADDITIVE —
+        # ``None`` when no ``--run-log`` was given, so a one-shot run deposits
+        # byte-identically to the pre-run-log shape. When present, ``run_log_path``
+        # is the persisted per-step loss-trajectory artifact and ``run_log_sha256``
+        # is its content hash (over canonical bytes, independent of indentation)
+        # — the reproducibility companion to ``evidence_hash``: the deposit's
+        # evidence hash freezes the terminal measurements; the run log certifies a
+        # GPU produced the dynamics behind them. Deliberately NOT in
+        # :data:`EVIDENCE_HASH_KEYS` (the path is machine-specific and the run log
+        # carries its OWN hash), so it never perturbs the pinned evidence hash.
+        "run_log_path": result.get("run_log_path"),
+        "run_log_sha256": result.get("run_log_sha256"),
     }
     # GOAL §7 reproducibility provenance — see :func:`_evidence_hash`. Computed
     # last, over the evidence keys only (never the verdict/gate/regime it would
@@ -1943,6 +2105,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--run-log", default=None,
+        help=(
+            "Run-log / loss-curve artifact path (JSON). When set, each arm's "
+            "full per-step training-loss trajectory is persisted here alongside "
+            "the run-determining config and per-arm provenance, and the deposit "
+            "carries run_log_path + a content hash (run_log_sha256) linking it — "
+            "the reproducibility companion to evidence_hash (which freezes the "
+            "terminal measurements but cannot certify a GPU produced them). "
+            "Recommended for any citable run so the verdict is independently "
+            "reproducible from the recorded dynamics. Default None = no run log "
+            "(the deposit is byte-identical to a no-run-log run)."
+        ),
+    )
+    p.add_argument(
         "--min-free-gib", type=float, default=DEFAULT_MIN_FREE_GIB,
         help=(
             "Free-GPU-memory floor in GiB for the pre-flight check. If the card "
@@ -2000,8 +2176,10 @@ def gpu_free_memory_deferred(min_free_gib: float) -> str | None:
     return None
 
 
-def output_paths_writable(output: str | None, ledger: str | None) -> str | None:
-    """Return a fatal reason if ``--output`` or ``--ledger`` can't be written.
+def output_paths_writable(
+    output: str | None, ledger: str | None, run_log: str | None = None,
+) -> str | None:
+    """Return a fatal reason if ``--output`` / ``--ledger`` / ``--run-log`` can't be written.
 
     ``None`` means "both writable, proceed". A non-None string means "abort":
     the parent directory of the given path either does not exist or is not
@@ -2026,7 +2204,9 @@ def output_paths_writable(output: str | None, ledger: str | None) -> str | None:
     the trap is detected without a fragile ``os.getcwd()`` that would itself
     raise.
     """
-    for flag, path in (("--output", output), ("--ledger", ledger)):
+    for flag, path in (
+        ("--output", output), ("--ledger", ledger), ("--run-log", run_log),
+    ):
         if not path:
             continue
         parent = Path(path).parent
@@ -2062,34 +2242,39 @@ def cwd_is_alive() -> bool:
         return False
 
 
-def _outputs_are_absolute(output: str | None, ledger: str | None) -> bool:
+def _outputs_are_absolute(
+    output: str | None, ledger: str | None, run_log: str | None = None,
+) -> bool:
     """True when every given output path is absolute.
 
-    Absolute ``--output`` / ``--ledger`` survive the run's CWD being removed
-    (their writes never resolve against CWD), so a mid-run dead CWD is harmless
-    for them — the check in :func:`_collect_arms` is skipped. A single relative
-    path makes the run CWD-dependent, so this returns False. ``None`` paths
-    impose no constraint.
+    Absolute ``--output`` / ``--ledger`` / ``--run-log`` survive the run's CWD
+    being removed (their writes never resolve against CWD), so a mid-run dead
+    CWD is harmless for them — the check in :func:`_collect_arms` is skipped. A
+    single relative path makes the run CWD-dependent, so this returns False.
+    ``None`` paths impose no constraint.
     """
-    for path in (output, ledger):
+    for path in (output, ledger, run_log):
         if path and not Path(path).is_absolute():
             return False
     return True
 
 
-def _ensure_output_parent_dirs(output: str | None, ledger: str | None) -> None:
-    """Create the ``--output`` / ``--ledger`` parent dirs up front.
+def _ensure_output_parent_dirs(
+    output: str | None, ledger: str | None, run_log: str | None = None,
+) -> None:
+    """Create the ``--output`` / ``--ledger`` / ``--run-log`` parent dirs up front.
 
-    ``append_arm_to_ledger`` already ``mkdir(parents=True, exist_ok=True)`` at
-    write time, so a missing parent (a fresh worktree with no ``runs/``) is a
-    trivial setup step — NOT the dead-CWD trap. Doing it at pre-flight (after
-    the :func:`cwd_is_alive` gate, so a truly dead CWD is still caught first)
-    makes a fresh-worktree ``make freeze-validloss-ci-9b-full-bg`` proceed
-    instead of FATALing on a ``runs/`` that the run would have created anyway.
-    Silently best-effort: a path whose parent cannot be created is left for
-    :func:`output_paths_writable` to report.
+    ``append_arm_to_ledger`` and :func:`_write_run_log` already
+    ``mkdir(parents=True, exist_ok=True)`` at write time, so a missing parent (a
+    fresh worktree with no ``runs/``) is a trivial setup step — NOT the dead-CWD
+    trap. Doing it at pre-flight (after the :func:`cwd_is_alive` gate, so a truly
+    dead CWD is still caught first) makes a fresh-worktree
+    ``make freeze-validloss-ci-9b-full-bg`` proceed instead of FATALing on a
+    ``runs/`` that the run would have created anyway. Silently best-effort: a
+    path whose parent cannot be created is left for :func:`output_paths_writable`
+    to report.
     """
-    for path in (output, ledger):
+    for path in (output, ledger, run_log):
         if path:
             try:
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -2123,8 +2308,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "(fatal, not a retryable tempfail)."
         )
         return 1
-    _ensure_output_parent_dirs(args.output, args.ledger)
-    unwritable = output_paths_writable(args.output, args.ledger)
+    _ensure_output_parent_dirs(args.output, args.ledger, args.run_log)
+    unwritable = output_paths_writable(args.output, args.ledger, args.run_log)
     if unwritable is not None:
         logger.error("%s", unwritable)
         return 1
@@ -2163,6 +2348,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ledger_path=args.ledger,
             output=args.output,
             architecture=args.architecture,
+            run_log_path=args.run_log,
         )
     except IncompleteResumeError as exc:
         # The resumed ledger banked only one side of the A/B, so no verdict can

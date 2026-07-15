@@ -214,6 +214,27 @@ class TestOutputPathsWritable:
         assert reason is not None
         assert "--output" in reason
 
+    def test_writable_run_log_proceeds(self, tmp_path):
+        # A writable --run-log parent proceeds (the guard only fires on a path
+        # whose parent is missing/unwritable).
+        assert output_paths_writable(
+            str(tmp_path / "out.json"), None, str(tmp_path / "runlog.json")
+        ) is None
+
+    def test_missing_run_log_parent_is_fatal(self, tmp_path):
+        # --run-log gets the SAME dead-path fail-loud as --output/--ledger: a
+        # run-log path whose parent is missing/removed aborts at pre-flight
+        # rather than spending GPU then failing to persist the loss curve (the
+        # run-log write happens at run end, so a dead path would otherwise waste
+        # the whole multi-hour run before raising).
+        reason = output_paths_writable(
+            None, None, str(tmp_path / "no_such_dir" / "runlog.json")
+        )
+        assert reason is not None
+        assert "--run-log" in reason
+        assert "dead-CWD" in reason
+        assert "fatal" in reason
+
 
 class TestOutputGuardMainIntegration:
     def _boom_if(self, name):
