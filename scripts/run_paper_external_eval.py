@@ -120,36 +120,62 @@ def evaluate_g3(
     *,
     max_aggregate_drop: float = 0.01,
     max_single_task_drop: float = 0.03,
+    requested_tasks: list[str] | None = None,
 ) -> dict[str, Any]:
     """Evaluate G3 gate: aggregate mean relative drop < 1%, single task < 3%.
 
     Compares TG vs baseline scores across tasks. A positive relative drop means
     TG is worse than baseline.
-    """
-    common_tasks = [t for t in tg_results if t in bl_results and bl_results[t] > 0]
 
-    if not common_tasks:
+    A requested task that failed to produce a score on one or both sides (e.g.
+    an lm-eval task whose primary metric was not recognized, so it never entered
+    ``tg_results``/``bl_results``) is recorded in ``dropped_tasks`` with
+    ``incomplete=True`` rather than vanishing silently — a gate that PASSES over
+    a secretly-truncated task set is dishonest. The threshold verdict
+    (``passed``) is still computed over the compared survivors; the downstream
+    G3.3 "required tasks present" guard is what turns a drop into a gate FAIL.
+    """
+    compared_tasks = [t for t in tg_results if t in bl_results and bl_results[t] > 0]
+
+    if not compared_tasks:
+        # Still surface what was requested vs. what vanished, so an all-drop is
+        # loud rather than reading as an empty-but-clean report.
+        dropped = _compute_dropped_tasks(requested_tasks, tg_results, bl_results, [])
+        detail = "No common tasks with non-zero baseline scores to compare"
+        if dropped:
+            detail += f"; dropped: {sorted(dropped)}"
         return {
             "passed": False,
             "aggregate_relative_drop": None,
             "task_drops": {},
-            "detail": "No common tasks with non-zero baseline scores to compare",
+            "compared_tasks": [],
+            "dropped_tasks": sorted(dropped),
+            "incomplete": bool(dropped),
+            "detail": detail,
         }
 
     task_drops: dict[str, float] = {}
-    for task in common_tasks:
+    for task in compared_tasks:
         tg_score = tg_results[task]
         bl_score = bl_results[task]
         if bl_score > 0:
             relative_drop = (bl_score - tg_score) / bl_score
             task_drops[task] = float(relative_drop)
 
+    dropped = _compute_dropped_tasks(requested_tasks, tg_results, bl_results, compared_tasks)
+
     if not task_drops:
+        detail = "No valid task comparisons"
+        if dropped:
+            detail += f"; dropped: {sorted(dropped)}"
         return {
             "passed": False,
             "aggregate_relative_drop": None,
             "task_drops": {},
-            "detail": "No valid task comparisons",
+            "compared_tasks": sorted(compared_tasks),
+            "dropped_tasks": sorted(dropped),
+            "incomplete": bool(dropped),
+            "detail": detail,
         }
 
     aggregate_drop = float(sum(task_drops.values()) / len(task_drops))
@@ -158,13 +184,41 @@ def evaluate_g3(
     aggregate_ok = aggregate_drop < max_aggregate_drop
     single_task_ok = max_drop < max_single_task_drop
 
+    detail = f"Aggregate drop: {aggregate_drop*100:.2f}%, max single-task: {max_drop*100:.2f}%"
+    if dropped:
+        detail += f"; DROPPED (not compared): {sorted(dropped)}"
+
     return {
         "passed": bool(aggregate_ok and single_task_ok),
         "aggregate_relative_drop": aggregate_drop,
         "task_drops": task_drops,
+        "compared_tasks": sorted(compared_tasks),
+        "dropped_tasks": sorted(dropped),
+        "incomplete": bool(dropped),
         "max_single_task_drop": max_drop,
-        "detail": f"Aggregate drop: {aggregate_drop*100:.2f}%, max single-task: {max_drop*100:.2f}%",
+        "detail": detail,
     }
+
+
+def _compute_dropped_tasks(
+    requested_tasks: list[str] | None,
+    tg_results: dict[str, float],
+    bl_results: dict[str, float],
+    compared_tasks: list[str],
+) -> list[str]:
+    """Tasks that were requested (or seen on one side) but never compared.
+
+    When ``requested_tasks`` is given (the normal harvest path), a drop is any
+    requested task absent from the compared set — this catches the truly silent
+    case where a task produced no score on EITHER side and therefore appears in
+    neither results dict. Without the requested list that case is undetectable,
+    so we fall back to flagging tasks present on only one side as incomparable.
+    """
+    compared = set(compared_tasks)
+    if requested_tasks is not None:
+        return [t for t in requested_tasks if t not in compared]
+    seen = set(tg_results) | set(bl_results)
+    return [t for t in seen if t not in compared]
 
 
 def build_external_eval_results(
@@ -176,8 +230,14 @@ def build_external_eval_results(
     baseline_adapter_path: str | None,
     tasks: list[str],
 ) -> dict[str, Any]:
-    """Build the external_eval_results.json structure."""
-    g3 = evaluate_g3(tg_results, baseline_results)
+    """Build the external_eval_results.json structure.
+
+    ``tasks`` is the list of REQUESTED tasks. The ``comparison`` block records
+    ``compared_tasks`` (actually scored on both sides) and ``dropped_tasks``
+    (requested but silently unscored) so a reader can tell intent from reality —
+    the top-level ``tasks`` field alone would hide a silent drop.
+    """
+    g3 = evaluate_g3(tg_results, baseline_results, requested_tasks=tasks)
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -200,8 +260,52 @@ def build_external_eval_results(
             "aggregate_relative_drop": g3["aggregate_relative_drop"],
             "task_relative_drops": g3.get("task_drops", {}),
             "g3_passed": g3["passed"],
+            "compared_tasks": g3.get("compared_tasks", []),
+            "dropped_tasks": g3.get("dropped_tasks", []),
+            "incomplete": g3.get("incomplete", False),
         },
     }
+
+
+# Primary lm-eval metric per known task (the raw metric name, sans the
+# ",none" suffix lm-eval appends). truthfulqa_mc2 reports ``mc2`` and gsm8k
+# reports ``exact_match`` — NEITHER is in the acc/acc_norm family, so the old
+# hardcoded acc-only key list silently dropped their scores, and the task
+# vanished from the G3 report (and from the G3.3 "required tasks" guard, which
+# read the requested-task list). Map the required + common tasks explicitly.
+_TASK_PRIMARY_METRIC: dict[str, str] = {
+    "truthfulqa_mc2": "mc2",
+    "truthfulqa_mc1": "mc1",
+    "arc_easy": "acc_norm",
+    "arc_challenge": "acc_norm",
+    "hellaswag": "acc_norm",
+    "winogrande": "acc",
+    "piqa": "acc",
+    "gsm8k": "exact_match",
+    "mmlu": "acc",
+}
+
+
+def _extract_primary_metric(task_name: str, task_data: dict[str, Any]) -> float | None:
+    """Extract a task's primary lm-eval score, or ``None`` if unrecognized.
+
+    Returns ``None`` (rather than silently omitting the task) so the caller can
+    record the task as dropped via :func:`evaluate_g3`'s ``dropped_tasks``
+    instead of letting it vanish from the report. Preference order: the task's
+    known primary metric (e.g. ``mc2`` for truthfulqa), then the generic
+    acc/acc_norm family for unmapped tasks.
+    """
+    candidates: list[str] = []
+    primary = _TASK_PRIMARY_METRIC.get(task_name)
+    if primary is not None:
+        candidates.append(f"{primary},none")
+        candidates.append(primary)
+    candidates.extend(["acc_norm,none", "acc,none", "acc_norm", "acc"])
+    for key in candidates:
+        value = task_data.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return None
 
 
 def _run_lm_eval(
@@ -257,11 +361,13 @@ def _run_lm_eval(
 
     task_scores: dict[str, float] = {}
     for task_name, task_data in results.get("results", {}).items():
-        # Extract the primary metric (acc_norm or acc)
-        for key in ["acc_norm,none", "acc,none", "acc_norm", "acc"]:
-            if key in task_data:
-                task_scores[task_name] = float(task_data[key])
-                break
+        # Extract the task's primary metric (mc2 for truthfulqa, exact_match for
+        # gsm8k, acc/acc_norm otherwise). A task with no recognized metric is
+        # NOT added here — evaluate_g3(dropped_tasks=...) surfaces the drop
+        # loudly rather than letting the task vanish from the G3 report.
+        score = _extract_primary_metric(task_name, task_data)
+        if score is not None:
+            task_scores[task_name] = score
 
     return task_scores
 
@@ -330,11 +436,15 @@ def main() -> None:
         eval_data = _load_json(args.external_eval)
         tg_results = eval_data.get("models", {}).get("tg", {}).get("results", {})
         bl_results = eval_data.get("models", {}).get("baseline", {}).get("results", {})
+        # Prefer the requested-task list recorded in the file (intent) so a task
+        # that silently failed to score is detected as a drop, not hidden.
+        requested = eval_data.get("tasks") or tasks
 
         g3 = evaluate_g3(
             tg_results, bl_results,
             max_aggregate_drop=args.max_aggregate_drop,
             max_single_task_drop=args.max_single_task_drop,
+            requested_tasks=requested,
         )
 
         print("=" * 50)
@@ -347,7 +457,18 @@ def main() -> None:
         agg = g3.get("aggregate_relative_drop")
         if agg is not None:
             print(f"Aggregate mean drop: {agg*100:.2f}%")
-        print(f"\nG3 Result: {'PASS' if g3['passed'] else 'FAIL'}")
+        # A dropped task is LOUD: it means a requested task produced no score
+        # and would otherwise skew (or vacuously pass) the gate. Surface it as a
+        # prominent banner, not just a buried JSON field.
+        dropped = g3.get("dropped_tasks", [])
+        if dropped:
+            print(
+                f"\nINCOMPLETE: {len(dropped)} requested task(s) produced no comparable "
+                f"score and were dropped: {dropped}",
+                file=sys.stderr,
+            )
+        print(f"\nG3 Result: {'PASS' if g3['passed'] else 'FAIL'}"
+              f"{' (INCOMPLETE)' if g3.get('incomplete') else ''}")
         print("=" * 50)
 
         if args.output:
@@ -422,9 +543,20 @@ def main() -> None:
     )
     print(f"\nExternal eval results written to {output_path}")
 
-    g3 = evaluate_g3(tg_results, bl_results)
+    g3 = evaluate_g3(
+        tg_results, bl_results,
+        max_aggregate_drop=args.max_aggregate_drop,
+        max_single_task_drop=args.max_single_task_drop,
+        requested_tasks=tasks,
+    )
     status = "PASS" if g3["passed"] else "FAIL"
     print(f"G3 Gate: {status} — {g3.get('detail', '')}")
+    if g3.get("incomplete"):
+        print(
+            f"INCOMPLETE: {len(g3['dropped_tasks'])} requested task(s) produced no "
+            f"comparable score and were dropped: {g3['dropped_tasks']}",
+            file=sys.stderr,
+        )
 
     sys.exit(0 if g3["passed"] else 1)
 

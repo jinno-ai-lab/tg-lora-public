@@ -149,8 +149,11 @@ class TestEvaluateG3:
         bl_results = {"truthfulqa_mc2": 0.453, "arc_easy": 0.785, "hellaswag": 0.655}
 
         result = evaluate_g3(tg_results, bl_results)
-        # hellaswag missing from TG → that task is not compared
+        # hellaswag missing from TG → not compared AND now surfaced as dropped
+        # (loud), rather than vanishing silently from the report.
         assert "hellaswag" not in result.get("task_drops", {})
+        assert "hellaswag" in result["dropped_tasks"]
+        assert result["incomplete"] is True
 
 
 class TestBuildExternalEvalResults:
@@ -183,6 +186,104 @@ class TestBuildExternalEvalResults:
         assert "aggregate_relative_drop" in result["comparison"]
         assert "task_relative_drops" in result["comparison"]
         assert "g3_passed" in result["comparison"]
+
+
+class TestSilentDropPrevention:
+    """Regression guard for the silent task-drop bug class.
+
+    Feedback directive: a requested eval task that fails to score must FAIL
+    LOUD, not vanish from the report. Root cause: ``_run_lm_eval`` only
+    recognized acc/acc_norm metrics, so a task whose lm-eval primary metric is
+    neither (``truthfulqa_mc2`` -> ``mc2``, ``gsm8k`` -> ``exact_match``)
+    silently produced no score, dropped out of the G3 comparison, and -- because
+    ``G3.3`` checked the REQUESTED task list -- the gate's own "required tasks
+    present" guard still passed. These tests pin both the source fix (metric
+    recognition + drop surfacing) and the guard fix (check scored, not
+    requested).
+    """
+
+    def test_extract_primary_metric_recognizes_truthfulqa_mc2(self):
+        from scripts.run_paper_external_eval import _extract_primary_metric
+        # truthfulqa_mc2 reports `mc2`, which the old acc-only list dropped.
+        assert _extract_primary_metric("truthfulqa_mc2", {"mc2,none": 0.4321}) == 0.4321
+
+    def test_extract_primary_metric_recognizes_gsm8k_exact_match(self):
+        from scripts.run_paper_external_eval import _extract_primary_metric
+        assert _extract_primary_metric("gsm8k", {"exact_match,none": 0.12}) == 0.12
+
+    def test_extract_primary_metric_acc_norm_for_unmapped_task(self):
+        from scripts.run_paper_external_eval import _extract_primary_metric
+        assert _extract_primary_metric("some_custom_task", {"acc_norm,none": 0.7}) == 0.7
+
+    def test_extract_primary_metric_returns_none_when_unrecognized(self):
+        from scripts.run_paper_external_eval import _extract_primary_metric
+        # No recognized key -> None (NOT silently omitted) so the caller records
+        # the task as dropped instead of letting it vanish from the report.
+        assert _extract_primary_metric("weird_task", {"foo,none": 0.5}) is None
+
+    # Analog of the requested "extension-coverage" test, translated to this
+    # repo's domain: every DEFAULT/REQUIRED G3 task must resolve to a non-None
+    # primary metric against its real lm-eval result shape, so the next
+    # unmapped default task fails LOUDLY at test time rather than vanishing
+    # silently from a G3 report. truthfulqa_mc2 is the load-bearing case (its
+    # real metric ``mc2`` is not acc/acc_norm -- drop its map entry and this RED).
+    @pytest.mark.parametrize("task", ["truthfulqa_mc2", "arc_easy", "hellaswag"])
+    def test_every_default_task_resolves_nonzero_metric(self, task):
+        from scripts.run_paper_external_eval import _extract_primary_metric
+        fixtures = {
+            "truthfulqa_mc2": {"mc2,none": 0.4321, "mc2_stderr,none": 0.012},
+            "arc_easy": {"acc,none": 0.6012, "acc_norm,none": 0.6503,
+                         "acc_stderr,none": 0.004, "acc_norm_stderr,none": 0.004},
+            "hellaswag": {"acc,none": 0.4010, "acc_norm,none": 0.5520,
+                          "acc_stderr,none": 0.005, "acc_norm_stderr,none": 0.005},
+        }
+        score = _extract_primary_metric(task, fixtures[task])
+        assert score is not None, f"{task} produced no recognized metric (would silently drop)"
+        assert score > 0
+
+    def test_evaluate_g3_surfaces_dropped_requested_task(self):
+        from scripts.run_paper_external_eval import evaluate_g3
+        # truthfulqa_mc2 vanished from BOTH sides (no recognized metric) -- the
+        # truly silent case, undetectable without the requested-task list.
+        tg = {"arc_easy": 0.78, "hellaswag": 0.65}
+        bl = {"arc_easy": 0.785, "hellaswag": 0.655}
+        result = evaluate_g3(
+            tg, bl,
+            requested_tasks=["truthfulqa_mc2", "arc_easy", "hellaswag"],
+        )
+        assert result["incomplete"] is True
+        assert "truthfulqa_mc2" in result["dropped_tasks"]
+        assert set(result["compared_tasks"]) == {"arc_easy", "hellaswag"}
+        # The threshold verdict is still computed over the survivors ...
+        assert result["passed"] is True
+        # ... but the drop is named in the detail, not buried.
+        assert "truthfulqa_mc2" in result["detail"]
+
+    def test_evaluate_g3_no_drop_when_all_requested_scored(self):
+        from scripts.run_paper_external_eval import evaluate_g3
+        tg = {"truthfulqa_mc2": 0.45, "arc_easy": 0.78, "hellaswag": 0.65}
+        bl = {"truthfulqa_mc2": 0.453, "arc_easy": 0.785, "hellaswag": 0.655}
+        result = evaluate_g3(tg, bl, requested_tasks=list(tg))
+        assert result["incomplete"] is False
+        assert result["dropped_tasks"] == []
+
+    def test_build_external_eval_results_records_scored_vs_dropped(self):
+        from scripts.run_paper_external_eval import build_external_eval_results
+        # Request 3, only 2 score -> the report must distinguish request from
+        # reality so a drop can't hide behind the top-level `tasks` field.
+        result = build_external_eval_results(
+            tg_results={"arc_easy": 0.78, "hellaswag": 0.65},
+            baseline_results={"arc_easy": 0.785, "hellaswag": 0.655},
+            base_model="M",
+            tg_adapter_path="/tg",
+            baseline_adapter_path="/bl",
+            tasks=["truthfulqa_mc2", "arc_easy", "hellaswag"],
+        )
+        cmp = result["comparison"]
+        assert result["tasks"] == ["truthfulqa_mc2", "arc_easy", "hellaswag"]
+        assert cmp["incomplete"] is True
+        assert cmp["dropped_tasks"] == ["truthfulqa_mc2"]
+        assert set(cmp["compared_tasks"]) == {"arc_easy", "hellaswag"}
 
 
 @pytest.mark.skipif(not _LM_EVAL_AVAILABLE, reason="lm_eval not installed")
@@ -379,3 +480,40 @@ class TestG3GateIntegration:
         # Call without explicit path — should auto-discover
         result = _check_g3(summary, external_eval_path=str(eval_path))
         assert result["passed"]
+
+    def test_g3_fails_when_required_task_silently_dropped(self, tmp_path):
+        """G3.3 must check SCORED tasks, not the REQUESTED list.
+
+        Regression for the silent-drop bug class: a task that failed to score
+        (absent from ``task_relative_drops``) used to fool G3.3 into PASSING,
+        because the guard read the top-level ``tasks`` (request) field. With the
+        fix, the gate fails and names the dropped required task. (Mutation
+        check: revert G3.3 to checking ``tasks`` and this turns RED.)
+        """
+        from scripts.evaluate_paper_gates import _check_g3
+        summary = _make_summary()
+        external_eval = {
+            "generated_at": "2026-05-25T00:00:00+00:00",
+            "tasks": ["truthfulqa_mc2", "arc_easy", "hellaswag"],  # requested
+            "comparison": {
+                "aggregate_relative_drop": 0.004,
+                "task_relative_drops": {
+                    # truthfulqa_mc2 silently vanished -- only 2 of 3 compared
+                    "arc_easy": 0.004,
+                    "hellaswag": 0.005,
+                },
+                "g3_passed": True,
+            },
+        }
+        eval_path = tmp_path / "external_eval_results.json"
+        eval_path.write_text(json.dumps(external_eval))
+
+        result = _check_g3(summary, external_eval_path=str(eval_path))
+        # The gate must NOT pass while a required task is silently missing.
+        assert not result["passed"]
+        g33 = next(
+            c for c in result["checks"]
+            if c["check"] == "G3.3_required_tasks_present"
+        )
+        assert g33["pass"] is False
+        assert "truthfulqa_mc2" in g33["detail"]

@@ -724,13 +724,31 @@ def _check_g3(
                 "detail": "No per-task relative drop data in external eval results",
             })
 
-        tasks_run = eval_data.get("tasks", [])
+        # G3.3 must verify the required tasks were actually SCORED (produced a
+        # comparable metric on both sides), not merely REQUESTED. The top-level
+        # ``tasks`` field records the request; a task whose lm-eval primary
+        # metric was not recognized (e.g. truthfulqa_mc2 reports ``mc2``, not
+        # acc/acc_norm) silently fails to enter ``task_relative_drops``. Checking
+        # the request list would let such a drop fool this guard into PASSING —
+        # so we check the compared-tasks reality (the explicit ``compared_tasks``
+        # field when the producer recorded it, else the task_relative_drops
+        # keys), and name any requested-but-not-scored task in the detail.
+        requested_tasks = eval_data.get("tasks", [])
+        compared_tasks = (
+            comparison.get("compared_tasks")
+            or list((task_drops or {}).keys())
+        )
         required = {"truthfulqa_mc2", "arc_easy", "hellaswag"}
-        has_required = required.issubset(set(tasks_run))
+        scored = set(compared_tasks)
+        has_required = required.issubset(scored)
+        dropped_here = sorted(set(requested_tasks) - scored)
+        detail = f"Scored: {sorted(scored)} (required: {sorted(required)})"
+        if dropped_here:
+            detail += f"; requested but NOT scored: {dropped_here}"
         checks.append({
             "check": "G3.3_required_tasks_present",
             "pass": has_required,
-            "detail": f"Tasks: {tasks_run} (required: {sorted(required)})",
+            "detail": detail,
         })
     else:
         return {
