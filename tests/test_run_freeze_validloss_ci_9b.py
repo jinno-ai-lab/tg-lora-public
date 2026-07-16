@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import types
 from pathlib import Path
@@ -69,6 +70,7 @@ from scripts.run_freeze_validloss_ci_9b import (
     _reset_lora_for_arm,
     _run_log_payload,
     _run_log_sha256,
+    _write_deposit,
     _write_run_log,
     arm_valid_loss_9b,
     build_parser,
@@ -3034,6 +3036,82 @@ class TestCudaOomTempfail:
         ]
         with pytest.raises(RuntimeError, match="scope drifted"):
             main(argv)
+
+
+class TestAtomicDepositAndRunLogWrites:
+    """The citable §4 verdict deposit + its loss-curve run-log witness are
+    written ATOMICALLY.
+
+    A bare ``open(path, "w")`` truncates the destination before writing, so a
+    kill mid-write (OOM-kill, SIGINT, a host recycling the worktree mid-run) —
+    or an operator harvesting the file while the write is in flight — would
+    leave a torn deposit: a parse failure that wastes the multi-hour run, or
+    worse a silently-truncated verdict that commits wrong numbers. Both writes
+    route through :func:`src.utils.io._atomic_write_text` (temp + ``os.replace``),
+    the JSON analogue of ``_atomic_torch_save``. This pins that guarantee
+    directly at the two 9B write sites the in-flight heterogeneous-full run will
+    land through, mirroring :mod:`tests.test_atomic_save`'s torch-artifact pin.
+    """
+
+    @pytest.mark.parametrize("interrupt", [OSError, KeyboardInterrupt, SystemExit])
+    def test_write_deposit_prior_survives_mid_publish(
+        self, tmp_path, monkeypatch, interrupt
+    ):
+        # Publish a valid v1 deposit (real os.replace), then interrupt at the
+        # rename boundary while overwriting with v2.
+        path = tmp_path / "deposit.json"
+        _write_deposit(path, '{"verdict": "TIES", "v": 1}')
+        assert path.read_text(encoding="utf-8") == '{"verdict": "TIES", "v": 1}\n'
+
+        def _boom(_src, _dst):
+            raise interrupt("simulated mid-publish interrupt")
+
+        monkeypatch.setattr(os, "replace", _boom)
+        with pytest.raises(interrupt):
+            _write_deposit(path, '{"verdict": "SURPASSES", "v": 2}')
+
+        # The prior, still-intact deposit keeps its OLD content — the torn v2
+        # (which would flip the verdict headline) was never published.
+        assert path.read_text(encoding="utf-8") == '{"verdict": "TIES", "v": 1}\n'
+        assert not list(tmp_path.glob("deposit.json.tmp.*"))  # no orphan temp
+
+    @pytest.mark.parametrize("interrupt", [OSError, KeyboardInterrupt, SystemExit])
+    def test_write_deposit_fresh_interrupt_publishes_nothing(
+        self, tmp_path, monkeypatch, interrupt
+    ):
+        # No prior destination: an interrupted fresh deposit writes nothing.
+        path = tmp_path / "fresh.json"
+
+        def _boom(_src, _dst):
+            raise interrupt("simulated mid-publish interrupt")
+
+        monkeypatch.setattr(os, "replace", _boom)
+        with pytest.raises(interrupt):
+            _write_deposit(path, '{"verdict": "SURPASSES"}')
+
+        assert not path.exists()
+        assert not list(tmp_path.glob("fresh.json.tmp.*"))
+
+    @pytest.mark.parametrize("interrupt", [OSError, KeyboardInterrupt, SystemExit])
+    def test_write_run_log_prior_survives_mid_publish(
+        self, tmp_path, monkeypatch, interrupt
+    ):
+        # A minimal result/curves pair is enough for _run_log_payload (config
+        # keys default via .get); the load-bearing behavior is the atomic write.
+        path = tmp_path / "runlog.json"
+        _write_run_log(path, {}, [])
+        assert path.exists()
+
+        def _boom(_src, _dst):
+            raise interrupt("simulated mid-publish interrupt")
+
+        monkeypatch.setattr(os, "replace", _boom)
+        with pytest.raises(interrupt):
+            _write_run_log(path, {"seq_len": 1024}, [{"role": "candidate", "index": 0}])
+
+        # The prior run log survives; the new payload was never published.
+        assert json.loads(path.read_text(encoding="utf-8"))["arms"] == []
+        assert not list(tmp_path.glob("runlog.json.tmp.*"))
 
 
 # ── CLI health ──────────────────────────────────────────────────────────────

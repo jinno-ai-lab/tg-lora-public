@@ -129,6 +129,7 @@ from src.tg_lora.freeze_surrogate_ci import (
     surrogate_valid_loss_ci,
 )
 from src.tg_lora.progressive_freeze import ProgressiveFreezeController
+from src.utils.io import _atomic_write_text
 
 logger = logging.getLogger("freeze-validloss-ci-9b")
 
@@ -1692,20 +1693,38 @@ def _run_log_payload(result: dict, arm_curves: list[dict]) -> dict:
 
 
 def _write_run_log(path, result: dict, arm_curves: list[dict]) -> str:
-    """Write the loss-curve run-log artifact; return its content hash.
+    """Write the loss-curve run-log artifact ATOMICALLY; return its content hash.
 
     Returns ``_run_log_sha256`` over the canonical payload (independent of the
     indented on-disk formatting), so the deposit's ``run_log_sha256`` certifies
     the artifact *content* the verifier recomputes from the file, not its
-    whitespace. The parent directory is created best-effort (the pre-flight
-    :func:`output_paths_writable` already fail-loud on a dead/unwritable path).
+    whitespace. The write routes through :func:`src.utils.io._atomic_write_text`
+    (temp + ``os.replace``) so a kill mid-write or a witness harvest during the
+    write can never leave a torn run log — the artifact is either fully present
+    or at its prior value, the JSON analogue of ``_atomic_torch_save``.
     """
     payload = _run_log_payload(result, arm_curves)
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    _atomic_write_text(
+        path, json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    )
     return _run_log_sha256(payload)
+
+
+def _write_deposit(path, payload: str) -> None:
+    """Atomically write the JSON deposit text (the citable §4 verdict) to *path*.
+
+    The deposit is the single most important on-disk artifact of a multi-hour,
+    multi-arm 9B run, written ONCE after every arm completes. A bare
+    ``open(path, "w")`` truncates the destination before writing, so a kill
+    mid-write (OOM-kill, SIGINT, host recycling the worktree) — or an operator
+    harvesting the file while the write is in flight — would leave a torn
+    deposit: a parse failure that wastes the whole run, or worse a
+    silently-truncated verdict that commits wrong numbers. Routes through
+    :func:`src.utils.io._atomic_write_text` (temp + ``os.replace``) so the
+    deposit is either fully present and correct or absent, never torn — the same
+    atomicity guarantee ``_atomic_torch_save`` gives checkpoints.
+    """
+    _atomic_write_text(path, payload + "\n")
 
 
 def result_to_json(result: dict) -> dict:
@@ -2448,8 +2467,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(payload, flush=True)
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as fh:
-            fh.write(payload + "\n")
+        _write_deposit(args.output, payload)
         logger.info("Wrote %s", args.output)
     return 0
 
