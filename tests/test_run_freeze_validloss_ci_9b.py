@@ -2760,6 +2760,147 @@ class TestHeterogeneousTargetScaleDeposit:
         assert data["total_steps"] < data["cfg_max_steps"]
 
 
+# ── full-budget × heterogeneous launch path: the ONE remaining open §4 leg ───
+#
+# The homogeneous full-budget verdict LANDED (TIES, ``4b88ca8``) and the
+# heterogeneous REDUCED-budget verdict LANDED (SURPASSES, ``FIXTURE_9B_HETEROGE-
+# NEOUS``). Their missing intersection — the heterogeneous FULL-budget leg, i.e.
+# does the output-first order effect survive full-budget generalization on an
+# ASYMMETRIC adapter? — is the one open §4 research task, and it is GPU-gated (a
+# ~hours, 9-arm, 1500-step run). The deposit does NOT exist yet: no fabricated
+# verdict. These tests pin the parts that need NO GPU, so the leg is correctly
+# wired and will be HONESTLY labeled the moment a free GPU window lets it run via
+# ``make freeze-validloss-ci-9b-full-heterogeneous-bg``.
+
+
+class TestFullBudgetHeterogeneousLaunchPath:
+    """The full-budget × heterogeneous §4 leg is launchable and honestly gated.
+
+    Companion to :class:`TestHeterogeneousTargetScaleDeposit` (the REDUCED-budget
+    heterogeneous deposit) and :class:`TestFullBudgetDepositVerdictPin` (the
+    FULL-budget HOMOGENEOUS deposit): this is their missing intersection — the
+    one open research task. Four GPU-free invariants make the leg launch-ready:
+
+    * the harness ACCEPTS the composition (``--architecture heterogeneous`` is a
+      declared choice that composes with the full-budget flag set);
+    * the citation gate is ARCHITECTURE-AGNOSTIC — a would-be full-budget
+      heterogeneous deposit clears it on exactly the same four conjuncts as the
+      homogeneous one, and each conjunct is load-bearing (mutation-proven), so
+      the leg can be neither silently over- nor under-cited when it lands;
+    * the heterogeneous full deposit's EVIDENCE HASH is DISTINCT from the
+      homogeneous full deposit's (``architecture`` is an evidence key), so the
+      two citable full-budget verdicts can never be silently conflated;
+    * the Makefile wires the leg with a DISTINCT deposit and ledger path and
+      routes the bg launcher through the generic ``launch_freeze_ci_9b_full``.
+
+    What these tests deliberately do NOT do: fabricate a verdict. The 1500-step
+    run itself waits for a free GPU window — the bg launcher polls a held GPU,
+    defers (exit 75), and banks completed arms in ``--ledger``.
+    """
+
+    def test_harness_accepts_full_budget_heterogeneous_composition(self):
+        # ``--architecture heterogeneous`` is a declared choice that composes
+        # with the full-budget flag set, so the open leg is reachable from the
+        # SAME CLI the homogeneous full run uses — no harness change needed.
+        parser = build_parser()
+        args = parser.parse_args(
+            ["--architecture", "heterogeneous", "--total-steps", "1500"]
+        )
+        assert HETEROGENEOUS in ARCHITECTURES
+        assert args.architecture == HETEROGENEOUS
+        assert args.total_steps == 1500
+
+    def test_full_section4_gate_is_architecture_agnostic(self):
+        # THE honesty load-bearer. The citation gate takes NO architecture
+        # parameter: a full-budget heterogeneous deposit clears it on EXACTLY
+        # the same four conjuncts as the homogeneous deposit. So when the leg
+        # runs it is cited on its actual evidence — never over-cited (gate opens
+        # for a thin / memorized run) nor under-cited (gate stays shut on a
+        # clean full run). Each conjunct is independently load-bearing.
+        clearing = dict(
+            proxy_scale=False,
+            reduced_budget=False,
+            is_thin_evidence=False,
+            regime=REGIME_GENERALIZATION,
+        )
+        assert _full_section4_verdict_gate(**clearing) is True
+        for axis, bad in (
+            ("proxy_scale", True),
+            ("reduced_budget", True),
+            ("is_thin_evidence", True),
+            ("regime", REGIME_MEMORIZATION),
+        ):
+            blocked = dict(clearing)
+            blocked[axis] = bad
+            assert _full_section4_verdict_gate(**blocked) is False, (
+                f"flipping the {axis} axis must close the gate — a would-be "
+                f"heterogeneous-full deposit could otherwise be silently mis-cited."
+            )
+
+    def test_heterogeneous_full_evidence_hash_is_distinct_from_homogeneous(self):
+        # ``architecture`` (and ``lora_rank_pattern``) are EVIDENCE keys, so a
+        # future full-budget heterogeneous deposit hashes DISTINCTLY from the
+        # landed homogeneous full deposit. The two citable full-budget verdicts
+        # can never be silently conflated, and the heterogeneous one will land
+        # with its OWN frozen evidence-hash literal rather than reuse the
+        # homogeneous pin (see ``TestDepositEvidenceHash``).
+        hom = json.loads(FIXTURE_9B_FULL.read_text())
+        assert hom.get("architecture") != HETEROGENEOUS  # sibling is homogeneous
+        # Architecture ALONE is load-bearing in the hash (no rank pattern yet).
+        het_arch_only = dict(hom)
+        het_arch_only["architecture"] = HETEROGENEOUS
+        assert _evidence_hash(het_arch_only) != _evidence_hash(hom)
+        # Adding the asymmetric rank pattern moves it again — the eventual
+        # heterogeneous-full deposit carries BOTH distinguishing evidence keys.
+        het_full = dict(het_arch_only)
+        het_full["lora_rank_pattern"] = {"29": 7, "30": 11, "31": 16}
+        assert _evidence_hash(het_full) != _evidence_hash(het_arch_only)
+
+    def test_makefile_wires_distinct_full_budget_heterogeneous_paths(self):
+        # Fail-loud composition guard. The Makefile must wire the open leg with
+        # ``--architecture heterogeneous`` + the full-budget flag var + a DISTINCT
+        # deposit and ledger path (so it never clobbers the homogeneous full
+        # deposit/ledger), and the bg variant must route through the generic
+        # ``launch_freeze_ci_9b_full``. A refactor that drops the architecture
+        # flag or collapses the path onto the homogeneous sibling flips this red.
+        repo_root = Path(__file__).resolve().parents[1]
+        makefile = (repo_root / "Makefile").read_text()
+        lines = makefile.splitlines()
+
+        def recipe(target_prefix):
+            start = next(
+                i for i, ln in enumerate(lines) if ln.startswith(target_prefix)
+            )
+            body = []
+            for ln in lines[start + 1 :]:
+                if ln.startswith("\t"):
+                    body.append(ln)
+                elif ln.strip() == "":
+                    continue
+                else:
+                    break
+            return " ".join(body)
+
+        # The flag var is defined at full budget with a distinct ledger.
+        flag_def = next(
+            ln for ln in lines if ln.startswith("FREEZE_9B_FULL_HETEROGENEOUS_FLAGS ?=")
+        )
+        assert "--total-steps 1500" in flag_def
+        assert "freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl" in flag_def
+
+        direct = recipe("freeze-validloss-ci-9b-full-heterogeneous:")
+        bg = recipe("freeze-validloss-ci-9b-full-heterogeneous-bg:")
+        assert direct and bg  # both targets exist with a recipe
+        for body in (direct, bg):
+            assert "FREEZE_9B_FULL_HETEROGENEOUS_FLAGS" in body
+            assert "--architecture heterogeneous" in body
+            # Exact ``--output`` path — the heterogeneous deposit, NOT the
+            # homogeneous sibling (substring-safe: asserted as a full token).
+            assert "--output tests/fixtures/freeze_validloss_ci_9b_full_heterogeneous.json" in body
+        assert "run_freeze_validloss_ci_9b" in direct  # direct invokes worker
+        assert "launch_freeze_ci_9b_full" in bg  # bg delegates to generic launcher
+
+
 # ── CLI health ──────────────────────────────────────────────────────────────
 
 

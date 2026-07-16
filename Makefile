@@ -2,7 +2,7 @@
        smoke smoke-tg smoke-bl \
        train-baseline train-tg-lora train-tg-lora-optreuse train-tg-lora-prefix \
        eval eval-lora eval-downstream eval-downstream-mlx eval-llm-jp-eval-mlx eval-mlx eval-base eval-35b-base eval-35b-ckpt \
-       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize freeze-validloss-ci-9b freeze-validloss-ci-9b-generalization freeze-validloss-ci-9b-heterogeneous-generalization freeze-validloss-ci-9b-baseline freeze-validloss-ci-9b-full freeze-validloss-ci-9b-full-bg freeze-replay \
+       ingest-evidence check-evidence run-paper-experiment freeze-validloss-ci freeze-validloss-ci-heterogeneous freeze-validloss-ci-generalize freeze-validloss-ci-9b freeze-validloss-ci-9b-generalization freeze-validloss-ci-9b-heterogeneous-generalization freeze-validloss-ci-9b-baseline freeze-validloss-ci-9b-full freeze-validloss-ci-9b-full-bg freeze-validloss-ci-9b-full-heterogeneous freeze-validloss-ci-9b-full-heterogeneous-bg freeze-replay \
 
 	compare compare-prefix compare-prefix-cold compare-prefix-warm compare-prefix-coldwarm compare-report paper-memory paper-memory-dry-run paper-memory-one-shot paper-memory-compare-modes paper-memory-all-modes paper-memory-evaluate-gates paper-memory-external-eval paper-memory-frontier-sweep paper-memory-cache-ablation cosine-n-ablation cosine-n-ablation-dry-run cosine-n-skip-ablation cosine-n-skip-ablation-dry-run precompute-prefix-cache ablation sweep accel-sweep \
 	bench-optimizer bench-prefix-cache bench-prefix-cache-one-shot analyze-prefix-break-even analyze-prefix-break-even-ci bench-velocity-ops bench-velocity-ops-ci bench-velocity-ops-save-baseline \
@@ -1009,6 +1009,46 @@ freeze-validloss-ci-9b-full: ## GOAL §4 real-9B FULL-BUDGET A/B verdict (1500 s
 LAUNCH_FLAGS ?=
 freeze-validloss-ci-9b-full-bg: ## Self-retrying background launcher for the full-budget 9B verdict (polls a busy GPU, banks via --ledger)
 	$(PYTHON_VENV) -m scripts.launch_freeze_ci_9b_full $(LAUNCH_FLAGS) -- $(FREEZE_9B_FULL_FLAGS) --json --output tests/fixtures/freeze_validloss_ci_9b_full.json
+
+# The FULL-BUDGET × HETEROGENEOUS §4 leg — the ONE remaining open research task.
+# The homogeneous full-budget verdict LANDED (TIES, commit 4b88ca8: the output-
+# first ORDER effect does not survive full-budget generalization) and the
+# heterogeneous REDUCED-budget verdict LANDED (SURPASSES, 96 steps). What no run
+# has yet measured: does the heterogeneous SURPASSES survive the FULL budget
+# (1500 steps, generalization regime) on an ASYMMETRIC per-layer-rank adapter?
+# This target closes the launch-path gap so the open leg runs through the SAME
+# robust bg-launcher infrastructure as the homogeneous full run the moment a GPU
+# window opens. The harness already supports the combination — ``--architecture
+# heterogeneous`` threads through arm_valid_loss_9b and the ledger fingerprint,
+# the citation gate (_full_section4_verdict_gate) is architecture-agnostic, and
+# scripts/launch_freeze_ci_9b_full is a generic pass-through — so NO harness
+# change is needed; only the canonical flag composition + a DISTINCT deposit and
+# ledger path (so the heterogeneous full verdict never clobbers the homogeneous
+# full deposit/ledger). The arm shape mirrors the landed heterogeneous-
+# generalization target (candidate + surrogate + input-side control = the
+# direction-isolation A/B), bumped from 96 to 1500 steps; --total-steps 1500
+# reaches the config max_steps so reduced_budget=False, and --train-examples 600
+# keeps a 1500-step run at ~2.5 epochs = generalization regime (the 4th honesty
+# axis a naive 1500/48 run would violate by memorizing). Verdict reading mirrors
+# the homogeneous full leg: SURPASSES (order survives full budget) / TIES (order
+# effect evaporates, as it did homogeneously) / UNDERSHOOTS (freeze cost quality).
+# Needs a torch+bnb+GPU interpreter: PYTHON_VENV=/path/to/torch-python make freeze-validloss-ci-9b-full-heterogeneous
+FREEZE_9B_FULL_HETEROGENEOUS_FLAGS ?= --seq-len 1024 --total-steps 1500 --warmup-steps 150 --depth 3 --spacing 450 --n-candidate 3 --n-surrogate 3 --n-control 3 --train-examples 600 --valid-examples 64 --max-dataset-rows 2000 --ledger runs/freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl
+
+freeze-validloss-ci-9b-full-heterogeneous: ## GOAL §4 real-9B FULL-BUDGET A/B on a HETEROGENEOUS per-layer-rank stack (1500 steps; generalization; ~hours GPU)
+	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_FULL_HETEROGENEOUS_FLAGS) --architecture heterogeneous --json --output tests/fixtures/freeze_validloss_ci_9b_full_heterogeneous.json
+
+# Self-retrying background launcher for the leg above — same wrapper as the
+# homogeneous full run (subprocess-invokes the worker so exit codes survive,
+# retries GPU-tempfail 75 / torn-ledger 3, stops on 0/1/2, bounded so a held GPU
+# cannot spin forever, banks completed arms in --ledger). Identical worker flags
+# to the direct target — only the retry wrapper differs — so the SAME deposit
+# and ledger land either way. Run detached, e.g.:
+#   nohup env PYTHON_VENV=/torch/venv/bin/python \
+#     make freeze-validloss-ci-9b-full-heterogeneous-bg >runs/full_heterogeneous_bg.log 2>&1 &
+# Needs a torch+bnb+GPU interpreter: PYTHON_VENV=/path/to/torch-python make freeze-validloss-ci-9b-full-heterogeneous-bg
+freeze-validloss-ci-9b-full-heterogeneous-bg: ## Self-retrying background launcher for the full-budget heterogeneous 9B verdict (polls a busy GPU, banks via --ledger)
+	$(PYTHON_VENV) -m scripts.launch_freeze_ci_9b_full $(LAUNCH_FLAGS) -- $(FREEZE_9B_FULL_HETEROGENEOUS_FLAGS) --architecture heterogeneous --json --output tests/fixtures/freeze_validloss_ci_9b_full_heterogeneous.json
 
 
 # The apparatus order-resolution diagnostic. Variance-decomposes the proxy's
