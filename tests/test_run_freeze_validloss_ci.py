@@ -652,8 +652,11 @@ class TestApparatusDriftSentinel:
     """
 
     # Golden output of run_ci(generalize, tiny CPU budget), captured from a real
-    # deterministic run. Every RNG is locally seeded, so this is bit-stable on a
-    # fixed torch/CPU — exactly the determinism the GPU recording relies on.
+    # deterministic run on the original build (3169a65). Every RNG is locally
+    # seeded, so this is bit-stable *within* a fixed torch/CPU build — exactly
+    # the determinism the GPU recording relies on within a session. Across builds
+    # float32 reduction-order rounding diverges by ~1 ULP, so the assertions
+    # below compare with rel=1e-6 (rationale there) rather than exact `==`.
     _GOLDEN_CANDIDATE = (3.1415646076202393, 2.9830827713012695, 3.1431686878204346)
     _GOLDEN_SURROGATE = (3.3331193923950195, 2.9940176010131836, 3.2981650829315186)
 
@@ -661,10 +664,21 @@ class TestApparatusDriftSentinel:
         from scripts.run_freeze_validloss_ci import TASK_GENERALIZE, run_ci
 
         r = run_ci(device=_DEVICE, task=TASK_GENERALIZE, num_layers=6, **_TINY)
-        # Exact equality: the apparatus is bit-deterministic (the reproducibility
-        # test asserts a == b within a session), so any change in the pinned
-        # constants/logic moves these floats and fails the sentinel — flagging
-        # that the GPU fixture must be regenerated.
-        assert tuple(r["candidate_losses"]) == self._GOLDEN_CANDIDATE
-        assert tuple(r["surrogate_losses"]) == self._GOLDEN_SURROGATE
+        # Tight tolerance, NOT exact equality. The apparatus IS bit-deterministic
+        # *within* a torch/BLAS build (3 consecutive runs here agree bit-for-bit,
+        # and the reproducibility test asserts a == b within a session) — but
+        # comparing against a golden captured on ONE build (3169a65) is not a
+        # bit-portable contract: float32 reduction-order rounding diverges by ~1
+        # ULP across builds. On this build candidate (all 3) and surrogate[1]
+        # match the golden exactly, while surrogate[0]/[2] each land one ULP
+        # (~2.4e-7 ≈ float32 eps at this magnitude) off — identical-ULP drift on
+        # two independent values is the signature of BLAS rounding, not logic.
+        # A logic change to any pinned constant moves these floats by >>1e-5 rel
+        # (measured: LR ±0.01% → 1.3e-5; TEACHER_SEED +1 → 0.15), ~13x above
+        # rel=1e-6, so the sentinel still catches drift — it just no longer false-
+        # positives on build-specific float rounding. The within-session repro
+        # test above stays exact `==`; only this cross-build golden comparison is
+        # tolerance-based.
+        assert tuple(r["candidate_losses"]) == pytest.approx(self._GOLDEN_CANDIDATE, rel=1e-6)
+        assert tuple(r["surrogate_losses"]) == pytest.approx(self._GOLDEN_SURROGATE, rel=1e-6)
         assert r["ci"].significance_verdict == TIES
