@@ -191,6 +191,27 @@ class ProgressiveFreezeController:
         schedule: FreezeSchedule | None = None,
     ) -> None:
         self._start_cycle = start_cycle
+        # Validate the freeze-layer spec at construction (fail loud at the
+        # config-bind boundary, before any training). An int pins a specific
+        # decoder-layer index; the only named string is ``"last_active"`` (the
+        # max active index, or the last LoRA layer when none are pinned). Any
+        # other value used to fall through ``_resolve_target_layer`` and
+        # silently freeze the LAST layer — a misconfiguration that, for a
+        # research whose entire experimental variable is WHICH layer freezes
+        # (the §4 output-first vs input-first contrast), would corrupt a run
+        # with no signal (constitution P0: exclude "looks configured but
+        # actually wrong"). ``bool`` is an ``int`` subclass, so it is rejected
+        # explicitly lest ``True`` silently pin layer index 1.
+        if isinstance(freeze_layer, bool) or not isinstance(freeze_layer, (int, str)):
+            raise TypeError(
+                "freeze_layer must be an int (layer index) or 'last_active', "
+                f"got {type(freeze_layer).__name__}"
+            )
+        if isinstance(freeze_layer, str) and freeze_layer != "last_active":
+            raise ValueError(
+                "freeze_layer named spec must be 'last_active' "
+                f"(got {freeze_layer!r}); pass an int to pin a specific layer index"
+            )
         self._freeze_layer_spec = freeze_layer
         self._active_layer_indices = active_layer_indices or set()
         self._schedule = schedule

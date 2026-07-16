@@ -77,6 +77,46 @@ class TestLayerResolution:
         assert ctrl._resolve_target_layer(model) == 3
 
 
+class TestFreezeLayerSpecValidation:
+    """The freeze-layer spec is the core experimental variable: WHICH layer
+    freezes (the §4 output-first vs input-first contrast). The only named
+    string is ``"last_active"``; a typo'd or speculative value must fail loud
+    at construction, not silently resolve to the last layer (constitution P0:
+    exclude "looks configured but actually wrong").
+    """
+
+    def test_unknown_named_string_rejected(self):
+        # "first_active" is a plausible intent that does NOT exist — it must
+        # raise, not silently freeze the last layer.
+        with pytest.raises(ValueError, match="last_active"):
+            ProgressiveFreezeController(start_cycle=1, freeze_layer="first_active")
+
+    def test_typo_of_last_active_rejected(self):
+        with pytest.raises(ValueError):
+            ProgressiveFreezeController(start_cycle=1, freeze_layer="last_actve")
+
+    def test_bool_rejected(self):
+        # bool is an int subclass; True would silently pin layer index 1.
+        with pytest.raises(TypeError):
+            ProgressiveFreezeController(start_cycle=1, freeze_layer=True)
+
+    def test_non_int_non_str_rejected(self):
+        with pytest.raises(TypeError):
+            ProgressiveFreezeController(start_cycle=1, freeze_layer=2.5)
+
+    def test_last_active_still_accepted(self):
+        ctrl = ProgressiveFreezeController(start_cycle=1, freeze_layer="last_active")
+        assert ctrl._freeze_layer_spec == "last_active"
+
+    def test_explicit_int_still_accepted(self):
+        ctrl = ProgressiveFreezeController(start_cycle=1, freeze_layer=3)
+        assert ctrl._freeze_layer_spec == 3
+
+    def test_default_spec_is_last_active(self):
+        ctrl = ProgressiveFreezeController(start_cycle=1)
+        assert ctrl._freeze_layer_spec == "last_active"
+
+
 class TestApplyFreeze:
     def test_sets_requires_grad_false(self):
         model = FakeTransformerModel(4)
