@@ -700,6 +700,32 @@ class TestCandidateCostReduction:
         assert _candidate_cost_reduction({}) is None
         assert _candidate_cost_reduction({"candidate_order": [3, 2, 1, 0]}) is None
 
+    @pytest.mark.parametrize(
+        "field,value,exc",
+        [
+            ("depth", "not-an-int", ValueError),
+            ("depth", None, TypeError),
+            ("warmup_steps", None, TypeError),
+            ("spacing", None, TypeError),
+            ("total_steps", "x", ValueError),
+            ("candidate_order", 5, TypeError),   # present but non-iterable
+            ("active_scope", None, TypeError),   # list(None) → TypeError
+        ],
+    )
+    def test_present_but_malformed_schedule_raises_loud(self, field, value, exc):
+        # Silent-drop guard (the feedback's named bug class): a PRESENT-but-
+        # malformed candidate schedule must NOT collapse to None and silently
+        # drop the §4 cost-success axis from the deposit (`result_to_json`
+        # serializes `_candidate_cost_reduction(result)` verbatim — a None here
+        # becomes `"candidate_cost_reduction": null` and the constitution's
+        # condition-(b) cost half vanishes unnoticed). The docstring contract is
+        # "a present-but-malformed schedule raises loudly"; only an ABSENT key
+        # (partial/legacy result, covered above) yields None. Parameterized so
+        # the next malformation fails loudly at test time rather than vanishing
+        # from the report.
+        with pytest.raises(exc):
+            _candidate_cost_reduction(self._sched(**{field: value}))
+
 
 # ── regime classification (4th honesty axis: generalization vs memorization/overfit)
 

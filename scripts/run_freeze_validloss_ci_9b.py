@@ -799,11 +799,17 @@ def _candidate_cost_reduction(result: dict, *, level: int = 1) -> dict | None:
     figure as a realized saving — the same realizability correction the §7 speed
     gate applies.
 
-    Returns ``None`` only when the result lacks the candidate-arm schedule keys
-    (a partial / legacy result); a plannable schedule always yields a dict
-    (depth 0 → reduction 0.0, i.e. full backprop). A present-but-malformed
-    schedule raises loudly (a deposit must not silently serialize a broken
-    candidate cost axis).
+    Returns ``None`` when the candidate-arm schedule keys are absent (a partial /
+    legacy result) or degenerate-but-well-typed (empty active scope / non-positive
+    steps, where no schedule is plannable); a plannable schedule always yields a
+    dict (depth 0 → reduction 0.0, i.e. full backprop). A present-but-MALFORMED
+    schedule (a key present with the wrong type — e.g. ``depth=None`` /
+    ``depth="x"``) raises loudly: ``result_to_json`` serializes this function's
+    return verbatim as ``candidate_cost_reduction``, so swallowing a malformed
+    schedule into ``None`` would silently drop the §4 condition-(b) cost-success
+    axis from the deposit. Only an ABSENT key (``KeyError``) is a legitimate
+    partial/legacy result → ``None``; ``TypeError`` / ``ValueError`` mean the key
+    is present-but-broken and must surface, not vanish.
     """
     try:
         order = list(result["candidate_order"])
@@ -812,7 +818,11 @@ def _candidate_cost_reduction(result: dict, *, level: int = 1) -> dict | None:
         warmup_steps = int(result["warmup_steps"])
         spacing = int(result["spacing"])
         total_steps = int(result["total_steps"])
-    except (KeyError, TypeError, ValueError):
+    except KeyError:
+        # A genuinely absent schedule key = a partial / legacy result with no
+        # candidate cost axis to report. TypeError/ValueError (a key PRESENT with
+        # the wrong type) are deliberately NOT caught — see docstring: a malformed
+        # schedule must raise, not silently null the deposit's cost axis.
         return None
     if not active_scope or total_steps < 1 or spacing < 1:
         return None
