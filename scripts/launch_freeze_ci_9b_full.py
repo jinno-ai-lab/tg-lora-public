@@ -25,7 +25,7 @@ Worker exit-code contract (``scripts/run_freeze_validloss_ci_9b.py``, lines
     1  unexpected error (uncaught exc.)    -> FATAL (operator: investigate, re-run)
     2  CUDA unavailable                    -> FATAL (operator: not retryable here)
     3  IncompleteResumeError (torn ledger) -> RETRY (re-run fills the gap)
-    75 GPU free-memory tempfail            -> RETRY (wait for a free-GPU window)
+    75 GPU free-memory tempfail OR run-time CUDA OOM (contention) -> RETRY (wait for a free-GPU window)
     other                                  -> FATAL (do not infinite-loop on the unknown)
 
 Run detached, e.g.::

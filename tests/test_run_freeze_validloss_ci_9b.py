@@ -51,6 +51,7 @@ from scripts.run_freeze_validloss_ci_9b import (
     ARCHITECTURES,
     HETEROGENEOUS,
     HOMOGENEOUS,
+    EXIT_GPU_TEMPFAIL,
     REGIME_GENERALIZATION,
     REGIME_MEMORIZATION,
     REGIME_OVERFIT,
@@ -76,6 +77,8 @@ from scripts.run_freeze_validloss_ci_9b import (
     candidate_order_9b,
     control_order_9b,
     heterogeneous_ranks_9b,
+    is_cuda_oom,
+    main,
     result_to_json,
     run_ci_9b,
 )
@@ -2899,6 +2902,138 @@ class TestFullBudgetHeterogeneousLaunchPath:
             assert "--output tests/fixtures/freeze_validloss_ci_9b_full_heterogeneous.json" in body
         assert "run_freeze_validloss_ci_9b" in direct  # direct invokes worker
         assert "launch_freeze_ci_9b_full" in bg  # bg delegates to generic launcher
+
+    def test_fire_script_robustly_launches_full_budget_heterogeneous(self):
+        # The committed robust launcher for the OPEN leg. The Makefile ``-bg``
+        # target fires from the worktree with RELATIVE ``--output``/``--ledger``
+        # paths, so recycling the worktree mid-run would orphan the deposit (the
+        # [[dead-cwd-background-run-trap]]: a multi-hour 9B run that trains fine
+        # but can never persist). ``scripts/fire_freeze_ci_9b_full_heterogeneous.sh``
+        # is the documented escape — it resolves code + deposit ABSOLUTELY against
+        # a stable dir and PYTHONPATH-pointed repo, so the leg can be fired to
+        # survive worktree recycling. This guard pins the composition so a refactor
+        # cannot silently drop the architecture flag, collapse the deposit onto the
+        # homogeneous sibling, or regress to a worktree-relative path.
+        repo_root = Path(__file__).resolve().parents[1]
+        fire = (repo_root / "scripts" / "fire_freeze_ci_9b_full_heterogeneous.sh")
+        assert fire.exists(), "the robust launcher for the open heterogeneous leg must be committed"
+        assert fire.stat().st_mode & 0o111, "the fire script must be executable"
+        text = fire.read_text()
+
+        # Routes through the generic polling launcher (defers exit 75 on a held
+        # GPU, banks arms in --ledger, bounded) — not the worker directly.
+        assert "launch_freeze_ci_9b_full" in text
+        assert "--architecture heterogeneous" in text
+        # Direction-isolation A/B (candidate/surrogate/CONTROL), NOT the
+        # homogeneous leg's full-backprop baseline arm.
+        assert "--n-control 3" in text
+        assert "--n-baseline" not in text
+        # Full budget + generalization regime (the two honesty axes that clear
+        # ``reduced_budget`` and the regime gate conjunct).
+        assert "--total-steps 1500" in text
+        assert "--train-examples 600" in text
+
+        # Distinct heterogeneous deposit + ledger — substring-safe full tokens so
+        # the leg never clobbers the homogeneous full deposit/ledger.
+        assert "freeze_validloss_ci_9b_full_heterogeneous.json" in text
+        assert "freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl" in text
+        assert "freeze_validloss_ci_9b_full_ledger.jsonl" not in text  # homogeneous sibling
+
+        # Dead-CWD-trap defeat: the ``--config`` / ``--ledger`` / ``--output``
+        # FLAG VALUES anchor to ``$STABLE`` (absolute), and PYTHONPATH points at
+        # the stable repo — so a recycled worktree cannot orphan a running arm or
+        # its deposit. (The comment block legitimately names ``tests/fixtures/``
+        # as the harvest target; the load-bearing check is the flag values.)
+        assert "TG_LORA_FULL_RUN_DIR" in text  # overridable stable dir
+        assert "PYTHONPATH" in text
+        for flag in ("--config", "--ledger", "--output"):
+            assert f'{flag} "$STABLE/' in text, (
+                f"{flag} must resolve under $STABLE (absolute), not a worktree-relative path"
+            )
+
+
+class TestCudaOomTempfail:
+    """A run-time CUDA OOM is transient CONTENTION, classified as the tempfail
+    the self-retrying launcher polls — not a fatal exit 1 that kills a multi-hour
+    full-budget run after a single contention spike.
+
+    The pre-flight free-memory gate (:func:`gpu_free_memory_deferred`) is a
+    point-in-time snapshot: it passes, then a concurrent process re-claims the
+    card in the seconds before the model's weight allocation (a TOCTOU race that
+    bit the heterogeneous full launch on a contended 12 GiB card — the load OOM'd
+    ~14 s after a passing snapshot, surfacing as ``torch.AcceleratorError``, and
+    the uncaught exception exited 1 = FATAL, so the launcher died instead of
+    retrying the next free-GPU window). These tests pin the honest
+    re-classification: a CUDA OOM → exit 75 (RETRY); a non-OOM RuntimeError stays
+    fatal (never swallowed as retryable).
+    """
+
+    @pytest.mark.parametrize("exc", [
+        pytest.param(torch.cuda.OutOfMemoryError("CUDA out of memory."), id="typed-oom"),
+        pytest.param(getattr(torch, "AcceleratorError", RuntimeError)(
+            "CUDA error: out of memory"), id="accelerator-oom"),
+        pytest.param(RuntimeError("RuntimeError: CUDA out of memory."), id="legacy-runtimeerror"),
+    ])
+    def test_is_cuda_oom_matches_oom_variants(self, exc):
+        # torch surfaces OOM two ways — the typed ``OutOfMemoryError`` and, under
+        # the device-dispatch path, an ``AcceleratorError`` whose message carries
+        # "out of memory". NEITHER is a parent of the other, so all three
+        # (incl. legacy plain-RuntimeError) must match.
+        assert is_cuda_oom(exc) is True
+
+    @pytest.mark.parametrize("exc", [
+        pytest.param(RuntimeError("Pre-LoRA active scope drifted from post-LoRA"), id="scope-drift"),
+        pytest.param(getattr(torch, "AcceleratorError", RuntimeError)(
+            "CUDA error: device-side assert triggered"), id="non-oom-device-error"),
+        pytest.param(ValueError("not enough host RAM"), id="non-runtime"),
+    ])
+    def test_is_cuda_oom_rejects_non_oom(self, exc):
+        # A scope-drift RuntimeError or a non-OOM device error must STAY fatal —
+        # mis-classifying either as retryable contention would swallow a real bug
+        # behind an infinite retry loop.
+        assert is_cuda_oom(exc) is False
+
+    def test_main_classifies_run_time_oom_as_tempfail(self, tmp_path, monkeypatch):
+        # Bypass the pre-flight (--min-free-gib 0) so a contended card doesn't
+        # defer before run_ci_9b; the OOM a concurrent process causes inside the
+        # run must surface as exit 75 (RETRY), not exit 1 (FATAL).
+        import scripts.run_freeze_validloss_ci_9b as mod
+        repo_root = Path(__file__).resolve().parents[1]
+
+        def _boom(**kwargs):
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory.")
+        monkeypatch.setattr(mod, "run_ci_9b", _boom)
+
+        argv = [
+            "--config", str(repo_root / "configs" / "9b_baseline_suffix_only_last25.yaml"),
+            "--output", str(tmp_path / "out.json"),
+            "--ledger", str(tmp_path / "ledger.jsonl"),
+            "--architecture", "heterogeneous",
+            "--total-steps", "1500",
+            "--min-free-gib", "0",  # bypass the pre-flight snapshot
+        ]
+        assert main(argv) == EXIT_GPU_TEMPFAIL  # 75 → launcher retries
+
+    def test_main_reraises_non_oom_runtimeerror(self, tmp_path, monkeypatch):
+        # A non-OOM RuntimeError (e.g. heterogeneous scope drift) stays FATAL —
+        # the launcher must NOT infinite-loop it as retryable contention.
+        import scripts.run_freeze_validloss_ci_9b as mod
+        repo_root = Path(__file__).resolve().parents[1]
+
+        def _drift(**kwargs):
+            raise RuntimeError("Pre-LoRA active scope drifted from the post-LoRA scope")
+        monkeypatch.setattr(mod, "run_ci_9b", _drift)
+
+        argv = [
+            "--config", str(repo_root / "configs" / "9b_baseline_suffix_only_last25.yaml"),
+            "--output", str(tmp_path / "out.json"),
+            "--ledger", str(tmp_path / "ledger.jsonl"),
+            "--architecture", "heterogeneous",
+            "--total-steps", "1500",
+            "--min-free-gib", "0",
+        ]
+        with pytest.raises(RuntimeError, match="scope drifted"):
+            main(argv)
 
 
 # ── CLI health ──────────────────────────────────────────────────────────────

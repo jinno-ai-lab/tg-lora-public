@@ -158,7 +158,9 @@ DEFAULT_MAX_DATASET_ROWS = 4000   # cap the download for a bounded run
 #   1  unexpected error (uncaught exception)
 #   2  CUDA unavailable
 #   3  IncompleteResumeError (ledger banked only one side of the A/B; re-run)
-#   75 GPU free-memory tempfail (EX_TEMPFAIL from sysexits.h: "retry later")
+#   75 GPU free-memory tempfail OR a run-time CUDA OOM (transient contention —
+#      the pre-flight snapshot raced a concurrent process re-claiming the card);
+#      EX_TEMPFAIL from sysexits.h: "retry later"
 EXIT_GPU_TEMPFAIL = 75
 
 # Free-GPU-memory floor for the pre-flight (GiB). Calibrated to defer only when
@@ -2185,6 +2187,48 @@ def gpu_free_memory_deferred(min_free_gib: float) -> str | None:
     return None
 
 
+# torch surfaces a CUDA out-of-memory through two sibling ``RuntimeError``
+# subclasses: ``torch.cuda.OutOfMemoryError`` (the classic typed OOM) and, under
+# the device-dispatch path (torch 2.12+), ``torch.AcceleratorError`` whose message
+# carries "out of memory". NEITHER is a parent of the other, so a bare
+# ``except torch.cuda.OutOfMemoryError`` misses the AcceleratorError path that a
+# 9B model load actually raises on this venv. Built lazily so an older torch
+# missing one of the attributes does not fail to import.
+_OOM_EXCEPTION_TYPES = tuple(
+    t for t in (
+        getattr(torch, "OutOfMemoryError", None),
+        getattr(torch.cuda, "OutOfMemoryError", None),
+        getattr(torch, "AcceleratorError", None),
+    )
+    if isinstance(t, type)
+)
+
+
+def is_cuda_oom(exc: BaseException) -> bool:
+    """True if ``exc`` is a CUDA out-of-memory, across torch's exception surfaces.
+
+    The pre-flight free-memory gate (:func:`gpu_free_memory_deferred`) is a
+    point-in-time snapshot, and a concurrent process can reclaim GPU memory in
+    the seconds between that snapshot and the model's weight allocation (a
+    TOCTOU race), so the gate passes yet the load still OOMs. Such an OOM is
+    transient CONTENTION, not a fatal logic error — the model fits uncontended
+    (the homogeneous full deposit ``4b88ca8`` and heterogeneous reduced deposit
+    ``db542fe`` both landed on this 12 GiB card) — so :func:`main` re-classifies
+    it as ``EXIT_GPU_TEMPFAIL`` (75) for the launcher to poll the next free-GPU
+    window, instead of dying on exit 1 after a single contention spike.
+
+    The typed match is narrowed by message: ``AcceleratorError`` covers non-OOM
+    device errors too, and a generic ``RuntimeError`` "out of memory" (legacy
+    torch) must say so — a different CUDA failure must stay fatal, not be
+    silently swallowed as retryable.
+    """
+    if _OOM_EXCEPTION_TYPES and isinstance(exc, _OOM_EXCEPTION_TYPES):
+        return "out of memory" in str(exc).lower()
+    if isinstance(exc, RuntimeError):
+        return "out of memory" in str(exc).lower()
+    return False
+
+
 def output_paths_writable(
     output: str | None, ledger: str | None, run_log: str | None = None,
 ) -> str | None:
@@ -2373,6 +2417,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         # in the --ledger survive a re-fire from a live CWD.
         logger.error("%s", exc)
         return 1
+    except RuntimeError as exc:
+        # A CUDA out-of-memory during the run is transient CONTENTION, not a
+        # fatal logic error: the pre-flight free-memory gate is a snapshot, and a
+        # concurrent process can reclaim the card in the seconds between that
+        # snapshot and the weight allocation (a TOCTOU race that bites a 9B load
+        # on a shared 12 GiB card) — so the gate passes yet the load still OOMs,
+        # surfacing as ``torch.AcceleratorError`` / ``OutOfMemoryError``. The
+        # model fits uncontended (landed full/heterogeneous deposits), so
+        # re-classify as the tempfail the launcher POLLS on instead of dying on
+        # exit 1 after one contention spike. Completed arms stay banked in the
+        # --ledger; a non-OOM RuntimeError is re-raised (stays fatal) — never
+        # swallow a non-OOM device error or scope-drift as retryable.
+        if is_cuda_oom(exc):
+            logger.error(
+                "CUDA out-of-memory during the run (%s). A concurrent process "
+                "is likely holding the card (the pre-flight free-memory gate is "
+                "a snapshot, and memory can be reclaimed between it and the "
+                "allocation). Deferring — exit %d (EX_TEMPFAIL, retry later); "
+                "completed arms stay banked in the --ledger.",
+                type(exc).__name__, EXIT_GPU_TEMPFAIL,
+            )
+            return EXIT_GPU_TEMPFAIL
+        raise
 
     payload = (
         json.dumps(result_to_json(result), indent=2)
