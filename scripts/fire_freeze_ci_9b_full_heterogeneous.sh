@@ -33,9 +33,38 @@
 #   nohup bash scripts/fire_freeze_ci_9b_full_heterogeneous.sh \
 #     > /home/jinno/tg-lora-public-full-run/full_heterogeneous_bg.log 2>&1 &
 #
-# Harvest (next session, when the ledger has 9 lines + the deposit is written):
+# Harvest (next session, when the ledger has 9 lines + the deposit is written).
+# This verdict is the 2nd citable full-budget result, so it earns the SAME
+# independent-reproducibility provenance the homogeneous full got at ``7489023``:
+# a committed LEDGER WITNESS. The worker stamps ``run_log_*`` but NEVER
+# ``ledger_witness_*`` — those are HARVEST fields stamped post-hoc into the
+# deposit JSON. Forgetting the witness would land a verdict that is citable but
+# NOT independently reproducible from committed bytes (the exact gap ``7489023``
+# closed); ``TestCommittedLedgerWitnessHeterogeneousFull`` auto-verifies the
+# harvest below, so an incomplete harvest fails the test suite rather than
+# passing silently. Full harvest (run from the repo root):
+#   # 1. committed deposit + ledger witness:
 #   cp /home/jinno/tg-lora-public-full-run/freeze_validloss_ci_9b_full_heterogeneous.json \
 #     tests/fixtures/
+#   cp /home/jinno/tg-lora-public-full-run/runs/freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl \
+#     tests/fixtures/freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl
+#   # 2. stamp the HARVEST witness fields into the deposit JSON (relative path +
+#   #    canonical SHA-256 over the parsed JSONL, same canonicalization as
+#   #    TestCommittedLedgerWitness._ledger_witness_sha256):
+#   python -c "
+#   import json, hashlib
+#   p='tests/fixtures/freeze_validloss_ci_9b_full_heterogeneous.json'
+#   L='tests/fixtures/freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl'
+#   d=json.load(open(p))
+#   parsed=[json.loads(l) for l in open(L).read().splitlines() if l.strip()]
+#   d['ledger_witness_path']=L
+#   d['ledger_witness_sha256']=hashlib.sha256(
+#       json.dumps(parsed,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+#   json.dump(d,open(p,'w'),indent=2,sort_keys=False); print(d['ledger_witness_sha256'])
+#   "
+#   # 3. pin the two frozen literals the test suite forces you to set on a real
+#   #    deposit: TestCommittedLedgerWitnessHeterogeneousFull._FROZEN_WITNESS_HASH
+#   #    and the _EXPECTED entry in TestDepositEvidenceHash (both currently skip).
 # Do NOT re-fire the homogeneous leg — it is harvested (``4b88ca8``).
 set -euo pipefail
 

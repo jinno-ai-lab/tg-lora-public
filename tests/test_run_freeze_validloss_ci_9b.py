@@ -233,6 +233,45 @@ FIXTURE_9B_HETEROGENEOUS_RUNLOG = (
     / "freeze_validloss_ci_9b_heterogeneous_generalization_runlog.json"
 )
 
+# The FULL-BUDGET × HETEROGENEOUS deposit — the ONE remaining open §4 leg (the
+# homogeneous full LANDED→TIES ``4b88ca8``; the heterogeneous REDUCED-budget
+# LANDED→SURPASSES ``d00a362``; whether the heterogeneous SURPASSES survives the
+# full 1500-step budget on an asymmetric per-layer-rank adapter is unmeasured).
+# Arm shape MIRRORS the reduced heterogeneous direction-isolation design —
+# candidate (output-first) + surrogate (random) + input-side control — bumped
+# 96→1500 steps at 600 train / 2.5 epoch = generalization regime, with NO
+# full-backprop baseline arm (``n_baseline == 0``). This is the SECOND citable
+# full-budget deposit (``citable_as_full_section4_verdict=True`` when it lands),
+# so its arm SHAPE differs from the homogeneous full (control, not baseline) —
+# the shape-SPECIFIC guards below (structural-full-budget, ledger-witness
+# reconstruction) therefore have heterogeneous variants, while the shape-
+# INDEPENDENT guards (gate/regime/evidence-hash self-consistency) cover it via
+# ``_REAL_9B_DEPOSIT_FIXTURES``. In flight via
+# ``scripts/fire_freeze_ci_9b_full_heterogeneous.sh``; NOT landed yet, so every
+# test touching it skips-until-exists rather than fabricating a verdict.
+FIXTURE_9B_FULL_HETEROGENEOUS = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "freeze_validloss_ci_9b_full_heterogeneous.json"
+)
+
+# The committed LEDGER WITNESS for the full-budget heterogeneous deposit — the
+# committed-verification analogue of ``FIXTURE_9B_FULL_LEDGER`` for the
+# heterogeneous arm shape. The bg run writes its resumability ledger to the
+# stable ``runs/`` dir; at HARVEST the operator copies it here (a committed
+# repo file, no gitignored ``runs/`` dependency) and stamps
+# ``ledger_witness_path`` / ``ledger_witness_sha256`` into the deposit (these
+# are HARVEST fields — the worker stamps ``run_log_*`` but NOT ``ledger_witness_*``;
+# see ``scripts/fire_freeze_ci_9b_full_heterogeneous.sh`` harvest notes). 10
+# JSONL lines (1 header + 9 arms: 3 candidate / 3 surrogate / 3 control), each
+# carrying the arm's exact ``valid_loss`` — so the deposit's three loss-vectors
+# reconstruct byte-for-byte from this witness. NOT landed yet.
+FIXTURE_9B_FULL_HETEROGENEOUS_LEDGER = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl"
+)
+
 
 # ── stubs ───────────────────────────────────────────────────────────────────
 
@@ -1344,6 +1383,24 @@ _REAL_9B_DEPOSIT_FIXTURES = [
     pytest.param(FIXTURE_9B_BASELINE, id="baseline"),
     pytest.param(FIXTURE_9B_FULL, id="full"),
     pytest.param(FIXTURE_9B_HETEROGENEOUS, id="heterogeneous"),
+    # The full-budget heterogeneous deposit — the 2nd citable full verdict. NOT
+    # landed yet (run in flight); every parametrized sweep skips-until-exists so
+    # the 4 shape-INDEPENDENT guards (gate-boolean / regime-field / evidence-hash
+    # stamp / frozen-literal) auto-cover it the moment it is harvested, rather
+    # than silently bypassing the repo's headline-result integrity net.
+    pytest.param(FIXTURE_9B_FULL_HETEROGENEOUS, id="full-heterogeneous"),
+]
+
+# The citable FULL-BUDGET deposits (``citable_as_full_section4_verdict=True``) —
+# the runs where the gate's regime conjunct is load-bearing (``reduced_budget=
+# False``). The two have DIFFERENT arm shapes (homogeneous carries a full-backprop
+# BASELINE; heterogeneous carries an input-side CONTROL), so the shape-specific
+# guards are separate — but the shape-INDEPENDENT full-budget guards (the
+# load-bearing regime-on-real-data check + the top-level CE rollup) parametrize
+# over BOTH so every citable full verdict is held to the same standard.
+_CITABLE_FULL_DEPOSIT_FIXTURES = [
+    pytest.param(FIXTURE_9B_FULL, id="homogeneous"),
+    pytest.param(FIXTURE_9B_FULL_HETEROGENEOUS, id="heterogeneous"),
 ]
 
 
@@ -1393,19 +1450,21 @@ class TestDepositGateSelfConsistency:
         )
         assert data.get("regime") == recomputed
 
-    def test_full_deposit_top_level_ce_matches_provenance_rollup(self):
+    @pytest.mark.parametrize("path", _CITABLE_FULL_DEPOSIT_FIXTURES)
+    def test_full_deposit_top_level_ce_matches_provenance_rollup(self, path):
         # The top-level ``candidate_final_ce_train_loss_mean`` must equal the mean
         # of the candidate provenance ``final_ce_train_loss`` values (the same
         # ``_candidate_final_ce_mean`` that produced it) — pins the rollup to the
         # per-arm data so a deposit can't ship a stale/edited headline number.
-        if not FIXTURE_9B_FULL.exists():
-            pytest.skip("full-budget deposit not landed yet (run still banking)")
-        data = json.loads(FIXTURE_9B_FULL.read_text())
+        if not path.exists():
+            pytest.skip(f"{path.name} not landed yet (run still banking)")
+        data = json.loads(path.read_text())
         assert data["candidate_final_ce_train_loss_mean"] == pytest.approx(
             _candidate_final_ce_mean(data)
         )
 
-    def test_full_deposit_regime_conjunct_evaluated_on_real_data(self):
+    @pytest.mark.parametrize("path", _CITABLE_FULL_DEPOSIT_FIXTURES)
+    def test_full_deposit_regime_conjunct_evaluated_on_real_data(self, path):
         # THE LOAD-BEARING GUARD. The full-budget verdict is the FIRST committed
         # deposit with ``reduced_budget=False``, so the gate's regime conjunct
         # decides ``citable_as_full_section4_verdict`` for the first time. If the
@@ -1415,9 +1474,9 @@ class TestDepositGateSelfConsistency:
         # number, so the gate's decision rests on real data, not a silent
         # default. (Function-level closure: ``test_unknown_regime_blocks_full_
         # citation``; this is its landing-time enforcement on the real deposit.)
-        if not FIXTURE_9B_FULL.exists():
-            pytest.skip("full-budget deposit not landed yet (run still banking)")
-        data = json.loads(FIXTURE_9B_FULL.read_text())
+        if not path.exists():
+            pytest.skip(f"{path.name} not landed yet (run still banking)")
+        data = json.loads(path.read_text())
         assert "candidate_final_ce_train_loss_mean" in data
         ce = data["candidate_final_ce_train_loss_mean"]
         assert isinstance(ce, (int, float)) and math.isfinite(ce)
@@ -1439,6 +1498,32 @@ class TestDepositGateSelfConsistency:
         assert data["n_candidate"] >= 3
         assert data["n_surrogate"] >= 3
         assert data["n_baseline"] >= 3
+
+    def test_heterogeneous_full_deposit_is_structurally_full_budget(self):
+        # The heterogeneous full verdict has a DIFFERENT arm shape from the
+        # homogeneous full: it re-runs the reduced-heterogeneous direction-
+        # isolation design (candidate output-first + random surrogate + input-side
+        # control) at the full 1500-step budget, with NO full-backprop baseline arm
+        # (``n_baseline == 0`` — the baseline is the homogeneous leg's condition-(a)
+        # question, already answered at ``4b88ca8``). So the homogeneous structural
+        # test's ``n_baseline >= 3`` assertion does NOT apply; this pins the
+        # heterogeneous arm shape instead, plus the SAME shared full-budget axes
+        # (not proxy / not reduced / total_steps reaches cfg_max_steps / non-thin).
+        # Independent of the empirical SURPASSES/TIES outcome the gate test handles.
+        if not FIXTURE_9B_FULL_HETEROGENEOUS.exists():
+            pytest.skip(
+                "full-budget heterogeneous deposit not landed yet (run in flight)"
+            )
+        data = json.loads(FIXTURE_9B_FULL_HETEROGENEOUS.read_text())
+        assert data["architecture"] == "heterogeneous"
+        assert data["proxy_scale"] is False
+        assert data["reduced_budget"] is False
+        assert data["total_steps"] == data["cfg_max_steps"]
+        assert data["is_thin_evidence"] is False
+        assert data["n_candidate"] >= 3
+        assert data["n_surrogate"] >= 3
+        assert data["n_control"] >= 3
+        assert data["n_baseline"] == 0  # no baseline arm — direction-isolation design
 
 
 class TestRunLogArtifact:
@@ -1647,6 +1732,17 @@ class TestDepositEvidenceHash:
         if not path.exists():
             pytest.skip(f"{path.name} not landed yet")
         data = json.loads(path.read_text())
+        # A deposit that has LANDED must have its frozen literal pinned here —
+        # that pin IS the deliberate change this guard exists to force. Failing
+        # loud with a clear message (rather than a KeyError on ``_EXPECTED[path]``)
+        # so the harvest operator knows the one remaining step; this also closes
+        # the trap where a newly-registered deposit (e.g. the in-flight
+        # full-heterogeneous verdict) lands and silently bypasses the pin because
+        # no literal was ever added.
+        assert path in self._EXPECTED, (
+            f"{path.name} landed but has no frozen evidence_hash literal in "
+            f"_EXPECTED — pin it (the deliberate change this guard exists to force)."
+        )
         assert data["evidence_hash"] == self._EXPECTED[path]
 
     def test_hash_is_over_evidence_not_derived_labels(self):
@@ -1975,6 +2071,116 @@ class TestCommittedLedgerWitness:
             "ledger_witness_* leaked into evidence_hash — the witness must be "
             "additive provenance, not evidence."
         )
+
+
+class TestCommittedLedgerWitnessHeterogeneousFull:
+    """Independent-reproducibility provenance for the 2nd citable full verdict —
+    the heterogeneous-FULL ledger witness (the committed-verification analogue of
+    ``TestCommittedLedgerWitness`` for the heterogeneous arm shape).
+
+    The bg heterogeneous-full run writes its resumability ledger to the stable
+    ``runs/`` dir; at HARVEST the operator copies it to
+    ``FIXTURE_9B_FULL_HETEROGENEOUS_LEDGER`` and stamps
+    ``ledger_witness_path`` / ``ledger_witness_sha256`` into the deposit (HARVEST
+    fields — the worker stamps ``run_log_*`` but never ``ledger_witness_*``; see
+    ``scripts/fire_freeze_ci_9b_full_heterogeneous.sh``). These tests then
+    auto-verify the harvest: the witness is a committed repo file pointed at by a
+    RELATIVE path, its stamp is self-consistent with its bytes, and it
+    reconstructs the deposit's three loss-vectors (candidate / surrogate /
+    CONTROL — the heterogeneous arm shape, not baseline) byte-for-byte.
+
+    Canonical hashing DELEGATES to ``TestCommittedLedgerWitness._ledger_witness_
+    sha256`` so the two verdicts are held to a single canonicalization (a future
+    drift in one would fail the other). The run is IN FLIGHT — every test
+    skips-until-exists rather than fabricating a verdict. HARVEST TODO when the
+    ledger lands: fill ``_FROZEN_WITNESS_HASH`` (activates the coordinated-drift
+    pin) and the frozen evidence-hash literal in ``TestDepositEvidenceHash``.
+    """
+
+    # Frozen witness hash over the canonical encoding of the committed ledger.
+    # Fill at harvest (the deliberate change the pin exists to force); stays
+    # ``None`` until then so ``test_witness_hash_is_pinned_to_frozen_literal``
+    # skips rather than asserts against an unknown value.
+    _FROZEN_WITNESS_HASH = None
+
+    def test_witness_file_is_committed_and_deposit_points_at_it(self):
+        if not FIXTURE_9B_FULL_HETEROGENEOUS_LEDGER.exists():
+            pytest.skip("heterogeneous-full ledger witness not landed yet")
+        assert FIXTURE_9B_FULL_HETEROGENEOUS.exists(), (
+            "ledger witness landed but the deposit is missing — harvest incomplete."
+        )
+        data = json.loads(FIXTURE_9B_FULL_HETEROGENEOUS.read_text())
+        wit = data["ledger_witness_path"]
+        assert wit is not None
+        assert not Path(wit).is_absolute(), (
+            f"ledger_witness_path must be relative, got absolute {wit!r}"
+        )
+        assert (Path(__file__).resolve().parent.parent / wit).exists()
+
+    def test_witness_hash_is_self_consistent(self):
+        if not FIXTURE_9B_FULL_HETEROGENEOUS_LEDGER.exists():
+            pytest.skip("heterogeneous-full ledger witness not landed yet")
+        data = json.loads(FIXTURE_9B_FULL_HETEROGENEOUS.read_text())
+        recomputed = TestCommittedLedgerWitness._ledger_witness_sha256(
+            FIXTURE_9B_FULL_HETEROGENEOUS_LEDGER
+        )
+        assert data["ledger_witness_sha256"] == recomputed, (
+            f"deposit stamp {data['ledger_witness_sha256']!r} != "
+            f"recomputed {recomputed!r}"
+        )
+
+    def test_witness_hash_is_pinned_to_frozen_literal(self):
+        # THE coordinated-drift guard for the heterogeneous witness. Skips until
+        # harvest fills ``_FROZEN_WITNESS_HASH`` (the deliberate pin), then
+        # asserts the stamp equals BOTH the recomputed bytes AND the frozen
+        # literal — so a repaint of the ledger bytes + stamp cannot pass silently.
+        if not FIXTURE_9B_FULL_HETEROGENEOUS_LEDGER.exists():
+            pytest.skip("heterogeneous-full ledger witness not landed yet")
+        if self._FROZEN_WITNESS_HASH is None:
+            pytest.skip(
+                "frozen witness literal not pinned yet — fill "
+                "_FROZEN_WITNESS_HASH at harvest (the deliberate pin)."
+            )
+        data = json.loads(FIXTURE_9B_FULL_HETEROGENEOUS.read_text())
+        recomputed = TestCommittedLedgerWitness._ledger_witness_sha256(
+            FIXTURE_9B_FULL_HETEROGENEOUS_LEDGER
+        )
+        assert data["ledger_witness_sha256"] == self._FROZEN_WITNESS_HASH
+        assert self._FROZEN_WITNESS_HASH == recomputed
+
+    def test_ledger_reconstructs_deposit_loss_vectors_exactly(self):
+        # THE independent-reproducibility link for the heterogeneous arm shape:
+        # each ledger arm's ``valid_loss`` reconstructs the deposit's three loss
+        # vectors (candidate / surrogate / CONTROL) byte-for-byte. Mirrors the
+        # homogeneous reconstruction with the heterogeneous role map (control, not
+        # baseline — the heterogeneous full carries no full-backprop baseline arm).
+        if not FIXTURE_9B_FULL_HETEROGENEOUS_LEDGER.exists():
+            pytest.skip("heterogeneous-full ledger witness not landed yet")
+        data = json.loads(FIXTURE_9B_FULL_HETEROGENEOUS.read_text())
+        parsed = [
+            json.loads(line)
+            for line in FIXTURE_9B_FULL_HETEROGENEOUS_LEDGER.read_text().splitlines()
+            if line.strip()
+        ]
+        arms = [rec for rec in parsed if rec.get("type") == "arm"]
+        by_role_index = {(a["role"], a["index"]): a for a in arms}
+        for role, key in (
+            ("candidate", "candidate_losses"),
+            ("surrogate", "surrogate_losses"),
+            ("control", "control_losses"),
+        ):
+            losses = data[key]
+            n_ledger = sum(1 for r, _ in by_role_index if r == role)
+            assert len(losses) == n_ledger, (
+                f"{role}: deposit has {len(losses)} losses but ledger has "
+                f"{n_ledger} arms — reconstruction shape mismatch."
+            )
+            for i, expected in enumerate(losses):
+                arm = by_role_index[(role, i)]
+                assert arm["valid_loss"] == expected, (
+                    f"{role}[{i}]: ledger {arm['valid_loss']!r} != "
+                    f"deposit {expected!r} — reconstruction is NOT exact."
+                )
 
 
 # ── committed run-log witness: independent reproducibility of the het deposit ─
