@@ -241,14 +241,16 @@ FIXTURE_9B_HETEROGENEOUS_RUNLOG = (
 # candidate (output-first) + surrogate (random) + input-side control — bumped
 # 96→1500 steps at 600 train / 2.5 epoch = generalization regime, with NO
 # full-backprop baseline arm (``n_baseline == 0``). This is the SECOND citable
-# full-budget deposit (``citable_as_full_section4_verdict=True`` when it lands),
-# so its arm SHAPE differs from the homogeneous full (control, not baseline) —
-# the shape-SPECIFIC guards below (structural-full-budget, ledger-witness
-# reconstruction) therefore have heterogeneous variants, while the shape-
-# INDEPENDENT guards (gate/regime/evidence-hash self-consistency) cover it via
-# ``_REAL_9B_DEPOSIT_FIXTURES``. In flight via
-# ``scripts/fire_freeze_ci_9b_full_heterogeneous.sh``; NOT landed yet, so every
-# test touching it skips-until-exists rather than fabricating a verdict.
+# full-budget deposit (``citable_as_full_section4_verdict=True``; LANDED +
+# harvested 2026-07-18), so its arm SHAPE differs from the homogeneous full
+# (control, not baseline) — the shape-SPECIFIC guards below (structural-full-
+# budget, ledger-witness reconstruction) therefore have heterogeneous variants,
+# while the shape-INDEPENDENT guards (gate/regime/evidence-hash self-consistency)
+# cover it via ``_REAL_9B_DEPOSIT_FIXTURES``. Fired via
+# ``scripts/fire_freeze_ci_9b_full_heterogeneous.sh``; verdict TIES (the
+# reduced-budget heterogeneous SURPASSES does NOT survive the full 1500-step
+# budget), recorded honestly. Tests keep a skip-until-exists guard so an
+# accidentally-removed fixture fails loudly, not silently.
 FIXTURE_9B_FULL_HETEROGENEOUS = (
     Path(__file__).resolve().parent
     / "fixtures"
@@ -265,7 +267,8 @@ FIXTURE_9B_FULL_HETEROGENEOUS = (
 # see ``scripts/fire_freeze_ci_9b_full_heterogeneous.sh`` harvest notes). 10
 # JSONL lines (1 header + 9 arms: 3 candidate / 3 surrogate / 3 control), each
 # carrying the arm's exact ``valid_loss`` — so the deposit's three loss-vectors
-# reconstruct byte-for-byte from this witness. NOT landed yet.
+# reconstruct byte-for-byte from this witness. LANDED + harvested 2026-07-18
+# (see :class:`TestCommittedLedgerWitnessHeterogeneousFull`).
 FIXTURE_9B_FULL_HETEROGENEOUS_LEDGER = (
     Path(__file__).resolve().parent
     / "fixtures"
@@ -1383,11 +1386,11 @@ _REAL_9B_DEPOSIT_FIXTURES = [
     pytest.param(FIXTURE_9B_BASELINE, id="baseline"),
     pytest.param(FIXTURE_9B_FULL, id="full"),
     pytest.param(FIXTURE_9B_HETEROGENEOUS, id="heterogeneous"),
-    # The full-budget heterogeneous deposit — the 2nd citable full verdict. NOT
-    # landed yet (run in flight); every parametrized sweep skips-until-exists so
-    # the 4 shape-INDEPENDENT guards (gate-boolean / regime-field / evidence-hash
-    # stamp / frozen-literal) auto-cover it the moment it is harvested, rather
-    # than silently bypassing the repo's headline-result integrity net.
+    # The full-budget heterogeneous deposit — the 2nd citable full verdict,
+    # LANDED + harvested 2026-07-18. Every parametrized sweep still skip-until-
+    # exists so the 4 shape-INDEPENDENT guards (gate-boolean / regime-field /
+    # evidence-hash stamp / frozen-literal) auto-cover it and cannot silently
+    # bypass the repo's headline-result integrity net if the fixture is removed.
     pytest.param(FIXTURE_9B_FULL_HETEROGENEOUS, id="full-heterogeneous"),
 ]
 
@@ -1707,6 +1710,13 @@ class TestDepositEvidenceHash:
         FIXTURE_9B_BASELINE: "d0090d0740ac2ab8f93ac77eb4a55921fdd640ff08c44779d625e5559e48e8d3",
         FIXTURE_9B_FULL: "785d9cfae66fbf20fb0b9c3349dacbfd3ec5caf7cd9b046610d78f4e2bcf8577",
         FIXTURE_9B_HETEROGENEOUS: "c07b1de1e8f3692b4e99ee7a20fcef6ce3c3a6e955de4a672e62838d17288a49",
+        # The 2nd citable full-budget verdict — heterogeneous (per-layer rank)
+        # arm shape, LANDED 2026-07-18. Distinct from the homogeneous full pin
+        # above (``architecture`` + ``lora_rank_pattern`` are EVIDENCE keys) and
+        # from the reduced-budget heterogeneous pin (different total_steps +
+        # losses): the SURPASSES the reduced leg earned does NOT survive the
+        # full 1500-step budget → verdict TIES, recorded honestly either way.
+        FIXTURE_9B_FULL_HETEROGENEOUS: "335a1ffb5a740dfa70f19d17c201cf77901eaef86cc916cb603e7417e01fa323",
     }
 
     @pytest.mark.parametrize("path", _REAL_9B_DEPOSIT_FIXTURES)
@@ -2091,17 +2101,24 @@ class TestCommittedLedgerWitnessHeterogeneousFull:
 
     Canonical hashing DELEGATES to ``TestCommittedLedgerWitness._ledger_witness_
     sha256`` so the two verdicts are held to a single canonicalization (a future
-    drift in one would fail the other). The run is IN FLIGHT — every test
-    skips-until-exists rather than fabricating a verdict. HARVEST TODO when the
-    ledger lands: fill ``_FROZEN_WITNESS_HASH`` (activates the coordinated-drift
-    pin) and the frozen evidence-hash literal in ``TestDepositEvidenceHash``.
+    drift in one would fail the other). The run LANDED 2026-07-18 and the HARVEST
+    is DONE: ``_FROZEN_WITNESS_HASH`` (activates the coordinated-drift pin below)
+    and the frozen evidence-hash literal in :class:`TestDepositEvidenceHash` are
+    both pinned to the committed bytes. Tests keep a skip-until-exists guard so
+    an accidentally-removed witness/deposit fails loudly, not silently.
     """
 
     # Frozen witness hash over the canonical encoding of the committed ledger.
-    # Fill at harvest (the deliberate change the pin exists to force); stays
-    # ``None`` until then so ``test_witness_hash_is_pinned_to_frozen_literal``
-    # skips rather than asserts against an unknown value.
-    _FROZEN_WITNESS_HASH = None
+    # Filled at HARVEST (the deliberate change the pin exists to force) when the
+    # heterogeneous-full ledger landed (2026-07-18): the verdict TIES (candidate
+    # 1.71804 vs surrogate 1.71903, CI straddles 0) on a clean one-shot run
+    # (``resumed_arm_count=0``), so the SURPASSES the reduced-budget heterogeneous
+    # leg earned does NOT survive the full 1500-step budget — recorded honestly,
+    # not papered over. A future deliberate re-deposit (real re-run) must update
+    # this literal; that update is itself the reviewable change this guard forces.
+    _FROZEN_WITNESS_HASH = (
+        "00084c2646eb5463cd0ff835a8a6579d31c331c07d81a89bc1f7dc3e1f4b0390"
+    )
 
     def test_witness_file_is_committed_and_deposit_points_at_it(self):
         if not FIXTURE_9B_FULL_HETEROGENEOUS_LEDGER.exists():

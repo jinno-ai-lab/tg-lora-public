@@ -1,0 +1,230 @@
+{
+  "verdict": "TIES",
+  "passes": false,
+  "significant_surpasses": false,
+  "is_material": true,
+  "is_thin_evidence": false,
+  "candidate_mean": 1.7180370949596788,
+  "surrogate_mean": 1.7190324152858618,
+  "point_improvement": 0.0009953203261829913,
+  "lower": -0.0010013569941900169,
+  "upper": 0.0029919976465559994,
+  "confidence": 0.95,
+  "n_bootstrap": 10000,
+  "candidate_losses": [
+    1.7162720794731285,
+    1.7195302443869878,
+    1.71830896101892
+  ],
+  "surrogate_losses": [
+    1.7179620928363875,
+    1.7184411931375507,
+    1.720693959883647
+  ],
+  "candidate_order": [
+    31,
+    30,
+    29,
+    28,
+    27,
+    26,
+    25,
+    24
+  ],
+  "device": "cuda",
+  "model": "Qwen/Qwen3.5-9B",
+  "architecture": "heterogeneous",
+  "lora_rank_pattern": {
+    "24": 1,
+    "25": 1,
+    "26": 2,
+    "27": 3,
+    "28": 5,
+    "29": 7,
+    "30": 11,
+    "31": 16
+  },
+  "dataset": "databricks/databricks-dolly-15k",
+  "total_steps": 1500,
+  "warmup_steps": 150,
+  "depth": 3,
+  "spacing": 450,
+  "n_candidate": 3,
+  "n_surrogate": 3,
+  "base_seed": 0,
+  "active_scope": [
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "scope_label": "last_25_percent",
+  "n_active_layers": 8,
+  "scope_trainable_params": 3841728,
+  "seq_len": 1024,
+  "train_examples": 600,
+  "valid_examples": 64,
+  "use_local_loss": true,
+  "proxy_scale": false,
+  "reduced_budget": false,
+  "cfg_max_steps": 1500,
+  "candidate_final_ce_train_loss_mean": 1.4072170449306982,
+  "candidate_train_valid_gap": 0.3108200500289806,
+  "regime": "generalization",
+  "candidate_cost_reduction": {
+    "level": 1,
+    "reduction_rate": 0.11250000000000004,
+    "progressive_backward_flops": 21300.0,
+    "full_backward_flops": 24000.0,
+    "realized_reduction_rate": 0.0,
+    "level1_realization_ceiling": 0.0,
+    "realized_depth": 3,
+    "frozen_at_epoch": {
+      "31": 150,
+      "30": 600,
+      "29": 1050
+    },
+    "cost_model": "uniform_per_layer"
+  },
+  "candidate_provenance": [
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 1014336,
+      "last_train_loss": 0.000171661376953125,
+      "final_ce_train_loss": 1.4068043602909892
+    },
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 1014336,
+      "last_train_loss": 0.000179290771484375,
+      "final_ce_train_loss": 1.4077581132389605
+    },
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 1014336,
+      "last_train_loss": 0.000186920166015625,
+      "final_ce_train_loss": 1.4070886612621447
+    }
+  ],
+  "surrogate_provenance": [
+    {
+      "frozen_layers": [
+        25,
+        28,
+        31
+      ],
+      "n_trainable_params": 2047296,
+      "last_train_loss": 1.2099742889404297e-05,
+      "final_ce_train_loss": 1.407178320810199
+    },
+    {
+      "frozen_layers": [
+        26,
+        28,
+        29
+      ],
+      "n_trainable_params": 2636608,
+      "last_train_loss": 3.933906555175781e-05,
+      "final_ce_train_loss": 1.4069471029099077
+    },
+    {
+      "frozen_layers": [
+        24,
+        27,
+        28
+      ],
+      "n_trainable_params": 3085632,
+      "last_train_loss": 0.0,
+      "final_ce_train_loss": 1.4085560320007304
+    }
+  ],
+  "control_losses": [
+    1.719586925173644,
+    1.7207955297490116,
+    1.7173056988976896
+  ],
+  "control_order": [
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "n_control": 3,
+  "control_provenance": [
+    {
+      "frozen_layers": [
+        24,
+        25,
+        26
+      ],
+      "n_trainable_params": 3497408,
+      "last_train_loss": 0.0,
+      "final_ce_train_loss": 1.407553960159421
+    },
+    {
+      "frozen_layers": [
+        24,
+        25,
+        26
+      ],
+      "n_trainable_params": 3497408,
+      "last_train_loss": 0.0,
+      "final_ce_train_loss": 1.4096461836714298
+    },
+    {
+      "frozen_layers": [
+        24,
+        25,
+        26
+      ],
+      "n_trainable_params": 3497408,
+      "last_train_loss": 0.0,
+      "final_ce_train_loss": 1.4084648364254584
+    }
+  ],
+  "direction": {
+    "verdict": "TIES",
+    "candidate_mean": 1.7180370949596788,
+    "control_mean": 1.7192293846067817,
+    "point_improvement": 0.0011922896471028288,
+    "lower": -0.0010570422746241093,
+    "upper": 0.003441621568830211,
+    "confidence": 0.95,
+    "is_thin_evidence": false,
+    "n_candidate": 3,
+    "n_control": 3
+  },
+  "baseline_losses": [],
+  "n_baseline": 0,
+  "baseline_provenance": [],
+  "baseline": null,
+  "citable_as_target_scale": true,
+  "citable_as_full_section4_verdict": true,
+  "resumed_arm_count": 0,
+  "ledger_path": "/home/jinno/tg-lora-public-full-run/runs/freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl",
+  "ledger_witness_path": "tests/fixtures/freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl",
+  "ledger_witness_sha256": "00084c2646eb5463cd0ff835a8a6579d31c331c07d81a89bc1f7dc3e1f4b0390",
+  "run_log_path": null,
+  "run_log_sha256": null,
+  "evidence_hash": "335a1ffb5a740dfa70f19d17c201cf77901eaef86cc916cb603e7417e01fa323"
+}
