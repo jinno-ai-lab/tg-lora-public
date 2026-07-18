@@ -2186,7 +2186,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--json", action="store_true", help="emit JSON evidence to stdout.")
-    p.add_argument("--output", default=None, help="write the report/JSON to this path.")
+    p.add_argument(
+        "--output", default=None,
+        help=(
+            "Write the citable §4 verdict DEPOSIT to this path. Always the "
+            "canonical JSON shape (result_to_json) — independent of --json, "
+            "which selects JSON vs the human-readable text report on STDOUT "
+            "only. The deposit is harvested into tests/fixtures/ and re-loaded "
+            "as JSON, so a text report here would be a silently-corrupt "
+            "verdict."
+        ),
+    )
     p.add_argument(
         "--ledger", default=None,
         help=(
@@ -2525,14 +2535,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             return EXIT_GPU_TEMPFAIL
         raise
 
-    payload = (
-        json.dumps(result_to_json(result), indent=2)
-        if args.json
-        else format_report_9b(result)
-    )
-    print(payload, flush=True)
+    # The citable §4 verdict deposit is ALWAYS the canonical JSON shape
+    # (``result_to_json``): the ``--output`` artifact is harvested into
+    # ``tests/fixtures/``, pinned by the deposit / evidence-hash / ledger-
+    # witness tests, and re-loaded as JSON by the paper gate. A human-readable
+    # text report deposited to a ``.json`` path would be silently unparseable
+    # (or worse, parseable-but-truncated) — a GOAL §7 cardinal honesty break
+    # that wastes an entire multi-hour, multi-arm run. So the deposit format is
+    # DECOUPLED from ``--json``: ``--json`` selects JSON on STDOUT (for piping
+    # / CI capture); ``--output`` (the deposit) is JSON unconditionally.
+    # Previously ``--output`` without ``--json`` wrote ``format_report_9b`` text
+    # — correct only because every Makefile / launcher caller happened to pass
+    # ``--json`` alongside it. Moving that safety out of caller convention and
+    # into the entry point is the same class as the atomic-write (54a4cd8) and
+    # fingerprint-gating fixes: a §7 contract the code enforces, not one the
+    # caller must remember.
+    deposit_payload = json.dumps(result_to_json(result), indent=2)
+    stdout_payload = deposit_payload if args.json else format_report_9b(result)
+    print(stdout_payload, flush=True)
     if args.output:
-        _write_deposit(args.output, payload)
+        _write_deposit(args.output, deposit_payload)
         logger.info("Wrote %s", args.output)
     return 0
 

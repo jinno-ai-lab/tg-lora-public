@@ -3261,6 +3261,93 @@ class TestCudaOomTempfail:
             main(argv)
 
 
+class TestMainDepositIsAlwaysJson:
+    """``main()``'s ``--output`` deposit is ALWAYS canonical JSON, independent
+    of ``--json``.
+
+    The on-disk deposit is harvested into ``tests/fixtures/``, pinned by the
+    deposit / evidence-hash / ledger-witness tests, and re-loaded as JSON by the
+    paper gate — so a human-readable text report deposited to a ``.json`` path
+    would be a silently-unparseable (or parseable-but-truncated) §4 verdict, the
+    GOAL §7 cardinal honesty break that wastes a multi-hour, multi-arm run.
+    ``--json`` selects JSON vs the text report on STDOUT only; the deposit
+    format is decoupled from it. This guards the one assembled ``main() →
+    _write_deposit`` join that (a) the slice tests here leave uncovered — they
+    monkeypatch ``run_ci_9b`` to RAISE, so ``main()`` returns before the deposit
+    write — and (b) the ``run_ci_9b``-level launch-honesty dry-run
+    (``test_freeze_ci_9b_launch_honesty.py``) leaves uncovered — it calls
+    ``run_ci_9b`` directly and writes via ``_write_deposit`` with hand-built
+    JSON, bypassing ``main()`` entirely. Pre-fix the deposit format was coupled
+    to ``--json``, correct only because every Makefile / launcher caller
+    happened to pass ``--json`` alongside ``--output``.
+    """
+
+    @staticmethod
+    def _argv(repo_root, out_path, *, json_flag):
+        argv = [
+            "--config", str(repo_root / "configs" / "9b_baseline_suffix_only_last25.yaml"),
+            "--output", str(out_path),
+            "--min-free-gib", "0",  # bypass the pre-flight free-memory snapshot
+        ]
+        if json_flag:
+            argv.append("--json")
+        return argv
+
+    @staticmethod
+    def _depositable_stub():
+        # ``_stub_result``'s minimal ``_stub_ci`` is rich enough for
+        # ``result_to_json`` (the JSON path) but lacks the 4 fields
+        # ``format_report_9b`` → ``format_surrogate_valid_loss_ci`` reads
+        # (``n_candidate`` / ``n_surrogate`` / ``material_margin`` / ``seed``).
+        # The real ``ci`` from ``surrogate_valid_loss_ci`` carries them; the stub
+        # just has to mirror that so the no-``--json`` stdout text path renders.
+        return _stub_result(ci=_stub_ci(
+            n_candidate=2, n_surrogate=2, material_margin=0.05, seed=0,
+        ))
+
+    def test_deposit_is_json_without_json_flag(self, tmp_path, monkeypatch, capsys):
+        # Regression: ``--output`` WITHOUT ``--json`` must still deposit canonical
+        # JSON (not the format_report_9b text). Pre-fix this wrote text to a
+        # ``.json`` path → json.loads raises here → RED.
+        import scripts.run_freeze_validloss_ci_9b as mod
+        repo_root = Path(__file__).resolve().parents[1]
+        stub = self._depositable_stub()
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(mod, "run_ci_9b", lambda **kw: stub)
+
+        out = tmp_path / "deposit.json"
+        assert main(self._argv(repo_root, out, json_flag=False)) == 0
+
+        deposited = json.loads(out.read_text())  # text → JSONDecodeError → RED
+        assert deposited == result_to_json(stub)  # canonical JSON shape, not text
+        assert "verdict" in deposited and "candidate_losses" in deposited
+
+        # STDOUT honors --json: without it, stdout is the human-readable text
+        # report (NOT JSON) — so the deposit-vs-stdout decoupling is real, not a
+        # no-op rename. Pre-fix deposit == stdout == text.
+        stdout = capsys.readouterr().out
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(stdout)
+        assert "freeze_valid_loss_ci_9b" in stdout  # format_report_9b header line
+
+    def test_deposit_and_stdout_with_json_flag(self, tmp_path, monkeypatch, capsys):
+        # Backward-compat: the Makefile / launcher pairing (``--json --output``)
+        # is byte-identical to before — JSON deposit AND JSON stdout.
+        import scripts.run_freeze_validloss_ci_9b as mod
+        repo_root = Path(__file__).resolve().parents[1]
+        stub = self._depositable_stub()
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(mod, "run_ci_9b", lambda **kw: stub)
+
+        out = tmp_path / "deposit.json"
+        assert main(self._argv(repo_root, out, json_flag=True)) == 0
+
+        deposited = json.loads(out.read_text())
+        assert deposited == result_to_json(stub)
+        # --json → stdout is JSON too (unchanged).
+        assert json.loads(capsys.readouterr().out) == deposited
+
+
 class TestAtomicDepositAndRunLogWrites:
     """The citable §4 verdict deposit + its loss-curve run-log witness are
     written ATOMICALLY.
