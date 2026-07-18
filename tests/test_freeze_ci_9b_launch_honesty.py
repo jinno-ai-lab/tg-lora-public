@@ -1364,3 +1364,237 @@ class TestAssembledDoneRequiresDeposit:
                 "--min-free-gib", "0",
                 "--output", str(tmp_path / "deposit.json"),
             ])
+
+
+# ── (13) the LAUNCHER survives a worker run-time OOM (invariant 4's unjoined half) ──
+#
+# Invariant (4) (TestAssembledOomTempfail above) proves the WORKER half: a run-time
+# OOM raised from inside the REAL ``_collect_arms`` arm loop propagates as a
+# ``RuntimeError`` ``is_cuda_oom`` recognizes, and the ledger banks the completed
+# arm before it raises. ``tests/test_launch_freeze_ci_9b_full.py`` proves the
+# LAUNCHER half in ISOLATION: ``classify_exit_code(75) -> RETRY`` and
+# ``run_loop`` reaches DONE off a ``_FakeRunner`` that pops a HAND-BUILT
+# ``SimpleNamespace(returncode=75)`` — a 75 that never came from a worker. And
+# ``tests/test_run_freeze_validloss_ci_9b.py::test_main_classifies_run_time_oom_as_
+# tempfail`` proves ``main()`` returns 75 — but by STUBBING ``run_ci_9b`` with a
+# ``_boom`` that raises, so no real arm loop, no ledger banking, no launcher.
+#
+# NEITHER test JOINS the worker to the launcher: a real worker run-time OOM ->
+# ``main()`` exit 75 -> the launcher reads that code, classifies RETRY, re-fires,
+# and the re-fire completes the run with the banked arm carried across the
+# ``--ledger``. That join is the LITERAL directive invariant (4) ("the launcher
+# survives") and the one place the worker->launcher exit-code contract
+# (``ad8c84a``, pinned only STATICALLY — constant equality + a source grep for
+# the string ``return EXIT_GPU_TEMPFAIL``) is never exercised DYNAMICALLY. A
+# regression at the join — ``main()``'s ``except RuntimeError`` no longer
+# catching the OOM (returns 1 FATAL instead of 75), or a torch version where the
+# device-dispatch OOM surfaces as an exception that is NOT a ``RuntimeError``
+# sibling — passes EVERY slice above (the ``is_cuda_oom`` unit, the
+# ``classify_exit_code(75)`` unit, the ``_FakeRunner`` loop, the static contract
+# pin) yet strands the multi-hour run on one contention spike: the exact loss the
+# 4afc5e9 tempfail classification exists to prevent.
+#
+# This drives the REAL ``launch_freeze_ci_9b_full.run_loop`` against the REAL
+# worker ``main()`` via an in-process runner (it calls ``main()`` and wraps the
+# return in a ``CompletedProcess``-shaped object, so the worker->launcher
+# integer-exit-code boundary — the contract — is real, without spawning a
+# subprocess or touching a GPU). The worker's real arm loop OOMs on attempt 1
+# (after banking 1 arm), the launcher must classify the 75 as RETRY, re-fire, and
+# reach DONE; and a non-OOM RuntimeError must reach ``main()``'s reraise -> exit
+# 1 -> launcher FATAL (so a real bug is not infinite-looped as retryable).
+
+
+class TestAssembledLauncherSurvivesWorkerOom:
+    def _runner(self, worker_mod, *, attempt_state):
+        """A ``run_loop`` runner that invokes the REAL worker ``main()``
+        in-process and wraps its return code in a ``CompletedProcess`` stand-in —
+        so the integer exit-code boundary the worker->launcher contract is built
+        on is exercised for real, without a subprocess or a GPU.
+
+        ``attempt_state`` (a shared dict) lets the toy arm below behave
+        differently per launcher attempt (OOM on attempt 1 only)."""
+        from types import SimpleNamespace
+
+        def _run(argv, **kwargs):  # noqa: ARG001
+            attempt_state["attempt"] += 1
+            attempt_state["arm_calls"] = 0
+            module_argv = list(argv[3:])  # strip [interpreter, "-m", MODULE]
+            try:
+                rc = worker_mod.main(module_argv)
+            except SystemExit as exc:
+                # argparse errors etc. surface as SystemExit in-process; a real
+                # subprocess would exit with exc.code.
+                rc = int(exc.code) if exc.code is not None else 1
+            except BaseException:
+                # main() RERAISES a non-OOM RuntimeError (stays fatal); a real
+                # subprocess would print a traceback and exit 1. Model that here
+                # so the launcher sees the same integer the contract describes.
+                rc = 1
+            return SimpleNamespace(returncode=rc)
+
+        return _run
+
+    def _common_worker_flags(self, cfg_path, ledger, out):
+        return [
+            "--config", str(cfg_path), "--device", "cpu",
+            "--seq-len", "256", "--train-examples", "4", "--valid-examples", "4",
+            "--total-steps", "6", "--warmup-steps", "1", "--depth", "1",
+            "--spacing", "2", "--n-candidate", "2", "--n-surrogate", "2",
+            "--base-seed", "7", "--dataset", "dolly", "--max-dataset-rows", "12",
+            "--architecture", str(HETEROGENEOUS),
+            "--min-free-gib", "0",  # bypass the free-memory snapshot gate
+            "--ledger", str(ledger), "--output", str(out),
+        ]
+
+    def test_worker_oom_then_launcher_retries_to_done(self, monkeypatch, tmp_path):
+        # THE join: the real worker arm loop OOMs on attempt 1 -> main() exit 75
+        # -> the real launcher reads 75, classifies RETRY, re-fires, and the
+        # re-fire completes (DONE) with the OOM-attempt's banked arm carried
+        # across the --ledger. A FATAL here (main() returning 1, or the launcher
+        # not retrying 75) strands the multi-hour run — invariant (4)'s
+        # "launcher survives" half, proven at the assembled scale for the first
+        # time.
+        import scripts.run_freeze_validloss_ci_9b as worker_mod
+        import scripts.launch_freeze_ci_9b_full as launcher_mod
+
+        monkeypatch.setattr(worker_mod, "load_tokenizer", lambda cfg: _CharTokenizer())
+        monkeypatch.setattr(worker_mod, "load_base_model", lambda cfg: _tiny_llama(8))
+        monkeypatch.setattr(
+            worker_mod, "_load_dolly_records", lambda *a, **kw: _fake_dolly_records(),
+        )
+        # CUDA "available" so main()'s pre-flight reaches run_ci_9b (the run runs
+        # on --device cpu; the toy arm ignores device). The OOM is injected from
+        # inside the real arm loop, exactly the TOCTOU run-time contention 4afc5e9
+        # re-classifies.
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+        cfg_path = tmp_path / "cfg.yaml"
+        OmegaConf.save(_cpu_cfg(max_steps=6, base_rank=16), cfg_path)
+        ledger = tmp_path / "ledger.jsonl"
+        out = tmp_path / "deposit.json"
+
+        good_arm = _make_toy_arm(base_seed=7)
+        attempt_state = {"attempt": 0, "arm_calls": 0}
+
+        def _oom_on_attempt1_arm(*a, **kw):
+            attempt_state["arm_calls"] += 1
+            # Attempt 1: bank arm 1 (call 1 ok), OOM on arm 2 (call 2) — exactly
+            # the TestAssembledOomTempfail (4) injection point, reached here
+            # through main() instead of run_ci_9b directly.
+            if attempt_state["attempt"] == 1 and attempt_state["arm_calls"] > 1:
+                raise torch.cuda.OutOfMemoryError("CUDA out of memory.")
+            return good_arm(*a, **kw)
+
+        monkeypatch.setattr(worker_mod, "arm_valid_loss_9b", _oom_on_attempt1_arm)
+
+        sleeps: list[float] = []
+        result = launcher_mod.run_loop(
+            interpreter="/in-process/python",  # never spawned — runner calls main()
+            module_argv=self._common_worker_flags(cfg_path, ledger, out),
+            max_attempts=3, deadline_seconds=None,
+            resume_sleep=0.0, tempfail_sleep=0.0,
+            sleep_fn=lambda s: sleeps.append(s),
+            now_fn=(lambda: 0.0),
+            runner=self._runner(worker_mod, attempt_state=attempt_state),
+        )
+
+        assert result.outcome is launcher_mod.Outcome.DONE, (
+            f"the launcher did NOT survive a worker run-time OOM — outcome "
+            f"{result.outcome.value} (last worker exit {result.last_code}). A "
+            "real run-time OOM -> exit 75 must classify RETRY and the re-fire "
+            "must complete; stranding here is the multi-hour-run loss invariant "
+            "(4) / the 4afc5e9 tempfail exists to prevent (GOAL §7)."
+        )
+        assert result.last_code == 0
+        assert result.attempts == 2, (
+            f"the launcher took {result.attempts} attempt(s) — expected exactly 2 "
+            "(one OOM-deferred, one completing). A FATAL on the OOM (main() "
+            "returning 1 instead of 75) or a missing RETRY would break this."
+        )
+        assert sleeps == [0.0], (
+            f"the launcher backed off {sleeps!r} — expected exactly one tempfail "
+            "backoff between the OOM and the completing re-fire (the 'launcher "
+            "survives' behavior, not an instant fatal)."
+        )
+        # The OOM-attempt's banked arm carried across the --ledger: the completing
+        # re-fire resumed from it, not from zero — the resume the tempfail exists
+        # to enable, now proven joined to the launcher that polls for it.
+        assert out.exists(), "the completing re-fire did not write the deposit."
+        banked = [
+            ln for ln in ledger.read_text().splitlines()
+            if ln.strip() and json.loads(ln).get("type") == "arm"
+        ]
+        assert len(banked) == 4, (
+            f"the ledger banks {len(banked)} arm(s) — expected 4 (attempt 1 banked "
+            "1 before the OOM, the re-fire banked the other 3). Fewer means the "
+            "banked arm did NOT carry across the launcher retry, so a re-fire "
+            "would re-burn GPU on arms it already trained."
+        )
+
+    def test_worker_non_oom_runtimeerror_is_launcher_fatal_not_retried(
+        self, monkeypatch, tmp_path,
+    ):
+        # The complement of the join: a non-OOM RuntimeError from the real arm
+        # loop must reach main()'s reraise -> exit 1 -> launcher FATAL, NOT be
+        # mis-retried as tempfail contention. Infinite-looping a real bug
+        # (scope drift / a non-OOM device error) behind the retry backoff is the
+        # other half of GOAL §7 here: the launcher must DISTINGUISH the retryable
+        # 75 from the fatal 1 when fed a code the real worker produced — the
+        # slice tests (classify(1) -> FATAL with a bare int; _FakeRunner([1]))
+        # never prove the worker actually EMITS that 1 for a non-OOM failure.
+        import scripts.run_freeze_validloss_ci_9b as worker_mod
+        import scripts.launch_freeze_ci_9b_full as launcher_mod
+
+        monkeypatch.setattr(worker_mod, "load_tokenizer", lambda cfg: _CharTokenizer())
+        monkeypatch.setattr(worker_mod, "load_base_model", lambda cfg: _tiny_llama(8))
+        monkeypatch.setattr(
+            worker_mod, "_load_dolly_records", lambda *a, **kw: _fake_dolly_records(),
+        )
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+        cfg_path = tmp_path / "cfg.yaml"
+        OmegaConf.save(_cpu_cfg(max_steps=6, base_rank=16), cfg_path)
+        ledger = tmp_path / "ledger.jsonl"
+        out = tmp_path / "deposit.json"
+
+        def _fatal_arm(*a, **kw):  # noqa: ARG001
+            # A non-OOM RuntimeError (is_cuda_oom -> False): main() reraises it,
+            # the (real) subprocess would exit 1, and the launcher must STOP.
+            raise RuntimeError("synthetic non-OOM failure: device-side assert")
+
+        monkeypatch.setattr(worker_mod, "arm_valid_loss_9b", _fatal_arm)
+        attempt_state = {"attempt": 0, "arm_calls": 0}
+
+        sleeps: list[float] = []
+        result = launcher_mod.run_loop(
+            interpreter="/in-process/python",
+            module_argv=self._common_worker_flags(cfg_path, ledger, out),
+            max_attempts=3, deadline_seconds=None,
+            resume_sleep=0.0, tempfail_sleep=0.0,
+            sleep_fn=lambda s: sleeps.append(s),
+            now_fn=(lambda: 0.0),
+            runner=self._runner(worker_mod, attempt_state=attempt_state),
+        )
+
+        assert result.outcome is launcher_mod.Outcome.FATAL, (
+            f"a non-OOM worker RuntimeError classified {result.outcome.value} — "
+            "expected FATAL. main() must reraise it (exit 1) so the launcher "
+            "STOPS rather than infinite-looping a real bug as retryable "
+            "contention (GOAL §7: never swallow a non-OOM failure as tempfail)."
+        )
+        assert result.last_code == 1, (
+            f"the worker's non-OOM RuntimeError surfaced as exit {result.last_code} "
+            "— expected 1 (EXIT_UNEXPECTED), the contract code the launcher maps "
+            "to FATAL."
+        )
+        assert result.attempts == 1, (
+            f"the launcher retried a fatal worker error {result.attempts}x — a "
+            "non-OOM RuntimeError must NOT be retried (it would spin forever on a "
+            "real bug behind the backoff)."
+        )
+        assert sleeps == [], (
+            f"the launcher backed off {sleeps!r} for a fatal — a FATAL must stop "
+            "immediately, never sleep-and-retry."
+        )
+        # No deposit for a fatal run (the verdict never assembled).
+        assert not out.exists()
