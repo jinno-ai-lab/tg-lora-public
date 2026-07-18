@@ -51,7 +51,7 @@ def _fp(**overrides):
         seq_len=1024, train_examples=600, valid_examples=64,
         model="Qwen/Qwen3.5-9B", scope_label="last_25_percent",
         active_scope=SCOPE_SORTED, dataset="databricks/databricks-dolly-15k",
-        use_local_loss=True, base_seed=0,
+        use_local_loss=True, base_seed=0, learning_rate=2.0e-4,
         lora_r=16, lora_alpha=32.0, lora_dropout=0.0,
         lora_target_modules="all-linear",
     )
@@ -119,6 +119,16 @@ def test_fingerprint_changes_with_active_scope():
 
 def test_fingerprint_changes_with_use_local_loss():
     assert _fp(use_local_loss=True) != _fp(use_local_loss=False)
+
+
+def test_fingerprint_changes_with_learning_rate():
+    """``learning_rate`` builds every arm's optimizer
+    (``arm_valid_loss_9b`` → ``AdamW(trainable, lr=learning_rate)``), so a run
+    resumed after an operator tuned ``lr`` must NOT replay the old-``lr`` arms —
+    else a corrupt-but-green verdict (GOAL §7), the same class as the
+    ``lora_r`` gap (4ad9a73) for the most-edited hyperparameter.
+    """
+    assert _fp(learning_rate=1.0e-4) != _fp(learning_rate=2.0e-4)
 
 
 def test_fingerprint_carries_ledger_version():

@@ -87,15 +87,17 @@ def _tiny_llama(num_layers: int = 8):
     )
 
 
-def _cpu_cfg(*, max_steps: int = 6, base_rank: int = 16):
+def _cpu_cfg(*, max_steps: int = 6, base_rank: int = 16, lr: float = 1e-4):
     """Minimal float32 cfg for the REAL apply_lora + run_ci_9b on CPU
     (``load_in_4bit=False`` skips bnb/GPU). Carries every key run_ci_9b and
-    apply_lora read, so the assembled path needs no real 9B config file."""
+    apply_lora read, so the assembled path needs no real 9B config file. ``lr``
+    is exposed so a resume-fingerprint test can vary the learning rate (the
+    optimizer ``lr`` every arm's ``AdamW`` reads) against a shared ledger."""
     return OmegaConf.create({
         "model": {"name_or_path": "tiny-llama-stub", "load_in_4bit": False},
         "training": {
             "trainable_lora_scope": "last_25_percent",
-            "learning_rate": 1e-4,
+            "learning_rate": lr,
             "max_steps": max_steps,
             "gradient_checkpointing": False,
         },
@@ -508,3 +510,84 @@ class TestAssembledLoraFingerprintGate:
         # a replay would have seeded the verdict with arms trained under the
         # wrong schedule — the corrupt-but-green case the gate exists to prevent.
         assert run1["lora_rank_pattern"] != run2["lora_rank_pattern"]
+
+
+# ── (7) a learning_rate change does not replay stale ledger arms ──────────────
+#
+# Sibling of (6) for the OTHER config dimension the resume-ledger fingerprint
+# missed: ``learning_rate``. ``arm_valid_loss_9b`` builds every arm's optimizer
+# as ``AdamW(trainable, lr=learning_rate)``, so two runs at different learning
+# rates are NOT interchangeable — yet ``_config_fingerprint`` carried every
+# other training-regime field (total_steps / warmup_steps / use_local_loss) and
+# the whole LoRA adapter config, but NOT ``lr``. An operator resuming an
+# interrupted run after tuning ``lr`` (the single most-edited hyperparameter)
+# would hit a matching fingerprint and silently replay the old-``lr`` arms:
+# corrupt-but-green (GOAL §7), the same class as the ``lora_r`` gap (4ad9a73).
+# The fix threads ``learning_rate`` into ``_config_fingerprint``; this proves
+# at the assembled scale that the second run re-executes every arm. Unlike
+# ``lora_r`` (which rewrites ``lora_rank_pattern``), ``lr`` leaves no separate
+# deposit field, so only the replay COUNT exposes the corruption — the toy arm
+# is seed-based, so a replayed arm's LOSS is identical at either ``lr``.
+
+
+class TestAssembledLearningRateFingerprintGate:
+    def test_heterogeneous_rerun_at_new_lr_re_executes_not_replays(
+        self, monkeypatch, tmp_path,
+    ):
+        import scripts.run_freeze_validloss_ci_9b as mod
+
+        monkeypatch.setattr(mod, "load_tokenizer", lambda cfg: _CharTokenizer())
+        monkeypatch.setattr(mod, "load_base_model", lambda cfg: _tiny_llama(8))
+        monkeypatch.setattr(
+            mod, "_load_dolly_records", lambda *a, **kw: _fake_dolly_records()
+        )
+
+        calls = {"n": 0}
+        base_toy = _make_toy_arm(base_seed=7)
+
+        def _counting_arm(*a, **kw):
+            calls["n"] += 1
+            return base_toy(*a, **kw)
+
+        monkeypatch.setattr(mod, "arm_valid_loss_9b", _counting_arm)
+        ledger_path = str(tmp_path / "ledger.jsonl")
+        common = dict(
+            device=torch.device("cpu"), seq_len=256, train_examples=4,
+            valid_examples=4, total_steps=6, warmup_steps=1, depth=1,
+            spacing=2, n_candidate=2, n_surrogate=2, base_seed=7,
+            dataset="dolly", max_dataset_rows=12, architecture=HETEROGENEOUS,
+            ledger_path=ledger_path,
+        )
+
+        # First run at lr=1e-4 banks all 4 arms (2 candidate + 2 surrogate).
+        calls["n"] = 0
+        run1 = run_ci_9b(cfg=_cpu_cfg(max_steps=6, base_rank=16, lr=1e-4), **common)
+        assert run1["resumed_arm_count"] == 0
+        assert calls["n"] == 4, (
+            f"the lr=1e-4 run invoked the arm runner {calls['n']} time(s), "
+            "expected 4 (2 candidate + 2 surrogate) — harness setup drift."
+        )
+
+        # Second run at lr=2e-4 — the same geometry, the same ranks, the ONLY
+        # difference is the AdamW learning rate every arm trained under — against
+        # the SAME ledger. Before the fix the fingerprints matched (lr was not in
+        # the gate) and these 4 arms replayed silently from the lr=1e-4 ledger;
+        # after the fix learning_rate distinguishes them so every arm re-runs.
+        # The replay would be silent: the toy arm is seed-based, so a replayed
+        # arm's LOSS is identical at either lr — only the replay COUNT exposes it.
+        calls["n"] = 0
+        run2 = run_ci_9b(cfg=_cpu_cfg(max_steps=6, base_rank=16, lr=2e-4), **common)
+        assert run2["resumed_arm_count"] == 0, (
+            "the lr=2e-4 heterogeneous re-run replayed lr=1e-4 arms from the "
+            "ledger — the learning_rate fingerprint gate (GOAL §7) regressed: "
+            f"resumed {run2['resumed_arm_count']} arm(s) instead of re-executing."
+        )
+        assert calls["n"] == 4, (
+            f"the lr=2e-4 re-run invoked the arm runner {calls['n']} time(s), "
+            "expected 4 — stale lr=1e-4 ledger arms were silently replayed under "
+            "a different optimizer learning rate (corrupt-but-green, GOAL §7)."
+        )
+        # lr leaves no separate deposit field (unlike lora_r → lora_rank_pattern),
+        # so the re-execution count above is the SOLE corruption signal: the two
+        # runs share every deposit-visible field yet are different experiments.
+        assert run1["lora_rank_pattern"] == run2["lora_rank_pattern"]

@@ -956,6 +956,7 @@ def _config_fingerprint(
     active_scope,
     dataset: str,
     use_local_loss: bool,
+    learning_rate: float,
     base_seed: int,
     architecture: str = HOMOGENEOUS,
     lora_r: int,
@@ -986,6 +987,15 @@ def _config_fingerprint(
     :func:`heterogeneous_ranks_9b`), so without it a heterogeneous re-run at a
     different base rank would share this fingerprint and silently replay
     wrong-rank arms — a corrupt-but-green §4 verdict (GOAL §7).
+
+    ``learning_rate`` is included because :func:`arm_valid_loss_9b` builds every
+    arm's optimizer as ``AdamW(trainable, lr=learning_rate)`` — it changes the
+    result of EVERY arm, so two runs at different learning rates are NOT
+    interchangeable. An operator resuming an interrupted run after tuning ``lr``
+    (the single most-edited hyperparameter) must not have the old-``lr`` arms
+    silently replayed: without this field that replay would share the
+    fingerprint and seed the new run with wrong-``lr`` arms — the same
+    corrupt-but-green §4 verdict (GOAL §7) the other fields prevent.
     """
     return {
         "ledger_version": LEDGER_VERSION,
@@ -1001,6 +1011,7 @@ def _config_fingerprint(
         "active_scope": list(active_scope),
         "dataset": str(dataset),
         "use_local_loss": bool(use_local_loss),
+        "learning_rate": float(learning_rate),
         "base_seed": int(base_seed),
         "architecture": str(architecture),
         "lora_r": int(lora_r),
@@ -1437,7 +1448,7 @@ def run_ci_9b(
         valid_examples=valid_examples, model=cfg.model.name_or_path,
         scope_label=scope_label, active_scope=sorted(active_indices),
         dataset=dataset, use_local_loss=use_local_loss, base_seed=base_seed,
-        architecture=architecture,
+        architecture=architecture, learning_rate=lr,
         lora_r=int(cfg.lora.r),
         lora_alpha=float(cfg.lora.alpha),
         lora_dropout=float(cfg.lora.dropout),
