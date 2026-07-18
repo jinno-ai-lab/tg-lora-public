@@ -153,16 +153,26 @@ DEFAULT_BASE_SEED = 0
 DEFAULT_DATASET = "databricks/databricks-dolly-15k"
 DEFAULT_MAX_DATASET_ROWS = 4000   # cap the download for a bounded run
 
-# Exit codes main() can return — keep the table explicit so a polling loop /
-# the resumable --ledger workflow can branch on them:
-#   0  success (deposit written)
-#   1  unexpected error (uncaught exception)
-#   2  CUDA unavailable
-#   3  IncompleteResumeError (ledger banked only one side of the A/B; re-run)
-#   75 GPU free-memory tempfail OR a run-time CUDA OOM (transient contention —
-#      the pre-flight snapshot raced a concurrent process re-claiming the card);
-#      EX_TEMPFAIL from sysexits.h: "retry later"
-EXIT_GPU_TEMPFAIL = 75
+# Exit codes main() can return — kept as NAMED constants (not bare literals) so
+# the self-retrying launcher (scripts/launch_freeze_ci_9b_full.py::
+# classify_exit_code) and the resumable --ledger workflow branch on intent, not
+# on a magic number duplicated across two modules. The launcher MIRRORS these
+# five names verbatim — it cannot import them (it is deliberately torch-free so
+# it can poll a busy card without the worker's GPU/torch dependency) — so the
+# cross-module equality is pinned by tests/test_worker_launcher_exit_contract.py.
+# A unilateral change to EITHER side then
+# fails loud instead of silently misclassifying the worker's exit: e.g. exit 3
+# is the IncompleteResumeError resume path, and silently drifting it to FATAL
+# would defeat the ledger-resume the --ledger exists to enable — a
+# corrupt-but-green §4 verdict (GOAL §7).
+EXIT_DONE = 0               # success (deposit written)                 -> launcher DONE
+EXIT_UNEXPECTED = 1         # unexpected error / uncaught exception     -> launcher FATAL
+EXIT_CUDA_DOWN = 2          # CUDA unavailable (not retryable here)     -> launcher FATAL
+EXIT_INCOMPLETE_RESUME = 3  # IncompleteResumeError (re-run fills gap)  -> launcher RETRY
+EXIT_GPU_TEMPFAIL = 75      # GPU free-memory tempfail OR run-time CUDA OOM (transient
+                            # contention — the pre-flight snapshot raced a concurrent
+                            # process re-claiming the card); EX_TEMPFAIL from
+                            # sysexits.h: "retry later"                  -> launcher RETRY
 
 # Free-GPU-memory floor for the pre-flight (GiB). Calibrated to defer only when
 # another process is clearly holding the card — the seq1024 suffix-only peak is
@@ -2599,12 +2609,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--output / --ledger to survive worktree recycling. Aborting "
             "(fatal, not a retryable tempfail)."
         )
-        return 1
+        return EXIT_UNEXPECTED
     _ensure_output_parent_dirs(args.output, args.ledger, args.run_log)
     unwritable = output_paths_writable(args.output, args.ledger, args.run_log)
     if unwritable is not None:
         logger.error("%s", unwritable)
-        return 1
+        return EXIT_UNEXPECTED
 
     # GPU-free seal (mirror of run_ci_9b's check): if the ledger already banks
     # every arm of THIS run, the verdict assembles CPU-only with no model load —
@@ -2648,7 +2658,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if seal is None:
         if not torch.cuda.is_available():
             logger.error("CUDA not available — a real 9B run requires a GPU. Aborting.")
-            return 2
+            return EXIT_CUDA_DOWN
 
         deferred = gpu_free_memory_deferred(args.min_free_gib)
         if deferred is not None:
@@ -2698,14 +2708,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         # WITHOUT writing a deposit (an honest "not done yet") so the user knows
         # to re-run the same command and fill the gap.
         logger.error("%s", exc)
-        return 3
+        return EXIT_INCOMPLETE_RESUME
     except OutputPathDiedDuringRun as exc:
         # The worktree was removed mid-run; remaining arms can't persist. FATAL
         # (1) — NOT retryable: the self-retrying launcher would otherwise respawn
         # the worker into the same dead state forever. The arms already banked
         # in the --ledger survive a re-fire from a live CWD.
         logger.error("%s", exc)
-        return 1
+        return EXIT_UNEXPECTED
     except RuntimeError as exc:
         # A CUDA out-of-memory during the run is transient CONTENTION, not a
         # fatal logic error: the pre-flight free-memory gate is a snapshot, and a
@@ -2751,7 +2761,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.output:
         _write_deposit(args.output, deposit_payload)
         logger.info("Wrote %s", args.output)
-    return 0
+    return EXIT_DONE
 
 
 if __name__ == "__main__":
