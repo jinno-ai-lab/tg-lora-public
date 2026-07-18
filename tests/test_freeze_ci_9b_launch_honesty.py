@@ -45,6 +45,7 @@ import torch
 from omegaconf import OmegaConf
 
 from scripts.run_freeze_validloss_ci_9b import (
+    EVIDENCE_HASH_KEYS,
     HETEROGENEOUS,
     RUN_LOG_SCHEMA_VERSION,
     _evidence_hash,
@@ -822,3 +823,157 @@ class TestAssembledFingerprintGateAllDims:
             f"stale ledger arms were silently replayed under a different "
             f"run-config (corrupt-but-green, GOAL §7)."
         )
+
+
+# ── (10) a MATCHING fingerprint replays FAITHFULLY: resumed verdict == fresh ──
+#
+# Siblings (6)–(9) each prove the MISMATCH half of the resume-ledger gate — a
+# config change re-executes rather than silently replaying wrong arms. They
+# leave the gate's DEFINING contract unproven at assembled scale: when the
+# fingerprint MATCHES (a genuine resume — an interrupted full-budget run
+# re-fired on the next free-GPU window), the ledger-replayed arms must
+# reproduce the FRESH one-shot run's verdict, every loss sample, both CIs, all
+# provenance, and the ``evidence_hash`` byte-for-byte. The unit tests
+# (``test_freeze_validloss_ci_9b_resume.py``) prove the replay MECHANICS on
+# ``_collect_arms`` with STUB runners and round-numbered stub values — they
+# never run ``run_ci_9b`` assembled, so a corruption that lives in the
+# assembled join (a replayed arm's ``(valid_loss, provenance)`` mis-flowing
+# through ``surrogate_valid_loss_ci`` → ``result_to_json`` → the cost
+# accountant / regime classifier) would pass the unit tests and rot the
+# verdict here. The multi-window launcher architecture (TASK-0161/0162) banks
+# each arm to this ledger and resumes across GPU windows, so this faithfulness
+# is the property that architecture's headline deliverable rests on — and it
+# is the one direction of the gate no prior invariant pins.
+#
+# This exercises control arms too (``n_control``), the exact arm mix the
+# harvested heterogeneous full-budget verdict (``1224057``) used, so the
+# direction-isolation CI — candidate vs the input-contiguous control — is
+# proven reproducible under resume, not just the headline surrogate A/B.
+
+
+def _resume_pair(monkeypatch, tmp_path, *, n_candidate=2, n_surrogate=2, n_control=2):
+    """Run the REAL assembled heterogeneous path fresh, then resume it from a
+    ledger whose fingerprint MATCHES, returning ``(deposit_fresh,
+    deposit_resumed, resumed_arm_count)``.
+
+    Run 1 is a fresh one-shot (no ledger). Run 2 banks every arm to a ledger,
+    then run 3 re-fires against that SAME ledger — the fingerprint is
+    identical, so every arm replays and ``run_ci_9b`` assembles the verdict
+    entirely from ledger-cached ``(valid_loss, provenance)`` pairs. Both
+    deposits come from the REAL ``run_ci_9b`` → ``result_to_json`` assembly
+    (only the network/GPU boundaries are stubbed), so a faithfulness gap that
+    hides in the assembled replay join — not the unit-tested
+    ``_collect_arms`` mechanics — surfaces as a diff between the two deposits.
+    """
+    import scripts.run_freeze_validloss_ci_9b as mod
+
+    monkeypatch.setattr(mod, "load_tokenizer", lambda cfg: _CharTokenizer())
+    monkeypatch.setattr(mod, "load_base_model", lambda cfg: _tiny_llama(8))
+    monkeypatch.setattr(mod, "_load_dolly_records", lambda *a, **kw: _fake_dolly_records())
+    monkeypatch.setattr(mod, "arm_valid_loss_9b", _make_toy_arm(base_seed=7))
+
+    ledger_path = str(tmp_path / "ledger.jsonl")
+    common = dict(
+        cfg=_cpu_cfg(max_steps=6, base_rank=16), device=torch.device("cpu"),
+        seq_len=256, train_examples=4, valid_examples=4, total_steps=6,
+        warmup_steps=1, depth=1, spacing=2, n_candidate=n_candidate,
+        n_surrogate=n_surrogate, n_control=n_control, base_seed=7,
+        dataset="dolly", max_dataset_rows=12, architecture=HETEROGENEOUS,
+    )
+    deposit_fresh = result_to_json(run_ci_9b(**common))
+    # Bank every arm, then resume against the same matching-fingerprint ledger.
+    run_ci_9b(ledger_path=ledger_path, **common)
+    resumed = run_ci_9b(ledger_path=ledger_path, **common)
+    return deposit_fresh, result_to_json(resumed), resumed["resumed_arm_count"]
+
+
+class TestAssembledResumeFidelity:
+    """The MATCHING-fingerprint half of the resume-ledger gate: a resumed run
+    reproduces the fresh one-shot verdict. Siblings (6)–(9) cover MISMATCH;
+    this covers the gate's defining contract at assembled scale."""
+
+    def test_resumed_run_reproduces_fresh_verdict_and_evidence_hash(
+        self, monkeypatch, tmp_path,
+    ):
+        dep_f, dep_r, n_resumed = _resume_pair(monkeypatch, tmp_path)
+        total_arms = 2 + 2 + 2  # candidate + surrogate + control
+        assert n_resumed == total_arms, (
+            f"a matching-fingerprint resume replayed {n_resumed} arm(s), "
+            f"expected all {total_arms} — the ledger did not serve every arm "
+            "from cache, so this is not a genuine resume of the same run."
+        )
+        # The headline verdict + both means are identical (the property the
+        # multi-window launcher's assembled verdict rests on).
+        assert dep_f["verdict"] == dep_r["verdict"], (
+            f"verdict drifted on resume: fresh={dep_f['verdict']} "
+            f"resumed={dep_r['verdict']} — a ledger-replayed arm changed the "
+            "§4 verdict vs the fresh one-shot run."
+        )
+        assert dep_f["candidate_mean"] == dep_r["candidate_mean"]
+        assert dep_f["surrogate_mean"] == dep_r["surrogate_mean"]
+        # The load-bearing pin: EVERY evidence field (losses, orders, all four
+        # provenance dicts, the run-determining config) is byte-identical, so
+        # the evidence_hash is too. A ledger round-trip that corrupted any
+        # replayed arm's value (a float, a frozen-layer index, a provenance
+        # field) breaks this — the assembled scale where the unit-tested
+        # _collect_arms mechanics cannot catch a join-level corruption.
+        assert dep_f["evidence_hash"] == dep_r["evidence_hash"], (
+            "evidence_hash drifted on resume — at least one evidence field "
+            "(losses / orders / provenance / run-config) changed when an arm "
+            "was served from the ledger vs run fresh (GOAL §7: a resumed "
+            "multi-window verdict must reproduce the fresh one-shot hash)."
+        )
+        for key in EVIDENCE_HASH_KEYS:
+            assert dep_f[key] == dep_r[key], (
+                f"evidence field {key!r} differs fresh vs resumed — a "
+                "ledger-replayed arm did not reproduce its fresh value."
+            )
+
+    def test_only_honest_resume_provenance_differs(self, monkeypatch, tmp_path):
+        # The two deposits must differ ONLY in the two fields that honestly
+        # record HOW the run executed (``ledger_path`` / ``resumed_arm_count``)
+        # — never in a verdict, loss, or provenance field. A silent field-level
+        # corruption on replay would show up as a third diff here.
+        dep_f, dep_r, _ = _resume_pair(monkeypatch, tmp_path)
+        diffs = {
+            k for k in (set(dep_f) | set(dep_r))
+            if dep_f.get(k) != dep_r.get(k)
+        }
+        assert diffs == {"ledger_path", "resumed_arm_count"}, (
+            f"fresh vs resumed deposits differ on {sorted(diffs)} — expected "
+            "ONLY the honest ledger_path / resumed_arm_count provenance fields "
+            "to differ; every other field must be identical (GOAL §7)."
+        )
+        # And those two honest fields DO differ (the resume actually happened).
+        assert dep_r["resumed_arm_count"] == 6 and dep_f["resumed_arm_count"] == 0
+        assert dep_r["ledger_path"] is not None and dep_f["ledger_path"] is None
+
+    def test_direction_ci_faithfully_replayed_from_control_arms(
+        self, monkeypatch, tmp_path,
+    ):
+        # The control-arm mix the harvested heterogeneous full-budget verdict
+        # (1224057) used (n_candidate=3 / n_surrogate=3 / n_control=3). The
+        # direction-isolation CI (candidate vs the input-contiguous control)
+        # is the constitution-P0 attribution the control arm exists for; it
+        # must reproduce exactly when the control arms replay from the ledger,
+        # not just the headline surrogate A/B.
+        dep_f, dep_r, n_resumed = _resume_pair(
+            monkeypatch, tmp_path, n_candidate=3, n_surrogate=3, n_control=3,
+        )
+        assert n_resumed == 9, (
+            f"the 9-arm heterogeneous resume replayed {n_resumed} arm(s) — "
+            "expected all 9 (3 candidate + 3 surrogate + 3 control)."
+        )
+        assert dep_f["control_losses"] == dep_r["control_losses"], (
+            "control-arm losses drifted on resume — the direction-isolation "
+            "control did not reproduce its fresh values from the ledger."
+        )
+        assert dep_f["control_provenance"] == dep_r["control_provenance"]
+        assert dep_f["direction"] == dep_r["direction"], (
+            f"direction CI drifted on resume: fresh={dep_f['direction']} "
+            f"resumed={dep_r['direction']} — the constitution-P0 direction "
+            "attribution is not reproducible when control arms replay."
+        )
+        # The direction CI is real (not None): control arms ran, so the
+        # candidate-vs-control attribution is present in both deposits.
+        assert dep_f["direction"] is not None
