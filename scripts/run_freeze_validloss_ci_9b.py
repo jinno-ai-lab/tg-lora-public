@@ -2676,6 +2676,38 @@ def main(argv: Sequence[str] | None = None) -> int:
             "free-memory pre-flight gates; the verdict assembles CPU-only."
         )
 
+    # The citable §4 deposit (``--output``) is the ENTIRE point of executing
+    # ``run_ci_9b`` — the multi-hour, multi-arm GPU sweep whose result is
+    # harvested into ``tests/fixtures/`` and re-loaded as JSON by the paper
+    # gate. The launcher's exit-0 contract is literally "deposit written →
+    # DONE" (see ``scripts/launch_freeze_ci_9b_full.py``), so a run that
+    # computes the verdict but writes NO ``--output`` deposit would return
+    # ``EXIT_DONE`` and let the launcher declare a completed run with no
+    # harvestable artifact — the same "corrupt-but-green" class as the
+    # atomic-write (54a4cd8) and ``--output``-always-JSON (b8e7ce4) fixes: a
+    # GOAL §7 contract the code enforces, not one the caller must remember to
+    # pass. A fully-banked ledger makes this WORSE, not better: the GPU-free
+    # seal (dd0cc03) would assemble the verdict CPU-only and return DONE
+    # forever without ever writing the deposit — the one artifact the whole
+    # multi-window architecture exists to produce. Refuse to reach
+    # ``run_ci_9b`` without a citable ``--output`` sink.
+    #
+    # This gate runs AFTER the CUDA / free-memory / dead-CWD gates on purpose:
+    # the gpu_preflight tests omit ``--output`` and assert those gates fire
+    # first (a deferred GPU is 75, CUDA-down is 2) — moving this check earlier
+    # would mask those distinct exit codes behind EXIT_UNEXPECTED.
+    if args.output is None:
+        logger.error(
+            "Refusing to run without --output: the citable §4 verdict deposit is "
+            "the entire point of this run, and the launcher's exit-0 contract "
+            "means 'deposit written'. A run that computes the verdict but writes "
+            "no deposit would let the launcher declare DONE for a multi-hour run "
+            "with no harvestable artifact (GOAL §7 silent corruption — and a "
+            "fully-banked ledger would repeat it CPU-only on every re-fire). "
+            "Pass --output PATH to write the citable deposit."
+        )
+        return EXIT_UNEXPECTED
+
     device = resolve_device(args.device)
 
     try:

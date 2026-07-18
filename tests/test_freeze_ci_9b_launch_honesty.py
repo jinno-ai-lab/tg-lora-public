@@ -46,6 +46,8 @@ from omegaconf import OmegaConf
 
 from scripts.run_freeze_validloss_ci_9b import (
     EVIDENCE_HASH_KEYS,
+    EXIT_DONE,
+    EXIT_UNEXPECTED,
     HETEROGENEOUS,
     RUN_LOG_SCHEMA_VERSION,
     _evidence_hash,
@@ -1221,3 +1223,144 @@ def _bank_a_full_ledger(monkeypatch, tmp_path, *, base_rank):
         base_seed=7, dataset="dolly", max_dataset_rows=12, architecture=HETEROGENEOUS,
         ledger_path=str(tmp_path / "ledger.jsonl"),
     )
+
+
+# ── (12) DONE requires a written citable deposit — no silent deposit-less run ──
+#
+# The exit-code contract the launcher reads says exit 0 = "deposit written →
+# DONE" (``launch_freeze_ci_9b_full.classify_exit_code``). The deposit
+# (``--output``) is the ENTIRE point of executing ``run_ci_9b`` — the
+# multi-hour, multi-arm GPU sweep harvested into ``tests/fixtures/`` and
+# re-loaded as JSON by the paper gate. Pre-fix, ``main()`` returned EXIT_DONE
+# even when ``--output`` was unset: the verdict was computed (and maybe echoed
+# to stdout via ``--json``) but NO citable artifact was persisted, so the
+# launcher declared DONE for a run that wrote nothing. A fully-banked ledger
+# made it worse: the GPU-free seal (dd0cc03) assembles the verdict CPU-only and
+# would have returned DONE on EVERY re-fire without ever writing the deposit —
+# the one artifact the whole multi-window architecture exists to produce.
+# That is the same "corrupt-but-green" class as the atomic-write (54a4cd8) and
+# ``--output``-always-JSON (b8e7ce4) fixes: a GOAL §7 contract the code
+# enforces, not one the caller must remember. The guard refuses to reach
+# ``run_ci_9b`` without ``--output`` (placed AFTER the CUDA / free-memory gates
+# so the gpu_preflight tests, which omit ``--output`` and assert those gates
+# fire first, stay green). These prove it at the assembled scale.
+
+
+class TestAssembledDoneRequiresDeposit:
+    def test_seal_ready_run_without_output_is_not_done(self, monkeypatch, tmp_path):
+        # The headline corruption: a fully-banked ledger (the GPU-free-seal case)
+        # re-fired WITHOUT --output. Pre-fix this assembled CPU-only and returned
+        # EXIT_DONE, writing no deposit — and would do so on every re-fire, the
+        # multi-window architecture never producing its one artifact. The guard
+        # refuses: EXIT_UNEXPECTED (FATAL), not DONE, so the launcher stops and
+        # the operator adds --output rather than harvesting nothing.
+        import scripts.run_freeze_validloss_ci_9b as mod
+
+        monkeypatch.setattr(mod, "load_tokenizer", lambda cfg: _CharTokenizer())
+        monkeypatch.setattr(mod, "_load_dolly_records", lambda *a, **kw: _fake_dolly_records())
+        monkeypatch.setattr(mod, "load_base_model", lambda cfg: _tiny_llama(8))
+        monkeypatch.setattr(mod, "arm_valid_loss_9b", _make_toy_arm(base_seed=7))
+
+        cfg = _cpu_cfg(max_steps=6, base_rank=16)
+        cfg_path = tmp_path / "cfg.yaml"
+        OmegaConf.save(cfg, cfg_path)
+        ledger = tmp_path / "ledger.jsonl"
+        common = dict(
+            cfg=cfg, device=torch.device("cpu"), seq_len=256, train_examples=4,
+            valid_examples=4, total_steps=6, warmup_steps=1, depth=1, spacing=2,
+            n_candidate=2, n_surrogate=2, base_seed=7, dataset="dolly",
+            max_dataset_rows=12, architecture=HETEROGENEOUS, ledger_path=str(ledger),
+        )
+        # Bank every arm under the real (stubbed) model load.
+        run_ci_9b(**common)
+        ledger_lines = [ln for ln in ledger.read_text().splitlines() if ln.strip()]
+        assert len(ledger_lines) >= 5, "run 1 did not bank a header + 4 arms"
+
+        # CUDA now down — forces the GPU-free seal path (no model load). NO
+        # --output: the deposit the run exists to produce has nowhere to land.
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+        rc = mod.main([
+            "--config", str(cfg_path),
+            "--seq-len", "256", "--train-examples", "4", "--valid-examples", "4",
+            "--total-steps", "6", "--warmup-steps", "1", "--depth", "1",
+            "--spacing", "2", "--n-candidate", "2", "--n-surrogate", "2",
+            "--base-seed", "7", "--dataset", "dolly", "--max-dataset-rows", "12",
+            "--architecture", str(HETEROGENEOUS),
+            "--ledger", str(ledger),
+            # NOTE: deliberately NO --output — the silent-corruption case.
+        ])
+        assert rc == EXIT_UNEXPECTED, (
+            f"a deposit-less seal-ready run returned {rc} (DONE={EXIT_DONE}) — "
+            "EXIT_DONE's contract is 'deposit written → launcher DONE', but no "
+            "--output was given so no citable deposit could be written: the "
+            "launcher would declare a completed multi-hour run with no "
+            "harvestable artifact (GOAL §7 silent corruption)."
+        )
+
+    def test_live_gpu_run_without_output_refuses_before_burning_gpu(
+        self, monkeypatch, tmp_path,
+    ):
+        # The normal (non-seal) path: a live GPU, no ledger, NO --output. The
+        # guard must fire BEFORE run_ci_9b so no GPU is burned on a verdict that
+        # can't be persisted. The guard sits after the CUDA / free-memory gates
+        # so those distinct codes still surface first (pinned by the gpu_preflight
+        # suite); this proves the guard then stops the run before the sweep.
+        import scripts.run_freeze_validloss_ci_9b as mod
+
+        cfg = _cpu_cfg(max_steps=6, base_rank=16)
+        cfg_path = tmp_path / "cfg.yaml"
+        OmegaConf.save(cfg, cfg_path)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+        reached = {"run_ci_9b": False}
+
+        def _boom_if_reached(**kw):  # noqa: ARG001
+            reached["run_ci_9b"] = True
+            raise AssertionError(
+                "run_ci_9b was reached without --output — the guard did not stop "
+                "the run before burning GPU on a verdict that cannot be persisted."
+            )
+
+        monkeypatch.setattr(mod, "run_ci_9b", _boom_if_reached)
+
+        rc = mod.main([
+            "--config", str(cfg_path),
+            "--min-free-gib", "0",  # bypass the free-memory floor (no GPU touch)
+            # NO --ledger (so no seal path), NO --output — the guard must fire.
+        ])
+        assert rc == EXIT_UNEXPECTED, (
+            f"a deposit-less live-GPU run returned {rc} — expected the "
+            "EXIT_UNEXPECTED refusal, not a silent DONE."
+        )
+        assert reached["run_ci_9b"] is False, (
+            "the guard let run_ci_9b execute without --output — GPU would be "
+            "burned on a verdict with no citable sink."
+        )
+
+    def test_output_present_still_runs(self, monkeypatch, tmp_path):
+        # No false positive: with --output the guard does not fire and the run
+        # proceeds (here: reaches run_ci_9b, stubbed to a sentinel). This is the
+        # every-real-caller path (every Makefile target / the launcher pass
+        # --output), so the guard must not regress it.
+        import scripts.run_freeze_validloss_ci_9b as mod
+
+        cfg = _cpu_cfg(max_steps=6, base_rank=16)
+        cfg_path = tmp_path / "cfg.yaml"
+        OmegaConf.save(cfg, cfg_path)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+        class _Reached(RuntimeError):
+            pass
+
+        def _reach(**kw):  # noqa: ARG001
+            raise _Reached("reached run_ci_9b — guard did not block a --output run")
+
+        monkeypatch.setattr(mod, "run_ci_9b", _reach)
+
+        with pytest.raises(_Reached):
+            mod.main([
+                "--config", str(cfg_path),
+                "--min-free-gib", "0",
+                "--output", str(tmp_path / "deposit.json"),
+            ])
