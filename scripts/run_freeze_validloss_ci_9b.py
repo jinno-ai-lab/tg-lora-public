@@ -1080,8 +1080,36 @@ def _arm_specs(
     return specs
 
 
-def _ledger_header(fingerprint: dict) -> dict:
-    return {"type": "header", "fingerprint": fingerprint}
+def _ledger_header(fingerprint: dict, scope_trainable_params=None) -> dict:
+    """The JSONL ledger header: the run-config fingerprint every banked arm
+    shares, plus the one model-derived result field a GPU-free replay cannot
+    recompute (``scope_trainable_params``). Older ledgers (written before the
+    GPU-free seal) carry no ``scope_trainable_params``; the seal predicate treats
+    its absence as "not seal-ready" and falls back to the GPU path rather than
+    seal with a missing field."""
+    header = {"type": "header", "fingerprint": fingerprint}
+    if scope_trainable_params is not None:
+        header["scope_trainable_params"] = int(scope_trainable_params)
+    return header
+
+
+def _read_ledger_header(path) -> dict | None:
+    """Read ONLY the ledger's first line (the header), or ``None`` when absent /
+    unparseable / not a header. The GPU-free seal predicate reads the stored
+    fingerprint + ``scope_trainable_params`` from here without ever touching the
+    model — so deciding "can this run seal without the GPU?" is one line of IO.
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        with p.open("r", encoding="utf-8") as fh:
+            rec = json.loads(fh.readline().strip())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(rec, dict) or rec.get("type") != "header":
+        return None
+    return rec
 
 
 def _fingerprint_matches(stored, fingerprint: dict) -> bool:
@@ -1161,7 +1189,8 @@ def load_ledger(path, fingerprint: dict) -> dict:
 
 
 def append_arm_to_ledger(path, fingerprint: dict, spec: dict,
-                         valid_loss: float, provenance) -> None:
+                         valid_loss: float, provenance,
+                         scope_trainable_params=None) -> None:
     """Append one completed arm to the ledger, (re)writing the header first.
 
     When the file is absent or its header fingerprint is stale (a previous
@@ -1171,6 +1200,11 @@ def append_arm_to_ledger(path, fingerprint: dict, spec: dict,
     ``write`` + ``flush`` per arm is the durability unit: an arm is only
     considered banked once its line is on disk, so a crash after the runner
     returns loses at most the in-flight arm.
+
+    ``scope_trainable_params`` is stamped into a fresh header (the one
+    model-derived result field) so a later GPU-free seal can reproduce the
+    deposit without loading the model; it is ignored when the header already
+    matches (the value was recorded on the first arm of this run).
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -1191,9 +1225,83 @@ def append_arm_to_ledger(path, fingerprint: dict, spec: dict,
     }
     with p.open(mode, encoding="utf-8") as fh:
         if write_header:
-            fh.write(json.dumps(_ledger_header(fingerprint)) + "\n")
+            fh.write(
+                json.dumps(_ledger_header(fingerprint, scope_trainable_params)) + "\n"
+            )
         fh.write(json.dumps(rec) + "\n")
         fh.flush()
+
+
+def _ledger_seal_ready(
+    path,
+    *,
+    total_steps, warmup_steps, depth, spacing, seq_len,
+    train_examples, valid_examples, model, scope_label, dataset,
+    max_dataset_rows, use_local_loss, learning_rate, base_seed,
+    architecture, lora_r, lora_alpha, lora_dropout, lora_target_modules,
+    n_candidate, n_surrogate, n_control, n_baseline,
+) -> dict | None:
+    """Is the ledger a complete, config-matched bank of THIS run's arms?
+
+    Returns ``{"active_scope": [...], "scope_trainable_params": int}`` when the
+    ledger fully banks every arm of the requested run — so :func:`run_ci_9b` can
+    assemble the verdict CPU-only (no 9B model load) and :func:`main` can skip
+    the CUDA / free-memory pre-flight gates — or ``None`` when any arm still
+    needs the GPU (no ledger, a stale / pre-seal header, config drift, or arms
+    still missing).
+
+    The active layer scope is the one fingerprint field the model would compute;
+    every OTHER field is known from the run config alone, so this verifies the
+    stored fingerprint matches the requested config on all of them and then
+    TRUSTS the stored ``active_scope`` (deterministic from ``model`` +
+    ``scope_label`` — a matching model/scope reproduces it). The one
+    model-derived RESULT field a replay cannot recompute (``scope_trainable_
+    params``) must be present in the header; an older ledger written before the
+    GPU-free seal returns ``None`` (backward-compat: fall back to the GPU path
+    rather than seal with a missing field).
+    """
+    header = _read_ledger_header(path)
+    if header is None:
+        return None
+    fp = header.get("fingerprint")
+    if not isinstance(fp, dict):
+        return None
+    # Build the requested fingerprint with a placeholder active_scope (verified
+    # separately below — it is the one field this check cannot compute without
+    # the model) and compare every OTHER field to the stored fingerprint.
+    requested = _config_fingerprint(
+        total_steps=total_steps, warmup_steps=warmup_steps, depth=depth,
+        spacing=spacing, seq_len=seq_len, train_examples=train_examples,
+        valid_examples=valid_examples, model=model, scope_label=scope_label,
+        active_scope=[], dataset=dataset, max_dataset_rows=max_dataset_rows,
+        use_local_loss=use_local_loss, base_seed=base_seed,
+        architecture=architecture, learning_rate=learning_rate,
+        lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+        lora_target_modules=lora_target_modules,
+    )
+    for key, val in requested.items():
+        if key == "active_scope":
+            continue
+        if fp.get(key) != val:
+            return None  # config drift — not a replay of THIS run
+    active_scope = fp.get("active_scope")
+    if not isinstance(active_scope, list) or not active_scope:
+        return None
+    scope_trainable = header.get("scope_trainable_params")
+    if not isinstance(scope_trainable, int) or scope_trainable < 0:
+        return None  # pre-seal ledger → fall back to the GPU path
+    # Rebuild the arm specs from the stored scope and confirm every one cached.
+    active_indices = set(active_scope)
+    specs = _arm_specs(
+        active_indices=active_indices, scope_sorted=sorted(active_indices),
+        base_seed=base_seed, depth=depth, n_candidate=n_candidate,
+        n_surrogate=n_surrogate, n_control=n_control, n_baseline=n_baseline,
+    )
+    cached = load_ledger(path, fp)  # fp is the stored fingerprint → matches itself
+    for spec in specs:
+        if (spec["role"], spec["index"]) not in cached:
+            return None  # at least one arm still needs the GPU
+    return {"active_scope": active_scope, "scope_trainable_params": scope_trainable}
 
 
 def _collect_arms(
@@ -1203,6 +1311,7 @@ def _collect_arms(
     ledger_path=None,
     fingerprint=None,
     output=None,
+    scope_trainable_params=None,
 ):
     """Execute the arm specs, banking each to / replaying each from the ledger.
 
@@ -1247,7 +1356,10 @@ def _collect_arms(
         valid_loss, prov = runner(spec)
         collected[role].append((valid_loss, prov))
         if ledger_path is not None:
-            append_arm_to_ledger(ledger_path, fingerprint, spec, valid_loss, prov)
+            append_arm_to_ledger(
+                ledger_path, fingerprint, spec, valid_loss, prov,
+                scope_trainable_params=scope_trainable_params,
+            )
             logger.info(
                 "Ledger banked: %s[%d] (valid_loss=%.6f).",
                 role, spec["index"], valid_loss,
@@ -1384,54 +1496,87 @@ def run_ci_9b(
     and writes no ledger and is byte-identical to a one-shot run.
     """
     scope_label = cfg.training.get("trainable_lora_scope", "all")
-    logger.info("Loading tokenizer + model for %s ...", cfg.model.name_or_path)
-    tokenizer = load_tokenizer(cfg)
-    torch.manual_seed(base_seed)
-    model = load_base_model(cfg)
-    # Heterogeneous per-layer ranks are structural — they must be set at
-    # ``get_peft_model`` time, BEFORE ``configure_trainable_lora_scope`` derives
-    # the active set from the applied LoRA params. So the active scope is read
-    # pre-LoRA from the base model and (under heterogeneous) asserted to match
-    # the post-LoRA scope, so a model-structure surprise fails loud rather than
-    # seeding ranks on the wrong layers.
-    pre_scope = set(_active_scope_pre_lora(model, scope_label))
-    rank_pattern, alpha_pattern, layer_ranks = build_rank_pattern(
-        pre_scope, architecture, base_rank=int(cfg.lora.r),
-    )
-    if architecture == HETEROGENEOUS:
+    # GPU-free seal: if the ledger already banks every arm of THIS run, assemble
+    # the verdict from cached arms WITHOUT loading the 9B model — so a completed
+    # multi-window run that crashed before writing its deposit can still seal on
+    # a busy / no-GPU window. The model load is the ONLY GPU dependency of a
+    # full replay (every arm is cached, so the runner never trains); the one
+    # model-derived result field (scope_trainable_params) is read from the
+    # ledger header by the seal predicate.
+    seal = _ledger_seal_ready(
+        ledger_path,
+        total_steps=total_steps, warmup_steps=warmup_steps, depth=depth,
+        spacing=spacing, seq_len=seq_len, train_examples=train_examples,
+        valid_examples=valid_examples, model=cfg.model.name_or_path,
+        scope_label=scope_label, dataset=dataset, max_dataset_rows=max_dataset_rows,
+        use_local_loss=use_local_loss, base_seed=base_seed, architecture=architecture,
+        learning_rate=float(cfg.training.learning_rate), lora_r=int(cfg.lora.r),
+        lora_alpha=float(cfg.lora.alpha), lora_dropout=float(cfg.lora.dropout),
+        lora_target_modules=cfg.lora.target_modules, n_candidate=n_candidate,
+        n_surrogate=n_surrogate, n_control=n_control, n_baseline=n_baseline,
+    ) if ledger_path is not None else None
+    if seal is not None:
         logger.info(
-            "Heterogeneous architecture: per-layer ranks %s over active scope %s",
-            layer_ranks, sorted(pre_scope),
+            "Ledger fully banks every arm under this config — sealing CPU-only "
+            "(no 9B model load; %d arms cached).",
+            n_candidate + n_surrogate + n_control + n_baseline,
         )
-    model = apply_lora(
-        model, cfg, rank_pattern=rank_pattern, alpha_pattern=alpha_pattern,
-    )
-    _scope_names, active_indices = configure_trainable_lora_scope(model, scope_label)
-    if architecture == HETEROGENEOUS and active_indices != pre_scope:
-        raise RuntimeError(
-            "Pre-LoRA active scope drifted from the post-LoRA scope under "
-            f"heterogeneous ranks: {sorted(pre_scope)} != {sorted(active_indices)}"
+        active_indices = set(seal["active_scope"])
+        scope_trainable = seal["scope_trainable_params"]
+        rank_pattern, alpha_pattern, layer_ranks = build_rank_pattern(
+            active_indices, architecture, base_rank=int(cfg.lora.r),
         )
-    scope_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(
-        "Active scope (%s): %d layers %s (%d trainable params)",
-        scope_label, len(active_indices), sorted(active_indices), scope_trainable,
-    )
+        model = None
+        train_batches, valid_batches = [], []
+    else:
+        logger.info("Loading tokenizer + model for %s ...", cfg.model.name_or_path)
+        tokenizer = load_tokenizer(cfg)
+        torch.manual_seed(base_seed)
+        model = load_base_model(cfg)
+        # Heterogeneous per-layer ranks are structural — they must be set at
+        # ``get_peft_model`` time, BEFORE ``configure_trainable_lora_scope`` derives
+        # the active set from the applied LoRA params. So the active scope is read
+        # pre-LoRA from the base model and (under heterogeneous) asserted to match
+        # the post-LoRA scope, so a model-structure surprise fails loud rather than
+        # seeding ranks on the wrong layers.
+        pre_scope = set(_active_scope_pre_lora(model, scope_label))
+        rank_pattern, alpha_pattern, layer_ranks = build_rank_pattern(
+            pre_scope, architecture, base_rank=int(cfg.lora.r),
+        )
+        if architecture == HETEROGENEOUS:
+            logger.info(
+                "Heterogeneous architecture: per-layer ranks %s over active scope %s",
+                layer_ranks, sorted(pre_scope),
+            )
+        model = apply_lora(
+            model, cfg, rank_pattern=rank_pattern, alpha_pattern=alpha_pattern,
+        )
+        _scope_names, active_indices = configure_trainable_lora_scope(model, scope_label)
+        if architecture == HETEROGENEOUS and active_indices != pre_scope:
+            raise RuntimeError(
+                "Pre-LoRA active scope drifted from the post-LoRA scope under "
+                f"heterogeneous ranks: {sorted(pre_scope)} != {sorted(active_indices)}"
+            )
+        scope_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(
+            "Active scope (%s): %d layers %s (%d trainable params)",
+            scope_label, len(active_indices), sorted(active_indices), scope_trainable,
+        )
 
-    logger.info("Loading + tokenizing Dolly (%s) ...", dataset)
-    records = _load_dolly_records(dataset, max_dataset_rows, base_seed)
-    train_batches = build_real_batches(
-        tokenizer, records, n_examples=train_examples, device=device,
-        max_seq_len=seq_len, offset=0,
-    )
-    valid_batches = build_real_batches(
-        tokenizer, records, n_examples=valid_examples, device=device,
-        max_seq_len=seq_len, offset=train_examples,
-    )
-    logger.info(
-        "Data: %d train batches, %d valid batches (seq_len<=%d, batch_size=1)",
-        len(train_batches), len(valid_batches), seq_len,
-    )
+        logger.info("Loading + tokenizing Dolly (%s) ...", dataset)
+        records = _load_dolly_records(dataset, max_dataset_rows, base_seed)
+        train_batches = build_real_batches(
+            tokenizer, records, n_examples=train_examples, device=device,
+            max_seq_len=seq_len, offset=0,
+        )
+        valid_batches = build_real_batches(
+            tokenizer, records, n_examples=valid_examples, device=device,
+            max_seq_len=seq_len, offset=train_examples,
+        )
+        logger.info(
+            "Data: %d train batches, %d valid batches (seq_len<=%d, batch_size=1)",
+            len(train_batches), len(valid_batches), seq_len,
+        )
 
     cand_order = candidate_order_9b(active_indices)
     scope_sorted = sorted(active_indices)
@@ -1497,7 +1642,7 @@ def run_ci_9b(
     try:
         collected, n_resumed = _collect_arms(
             specs, _runner, ledger_path=ledger_path, fingerprint=fingerprint,
-            output=output,
+            output=output, scope_trainable_params=scope_trainable,
         )
         candidate_results = collected["candidate"]
         surrogate_results = collected["surrogate"]
@@ -2461,16 +2606,66 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("%s", unwritable)
         return 1
 
-    if not torch.cuda.is_available():
-        logger.error("CUDA not available — a real 9B run requires a GPU. Aborting.")
-        return 2
+    # GPU-free seal (mirror of run_ci_9b's check): if the ledger already banks
+    # every arm of THIS run, the verdict assembles CPU-only with no model load —
+    # so the CUDA / free-memory gates that guard a live 9B load must NOT block
+    # it. Without this, a run that banked every arm but crashed before writing
+    # its deposit could NEVER seal on a busy / no-GPU window: every re-fire hit
+    # the CUDA gate (exit 2) or the free-memory gate (exit 75) and deferred
+    # forever, wasting the multi-hour run behind the GPU queue for a result that
+    # needed zero GPU. A seal-ready ledger skips both gates; anything else
+    # (missing arms, stale header, config drift, no ledger) falls through to the
+    # normal live-GPU path.
+    #
+    # A seal is only possible when a ledger EXISTS on disk; with no ledger (or a
+    # partial / stale one) the original contract holds — the CUDA / free-memory
+    # guards fire BEFORE any config load, so a deferred / absent GPU never
+    # touches the config (pinned by the "guard fires before OmegaConf.load"
+    # pre-flight test). cfg is therefore loaded lazily: once, up front, only
+    # when a ledger exists on disk to seal-check; and again on the live-GPU path
+    # otherwise.
+    seal = None
+    cfg = None
+    if args.ledger is not None and Path(args.ledger).exists():
+        cfg = OmegaConf.load(args.config)
+        seal = _ledger_seal_ready(
+            args.ledger,
+            total_steps=args.total_steps, warmup_steps=args.warmup_steps,
+            depth=args.depth, spacing=args.spacing, seq_len=args.seq_len,
+            train_examples=args.train_examples, valid_examples=args.valid_examples,
+            model=cfg.model.name_or_path,
+            scope_label=cfg.training.get("trainable_lora_scope", "all"),
+            dataset=args.dataset, max_dataset_rows=args.max_dataset_rows,
+            use_local_loss=not args.no_local_loss, base_seed=args.base_seed,
+            architecture=args.architecture,
+            learning_rate=float(cfg.training.learning_rate), lora_r=int(cfg.lora.r),
+            lora_alpha=float(cfg.lora.alpha), lora_dropout=float(cfg.lora.dropout),
+            lora_target_modules=cfg.lora.target_modules, n_candidate=args.n_candidate,
+            n_surrogate=args.n_surrogate, n_control=args.n_control,
+            n_baseline=args.n_baseline,
+        )
 
-    deferred = gpu_free_memory_deferred(args.min_free_gib)
-    if deferred is not None:
-        logger.error("%s", deferred)
-        return EXIT_GPU_TEMPFAIL
+    if seal is None:
+        if not torch.cuda.is_available():
+            logger.error("CUDA not available — a real 9B run requires a GPU. Aborting.")
+            return 2
 
-    cfg = OmegaConf.load(args.config)
+        deferred = gpu_free_memory_deferred(args.min_free_gib)
+        if deferred is not None:
+            logger.error("%s", deferred)
+            return EXIT_GPU_TEMPFAIL
+
+        # Live-GPU path: load the config now that the guards have passed (this
+        # is the original position, preserving "guards fire before config load"
+        # for the no-ledger / non-sealed case).
+        if cfg is None:
+            cfg = OmegaConf.load(args.config)
+    else:
+        logger.info(
+            "Ledger fully banks every arm (seal ready) — skipping the CUDA / "
+            "free-memory pre-flight gates; the verdict assembles CPU-only."
+        )
+
     device = resolve_device(args.device)
 
     try:

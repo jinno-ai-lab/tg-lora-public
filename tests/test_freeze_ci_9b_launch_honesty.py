@@ -977,3 +977,247 @@ class TestAssembledResumeFidelity:
         # The direction CI is real (not None): control arms ran, so the
         # candidate-vs-control attribution is present in both deposits.
         assert dep_f["direction"] is not None
+
+
+# ── (11) a fully-banked ledger seals CPU-only — NO 9B model load ───────────────
+#
+# The multi-window launcher banks each arm to the ``--ledger`` across free-GPU
+# windows; that resumable ledger is the architecture that makes a multi-hour 9B
+# run survivable. But the FINAL seal (assemble the verdict from the banked arms
+# + write the deposit) needs NO GPU — every arm is cached. Before this fix
+# ``run_ci_9b`` loaded the 9B model UNCONDITIONALLY (to derive the active scope +
+# ``scope_trainable_params``) BEFORE the replay decision in ``_collect_arms``,
+# and ``main()``'s CUDA-available + free-memory pre-flight gates ran BEFORE
+# ``run_ci_9b``. So a run that banked every arm but crashed before writing its
+# deposit (an OOM in the post-arm cleanup, a host kill, a CWD death at the wire)
+# could NEVER seal: every re-fire hit the GPU gates, and on a busy / no-GPU
+# window it OOM-deferred (exit 75) or CUDA-down'd (exit 2) forever — wasting the
+# whole multi-hour run behind the GPU queue for a result that needed zero GPU.
+# This proves the seal is now GPU-free: a fully-banked re-fire never calls
+# ``load_base_model``, and the sealed deposit reproduces the fresh run's evidence
+# byte-for-byte.
+
+
+class TestAssembledGpuFreeSeal:
+    def _common(self, tmp_path, *, ledger_path, **overrides):
+        kw = dict(
+            cfg=_cpu_cfg(max_steps=6, base_rank=16), device=torch.device("cpu"),
+            seq_len=256, train_examples=4, valid_examples=4, total_steps=6,
+            warmup_steps=1, depth=1, spacing=2, n_candidate=2, n_surrogate=2,
+            base_seed=7, dataset="dolly", max_dataset_rows=12,
+            architecture=HETEROGENEOUS, ledger_path=str(ledger_path),
+        )
+        kw.update(overrides)
+        return kw
+
+    def test_fully_banked_seal_never_loads_the_model(self, monkeypatch, tmp_path):
+        import scripts.run_freeze_validloss_ci_9b as mod
+
+        monkeypatch.setattr(mod, "load_tokenizer", lambda cfg: _CharTokenizer())
+        monkeypatch.setattr(mod, "_load_dolly_records", lambda *a, **kw: _fake_dolly_records())
+        monkeypatch.setattr(mod, "load_base_model", lambda cfg: _tiny_llama(8))
+        monkeypatch.setattr(mod, "arm_valid_loss_9b", _make_toy_arm(base_seed=7))
+
+        ledger = tmp_path / "ledger.jsonl"
+        common = self._common(tmp_path, ledger_path=ledger)
+        # Run 1 banks every arm under the real (stubbed) model load.
+        fresh = result_to_json(run_ci_9b(**common))
+        ledger_lines = [
+            ln for ln in Path(ledger).read_text().splitlines() if ln.strip()
+        ]
+        assert len(ledger_lines) >= 5, "run 1 did not bank a header + 4 arms"
+
+        # Run 2 re-fires against the fully-banked ledger. ``load_base_model`` is
+        # now FATAL — the seal must assemble from cached arms and never reach it.
+        load_calls = {"n": 0}
+
+        def _boom(cfg):
+            load_calls["n"] += 1
+            raise AssertionError(
+                "the fully-banked seal loaded the 9B model — the seal is still "
+                "GPU-gated, so a completed multi-window run cannot finish on a "
+                "busy / no-GPU window."
+            )
+
+        monkeypatch.setattr(mod, "load_base_model", _boom)
+        sealed = result_to_json(run_ci_9b(**common))
+
+        assert load_calls["n"] == 0, (
+            "the fully-banked re-fire called load_base_model — the seal is still "
+            "GPU-gated, so a completed run that crashed before writing its deposit "
+            "would OOM-defer forever behind the GPU queue for a zero-GPU result."
+        )
+        # The GPU-free seal reproduces the fresh run's evidence byte-for-byte
+        # (the §7 fidelity the resume-fidelity invariant pins, in the no-GPU path).
+        assert sealed["evidence_hash"] == fresh["evidence_hash"], (
+            "the GPU-free seal changed the evidence — a corrupt-but-green deposit."
+        )
+        for key in EVIDENCE_HASH_KEYS:
+            assert sealed[key] == fresh[key], (
+                f"evidence field {key!r} differs fresh vs GPU-free-sealed."
+            )
+        # scope_trainable_params is the ONE model-derived field a replay cannot
+        # recompute; it is read from the ledger header, not lost — so the deposit
+        # is field-identical, not just evidence-identical.
+        assert sealed["scope_trainable_params"] == fresh["scope_trainable_params"]
+
+    def test_incomplete_ledger_still_loads_the_model(self, monkeypatch, tmp_path):
+        # A ledger that banks only SOME arms of the requested run must NOT seal
+        # GPU-free — the missing arms still need the GPU. ``load_base_model`` is
+        # reached (and the toy model served) so the missing arms train for real.
+        import scripts.run_freeze_validloss_ci_9b as mod
+
+        monkeypatch.setattr(mod, "load_tokenizer", lambda cfg: _CharTokenizer())
+        monkeypatch.setattr(mod, "_load_dolly_records", lambda *a, **kw: _fake_dolly_records())
+        monkeypatch.setattr(mod, "load_base_model", lambda cfg: _tiny_llama(8))
+        monkeypatch.setattr(mod, "arm_valid_loss_9b", _make_toy_arm(base_seed=7))
+
+        ledger = tmp_path / "ledger.jsonl"
+        # Bank only 2 arms (1 candidate + 1 surrogate) of the SAME config — same
+        # fingerprint, just fewer arms, so the seal check sees a partial bank.
+        run_ci_9b(**self._common(
+            tmp_path, ledger_path=ledger, n_candidate=1, n_surrogate=1,
+        ))
+
+        load_calls = {"n": 0}
+
+        def _count(cfg):
+            load_calls["n"] += 1
+            return _tiny_llama(8)
+
+        monkeypatch.setattr(mod, "load_base_model", _count)
+        # Re-fire the full 4-arm sweep: 2 cached, 2 missing → must train them.
+        run_ci_9b(**self._common(tmp_path, ledger_path=ledger))
+        assert load_calls["n"] >= 1, (
+            "a partial ledger (arms still missing) sealed GPU-free — the missing "
+            "arms would never train, producing a corrupt deposit (GOAL §7)."
+        )
+
+    def test_main_seals_fully_banked_ledger_with_cuda_down(self, monkeypatch, tmp_path):
+        """The launch path's killer proof: a CUDA-DOWN host (exit 2 forever under
+        the pre-seal behavior) seals a fully-banked verdict to rc=0 via main().
+
+        Banks every arm of a real (toy-stubbed) run, then makes CUDA completely
+        unavailable and re-fires through ``main`` itself (not ``run_ci_9b``
+        directly). With the GPU-free seal, main() recognizes the fully-banked
+        ledger, skips the CUDA gate, and assembles the deposit CPU-only — so a
+        completed multi-window run that crashed before writing its deposit
+        finishes on a host with NO GPU at all. The arm runner is fatal (it must
+        not be reached: the seal replays from the ledger) and the deposit's
+        evidence is byte-identical to the fresh run (§7 fidelity at the main()
+        seam)."""
+        import scripts.run_freeze_validloss_ci_9b as mod
+
+        monkeypatch.setattr(mod, "load_tokenizer", lambda cfg: _CharTokenizer())
+        monkeypatch.setattr(mod, "_load_dolly_records", lambda *a, **kw: _fake_dolly_records())
+        monkeypatch.setattr(mod, "load_base_model", lambda cfg: _tiny_llama(8))
+        monkeypatch.setattr(mod, "arm_valid_loss_9b", _make_toy_arm(base_seed=7))
+
+        cfg = _cpu_cfg(max_steps=6, base_rank=16)
+        ledger = tmp_path / "ledger.jsonl"
+        cfg_path = tmp_path / "cfg.yaml"
+        out = tmp_path / "deposit.json"
+        OmegaConf.save(cfg, cfg_path)
+
+        # Run 1: bank every arm under the real (stubbed) model load.
+        fresh = result_to_json(run_ci_9b(**self._common(tmp_path, ledger_path=ledger)))
+
+        # Run 2: CUDA is now UNAVAILABLE. Pre-seal, main() exits 2 here and the
+        # banked run could NEVER finish — the exact multi-window trap the seal
+        # closes. The arm runner is made FATAL: the seal must replay, not train.
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+        def _boom_arm(*a, **kw):  # noqa: ARG001
+            raise AssertionError(
+                "the arm runner trained on a fully-banked seal — the CUDA gate "
+                "was not skipped, so a sealed run still needs the GPU."
+            )
+
+        monkeypatch.setattr(mod, "arm_valid_loss_9b", _boom_arm)
+
+        rc = mod.main([
+            "--config", str(cfg_path),
+            "--seq-len", "256", "--train-examples", "4", "--valid-examples", "4",
+            "--total-steps", "6", "--warmup-steps", "1", "--depth", "1",
+            "--spacing", "2", "--n-candidate", "2", "--n-surrogate", "2",
+            "--base-seed", "7", "--dataset", "dolly", "--max-dataset-rows", "12",
+            "--architecture", str(HETEROGENEOUS),
+            "--ledger", str(ledger), "--output", str(out),
+        ])
+
+        assert rc == 0, (
+            f"a CUDA-DOWN host must seal a fully-banked verdict to rc=0, got {rc} "
+            "— the CUDA gate blocked a zero-GPU result (the multi-window trap)."
+        )
+        assert out.exists(), "the sealed deposit was not written to --output."
+        sealed = json.loads(out.read_text())
+        assert sealed["evidence_hash"] == fresh["evidence_hash"], (
+            "main()'s GPU-free seal changed the evidence — a corrupt-but-green deposit."
+        )
+
+
+class TestLedgerSealReadyGate:
+    """Unit-pins the seal-decision predicate the GPU-free path + main() gate-skip
+    both rely on — the edge cases the integration test above cannot reach
+    (config drift, an old pre-seal ledger, no ledger at all)."""
+
+    def _kwargs(self, tmp_path, **overrides):
+        from scripts.run_freeze_validloss_ci_9b import _ledger_seal_ready
+        kw = dict(
+            total_steps=6, warmup_steps=1, depth=1, spacing=2, seq_len=256,
+            train_examples=4, valid_examples=4, model="tiny-llama-stub",
+            scope_label="last_25_percent", dataset="dolly", max_dataset_rows=12,
+            use_local_loss=True, learning_rate=1e-4, base_seed=7,
+            architecture=HETEROGENEOUS, lora_r=16, lora_alpha=32, lora_dropout=0.0,
+            lora_target_modules="all-linear", n_candidate=2, n_surrogate=2,
+            n_control=0, n_baseline=0,
+        )
+        kw.update(overrides)
+        return _ledger_seal_ready, kw
+
+    def test_no_ledger_is_not_seal_ready(self, tmp_path):
+        _gate, kw = self._kwargs(tmp_path)
+        assert _gate(str(tmp_path / "absent.jsonl"), **kw) is None
+
+    def test_config_drift_is_not_seal_ready(self, monkeypatch, tmp_path):
+        # A ledger banked under a DIFFERENT config (here: a different base_rank →
+        # different lora_r fingerprint) is not a replay of THIS run.
+        _gate, kw = self._kwargs(tmp_path)
+        _bank_a_full_ledger(monkeypatch, tmp_path, base_rank=32)  # lora_r=32
+        # Requested config has lora_r=16 → drift → None.
+        assert _gate(str(tmp_path / "ledger.jsonl"), **kw) is None
+
+    def test_old_ledger_without_scope_trainable_is_not_seal_ready(
+        self, monkeypatch, tmp_path,
+    ):
+        # A ledger written BEFORE the GPU-free-seal field existed (no
+        # scope_trainable_params in the header) must NOT seal — fall back to the
+        # GPU path rather than seal with a missing model-derived field.
+        _gate, kw = self._kwargs(tmp_path)
+        _bank_a_full_ledger(monkeypatch, tmp_path, base_rank=16)
+        # Strip scope_trainable_params from the header to emulate an old ledger.
+        ledger = tmp_path / "ledger.jsonl"
+        lines = ledger.read_text().splitlines()
+        header = json.loads(lines[0])
+        header.pop("scope_trainable_params", None)
+        lines[0] = json.dumps(header)
+        ledger.write_text("\n".join(lines) + "\n")
+        assert _gate(str(ledger), **kw) is None
+
+
+def _bank_a_full_ledger(monkeypatch, tmp_path, *, base_rank):
+    """Bank a complete heterogeneous ledger under ``base_rank`` so a seal-ready
+    check has a real (config-matched, every-arm-cached) ledger to reason about."""
+    import scripts.run_freeze_validloss_ci_9b as mod
+
+    monkeypatch.setattr(mod, "load_tokenizer", lambda cfg: _CharTokenizer())
+    monkeypatch.setattr(mod, "load_base_model", lambda cfg: _tiny_llama(8))
+    monkeypatch.setattr(mod, "_load_dolly_records", lambda *a, **kw: _fake_dolly_records())
+    monkeypatch.setattr(mod, "arm_valid_loss_9b", _make_toy_arm(base_seed=7))
+    run_ci_9b(
+        cfg=_cpu_cfg(max_steps=6, base_rank=base_rank), device=torch.device("cpu"),
+        seq_len=256, train_examples=4, valid_examples=4, total_steps=6,
+        warmup_steps=1, depth=1, spacing=2, n_candidate=2, n_surrogate=2,
+        base_seed=7, dataset="dolly", max_dataset_rows=12, architecture=HETEROGENEOUS,
+        ledger_path=str(tmp_path / "ledger.jsonl"),
+    )
