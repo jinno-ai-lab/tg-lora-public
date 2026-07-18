@@ -926,6 +926,22 @@ class OutputPathDiedDuringRun(RuntimeError):
     """
 
 
+def _normalize_target_modules(target_modules):
+    """Canonical LoRA ``target_modules`` for the resume-ledger fingerprint.
+
+    PEFT accepts either a keyword (``"all-linear"``) or a list of module-name
+    suffixes (``["q_proj", "v_proj"]``); the list is matched as a SET, so its
+    order is not meaningful, and OmegaConf may hand back a ``ListConfig``. This
+    normalizes so two runs over the same modules — regardless of list order or
+    container typing — produce one fingerprint, while a different module SET
+    (or keyword) distinguishes. Strings pass through unchanged, so
+    ``"all-linear"`` never collides with an explicit module list.
+    """
+    if isinstance(target_modules, str):
+        return target_modules
+    return sorted(str(m) for m in target_modules)
+
+
 def _config_fingerprint(
     *,
     total_steps: int,
@@ -942,6 +958,10 @@ def _config_fingerprint(
     use_local_loss: bool,
     base_seed: int,
     architecture: str = HOMOGENEOUS,
+    lora_r: int,
+    lora_alpha: float,
+    lora_dropout: float,
+    lora_target_modules,
 ) -> dict:
     """The run-config identity that defines an arm's result.
 
@@ -956,6 +976,16 @@ def _config_fingerprint(
     so a heterogeneous run never reuses a homogeneous arm banked in a ledger
     (or vice versa). ``ledger_version`` gates the whole shape: a future schema
     change reads as a stale ledger.
+
+    The LoRA adapter config (``lora_r`` / ``lora_alpha`` / ``lora_dropout`` /
+    ``lora_target_modules`` — the four fields :func:`apply_lora` realizes) is
+    included because ALL four change the arm's training, so a ledger banked
+    under one LoRA config must NOT replay under another. ``lora_r`` is
+    load-bearing under ``HETEROGENEOUS``: it sets the WHOLE per-layer geometric
+    schedule (the §4 experimental variable, via
+    :func:`heterogeneous_ranks_9b`), so without it a heterogeneous re-run at a
+    different base rank would share this fingerprint and silently replay
+    wrong-rank arms — a corrupt-but-green §4 verdict (GOAL §7).
     """
     return {
         "ledger_version": LEDGER_VERSION,
@@ -973,6 +1003,10 @@ def _config_fingerprint(
         "use_local_loss": bool(use_local_loss),
         "base_seed": int(base_seed),
         "architecture": str(architecture),
+        "lora_r": int(lora_r),
+        "lora_alpha": float(lora_alpha),
+        "lora_dropout": float(lora_dropout),
+        "lora_target_modules": _normalize_target_modules(lora_target_modules),
     }
 
 
@@ -1404,6 +1438,10 @@ def run_ci_9b(
         scope_label=scope_label, active_scope=sorted(active_indices),
         dataset=dataset, use_local_loss=use_local_loss, base_seed=base_seed,
         architecture=architecture,
+        lora_r=int(cfg.lora.r),
+        lora_alpha=float(cfg.lora.alpha),
+        lora_dropout=float(cfg.lora.dropout),
+        lora_target_modules=cfg.lora.target_modules,
     )
     if ledger_path is not None:
         logger.info(

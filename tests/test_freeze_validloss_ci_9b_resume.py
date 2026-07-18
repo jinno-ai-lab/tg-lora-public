@@ -52,6 +52,8 @@ def _fp(**overrides):
         model="Qwen/Qwen3.5-9B", scope_label="last_25_percent",
         active_scope=SCOPE_SORTED, dataset="databricks/databricks-dolly-15k",
         use_local_loss=True, base_seed=0,
+        lora_r=16, lora_alpha=32.0, lora_dropout=0.0,
+        lora_target_modules="all-linear",
     )
     kw.update(overrides)
     return _config_fingerprint(**kw)
@@ -122,6 +124,40 @@ def test_fingerprint_changes_with_use_local_loss():
 def test_fingerprint_carries_ledger_version():
     """A future schema bump reads as stale via the embedded version."""
     assert _fp()["ledger_version"] == LEDGER_VERSION
+
+
+def test_fingerprint_changes_with_lora_rank():
+    """Under HETEROGENEOUS ``lora_r`` sets the whole geometric schedule (the §4
+    experimental variable), so a re-run at a different base rank must NOT replay
+    a ledger banked at the old rank — else a corrupt-but-green verdict (GOAL §7).
+    """
+    assert _fp(lora_r=16) != _fp(lora_r=32)
+
+
+def test_fingerprint_changes_with_lora_alpha():
+    """``lora_alpha`` is the LoRA scaling magnitude ``apply_lora`` realizes; a
+    change reseeds the arm, so the ledger must not replay the old-alpha arms."""
+    assert _fp(lora_alpha=32.0) != _fp(lora_alpha=64.0)
+
+
+def test_fingerprint_changes_with_lora_dropout():
+    """``lora_dropout`` changes the arm's regularization; the ledger must not
+    replay arms trained under a different dropout."""
+    assert _fp(lora_dropout=0.0) != _fp(lora_dropout=0.1)
+
+
+def test_fingerprint_changes_with_lora_target_modules():
+    """A different ``target_modules`` set changes which weights get an adapter;
+    the ledger must not replay arms wired to a different module set. List order
+    is not meaningful, so the normalized form must not collide on a reorder.
+    """
+    assert _fp(lora_target_modules="all-linear") != _fp(
+        lora_target_modules=["q_proj", "v_proj"]
+    )
+    # List order is canonicalized — the same set in a different order matches.
+    assert _fp(lora_target_modules=["q_proj", "v_proj"]) == _fp(
+        lora_target_modules=["v_proj", "q_proj"]
+    )
 
 
 # --- ledger I/O --------------------------------------------------------------

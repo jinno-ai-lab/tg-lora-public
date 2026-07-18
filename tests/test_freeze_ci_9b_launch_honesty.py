@@ -430,3 +430,81 @@ class TestAssembledLaunchReadiness:
         # a verdict painted on that disagrees with the floats fails here.
         assert loaded["candidate_mean"] < loaded["surrogate_mean"]
         assert loaded["verdict"] in ("SURPASSES", "TIES", "UNDERSHOOTS")
+
+
+# ── (6) a LoRA-config change does not replay stale ledger arms ────────────────
+#
+# The five invariants above each pin a per-commit fix in isolation. This one
+# pins the gap the assembled dry-run surfaced on THIS iteration: the resume-
+# ledger fingerprint is the SOLE config-gate (``load_ledger`` replays an arm
+# iff its header fingerprint matches exactly), yet it carried no LoRA adapter
+# config. Under HETEROGENEOUS, ``lora_r`` sets the WHOLE per-layer geometric
+# schedule — the §4 experimental variable itself — so a re-run at a different
+# base rank shared the old run's fingerprint and silently replayed its
+# WRONG-RANK arms from the ledger: a corrupt-but-green §4 verdict (GOAL §7
+# cardinal failure). The fix threads lora_r / lora_alpha / lora_dropout /
+# target_modules into ``_config_fingerprint``; this proves at the assembled
+# scale that the second run re-executes every arm rather than replaying them.
+
+
+class TestAssembledLoraFingerprintGate:
+    def test_heterogeneous_rerun_at_new_base_rank_re_executes_not_replays(
+        self, monkeypatch, tmp_path,
+    ):
+        import scripts.run_freeze_validloss_ci_9b as mod
+
+        monkeypatch.setattr(mod, "load_tokenizer", lambda cfg: _CharTokenizer())
+        monkeypatch.setattr(mod, "load_base_model", lambda cfg: _tiny_llama(8))
+        monkeypatch.setattr(
+            mod, "_load_dolly_records", lambda *a, **kw: _fake_dolly_records()
+        )
+
+        calls = {"n": 0}
+        base_toy = _make_toy_arm(base_seed=7)
+
+        def _counting_arm(*a, **kw):
+            calls["n"] += 1
+            return base_toy(*a, **kw)
+
+        monkeypatch.setattr(mod, "arm_valid_loss_9b", _counting_arm)
+        ledger_path = str(tmp_path / "ledger.jsonl")
+        common = dict(
+            device=torch.device("cpu"), seq_len=256, train_examples=4,
+            valid_examples=4, total_steps=6, warmup_steps=1, depth=1,
+            spacing=2, n_candidate=2, n_surrogate=2, base_seed=7,
+            dataset="dolly", max_dataset_rows=12, architecture=HETEROGENEOUS,
+            ledger_path=ledger_path,
+        )
+
+        # First run at base rank 16 banks all 4 arms (2 candidate + 2 surrogate).
+        calls["n"] = 0
+        run1 = run_ci_9b(cfg=_cpu_cfg(max_steps=6, base_rank=16), **common)
+        assert run1["resumed_arm_count"] == 0
+        assert calls["n"] == 4, (
+            f"the rank-16 run invoked the arm runner {calls['n']} time(s), "
+            "expected 4 (2 candidate + 2 surrogate) — harness setup drift."
+        )
+
+        # Second run at base rank 32 — a DIFFERENT geometric schedule, i.e. a
+        # genuinely different §4 experiment — against the SAME ledger. Before the
+        # fix the fingerprints matched and these 4 arms replayed silently from
+        # the rank-16 ledger; after the fix lora_r distinguishes them so every
+        # arm re-runs. The replay would be silent: the toy arm is seed-based, so
+        # a replayed arm's LOSS is identical — only the replay COUNT (and the
+        # differing lora_rank_pattern) exposes the corruption.
+        calls["n"] = 0
+        run2 = run_ci_9b(cfg=_cpu_cfg(max_steps=6, base_rank=32), **common)
+        assert run2["resumed_arm_count"] == 0, (
+            "the rank-32 heterogeneous re-run replayed rank-16 arms from the "
+            "ledger — the LoRA-config fingerprint gate (GOAL §7) regressed: "
+            f"resumed {run2['resumed_arm_count']} arm(s) instead of re-executing."
+        )
+        assert calls["n"] == 4, (
+            f"the rank-32 re-run invoked the arm runner {calls['n']} time(s), "
+            "expected 4 — stale rank-16 ledger arms were silently replayed "
+            "under a different per-layer rank schedule."
+        )
+        # The two runs ARE different experiments (different per-layer ranks), so
+        # a replay would have seeded the verdict with arms trained under the
+        # wrong schedule — the corrupt-but-green case the gate exists to prevent.
+        assert run1["lora_rank_pattern"] != run2["lora_rank_pattern"]
