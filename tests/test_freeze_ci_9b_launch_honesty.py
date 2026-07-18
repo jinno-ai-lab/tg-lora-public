@@ -674,3 +674,151 @@ class TestAssembledMaxDatasetRowsFingerprintGate:
         # corruption signal: the two runs share every deposit-visible field yet
         # are different experiments (different train/valid record content).
         assert run1["lora_rank_pattern"] == run2["lora_rank_pattern"]
+
+
+# ── (9) EVERY fingerprint dim re-executes at assembled scale, not just the 3 ──
+#
+# Siblings (6)/(7)/(8) proved three dims (lora_r / learning_rate /
+# max_dataset_rows) re-execute rather than silently replay. But
+# ``_config_fingerprint`` gates ~13 OTHER run-determining fields
+# (total_steps, warmup_steps, depth, spacing, seq_len, train_examples,
+# valid_examples, use_local_loss, base_seed, dataset, lora_alpha,
+# lora_dropout, lora_target_modules) — each one changes an arm's result, and
+# each was only ever proven as a pure-function unit assertion
+# (``test_fingerprint_changes_with_*`` in test_freeze_validloss_ci_9b_resume.py),
+# NEVER at the assembled scale. The assembled scale is where a WIRING gap would
+# hide: the dim flows into ``arm_valid_loss_9b`` (so it changes the result) but
+# not into the ``_config_fingerprint`` call in ``run_ci_9b`` (so the ledger
+# fingerprint matches and the 2nd run replays the 1st's now-WRONG arms) — or the
+# reverse. A unit test on the pure ``_config_fingerprint`` function cannot catch
+# that, because the unit test never runs ``run_ci_9b``'s wiring.
+#
+# This parametrizes the same two-run replay check (6)/(7)/(8) use across every
+# remaining dim — the directive's "EXPECT >=1 invariant to fail at integration
+# scale that passed in isolation" applied to the FULL fingerprint, not just the
+# three newest dims. A silent replay here is the corrupt-but-green §4 verdict
+# (GOAL §7) the gate exists to prevent.
+
+
+def _cfg_full(**deep_overrides):
+    """``_cpu_cfg`` extended to override ANY lora/training/model field, so the
+    cfg-sourced fingerprint dims (alpha / dropout / target_modules) can be
+    varied in the same two-run replay check as the kwarg-sourced dims. Mirrors
+    ``_cpu_cfg``'s shape exactly (the baseline path here is byte-identical to a
+    ``_cpu_cfg(max_steps=6, base_rank=16)`` run)."""
+    base = {
+        "model": {"name_or_path": "tiny-llama-stub", "load_in_4bit": False},
+        "training": {
+            "trainable_lora_scope": "last_25_percent",
+            "learning_rate": 1e-4, "max_steps": 6, "gradient_checkpointing": False,
+        },
+        "lora": {"r": 16, "alpha": 32, "dropout": 0.0, "target_modules": "all-linear"},
+    }
+    for section, overrides in deep_overrides.items():
+        base[section] = {**base.get(section, {}), **overrides}
+    return OmegaConf.create(base)
+
+
+def _replay_check(monkeypatch, tmp_path, *, run2_kw=None, run2_cfg_overrides=None):
+    """Run the assembled heterogeneous path twice against ONE ledger; return
+    ``(run2_resumed_arm_count, run2_arm_calls)``.
+
+    Run 1 banks 4 arms (2 candidate + 2 surrogate) under the baseline config.
+    Run 2 re-runs against the SAME ledger with exactly one fingerprint dim
+    varied (a kwarg dim via ``run2_kw``, or a cfg dim via ``run2_cfg_overrides``).
+    If that dim is wired into ``_config_fingerprint`` the two fingerprints
+    differ, run 2 ignores the stale ledger, and every arm re-executes
+    (``resumed_arm_count == 0`` and the arm runner fires 4×). A silent replay
+    (``resumed_arm_count > 0`` or fewer than 4 calls) is the corrupt-but-green
+    §4 failure (GOAL §7) the gate exists to prevent — and the signal the per-dim
+    unit tests structurally cannot produce.
+    """
+    import scripts.run_freeze_validloss_ci_9b as mod
+
+    monkeypatch.setattr(mod, "load_tokenizer", lambda cfg: _CharTokenizer())
+    monkeypatch.setattr(mod, "load_base_model", lambda cfg: _tiny_llama(8))
+    monkeypatch.setattr(mod, "_load_dolly_records", lambda *a, **kw: _fake_dolly_records())
+
+    calls = {"n": 0}
+    base_toy = _make_toy_arm(base_seed=7)
+
+    def _counting_arm(*a, **kw):
+        calls["n"] += 1
+        return base_toy(*a, **kw)
+
+    monkeypatch.setattr(mod, "arm_valid_loss_9b", _counting_arm)
+    ledger_path = str(tmp_path / "ledger.jsonl")
+    common = dict(
+        device=torch.device("cpu"), seq_len=256, train_examples=4,
+        valid_examples=4, total_steps=6, warmup_steps=1, depth=1, spacing=2,
+        n_candidate=2, n_surrogate=2, base_seed=7, dataset="dolly",
+        max_dataset_rows=12, architecture=HETEROGENEOUS, ledger_path=ledger_path,
+    )
+
+    calls["n"] = 0
+    run1 = run_ci_9b(cfg=_cfg_full(), **common)
+    assert run1["resumed_arm_count"] == 0, "baseline run banked from a stale ledger"
+    assert calls["n"] == 4, (
+        f"baseline run invoked the arm runner {calls['n']}x, expected 4 "
+        "(2 candidate + 2 surrogate) — harness setup drift."
+    )
+
+    run2_kw_final = {**common, **(run2_kw or {})}
+    calls["n"] = 0
+    run2 = run_ci_9b(
+        cfg=_cfg_full(**(run2_cfg_overrides or {})), **run2_kw_final,
+    )
+    return run2["resumed_arm_count"], calls["n"]
+
+
+# One fingerprint dim varied per case; the rest held at the (6)/(7)/(8)
+# baseline. Each variation is a genuine §4-experiment change (different
+# training length / freeze depth / context length / data slice / loss regime /
+# seed / dataset / LoRA adapter), so a replay under it would seed the verdict
+# with arms trained under the WRONG config — the corrupt-but-green case.
+_REPLAY_DIMS = [
+    pytest.param(dict(run2_kw={"total_steps": 8}), id="total_steps"),
+    pytest.param(dict(run2_kw={"warmup_steps": 2}), id="warmup_steps"),
+    pytest.param(dict(run2_kw={"depth": 2}), id="depth"),
+    pytest.param(dict(run2_kw={"spacing": 3}), id="spacing"),
+    pytest.param(dict(run2_kw={"seq_len": 192}), id="seq_len"),
+    pytest.param(dict(run2_kw={"train_examples": 3}), id="train_examples"),
+    pytest.param(dict(run2_kw={"valid_examples": 3}), id="valid_examples"),
+    pytest.param(dict(run2_kw={"use_local_loss": False}), id="use_local_loss"),
+    pytest.param(dict(run2_kw={"base_seed": 11}), id="base_seed"),
+    pytest.param(dict(run2_kw={"dataset": "dolly-15k"}), id="dataset"),
+    pytest.param(
+        dict(run2_cfg_overrides={"lora": {"alpha": 64}}), id="lora_alpha",
+    ),
+    pytest.param(
+        dict(run2_cfg_overrides={"lora": {"dropout": 0.1}}), id="lora_dropout",
+    ),
+    pytest.param(
+        dict(run2_cfg_overrides={"lora": {"target_modules": ["q_proj", "v_proj"]}}),
+        id="lora_target_modules",
+    ),
+]
+
+
+class TestAssembledFingerprintGateAllDims:
+    """The three sibling gates (6)/(7)/(8) cover lora_r / lr / max_dataset_rows.
+    This class closes the remaining coverage: every OTHER ``_config_fingerprint``
+    dim, proven at the assembled scale the unit tests cannot reach."""
+
+    @pytest.mark.parametrize("variation", _REPLAY_DIMS)
+    def test_dim_change_re_executes_not_replays(
+        self, monkeypatch, tmp_path, variation, request,
+    ):
+        dim = request.node.callspec.id
+        resumed, calls = _replay_check(monkeypatch, tmp_path, **variation)
+        assert resumed == 0, (
+            f"the {dim} re-run replayed stale ledger arms — that fingerprint "
+            f"dim is wired into the arm but NOT into the ``_config_fingerprint`` "
+            f"call in run_ci_9b (GOAL §7 corrupt-but-green §4 verdict): resumed "
+            f"{resumed} arm(s) instead of re-executing."
+        )
+        assert calls == 4, (
+            f"the {dim} re-run invoked the arm runner {calls}x, expected 4 — "
+            f"stale ledger arms were silently replayed under a different "
+            f"run-config (corrupt-but-green, GOAL §7)."
+        )
