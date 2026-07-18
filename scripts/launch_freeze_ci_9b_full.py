@@ -26,7 +26,21 @@ Worker exit-code contract (``scripts/run_freeze_validloss_ci_9b.py``, lines
     2  CUDA unavailable                    -> FATAL (operator: not retryable here)
     3  IncompleteResumeError (torn ledger) -> RETRY (re-run fills the gap)
     75 GPU free-memory tempfail OR run-time CUDA OOM (contention) -> RETRY (wait for a free-GPU window)
-    other                                  -> FATAL (do not infinite-loop on the unknown)
+    -N worker killed by signal N           -> RETRY (transient host event; see below)
+    other positive                         -> FATAL (do not infinite-loop on the unknown)
+
+    ``-N`` (signal-kill): on POSIX a NEGATIVE returncode means *exclusively* "the
+    child was terminated by signal N" — it is never "the subprocess never started"
+    (a failed exec returns a POSITIVE 127; a missing interpreter raises
+    FileNotFoundError in the launcher before any returncode exists). So ``-9`` is
+    always "the worker was SIGKILLed" — on a contended shared host (the exact
+    scenario this launcher exists for) that is the OOM-killer terminating the
+    5.5 GiB+ 9B worker, a TRANSIENT event where the ``--ledger`` has banked arms
+    and a re-fire on the next window completes the run. Treating it as FATAL
+    strands the multi-hour run on one contended-host kill — the same class as the
+    run-time-OOM-as-FATAL bug the ``is_cuda_oom`` tempfail (4afc5e9) closed. The
+    retry is bounded by ``--max-attempts`` / ``--deadline-seconds`` so a genuinely
+    broken worker surfaces ``RETRIES_EXHAUSTED`` instead of spinning forever.
 
 Run detached, e.g.::
 
@@ -103,6 +117,16 @@ def classify_exit_code(code: int, *, resume_sleep: float, tempfail_sleep: float)
     expressed here so it can be unit-pinned. ``resume_sleep`` (exit 3, re-run
     fills the gap *now*) is deliberately shorter than ``tempfail_sleep`` (exit
     75, wait for a *free-GPU window*).
+
+    A NEGATIVE ``code`` is a signal-kill (POSIX: the child was terminated by
+    signal ``-code``; e.g. ``-9`` = SIGKILL). On a contended shared host that is
+    the OOM-killer reclaiming the 9B worker mid-window — a *transient* event
+    where the ``--ledger`` has banked arms and a re-fire completes the run — so
+    it classifies as RETRY with ``tempfail_sleep`` (wait for a stable /
+    free-GPU window), the same branch exit 75 takes. A POSITIVE code outside the
+    contract (e.g. 127 = exec-failure) stays FATAL — it is not a host-imposed
+    kill and retrying it would loop on a non-transient failure. See the module
+    docstring for the full rationale (sibling of the 4afc5e9 run-time-OOM fix).
     """
     if code == EXIT_DONE:
         return Decision(Action.DONE, "success", 0.0)
@@ -114,6 +138,12 @@ def classify_exit_code(code: int, *, resume_sleep: float, tempfail_sleep: float)
         return Decision(Action.FATAL, "cuda_down", 0.0)
     if code == EXIT_UNEXPECTED:
         return Decision(Action.FATAL, "unexpected", 0.0)
+    if code < 0:
+        # Signal-kill: transient host event (OOM-killer / host SIGTERM), NOT a
+        # logic error — retry the next window; the --ledger banks progress. The
+        # bound (max_attempts / deadline_seconds) prevents infinite spinning on
+        # a genuinely-broken worker.
+        return Decision(Action.RETRY, "signal", tempfail_sleep)
     return Decision(Action.FATAL, "unknown", 0.0)
 
 

@@ -96,17 +96,41 @@ class TestClassifyExitCode:
         assert d.action is Action.FATAL
         assert d.kind == "unexpected"
 
-    def test_unknown_nonzero_is_fatal(self):
-        # An exit code outside the documented contract must NOT be silently retried
-        # (that would infinite-loop on an unforeseen failure mode).
-        d = classify_exit_code(99, resume_sleep=30, tempfail_sleep=120)
+    def test_unknown_positive_is_fatal(self):
+        # A POSITIVE exit code outside the documented contract (e.g. 127 = the
+        # interpreter's exec-failure / "command not found") must NOT be silently
+        # retried — that would infinite-loop on an unforeseen, non-transient
+        # failure mode. (A missing interpreter never reaches here at all: it raises
+        # FileNotFoundError in the launcher before a returncode exists.)
+        d = classify_exit_code(127, resume_sleep=30, tempfail_sleep=120)
         assert d.action is Action.FATAL
         assert d.kind == "unknown"
 
-    def test_negative_signal_is_fatal(self):
-        # A subprocess that never started (returncode -N) is not a tempfail.
-        d = classify_exit_code(-9, resume_sleep=30, tempfail_sleep=120)
-        assert d.action is Action.FATAL
+    def test_negative_signal_is_retriable_tempfail(self):
+        # On POSIX a NEGATIVE returncode means *exclusively* "the child was
+        # terminated by signal N" — it is never "the subprocess never started"
+        # (a failed exec returns a POSITIVE 127; a missing interpreter raises
+        # FileNotFoundError before any returncode exists). So returncode -9 is
+        # always "the worker was SIGKILLed" — on a contended shared host (the
+        # exact scenario this launcher exists for) that is the OOM-killer
+        # terminating the 5.5 GiB+ 9B worker: a TRANSIENT event where the
+        # --ledger has banked arms and a re-fire on the next window completes
+        # the run. Stranding the multi-hour run behind a FATAL here is the same
+        # class as the run-time-OOM-as-FATAL bug the 4afc5e9 tempfail fix
+        # closed — so a signal-kill classifies as RETRY (wait for a stable /
+        # free-GPU window via tempfail_sleep), bounded by --max-attempts /
+        # --deadline-seconds so a genuinely-broken worker surfaces
+        # RETRIES_EXHAUSTED instead of spinning forever.
+        for signum, code in [(9, -9), (15, -15), (6, -6), (11, -11)]:
+            d = classify_exit_code(code, resume_sleep=30, tempfail_sleep=120)
+            assert d.action is Action.RETRY, (
+                f"signal -{signum} (returncode {code}) classified {d.action.value} "
+                f"({d.kind}) — a host-killed worker is transient contention the "
+                "launcher must retry, not a fatal (GOAL §7: banked arms stranded "
+                "behind a contended-host kill)."
+            )
+            assert d.kind == "signal"
+            assert d.sleep_seconds == 120  # wait for a free-GPU / stable window
 
 
 class TestRunLoop:
@@ -148,6 +172,22 @@ class TestRunLoop:
         assert result.outcome is Outcome.DONE
         assert result.attempts == 2
         assert sleeps == [30]
+
+    def test_signal_kill_then_done(self):
+        # The contended-host kill the launcher exists to survive: the worker is
+        # SIGKILLed mid-window (returncode -9 — e.g. the OOM-killer reclaims the
+        # card), the launcher backs off for a free-GPU window (tempfail_sleep),
+        # and the re-fire completes the run with the banked arms intact. This is
+        # the run-loop-level proof of the signal→RETRY classification: a FATAL
+        # here would strand the multi-hour run on one contended-host kill.
+        runner = _FakeRunner([-9, 0])
+        sleeps: list[float] = []
+        result = self._loop(runner, sleep=sleeps.append)
+        assert result.outcome is Outcome.DONE
+        assert result.last_code == 0
+        assert result.attempts == 2
+        assert sleeps == [120]  # one signal backoff (tempfail_sleep) before success
+        assert len(runner.calls) == 2  # killed worker re-fired, not abandoned
 
     def test_cuda_down_is_fatal_immediately(self):
         runner = _FakeRunner([2])
