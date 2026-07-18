@@ -955,6 +955,7 @@ def _config_fingerprint(
     scope_label: str,
     active_scope,
     dataset: str,
+    max_dataset_rows: int,
     use_local_loss: bool,
     learning_rate: float,
     base_seed: int,
@@ -996,6 +997,19 @@ def _config_fingerprint(
     silently replayed: without this field that replay would share the
     fingerprint and seed the new run with wrong-``lr`` arms — the same
     corrupt-but-green §4 verdict (GOAL §7) the other fields prevent.
+
+    ``max_dataset_rows`` is included because :func:`_load_dolly_records` draws the
+    first ``max_dataset_rows`` records from the dataset and then shuffles that
+    POOL with ``random.Random(base_seed)`` — and a Fisher–Yates shuffle of a list
+    of length N yields a different permutation than one of length M even under the
+    same seed. The train/valid batches are then sliced (``offset=0`` /
+    ``offset=train_examples``) from that shuffled order, so two runs that share
+    every other field but differ in ``max_dataset_rows`` train on DIFFERENT record
+    content — a genuinely different §4 experiment. Without this field an operator
+    resuming an interrupted run after shrinking ``max_dataset_rows`` (e.g. for a
+    faster re-download) would hit a matching fingerprint and silently replay arms
+    trained on the larger pool's data subset — corrupt-but-green (GOAL §7), the
+    same class as the ``lora_r`` (4ad9a73) and ``learning_rate`` (d6af3cd) gaps.
     """
     return {
         "ledger_version": LEDGER_VERSION,
@@ -1010,6 +1024,7 @@ def _config_fingerprint(
         "scope_label": str(scope_label),
         "active_scope": list(active_scope),
         "dataset": str(dataset),
+        "max_dataset_rows": int(max_dataset_rows),
         "use_local_loss": bool(use_local_loss),
         "learning_rate": float(learning_rate),
         "base_seed": int(base_seed),
@@ -1447,7 +1462,8 @@ def run_ci_9b(
         spacing=spacing, seq_len=seq_len, train_examples=train_examples,
         valid_examples=valid_examples, model=cfg.model.name_or_path,
         scope_label=scope_label, active_scope=sorted(active_indices),
-        dataset=dataset, use_local_loss=use_local_loss, base_seed=base_seed,
+        dataset=dataset, max_dataset_rows=max_dataset_rows,
+        use_local_loss=use_local_loss, base_seed=base_seed,
         architecture=architecture, learning_rate=lr,
         lora_r=int(cfg.lora.r),
         lora_alpha=float(cfg.lora.alpha),

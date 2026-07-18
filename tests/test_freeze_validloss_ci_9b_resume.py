@@ -51,6 +51,7 @@ def _fp(**overrides):
         seq_len=1024, train_examples=600, valid_examples=64,
         model="Qwen/Qwen3.5-9B", scope_label="last_25_percent",
         active_scope=SCOPE_SORTED, dataset="databricks/databricks-dolly-15k",
+        max_dataset_rows=4000,
         use_local_loss=True, base_seed=0, learning_rate=2.0e-4,
         lora_r=16, lora_alpha=32.0, lora_dropout=0.0,
         lora_target_modules="all-linear",
@@ -129,6 +130,19 @@ def test_fingerprint_changes_with_learning_rate():
     ``lora_r`` gap (4ad9a73) for the most-edited hyperparameter.
     """
     assert _fp(learning_rate=1.0e-4) != _fp(learning_rate=2.0e-4)
+
+
+def test_fingerprint_changes_with_max_dataset_rows():
+    """``_load_dolly_records`` shuffles the first ``max_dataset_rows`` records
+    with ``random.Random(base_seed)``, and a Fisher–Yates shuffle of a list of
+    length N permutes differently than one of length M under the SAME seed — so
+    the train/valid slice (``offset=0`` / ``offset=train_examples``) lands on
+    DIFFERENT record content. Two runs that differ only in ``max_dataset_rows``
+    are therefore different §4 experiments; a ledger banked at one pool size must
+    NOT replay under another — else corrupt-but-green (GOAL §7), the same class
+    as the ``lora_r`` (4ad9a73) and ``learning_rate`` (d6af3cd) gaps.
+    """
+    assert _fp(max_dataset_rows=1000) != _fp(max_dataset_rows=4000)
 
 
 def test_fingerprint_carries_ledger_version():

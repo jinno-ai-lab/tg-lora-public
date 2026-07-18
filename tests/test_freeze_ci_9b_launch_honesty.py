@@ -591,3 +591,86 @@ class TestAssembledLearningRateFingerprintGate:
         # so the re-execution count above is the SOLE corruption signal: the two
         # runs share every deposit-visible field yet are different experiments.
         assert run1["lora_rank_pattern"] == run2["lora_rank_pattern"]
+
+
+# ── (8) a max_dataset_rows change does not replay stale ledger arms ───────────
+#
+# Sibling of (6)/(7) for the DATA-SAMPLING dimension the resume-ledger
+# fingerprint missed: ``max_dataset_rows``. ``_load_dolly_records`` draws the
+# first ``max_dataset_rows`` records and shuffles that POOL with
+# ``random.Random(base_seed)``; a Fisher–Yates shuffle of a length-N list
+# permutes differently than one of length-M under the SAME seed, so the
+# train/valid slice (``offset=0`` / ``offset=train_examples``) lands on DIFFERENT
+# record content. Two runs differing only in ``max_dataset_rows`` are therefore
+# different §4 experiments, yet before the fix they shared a fingerprint and the
+# 2nd replayed the 1st's arms — corrupt-but-green (GOAL §7), the same class as
+# the ``lora_r`` (4ad9a73) and ``learning_rate`` (d6af3cd) gaps. The fix threads
+# ``max_dataset_rows`` into ``_config_fingerprint``; this proves at the assembled
+# scale that the second run re-executes every arm rather than replaying them.
+
+
+class TestAssembledMaxDatasetRowsFingerprintGate:
+    def test_heterogeneous_rerun_at_new_pool_size_re_executes_not_replays(
+        self, monkeypatch, tmp_path,
+    ):
+        import scripts.run_freeze_validloss_ci_9b as mod
+
+        monkeypatch.setattr(mod, "load_tokenizer", lambda cfg: _CharTokenizer())
+        monkeypatch.setattr(mod, "load_base_model", lambda cfg: _tiny_llama(8))
+        monkeypatch.setattr(
+            mod, "_load_dolly_records", lambda *a, **kw: _fake_dolly_records()
+        )
+
+        calls = {"n": 0}
+        base_toy = _make_toy_arm(base_seed=7)
+
+        def _counting_arm(*a, **kw):
+            calls["n"] += 1
+            return base_toy(*a, **kw)
+
+        monkeypatch.setattr(mod, "arm_valid_loss_9b", _counting_arm)
+        ledger_path = str(tmp_path / "ledger.jsonl")
+        common = dict(
+            cfg=_cpu_cfg(max_steps=6, base_rank=16),
+            device=torch.device("cpu"), seq_len=256, train_examples=4,
+            valid_examples=4, total_steps=6, warmup_steps=1, depth=1,
+            spacing=2, n_candidate=2, n_surrogate=2, base_seed=7,
+            dataset="dolly", architecture=HETEROGENEOUS,
+            ledger_path=ledger_path,
+        )
+
+        # First run with a 12-record pool banks all 4 arms (2 candidate + 2
+        # surrogate).
+        calls["n"] = 0
+        run1 = run_ci_9b(max_dataset_rows=12, **common)
+        assert run1["resumed_arm_count"] == 0
+        assert calls["n"] == 4, (
+            f"the pool-12 run invoked the arm runner {calls['n']} time(s), "
+            "expected 4 (2 candidate + 2 surrogate) — harness setup drift."
+        )
+
+        # Second run with a 4000-record pool — a DIFFERENT seeded shuffle, i.e.
+        # different train/valid record content (a genuinely different §4
+        # experiment) — against the SAME ledger. Before the fix the fingerprints
+        # matched (max_dataset_rows was not in the gate) and these 4 arms
+        # replayed silently from the pool-12 ledger; after the fix
+        # max_dataset_rows distinguishes them so every arm re-runs. The replay
+        # would be silent: the toy arm is seed-based, so a replayed arm's LOSS is
+        # identical at either pool size — only the replay COUNT exposes it.
+        calls["n"] = 0
+        run2 = run_ci_9b(max_dataset_rows=4000, **common)
+        assert run2["resumed_arm_count"] == 0, (
+            "the pool-4000 heterogeneous re-run replayed pool-12 arms from the "
+            "ledger — the max_dataset_rows fingerprint gate (GOAL §7) regressed: "
+            f"resumed {run2['resumed_arm_count']} arm(s) instead of re-executing."
+        )
+        assert calls["n"] == 4, (
+            f"the pool-4000 re-run invoked the arm runner {calls['n']} time(s), "
+            "expected 4 — stale pool-12 ledger arms were silently replayed under "
+            "a different data-subsample shuffle (corrupt-but-green, GOAL §7)."
+        )
+        # max_dataset_rows leaves no separate deposit field (unlike lora_r →
+        # lora_rank_pattern), so the re-execution count above is the SOLE
+        # corruption signal: the two runs share every deposit-visible field yet
+        # are different experiments (different train/valid record content).
+        assert run1["lora_rank_pattern"] == run2["lora_rank_pattern"]
