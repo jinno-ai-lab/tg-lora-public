@@ -200,6 +200,20 @@ class TestIsGpuOomError:
     def test_string_not_exception(self):
         assert is_gpu_oom_error("out of memory") is False
 
+    def test_accelerator_error_device_dispatch_oom(self):
+        # torch 2.12+ can surface a CUDA OOM through torch.AcceleratorError — a
+        # RuntimeError sibling that is NOT a torch.cuda.OutOfMemoryError. Both
+        # production trainers (train_tg_lora / train_baseline_qlora) classify a
+        # deferrable OOM via is_gpu_oom_error, and the freeze-ci-9b harness fixed
+        # this exact sibling class (is_cuda_oom). If this predicate stops
+        # recognizing the device-dispatch path, a contended-GPU OOM is
+        # misclassified as a fatal cuda_error and the AGENTS.md exit-3 defer/retry
+        # contract silently breaks — so pin it on the real exception type.
+        ae = getattr(torch, "AcceleratorError", None)
+        if ae is None:
+            pytest.skip("torch.AcceleratorError absent (pre-2.12 torch)")
+        assert is_gpu_oom_error(ae("CUDA out of memory. Tried to allocate 3725.29 GiB.")) is True
+
 
 # ── resolve_compute_dtype ──────────────────────────────────────────
 

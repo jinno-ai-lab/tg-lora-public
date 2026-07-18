@@ -4528,7 +4528,27 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
             exc,
         )
     except RuntimeError as exc:
-        if _is_cuda_error(exc):
+        from src.utils.device import is_gpu_oom_error
+
+        if is_gpu_oom_error(exc):
+            # torch 2.12+ can surface a device-dispatch CUDA OOM as
+            # torch.AcceleratorError — a RuntimeError sibling that is NOT a
+            # torch.cuda.OutOfMemoryError, so the dedicated OOM handler above
+            # (``except torch.cuda.OutOfMemoryError``) does not catch it and it
+            # lands here. This branch MUST precede ``_is_cuda_error``: an OOM
+            # message carries "CUDA", so the cuda_error check (exit 2, fatal)
+            # would otherwise swallow it and a contended-GPU OOM during TG-LoRA
+            # training would crash instead of deferring to the next free window
+            # (exit 3). Same sibling-exception class ``train_baseline_qlora.py``
+            # enforces (``reason = "oom" if is_gpu_oom_error(exc) else
+            # "cuda_error"``) and the freeze-ci-9b harness fixed (``is_cuda_oom``).
+            fault_reason = "oom"
+            logger.warning(
+                "GPU out of memory (OOM) at cycle %d: %s — saving fault checkpoint",
+                cycle_state.cycle,
+                exc,
+            )
+        elif _is_cuda_error(exc):
             fault_reason = "cuda_error"
             logger.warning(
                 "GPU error at cycle %d: %s — saving fault checkpoint",
@@ -4594,7 +4614,17 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
             best_full_eval_loss = full_loss
             best_full_eval_perplexity = full_result.perplexity
             save_checkpoint(model, tokenizer, run_dir / "best_model")
-    except torch.cuda.OutOfMemoryError:
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as _eval_oom:
+        from src.utils.device import is_gpu_oom_error
+
+        if not is_gpu_oom_error(_eval_oom):
+            raise
+        # Same sibling-exception gap as the fault handler above: a device-dispatch
+        # OOM (torch.AcceleratorError) is not a torch.cuda.OutOfMemoryError, so a
+        # bare ``except torch.cuda.OutOfMemoryError`` would miss it and crash an
+        # otherwise-successful run at the final eval. Gate on is_gpu_oom_error so
+        # any OOM path (classic or device-dispatch) skips the eval gracefully and
+        # a non-OOM RuntimeError still propagates.
         logger.warning("Final full eval skipped: OOM on 12GB GPU. Training results are still valid.")
         cycle_state.record_full_eval(float("inf"))
 

@@ -142,3 +142,96 @@ def test_agents_md_documents_exit_code_contract() -> None:
     assert "defer" in text.lower(), (
         "AGENTS.md must state the 'defer and retry' semantics for the OOM exit code"
     )
+
+
+def test_trainer_classifies_device_dispatch_oom_before_cuda_error() -> None:
+    """A torch 2.12 device-dispatch CUDA OOM surfaces as torch.AcceleratorError.
+
+    That is a RuntimeError sibling that is NOT a torch.cuda.OutOfMemoryError, so
+    the TG-LoRA trainer's dedicated OOM handler (``except
+    torch.cuda.OutOfMemoryError``) does NOT catch it — it falls through to the
+    generic ``except RuntimeError`` handler. That handler must classify it as the
+    deferrable ``oom`` (exit 3) via ``is_gpu_oom_error`` BEFORE the
+    ``_is_cuda_error`` branch: an AcceleratorError OOM message carries "CUDA", so
+    the cuda_error check (exit 2, fatal) would otherwise swallow a deferrable OOM
+    and a contended-GPU OOM during TG-LoRA training would crash instead of
+    deferring. Same sibling-exception class ``train_baseline_qlora.py`` enforces
+    and the freeze-ci-9b harness fixed (``is_cuda_oom``). Static + mutation-safe:
+    drop the branch, or reorder it after ``_is_cuda_error``, and this fails loud.
+    """
+    text = TRAINER_PY.read_text()
+    marker = "except RuntimeError as exc:"
+    start = text.find(marker)
+    assert start != -1, (
+        "train_tg_lora.py must have an `except RuntimeError as exc:` fault handler"
+    )
+    rest = text[start:]
+    # The block ends at the next sibling `except`/`finally` at the same indent.
+    block_end = len(rest)
+    for kw in ("\n    except ", "\n    finally:"):
+        idx = rest.find(kw, 1)
+        if idx != -1:
+            block_end = min(block_end, idx)
+    block = rest[:block_end]
+
+    oom_idx = block.find("is_gpu_oom_error(exc)")
+    assert oom_idx != -1, (
+        "The RuntimeError handler must classify an OOM via is_gpu_oom_error(exc) "
+        "so a torch 2.12 AcceleratorError device-dispatch OOM (a RuntimeError "
+        "sibling the dedicated OOM handler misses) routes to `oom` (exit 3), not "
+        "cuda_error (exit 2)"
+    )
+    cuda_idx = block.find("_is_cuda_error(exc)")
+    assert cuda_idx != -1, (
+        "The RuntimeError handler must retain its _is_cuda_error(exc) cuda_error branch"
+    )
+    assert oom_idx < cuda_idx, (
+        "is_gpu_oom_error(exc) must be checked BEFORE _is_cuda_error(exc): an "
+        "AcceleratorError OOM message contains 'CUDA', so the cuda_error branch "
+        "would otherwise reclassify a deferrable OOM as a fatal fault (exit 2)"
+    )
+    assert 'fault_reason = "oom"' in block, (
+        'The is_gpu_oom_error branch must set fault_reason = "oom" (exit 3 defer)'
+    )
+
+
+def test_trainer_eval_skip_handler_catches_device_dispatch_oom() -> None:
+    """The final-full-eval OOM-skip handler must catch the device-dispatch path too.
+
+    A bare ``except torch.cuda.OutOfMemoryError`` (the pre-fix form) misses the
+    torch 2.12 AcceleratorError sibling, so an eval-time device-dispatch OOM
+    would crash an otherwise-successful run instead of gracefully skipping the
+    eval (the handler's documented intent: "Training results are still valid").
+    It must catch the RuntimeError family and gate on ``is_gpu_oom_error`` so any
+    OOM path skips the eval while a non-OOM RuntimeError still propagates. Static
+    + mutation-safe: revert to the bare OOM except, or drop the gate, → fail.
+    """
+    text = TRAINER_PY.read_text()
+    needle = "Final full eval skipped: OOM on 12GB GPU."
+    lines = text.splitlines()
+    try:
+        target = next(i for i, ln in enumerate(lines) if needle in ln)
+    except StopIteration:
+        raise AssertionError(
+            "eval-skip OOM handler with its canonical log line must remain"
+        )
+    # Nearest preceding line that IS an except clause (lstrip'd). A substring
+    # rfind would match the word "except" inside the handler's own comment
+    # (``except torch.cuda.OutOfMemoryError``), so scan whole lines instead.
+    try:
+        except_no = next(
+            i for i in range(target - 1, -1, -1) if lines[i].lstrip().startswith("except ")
+        )
+    except StopIteration:
+        raise AssertionError("an `except` clause must own the eval-skip log line")
+    except_line = lines[except_no]
+    assert "RuntimeError" in except_line, (
+        "the eval-skip OOM handler must catch the RuntimeError family (so the "
+        "torch.AcceleratorError device-dispatch OOM sibling is caught), not only "
+        "torch.cuda.OutOfMemoryError"
+    )
+    span = "\n".join(lines[except_no:target])
+    assert "is_gpu_oom_error" in span, (
+        "the eval-skip handler must gate on is_gpu_oom_error so a device-dispatch "
+        "OOM skips the eval while a non-OOM RuntimeError still propagates"
+    )
