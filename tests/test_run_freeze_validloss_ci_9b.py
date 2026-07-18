@@ -20,8 +20,9 @@ guard the GPU-free core that makes that verdict honest and replayable:
   zeroed, ``lora_A`` re-randomized per seed, scope grads re-enabled (un-freezing
   the prior arm's frozen layers).
 * :func:`result_to_json` — the deposit's GOAL §7 honesty labels
-  (``proxy_scale=False``, ``reduced_budget=True``, ``citable_as_target_scale=
-  True`` but NOT ``citable_as_full_section4_verdict``).
+  (``proxy_scale=False``, ``citable_as_target_scale=True``; ``reduced_budget``
+  and ``citable_as_full_section4_verdict`` are runtime-determined by the 4-axis
+  gate — a full-budget generalization-regime run clears both).
 * **Deposit replay faithfulness** — the committed real-9B recording
   (``freeze_validloss_ci_9b_surrogate.json``, a real RTX 3060 seq1024 run)
   re-judges through :func:`surrogate_valid_loss_ci` to the ``SURPASSES`` verdict
@@ -48,6 +49,7 @@ import torch
 from omegaconf import OmegaConf
 from torch import nn
 
+import scripts.run_freeze_validloss_ci_9b as ci9b
 from scripts.run_freeze_validloss_ci_9b import (
     ARCHITECTURES,
     HETEROGENEOUS,
@@ -3680,4 +3682,40 @@ def test_assert_dolly_schema_passes_dolly_row():
         "databricks/databricks-dolly-15k",
         {"instruction": "x", "context": "", "response": "y"},
     )
+
+
+class TestModuleDocstringAccurate:
+    """The module ``__doc__`` must not contradict the tested 4-axis citation gate.
+
+    The deposit's :attr:`~scripts.run_freeze_validloss_ci_9b.result_to_json`
+    labels ``reduced_budget`` / ``citable_as_full_section4_verdict`` are
+    **runtime-determined** by :func:`_is_reduced_budget` and the four-axis
+    :func:`_full_section4_verdict_gate` (exercised in ``test_honesty_labels_*``
+    above). An earlier docstring revision hardcoded ``reduced_budget=True`` /
+    ``citable_as_full_section4_verdict=False`` and called the tool "the first
+    real-9B sample" — all false once full-budget citable verdicts shipped (the
+    homogeneous + heterogeneous full deposits, both
+    ``citable_as_full_section4_verdict=True``). These pins keep ``__doc__``
+    honest so an agent reading it does not conclude the tool is
+    reduced-budget-only (the stale framing that re-asks to "fire the run" after
+    the measurement already landed).
+    """
+
+    DOC = ci9b.__doc__ or ""
+
+    def test_docstring_acknowledges_both_budget_outcomes(self):
+        """``reduced_budget`` is runtime-determined; ``__doc__`` must present
+        BOTH the reduced-smoke and full-budget paths, not reduced-only."""
+        assert "reduced_budget=True" in self.DOC
+        assert "reduced_budget=False" in self.DOC
+
+    def test_docstring_surfaces_citable_full_verdict_path(self):
+        """``__doc__`` must state that a full-budget run can clear
+        ``citable_as_full_section4_verdict`` (both such verdicts have landed)."""
+        assert "citable_as_full_section4_verdict=True" in self.DOC
+
+    def test_docstring_drops_stale_first_sample_framing(self):
+        """The 'first real-9B sample' framing is stale — the §4 verdict program
+        is complete (two citable full-budget verdicts on disk)."""
+        assert "It is the *first*" not in self.DOC
 

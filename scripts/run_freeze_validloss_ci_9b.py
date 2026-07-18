@@ -46,12 +46,16 @@ filtered-data run).
 
 Honesty (GOAL §7)
 -----------------
-This is a **real 9B + real data** A/B (``proxy_scale=False``), but a
-**reduced-budget** one: few seeds and short training, not the config's full
-``max_steps=1500`` multi-seed run. The deposit therefore carries
+This is a **real 9B + real data** A/B (``proxy_scale=False``). The budget and
+citation axes are **runtime-determined**, not fixed by the script: a short
+``--total-steps`` smoke (few seeds, short of ``max_steps``) deposits
 ``reduced_budget=True`` and ``citable_as_full_section4_verdict=False`` — the
-same honesty shape as the seq256 reduced probe (``e99e3c7``). It is the *first*
-real-9B real-data A/B sample; whatever the bootstrap CI says
+same honesty shape as the seq256 reduced probe (``e99e3c7``); a full-budget run
+(``make freeze-validloss-ci-9b-full`` homogeneous / ``-heterogeneous``) reaches
+``max_steps=1500`` on a sized train set and, in generalization regime, deposits
+``reduced_budget=False`` with ``citable_as_full_section4_verdict=True``. Both
+citable full §4 verdicts have now landed (TIES at full budget in the
+generalization regime); whatever the bootstrap CI says
 (``SURPASSES`` / ``TIES`` / ``UNDERSHOOTS``) is the measurement, never
 pre-decided.
 
@@ -2315,7 +2319,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Qwen/Qwen3.5-9B QLoRA (suffix-only scope) on real public Dolly data "
             "for an output-first candidate vs random-order surrogates, and feeds "
             "the real valid_loss samples to surrogate_valid_loss_ci "
-            "(proxy_scale=False, reduced budget)."
+            "(proxy_scale=False; budget and citability are runtime-determined "
+            "by --total-steps)."
         ),
     )
     p.add_argument("--config", default=DEFAULT_CONFIG, help="9B config to bind.")
