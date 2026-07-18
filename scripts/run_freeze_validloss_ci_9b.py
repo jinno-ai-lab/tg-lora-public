@@ -246,6 +246,34 @@ def build_sft_example(
     }
 
 
+_REQUIRED_DOLLY_FIELDS = ("instruction", "response")
+
+
+def _assert_dolly_schema(dataset: str, row) -> None:
+    """Fail loud when ``dataset`` records lack the Dolly instruction/response fields.
+
+    A missing field otherwise silently becomes ``""`` via ``row.get(..., "")``,
+    and :func:`build_sft_example` then turns an all-empty record into a
+    **non-skipped degenerate example**: the ChatML user/assistant markers alone
+    tokenize to a supervised tail (the empty-response terminator) that is NOT
+    all-``-100``, so :func:`build_real_batches` keeps it rather than dropping it.
+    The arm would then train on ``n_examples`` identical junk examples and STILL
+    emit a ``valid_loss`` — a corrupt-but-green §4 verdict (GOAL §7). This is the
+    one latent gap on the private-``src.data`` drop-in path (the sole remaining
+    open item): when that dataset lands, a schema mismatch must abort the run
+    rather than measure nothing and call the number a verdict.
+    """
+    missing = [k for k in _REQUIRED_DOLLY_FIELDS if k not in row]
+    if missing:
+        raise ValueError(
+            f"Dataset {dataset!r} records lack required field(s) {missing}; "
+            f"expected Dolly-style instruction/context/response. A schema "
+            f"mismatch must NOT silently fall back to empty records — the SFT "
+            f"builder would emit degenerate-but-non-skipped examples and yield "
+            f"a corrupt-but-green §4 verdict (GOAL §7)."
+        )
+
+
 def _load_dolly_records(
     dataset: str, max_rows: int, seed: int
 ) -> list[dict]:
@@ -254,6 +282,11 @@ def _load_dolly_records(
     Seeded locally so candidate and surrogate arms see the identical record
     order independent of the global RNG / arm call order (the same
     reproducibility property :func:`make_batches` gives the proxy harness).
+
+    The first row is schema-checked (:func:`_assert_dolly_schema`) so a
+    non-Dolly dataset aborts loudly instead of silently feeding empty/degenerate
+    records downstream — the DATA-axis honesty guard for the private-``src.data``
+    drop-in path.
     """
     import random as _random
     from datasets import load_dataset
@@ -263,6 +296,8 @@ def _load_dolly_records(
     for i, row in enumerate(ds):
         if i >= max_rows:
             break
+        if i == 0:
+            _assert_dolly_schema(dataset, row)
         records.append(
             {
                 "instruction": row.get("instruction", ""),

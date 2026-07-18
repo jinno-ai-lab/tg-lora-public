@@ -58,6 +58,7 @@ from scripts.run_freeze_validloss_ci_9b import (
     REGIME_OVERFIT,
     REGIME_UNKNOWN,
     _active_scope_pre_lora,
+    _assert_dolly_schema,
     _baseline_ci_to_json,
     _candidate_cost_reduction,
     _candidate_final_ce_mean,
@@ -67,6 +68,7 @@ from scripts.run_freeze_validloss_ci_9b import (
     _full_section4_verdict_gate,
     _gather_arm_curves,
     _is_reduced_budget,
+    _load_dolly_records,
     _reset_lora_for_arm,
     _run_log_payload,
     _run_log_sha256,
@@ -3591,4 +3593,91 @@ class TestHeterogeneousRankPattern:
                 if m:
                     ranks.setdefault(int(m.group(1)), set()).add(p.shape[0])
         assert all(v == {16} for v in ranks.values())
+
+
+# --- _load_dolly_records schema guard (DATA-axis honesty, GOAL §7) -----------
+# The real loader body (the ``datasets.load_dataset`` path) is NOT exercised by
+# the launch-honesty suite, which mocks ``_load_dolly_records`` whole with
+# Dolly-shaped fakes. These tests drive the REAL body by patching
+# ``datasets.load_dataset`` — including the schema-mismatch case that would
+# silently corrupt the §4 verdict on the private-``src.data`` drop-in path.
+
+
+def _fake_load_dataset(rows):
+    """A stand-in for ``datasets.load_dataset(..., streaming=True)``.
+
+    Returns a fresh iterator over ``rows`` each call, mimicking an iterable
+    streaming split (no network, no ``datasets`` build).
+    """
+
+    def _load(dataset, split="train", streaming=True):
+        return iter(list(rows))
+
+    return _load
+
+
+def test_load_dolly_records_rejects_schema_mismatch(monkeypatch):
+    """A dataset whose rows lack ``instruction``/``response`` must ABORT, not
+    silently feed empty records. With the bare ``.get(..., "")`` fallback every
+    record became all-empty → :func:`build_sft_example` emitted N identical
+    degenerate (non-skipped) examples → a corrupt-but-green §4 verdict (GOAL
+    §7). This is the latent gap on the private-``src.data`` drop-in path: when
+    that dataset lands, a wrong schema must fail loud, not measure nothing.
+
+    Mutation proof — remove the ``_assert_dolly_schema`` call in
+    :func:`_load_dolly_records` and this test goes RED (the loader would return
+    8 empty records instead of raising).
+    """
+    import datasets
+
+    wrong_schema = [{"prompt": f"q{i}", "completion": f"a{i}"} for i in range(8)]
+    monkeypatch.setattr(datasets, "load_dataset", _fake_load_dataset(wrong_schema))
+    with pytest.raises(ValueError, match="lack required field"):
+        _load_dolly_records("some/private-sft", max_rows=8, seed=7)
+
+
+def test_load_dolly_records_accepts_dolly_schema(monkeypatch):
+    """Byte-identical to the pre-guard behavior when the Dolly fields ARE
+    present: records are extracted and shuffled under the seeded RNG. The guard
+    never fires for the real dataset, so no committed verdict or fixture moves.
+    """
+    import datasets
+
+    rows = [
+        {"instruction": f"inst {i}", "context": "", "response": f"resp {i}"}
+        for i in range(8)
+    ]
+    monkeypatch.setattr(datasets, "load_dataset", _fake_load_dataset(rows))
+    out = _load_dolly_records(
+        "databricks/databricks-dolly-15k", max_rows=8, seed=7
+    )
+    # Same count + identical content set (shuffle permutes in place only).
+    assert len(out) == 8
+    assert {tuple(sorted(r.items())) for r in out} == {
+        (
+            ("context", ""),
+            ("instruction", f"inst {i}"),
+            ("response", f"resp {i}"),
+        )
+        for i in range(8)
+    }
+
+
+def test_assert_dolly_schema_message_names_dataset_and_fields():
+    """The error must name the dataset AND the missing field(s) so the operator
+    on the drop-in path knows exactly what schema to adapt."""
+    with pytest.raises(ValueError) as excinfo:
+        _assert_dolly_schema("org/private-sft", {"text": "only a text field"})
+    msg = str(excinfo.value)
+    assert "org/private-sft" in msg
+    assert "instruction" in msg and "response" in msg
+
+
+def test_assert_dolly_schema_passes_dolly_row():
+    """A Dolly-shaped row (instruction+response present) passes silently — the
+    guard is byte-identical for the real dataset. ``context`` is optional."""
+    _assert_dolly_schema(
+        "databricks/databricks-dolly-15k",
+        {"instruction": "x", "context": "", "response": "y"},
+    )
 
