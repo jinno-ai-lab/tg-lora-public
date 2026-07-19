@@ -1121,6 +1121,61 @@ class TestReducedContextProvenanceGuard:
         assert replay_samples(data).significance_verdict == SURPASSES
 
 
+class TestFullContextSeqLenOverridesFlag:
+    """The citation gate derives ``full_context`` from the artifact (``seq_len``)
+    over the operator-set flag — the full-context sibling of
+    ``_negative_control_active`` / ``9dff092``. A hand-edited or externally-
+    supplied deposit (the private-``src.data`` 9B drop-in path this harness
+    replays) that trained at reduced context must not be over-cited as the full
+    §4 verdict because the ``full_context`` flag is absent (default True) or
+    stale-True; ``seq_len`` is authoritative. Each test pins one branch of the
+    derivation and is mutation-proven against "trust the stored boolean alone"."""
+
+    def test_seq_len_overrides_absent_full_context_default_at_gate(self):
+        # The corruption this guard closes: a genuine target-scale recording that
+        # OMITS full_context (defaulting True) yet trained at seq_len=256. Trusting
+        # the default would over-cite it as the FULL §4 verdict; the artifact must
+        # withhold the claim.
+        data = _data([1.0] * 4, [2.0] * 4, proxy_scale=False)  # full_context absent
+        assert "full_context" not in data  # self-check: the default path IS the gap
+        data["seq_len"] = 256
+        out = replay_to_json("<9b-gap>", data, replay_samples(data))
+        assert out["full_context"] is False             # derived from seq_len, not default
+        assert out["citable_as_target_scale"] is True   # genuine 9B is still target-scale
+        assert out["citable_as_full_section4_verdict"] is False  # NOT the full verdict
+
+    def test_seq_len_overrides_explicit_false_full_context_flag(self):
+        # Symmetric: seq_len>=1024 overrides an explicit (stale) full_context=False,
+        # so a full-context run cannot be UNDER-cited because of a stale label.
+        data = _data([1.0] * 4, [2.0] * 4, proxy_scale=False, full_context=False)
+        data["seq_len"] = 1024
+        out = replay_to_json("<9b-overrides>", data, replay_samples(data))
+        assert out["full_context"] is True              # derived from seq_len over the flag
+        assert out["citable_as_full_section4_verdict"] is True
+
+    def test_explicit_full_context_true_refuted_by_seq_len_surfaces_loud(self):
+        # An operator over-claim (full_context=True) contradicted by seq_len=256:
+        # the gate withholds from the artifact and surfaces the contradiction loud
+        # (mirrors BUDGET_DIVERGENCE_UNFLAGGED), never silently trusting the label.
+        data = _data([1.0] * 4, [2.0] * 4, proxy_scale=False, full_context=True)
+        data["full_context"] = True  # explicitly assert the over-claim
+        data["seq_len"] = 256
+        out = replay_to_json("<9b-overclaim>", data, replay_samples(data))
+        text = format_replay("<9b-overclaim>", data, replay_samples(data))
+        assert out["full_context"] is False
+        assert out["citable_as_full_section4_verdict"] is False
+        assert "FULL_CONTEXT_FLAG_REFUTED" in text
+        assert "seq_len=256" in text
+
+    def test_stray_boolean_in_seq_len_does_not_count_as_context_length(self):
+        # A stray True written into seq_len must fall back to the flag, not be read
+        # as a count (bool is a subclass of int — the predicate excludes it).
+        data = _data([1.0] * 4, [2.0] * 4, proxy_scale=False, full_context=True)
+        data["seq_len"] = True
+        out = replay_to_json("<9b-bool>", data, replay_samples(data))
+        assert out["full_context"] is True  # falls back to the absent-flag default
+
+
 # Real 9B target-scale deposit (the feedback's "feed REAL numbers through it")
 
 

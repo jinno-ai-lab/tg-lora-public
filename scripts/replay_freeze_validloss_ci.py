@@ -200,6 +200,48 @@ def _negative_control_active(data: dict[str, Any]) -> bool:
     return _resolve_negative_control_arm(data) is not None
 
 
+def _seq_len_refutes_full_context(data: dict[str, Any]) -> bool:
+    """True when a recorded ``seq_len`` proves the run was NOT full-context.
+
+    A positive numeric ``seq_len < 1024`` is reduced-context (the only config a
+    12GB GPU fits, TASK-0152 lines 86-97); absent / non-numeric / ``>= 1024`` is
+    not a refutation. ``bool`` is excluded so a stray ``True``/``False`` flag
+    written into ``seq_len`` cannot masquerade as a count.
+    """
+    seq_len = data.get("seq_len")
+    if isinstance(seq_len, bool) or not isinstance(seq_len, (int, float)):
+        return False
+    return 0 < seq_len < 1024
+
+
+def _full_context_effective(data: dict[str, Any]) -> bool:
+    """Effective full-context status of a recording (GOAL §4 citation honesty).
+
+    ``full_context`` answers whether the run trained at the full §4
+    ``seq_len=1024``. The producer (``form_freeze_validloss_deposit``) DERIVES the
+    flag from ``seq_len`` (full_context = seq_len >= 1024), so the two agree on
+    every recording a producer writes — but the citation gate must not trust the
+    stored boolean *alone*: a hand-edited or externally-supplied deposit (the
+    private-``src.data`` 9B drop-in path this harness replays) that carries a
+    recorded ``seq_len < 1024`` yet an absent or stale ``full_context=True`` would
+    otherwise read as the *full* §4 verdict, the operator-set label trusted over
+    the machine-checkable artifact reality (the same class as the budget-divergence
+    negative-control gate :func:`_negative_control_active` / commit ``9dff092``
+    and the hand-typed ``best_valid_loss`` TASK-0152 closed). ``seq_len`` is
+    authoritative at the gate whether the flag says so or not; both the prose note
+    and ``citable_as_full_section4_verdict`` consult this so the machine gate and
+    the human report cannot drift apart.
+    """
+    seq_len = data.get("seq_len")
+    # ``seq_len`` is authoritative when it is a positive count: derive the gate's
+    # answer from the artifact rather than the (possibly stale/absent) operator
+    # flag. ``bool`` is excluded (a stray flag written into seq_len must not
+    # count as a context length).
+    if not isinstance(seq_len, bool) and isinstance(seq_len, (int, float)) and seq_len > 0:
+        return seq_len >= 1024
+    return bool(data.get("full_context", True))
+
+
 def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLossCI) -> str:
     """Human-readable replay block: scale, the §4 verdict, and faithfulness.
 
@@ -225,6 +267,12 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
     artifact (budget divergence) as well as the flag (see
     :func:`_negative_control_active`), so a deposit that diverged but left the
     flag unset is still withheld from citation and flagged BUDGET_DIVERGENCE_UNFLAGGED.
+
+    ``full_context`` is derived from ``seq_len`` as well as the flag (see
+    :func:`_full_context_effective`): a recording whose ``seq_len < 1024`` is
+    reduced-context whether the flag says so or not, so a hand-edited deposit that
+    over-claims ``full_context=True`` is still withheld from the full-§4 citation
+    and flagged FULL_CONTEXT_FLAG_REFUTED.
     """
     proxy_scale = bool(data.get("proxy_scale", True))
     synthetic = bool(data.get("synthetic", False))
@@ -235,11 +283,17 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
     # probe from an unflagged divergence the gate caught on its own.
     negative_control_flagged = bool(data.get("negative_control", False))
     negative_control = _negative_control_active(data)
-    # ``full_context`` (default True when absent): did the run train at the full
-    # §4 seq_len=1024? A 12GB probe is seq_len=256 (TASK-0152 lines 86-97) —
-    # genuine 9B / target-scale, but NOT the full verdict, so the strong claim is
-    # withheld. ``seq_len`` lets the REDUCED CONTEXT caveat state the shortfall.
-    full_context = bool(data.get("full_context", True))
+    # The operator-set flag is tracked separately from the EFFECTIVE status: a
+    # recorded ``seq_len < 1024`` makes a run reduced-context whether the flag was
+    # recorded or not (``_full_context_effective``), so the scale-line value
+    # reflects reality while a contradicted over-claim surfaces loud below.
+    full_context_flag_explicit = (
+        "full_context" in data and data.get("full_context") is True
+    )
+    full_context = _full_context_effective(data)
+    full_context_flag_refuted = (
+        full_context_flag_explicit and _seq_len_refutes_full_context(data)
+    )
     seq_len = data.get("seq_len")
     scale = "PROXY" if proxy_scale else "TARGET"
     recorded = data.get("verdict")
@@ -375,6 +429,22 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
                 "an apparatus-sensitivity probe, NOT a §4 order result; do not read "
                 "it as evidence for or against an output-first order advantage."
             )
+    # Full-context over-claim guard (mirrors BUDGET_DIVERGENCE_UNFLAGGED): a
+    # recording that explicitly asserts ``full_context=True`` but carries a
+    # recorded ``seq_len < 1024`` over-claims the context — the citation gate
+    # derives reduced-context from the artifact (seq_len) over the operator-set
+    # label, and surfaces the contradiction loud rather than silently trusting
+    # the stale flag (the stored-boolean-trusted-over-artifact path this guard
+    # closes, sibling of :func:`_negative_control_active` / ``9dff092``).
+    if full_context_flag_refuted:
+        lines.append(
+            "  note: FULL_CONTEXT_FLAG_REFUTED — the recording asserts "
+            f"full_context=True but its recorded seq_len={seq_len} (< 1024) "
+            "refutes it: the citation gate withholds the full-§4 claim from the "
+            "artifact (seq_len), not the stale label. Correct seq_len to >= 1024 "
+            "for a genuine full-context run, or set full_context: false to record "
+            "the reduced-context probe honestly."
+        )
     return "\n".join(lines)
 
 
@@ -403,7 +473,13 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
     # the machine-checkable budget reality over the operator-set label — see
     # ``_negative_control_active``).
     negative_control = _negative_control_active(data)
-    full_context = bool(data.get("full_context", True))
+    # Derived from the artifact (seq_len) as well as the flag, so a deposit that
+    # trained at reduced context but left ``full_context`` unset (or stale-True)
+    # cannot be cited as the *full* §4 verdict (mirrors :func:`format_replay`;
+    # the gate trusts the machine-checkable context length over the operator-set
+    # label — see ``_full_context_effective``, the full-context sibling of
+    # ``_negative_control_active`` / ``9dff092``).
+    full_context = _full_context_effective(data)
     citable_as_target_scale = (
         not proxy_scale and not synthetic and not negative_control
     )
@@ -418,8 +494,8 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         "proxy_scale": proxy_scale,
         "synthetic": synthetic,
         "negative_control": negative_control,
-        # Reduced-context provenance: full §4 seq_len=1024? Default True when
-        # absent (backward compatible). ``seq_len`` records the exact context.
+        # Reduced-context provenance: full §4 seq_len=1024? Derived from seq_len
+        # when recorded, else the (backward-compatible) flag default True.
         "full_context": full_context,
         "seq_len": data.get("seq_len"),
         # Which arm a negative control degraded (from ``negative_control_arm`` or
