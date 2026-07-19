@@ -297,6 +297,47 @@ def _assert_dolly_schema(dataset: str, row) -> None:
         )
 
 
+def _assert_dolly_content_non_empty(
+    dataset: str, index: int, instruction: str, response: str
+) -> None:
+    """Fail loud when a consumed Dolly record has empty instruction/response TEXT.
+
+    The schema guard (:func:`_assert_dolly_schema`) closes the missing-FIELD door
+    (a row lacking ``instruction``/``response``) — but only on the first row. This
+    sibling closes the empty-VALUE door on EVERY consumed row, the same
+    corrupt-but-green hazard the schema guard's docstring describes: a record
+    whose ``response`` is present but empty (or whitespace-only) makes
+    :func:`build_sft_example` format the bare ChatML assistant turn
+    (``"{response}<|im_end|>"`` → just ``"<|im_end|>"``). That terminator tail
+    sits past the masked prompt prefix, so the example's labels are NOT all
+    ``-100`` and :func:`build_real_batches` keeps it rather than dropping it —
+    the arm trains on a junk example and STILL emits a ``valid_loss``, a
+    corrupt-but-green §4 verdict (GOAL §7). An empty ``instruction`` is junk for
+    the matching reason (an empty user turn). ``context`` is legitimately
+    optional in real Dolly, so it is NOT required here.
+
+    Real Dolly records always carry non-empty ``instruction``/``response``, so
+    this guard is byte-identical for the real dataset (it never fires) — it fires
+    for a partially-empty drop-in dataset the way the schema guard fires for a
+    wrong-schema one, the second door into the same hazard. A later row that
+    lacks the key entirely (the schema guard only sees row 0) also reaches here
+    as an empty string via ``.get(..., "")`` and is rejected.
+    """
+    empty = [
+        name
+        for name, value in (("instruction", instruction), ("response", response))
+        if not str(value).strip()
+    ]
+    if empty:
+        raise ValueError(
+            f"Dataset {dataset!r} record {index} has empty/whitespace field(s) "
+            f"{empty}; expected non-empty Dolly instruction/response. An empty "
+            f"response tokenizes to a supervised <|im_end|> terminator tail that "
+            f"build_sft_example does NOT skip, so the arm trains on a junk "
+            f"example and still emits a valid_loss — corrupt-but-green (GOAL §7)."
+        )
+
+
 def _load_dolly_records(
     dataset: str, max_rows: int, seed: int
 ) -> list[dict]:
@@ -307,9 +348,11 @@ def _load_dolly_records(
     reproducibility property :func:`make_batches` gives the proxy harness).
 
     The first row is schema-checked (:func:`_assert_dolly_schema`) so a
-    non-Dolly dataset aborts loudly instead of silently feeding empty/degenerate
-    records downstream — the DATA-axis honesty guard for the private-``src.data``
-    drop-in path.
+    non-Dolly dataset aborts loudly, and EVERY consumed row is content-checked
+    (:func:`_assert_dolly_content_non_empty`) so a record with an empty
+    instruction/response aborts loudly too — instead of silently feeding
+    empty/degenerate records downstream. Both are DATA-axis honesty guards for
+    the private-``src.data`` drop-in path.
     """
     import random as _random
     from datasets import load_dataset
@@ -321,11 +364,21 @@ def _load_dolly_records(
             break
         if i == 0:
             _assert_dolly_schema(dataset, row)
+        instruction = row.get("instruction", "")
+        context = row.get("context", "")
+        response = row.get("response", "")
+        # Per-row content guard: the row-0 schema check closes the missing-FIELD
+        # door; this closes the empty-VALUE door on every consumed row. A record
+        # whose response is present but empty trains the arm on a bare
+        # <|im_end|> terminator tail and still emits a valid_loss —
+        # corrupt-but-green, GOAL §7 (see _assert_dolly_content_non_empty). A
+        # later row missing the key entirely also reaches here via .get("","").
+        _assert_dolly_content_non_empty(dataset, i, instruction, response)
         records.append(
             {
-                "instruction": row.get("instruction", ""),
-                "context": row.get("context", ""),
-                "response": row.get("response", ""),
+                "instruction": instruction,
+                "context": context,
+                "response": response,
             }
         )
     rng = _random.Random(seed)

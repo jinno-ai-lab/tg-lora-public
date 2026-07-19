@@ -61,6 +61,7 @@ from scripts.run_freeze_validloss_ci_9b import (
     REGIME_UNKNOWN,
     _active_scope_pre_lora,
     _assert_dolly_schema,
+    _assert_dolly_content_non_empty,
     _baseline_ci_to_json,
     _candidate_cost_reduction,
     _candidate_final_ce_mean,
@@ -388,6 +389,29 @@ class TestBuildSftExample:
         for key in ("input_ids", "attention_mask", "labels"):
             assert ex[key].shape[0] == 1
             assert ex[key].dtype == torch.long
+
+    def test_empty_response_is_a_non_skipped_degenerate_example(self):
+        """GROUND the DATA-axis hazard the loader's content guard must catch: a
+        record whose ``response`` key is PRESENT but empty formats the bare
+        ChatML assistant turn (``"{response}<|im_end|>"`` → just
+        ``"<|im_end|>"``). That terminator tail sits past the masked prompt
+        prefix, so the labels are NOT all ``-100`` and the example is NOT dropped
+        — the arm would train on it and still emit a valid_loss, corrupt-but-green
+        (GOAL §7). The presence-only schema guard misses this (the key exists);
+        the per-row content guard exists to catch it upstream. Char-tokenized, so
+        the supervised tail is the 10 ``<|im_end|>`` chars."""
+        ex = build_sft_example(_CharTokenizer(), "INST", response="", max_seq_len=4096)
+        assert ex is not None  # NOT skipped — this is the corrupt-but-green path
+        labels = ex["labels"][0].tolist()
+        assert any(lab != -100 for lab in labels)  # bare terminator tail supervised
+
+    def test_whitespace_response_is_also_non_skipped(self):
+        """A whitespace-only response reaches the same non-skipped hazard (a
+        content guard must therefore use ``.strip()``, not bare truthiness)."""
+        ex = build_sft_example(_CharTokenizer(), "INST", response="   ", max_seq_len=4096)
+        assert ex is not None
+        labels = ex["labels"][0].tolist()
+        assert any(lab != -100 for lab in labels)
 
 
 # ── candidate_order_9b: output-first descending ─────────────────────────────
@@ -3718,6 +3742,124 @@ def test_assert_dolly_schema_passes_dolly_row():
     _assert_dolly_schema(
         "databricks/databricks-dolly-15k",
         {"instruction": "x", "context": "", "response": "y"},
+    )
+
+
+# --- _load_dolly_records non-empty-content guard (DATA-axis honesty, GOAL §7) --
+# The schema guard (7c4aebf) closes the missing-FIELD door on row 0; these drive
+# the REAL loader body to prove the empty-VALUE door is closed on EVERY consumed
+# row — the second way the same corrupt-but-green hazard reaches the SFT builder.
+
+
+def test_load_dolly_records_rejects_empty_response(monkeypatch):
+    """A record whose ``response`` key is PRESENT but empty hits the SAME
+    corrupt-but-green hazard the schema guard's docstring describes: the bare
+    ``<|im_end|>`` terminator tail is supervised (see
+    ``test_empty_response_is_a_non_skipped_degenerate_example``), so the arm
+    trains on junk and still emits a valid_loss. The presence-only schema guard
+    misses this (the key exists) AND only sees row 0 — the content guard must
+    catch it on a later row.
+
+    Mutation proof — remove the ``_assert_dolly_content_non_empty`` call in
+    :func:`_load_dolly_records` and this test goes RED (the loader would return
+    8 records, one with an empty response, instead of raising)."""
+    import datasets
+
+    rows = [
+        {"instruction": f"inst {i}", "context": "", "response": f"resp {i}"}
+        for i in range(8)
+    ]
+    rows[3]["response"] = ""  # present key, empty value, on a LATER row
+    monkeypatch.setattr(datasets, "load_dataset", _fake_load_dataset(rows))
+    with pytest.raises(ValueError, match="empty/whitespace"):
+        _load_dolly_records("some/private-sft", max_rows=8, seed=7)
+
+
+def test_load_dolly_records_rejects_whitespace_response(monkeypatch):
+    """A whitespace-only response is empty for SFT purposes, so it is rejected
+    just like an empty one — the guard must ``.strip()`` rather than trust
+    truthiness (``"  "`` is truthy but tokenizes to the same junk tail)."""
+    import datasets
+
+    rows = [{"instruction": "inst", "context": "", "response": "  \n  "}]
+    monkeypatch.setattr(datasets, "load_dataset", _fake_load_dataset(rows))
+    with pytest.raises(ValueError, match="empty/whitespace"):
+        _load_dolly_records("some/private-sft", max_rows=8, seed=7)
+
+
+def test_load_dolly_records_rejects_empty_instruction(monkeypatch):
+    """An empty instruction (empty user turn) is junk for the same reason and is
+    rejected even when the response is valid — both required fields must carry
+    content."""
+    import datasets
+
+    rows = [{"instruction": "", "context": "", "response": "resp"}]
+    monkeypatch.setattr(datasets, "load_dataset", _fake_load_dataset(rows))
+    with pytest.raises(ValueError, match="empty/whitespace"):
+        _load_dolly_records("some/private-sft", max_rows=8, seed=7)
+
+
+def test_load_dolly_records_rejects_per_row_missing_response_key(monkeypatch):
+    """The schema guard only checks row 0; a LATER row that LACKS the
+    ``response`` key entirely reaches the content guard as an empty string via
+    ``.get(..., "")`` and is rejected — closing the per-row missing-key door the
+    row-0 schema check cannot see."""
+    import datasets
+
+    rows = [
+        {"instruction": f"inst {i}", "context": "", "response": f"resp {i}"}
+        for i in range(8)
+    ]
+    del rows[5]["response"]  # later row missing the key entirely
+    monkeypatch.setattr(datasets, "load_dataset", _fake_load_dataset(rows))
+    with pytest.raises(ValueError, match="empty/whitespace"):
+        _load_dolly_records("some/private-sft", max_rows=8, seed=7)
+
+
+def test_load_dolly_records_content_guard_byte_identical_for_real_dolly(monkeypatch):
+    """Real Dolly records carry non-empty instruction/response (``context`` is
+    legitimately optional), so the content guard never fires for the real
+    dataset — the loader is byte-identical to the pre-content-guard behavior and
+    no committed verdict or fixture moves. Mirrors
+    ``test_load_dolly_records_accepts_dolly_schema`` for the second guard."""
+    import datasets
+
+    rows = [
+        {"instruction": f"inst {i}", "context": "", "response": f"resp {i}"}
+        for i in range(8)
+    ]
+    monkeypatch.setattr(datasets, "load_dataset", _fake_load_dataset(rows))
+    out = _load_dolly_records(
+        "databricks/databricks-dolly-15k", max_rows=8, seed=7
+    )
+    assert len(out) == 8
+    assert {tuple(sorted(r.items())) for r in out} == {
+        (
+            ("context", ""),
+            ("instruction", f"inst {i}"),
+            ("response", f"resp {i}"),
+        )
+        for i in range(8)
+    }
+
+
+def test_assert_dolly_content_non_empty_message_names_dataset_index_fields():
+    """The error must name the dataset, the row index, and the empty field(s) so
+    the operator on the drop-in path can locate the offending record (a streaming
+    dataset gives no other handle to row N)."""
+    with pytest.raises(ValueError) as excinfo:
+        _assert_dolly_content_non_empty("org/private-sft", 42, "inst", "")
+    msg = str(excinfo.value)
+    assert "org/private-sft" in msg
+    assert "42" in msg
+    assert "response" in msg
+
+
+def test_assert_dolly_content_non_empty_passes_real_dolly_row():
+    """Non-empty instruction+response passes silently — byte-identical for the
+    real dataset. ``context`` is not a required field and is not checked."""
+    _assert_dolly_content_non_empty(
+        "databricks/databricks-dolly-15k", 0, "inst", "resp"
     )
 
 
