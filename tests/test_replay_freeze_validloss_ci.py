@@ -686,6 +686,156 @@ class TestNegativeControlSurpasses:
 
 
 # ---------------------------------------------------------------------------
+# Citation gate derives negative-control from the budget artifact, not just the
+# stored flag — the operator-set label must not override machine-checkable reality
+# ---------------------------------------------------------------------------
+
+
+class TestUnflaggedBudgetDivergence:
+    """A degraded-arm deposit whose ``negative_control`` flag is unset must NOT
+    be citable — the gate derives negative-control from the budget artifact, not
+    only from the stored boolean.
+
+    The producer (``scripts.run_freeze_validloss_ci``) DERIVES the flag from
+    per-arm budget divergence, so a deposit it writes cannot degrade an arm
+    without flagging it. But until this fix the replay citation gate re-read the
+    STORED boolean alone, so a hand-edited or externally-supplied deposit —
+    divergent ``candidate_total`` / ``surrogate_total`` with the flag absent —
+    would silently read as a citable target-scale §4 result: the operator-set
+    label trusted over the machine-checkable artifact reality, the same class as
+    TASK-0152's hand-typed ``best_valid_loss`` and the swapped-arm guard
+    (``5ed3380``). This class closes that: budget divergence is authoritative at
+    the gate whether the flag says so or not.
+    """
+
+    def _unflagged_divergent(self, *, arm="candidate"):
+        # A target-scale deposit (proxy_scale=False, not synthetic) whose arm was
+        # degraded but whose negative_control flag is ABSENT — the inconsistent
+        # state no committed fixture carries (every committed divergent-budget
+        # deposit sets negative_control=True). Built directly so the budget fields
+        # are present without the _data helper's flag default.
+        d = _data([1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0],
+                  proxy_scale=False, synthetic=False, negative_control=False)
+        d["total"] = 60
+        if arm == "candidate":
+            d["candidate_total"] = 2
+            d["surrogate_total"] = 60
+        elif arm == "surrogate":
+            d["candidate_total"] = 60
+            d["surrogate_total"] = 2
+        return d
+
+    def test_divergent_budget_unflagged_withholds_target_scale(self):
+        # PRIMARY mutation proof: before the fix the flag was trusted and this
+        # read True; the gate now sees the divergent candidate_total and withholds.
+        data = self._unflagged_divergent()
+        out = replay_to_json("<test>", data, replay_samples(data))
+        assert out["citable_as_target_scale"] is False
+
+    def test_divergent_budget_unflagged_withholds_full_section4(self):
+        # The full-§4 gate is target-scale AND full_context; withholding
+        # target-scale withholds the full verdict too, even at full context.
+        data = self._unflagged_divergent()
+        assert data.get("full_context", True) is True  # default = full context
+        out = replay_to_json("<test>", data, replay_samples(data))
+        assert out["citable_as_full_section4_verdict"] is False
+
+    def test_effective_negative_control_surfaced_machine_readable(self):
+        # The machine output surfaces the EFFECTIVE negative_control (True), not
+        # the stale stored flag, so a consumer sees how the gate treated it and
+        # which arm diverged.
+        data = self._unflagged_divergent()
+        out = replay_to_json("<test>", data, replay_samples(data))
+        assert out["negative_control"] is True
+        assert out["negative_control_arm"] == "candidate"
+
+    def test_explicit_false_flag_with_divergence_still_withholds(self):
+        # An explicit negative_control: false must NOT override the budget
+        # reality — the operator cannot defeat the gate by setting the flag false.
+        data = self._unflagged_divergent()
+        data["negative_control"] = False  # explicit, not merely absent
+        out = replay_to_json("<test>", data, replay_samples(data))
+        assert out["citable_as_target_scale"] is False
+        assert out["negative_control"] is True  # effective, not stored
+
+    def test_surrogate_divergence_unflagged_also_withholds(self):
+        # Symmetric: a surrogate-degraded unflagged deposit is also withheld and
+        # names the surrogate arm.
+        data = self._unflagged_divergent(arm="surrogate")
+        out = replay_to_json("<test>", data, replay_samples(data))
+        assert out["citable_as_target_scale"] is False
+        assert out["negative_control_arm"] == "surrogate"
+
+    def test_unflagged_divergence_note_is_emitted(self):
+        # The inconsistency the stored flag hid surfaces LOUD in the human report
+        # — a dedicated note names the divergence and the unset flag.
+        data = self._unflagged_divergent()
+        text = format_replay("<test>", data, replay_samples(data))
+        assert "BUDGET_DIVERGENCE_UNFLAGGED" in text
+        assert "not asserted" in text
+        # The stale flag value (False) is shown so the operator sees the gap.
+        assert "negative_control is False" in text
+
+    def test_unflagged_divergence_does_not_claim_deliberate(self):
+        # The unflagged note must NOT assert the degradation was deliberate — the
+        # gate detects divergence but cannot know intent, so it withholds without
+        # claiming a deliberate probe (the regular NEGATIVE_CONTROL note reserves
+        # "deliberately degraded" for the explicitly-flagged case).
+        data = self._unflagged_divergent()
+        text = format_replay("<test>", data, replay_samples(data))
+        assert "deliberately degraded" not in text
+
+    def test_symmetric_budget_unflagged_remains_citable(self):
+        # NO false positive: a symmetric-budget target-scale deposit with the
+        # flag absent stays citable at both levels — the fix only fires on
+        # divergence. Mirrors the committed real-9B target deposit (total=15,
+        # candidate_total=15, surrogate_total=15, negative_control=false) which
+        # carries the budget fields precisely so the gate can verify no divergence.
+        d = _data([1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0],
+                  proxy_scale=False, synthetic=False, negative_control=False)
+        d["total"] = 60
+        d["candidate_total"] = 60
+        d["surrogate_total"] = 60
+        out = replay_to_json("<test>", d, replay_samples(d))
+        assert out["citable_as_target_scale"] is True
+        assert out["citable_as_full_section4_verdict"] is True
+        assert out["negative_control"] is False
+
+    def test_committed_real_9b_target_deposit_unchanged(self):
+        # The committed real-9B seq256 deposit (symmetric 15/15/15 budgets, flag
+        # false) is byte-identical under the fix: still citable target-scale.
+        data = load_samples(FIXTURE_REAL_9B)
+        out = replay_to_json(FIXTURE_REAL_9B, data, replay_samples(data))
+        assert out["negative_control"] is False
+        assert out["citable_as_target_scale"] is True
+        assert out["citable_as_full_section4_verdict"] is False  # seq256, not full
+
+    def test_every_committed_deposit_effective_equals_stored(self):
+        # INVARIANT: no committed deposit carries the corrupt divergent-but-
+        # unflagged state, so the effective status equals the stored flag for
+        # every committed fixture — the fix is byte-identical across the corpus.
+        # A future fixture that legitimately diverges without the flag would trip
+        # this and force a deliberate decision rather than a silent flip.
+        fixture_dir = Path(__file__).resolve().parent / "fixtures"
+        any_checked = False
+        for fixture in sorted(fixture_dir.glob("freeze_validloss_*.json")):
+            if "runlog" in fixture.name:
+                # A loss-curve artifact, not a deposit (no candidate/surrogate
+                # sample lists); load_samples is not its schema.
+                continue
+            data = load_samples(fixture)
+            out = replay_to_json(fixture, data, replay_samples(data))
+            stored = bool(data.get("negative_control", False))
+            assert out["negative_control"] is stored, (
+                f"{fixture.name}: effective negative_control "
+                f"({out['negative_control']}) != stored flag ({stored}) — this "
+                f"fixture carries a divergent-but-unflagged budget"
+            )
+            any_checked = True
+        assert any_checked  # guard against a glob that matched nothing
+
+
+# ---------------------------------------------------------------------------
 # Scale honesty + CLI assertion
 # ---------------------------------------------------------------------------
 

@@ -176,6 +176,30 @@ def _resolve_negative_control_arm(data: dict[str, Any]) -> str | None:
     return None
 
 
+def _negative_control_active(data: dict[str, Any]) -> bool:
+    """Effective negative-control status of a recording (GOAL §7 citation honesty).
+
+    A recording is a negative control when EITHER the operator set the
+    ``negative_control`` flag (explicit provenance) OR the gate can detect it
+    from the artifact itself: an arm whose recorded training budget diverged
+    (``candidate_total`` / ``surrogate_total`` ≠ ``total``) was degraded on a
+    non-order lever. The producers (``run_freeze_validloss_ci`` /
+    ``run_freeze_validloss_ci_9b``) set the flag from exactly this divergence,
+    so the two agree on every recording a producer writes — but the citation
+    gate must not trust the stored boolean *alone*: a hand-edited or externally-
+    supplied deposit that carries a divergent budget yet an absent/stale flag
+    would otherwise read as a citable §4 target-scale result, the operator-set
+    label trusted over the machine-checkable artifact reality (the same class
+    as the hand-typed ``best_valid_loss`` TASK-0152 closed and the swapped-arm
+    guard ``5ed3380``). Budget divergence is authoritative at the gate whether
+    the flag says so or not; ``citable_as_target_scale`` / the prose note both
+    consult this so the machine gate and the human report cannot drift apart.
+    """
+    if bool(data.get("negative_control", False)):
+        return True
+    return _resolve_negative_control_arm(data) is not None
+
+
 def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLossCI) -> str:
     """Human-readable replay block: scale, the §4 verdict, and faithfulness.
 
@@ -192,16 +216,25 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
     feedback's "do not cite as a target-scale result" warning in the rendered
     output rather than relying on prose alone.
 
-    ``negative_control`` (default ``False``) is the apparatus-provenance guard:
-    a recording whose candidate arm was deliberately degraded on a non-order
-    lever (an asymmetric training budget). Such a recording IS a real
-    measurement and is judged faithfully, but its verdict is a sensitivity
-    probe, not a §4 order result — an additive note says so plainly, keeping a
-    recorded UNDERSHOOTS from being misread as an order disadvantage.
+    ``negative_control`` is the apparatus-provenance guard: a recording whose
+    candidate (or surrogate) arm was degraded on a non-order lever (an
+    asymmetric training budget). Such a recording IS a real measurement and is
+    judged faithfully, but its verdict is a sensitivity probe, not a §4 order
+    result — an additive note says so plainly, keeping a recorded UNDERSHOOTS
+    from being misread as an order disadvantage. The status is derived from the
+    artifact (budget divergence) as well as the flag (see
+    :func:`_negative_control_active`), so a deposit that diverged but left the
+    flag unset is still withheld from citation and flagged BUDGET_DIVERGENCE_UNFLAGGED.
     """
     proxy_scale = bool(data.get("proxy_scale", True))
     synthetic = bool(data.get("synthetic", False))
-    negative_control = bool(data.get("negative_control", False))
+    # The operator-set flag is tracked separately from the EFFECTIVE status: a
+    # divergent budget makes a recording a negative control whether the flag was
+    # recorded or not (``_negative_control_active``), so the scale-line value
+    # reflects reality while the prose note distinguishes a flagged sensitivity
+    # probe from an unflagged divergence the gate caught on its own.
+    negative_control_flagged = bool(data.get("negative_control", False))
+    negative_control = _negative_control_active(data)
     # ``full_context`` (default True when absent): did the run train at the full
     # §4 seq_len=1024? A 12GB probe is seq_len=256 (TASK-0152 lines 86-97) —
     # genuine 9B / target-scale, but NOT the full verdict, so the strong claim is
@@ -257,18 +290,28 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
         # full seq_len=1024 verdict. The cross-check pins these to the machine
         # gates so prose and JSON cannot drift.
         if negative_control:
-            arm = _resolve_negative_control_arm(data)
-            arm_clause = (
-                "the candidate arm was" if arm != "surrogate"
-                else "the surrogate arm was"
-            )
-            lines.append(
-                "  note: TARGET_SCALE — the recording is at target scale (a 9B "
-                "run); however a negative control was applied "
-                f"({arm_clause} deliberately degraded on a non-order lever), so "
-                "the verdict is a sensitivity probe recorded at target scale, "
-                "NOT a citable §4 order result."
-            )
+            if negative_control_flagged:
+                arm = _resolve_negative_control_arm(data)
+                arm_clause = (
+                    "the candidate arm was" if arm != "surrogate"
+                    else "the surrogate arm was"
+                )
+                lines.append(
+                    "  note: TARGET_SCALE — the recording is at target scale (a 9B "
+                    "run); however a negative control was applied "
+                    f"({arm_clause} deliberately degraded on a non-order lever), so "
+                    "the verdict is a sensitivity probe recorded at target scale, "
+                    "NOT a citable §4 order result."
+                )
+            else:
+                # Divergent budget the operator flag did not assert: withhold the
+                # strong claim from the artifact reality, not the stale label.
+                lines.append(
+                    "  note: TARGET_SCALE — the recording is at target scale, but "
+                    "the arms' budgets diverged while the negative_control flag is "
+                    "UNSET; the gate withholds the citable §4 order claim from the "
+                    "divergence (see BUDGET_DIVERGENCE_UNFLAGGED), not the flag."
+                )
         elif not full_context:
             seq_clause = f" at seq_len={seq_len}" if seq_len is not None else ""
             lines.append(
@@ -295,19 +338,43 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
     # why it is never a §4 order result, never which label it earned.
     if negative_control:
         arm = _resolve_negative_control_arm(data)
-        if arm == "surrogate":
-            arm_phrase = "the surrogate arm was deliberately degraded"
-        elif arm == "both":
-            arm_phrase = "both arms were deliberately degraded asymmetrically"
-        else:  # "candidate" (and the legacy default for pre-arm recordings)
-            arm_phrase = "the candidate arm was deliberately degraded"
-        lines.append(
-            f"  note: NEGATIVE_CONTROL — {arm_phrase} (an asymmetric training "
-            "budget, unrelated to freeze order) to inject a real quality gap. "
-            "The verdict is faithfully recomputed from the stored floats but is "
-            "an apparatus-sensitivity probe, NOT a §4 order result; do not read "
-            "it as evidence for or against an output-first order advantage."
-        )
+        if not negative_control_flagged:
+            # Budget divergence the operator flag did not assert: the citation
+            # gate withholds from the artifact reality, not a label that may be
+            # stale, so the inconsistency the flag hid surfaces loud in the report
+            # (the silent-corruption path this guard closes — the operator-set
+            # label trusted over the machine-checkable budget reality).
+            arm_word = (
+                "the surrogate arm" if arm == "surrogate"
+                else "both arms" if arm == "both"
+                else "the candidate arm"
+            )
+            lines.append(
+                "  note: BUDGET_DIVERGENCE_UNFLAGGED — the arms' recorded budgets "
+                f"diverge ({arm_word} training total differs) but "
+                f"negative_control is {data.get('negative_control', False)!r} "
+                "(not asserted). The citation gate treats a divergent-budget "
+                "recording as a negative control whether the flag is set or not: "
+                "a degraded arm is a sensitivity probe, never a §4 order result. "
+                "The stored verdict is faithfully recomputed but is NOT citable "
+                "as a §4 order result. Set negative_control: true to record an "
+                "intentional sensitivity probe, or correct the budgets to remove "
+                "the divergence."
+            )
+        else:
+            if arm == "surrogate":
+                arm_phrase = "the surrogate arm was deliberately degraded"
+            elif arm == "both":
+                arm_phrase = "both arms were deliberately degraded asymmetrically"
+            else:  # "candidate" (and the legacy default for pre-arm recordings)
+                arm_phrase = "the candidate arm was deliberately degraded"
+            lines.append(
+                f"  note: NEGATIVE_CONTROL — {arm_phrase} (an asymmetric training "
+                "budget, unrelated to freeze order) to inject a real quality gap. "
+                "The verdict is faithfully recomputed from the stored floats but is "
+                "an apparatus-sensitivity probe, NOT a §4 order result; do not read "
+                "it as evidence for or against an output-first order advantage."
+            )
     return "\n".join(lines)
 
 
@@ -320,14 +387,22 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
     * ``citable_as_target_scale`` — ``True`` for a genuine target-scale recording
       (``proxy_scale=False``, not ``synthetic``, not a negative control). A
       reduced-context (seq_len=256) 9B probe still qualifies — it IS a real 9B
-      run, just not at seq_len=1024.
+      run, just not at seq_len=1024. Negative-control status is derived from
+      budget divergence as well as the flag (:func:`_negative_control_active`),
+      so an unflagged degraded arm cannot slip through and be cited as an order
+      result.
     * ``citable_as_full_section4_verdict`` — ``True`` only when target-scale AND
       ``full_context``. A reduced-context probe is ``False``: it must not be
       cited as the *full* §4 verdict (TASK-0152 lines 86-97, enforced as a field).
     """
     proxy_scale = bool(data.get("proxy_scale", True))
     synthetic = bool(data.get("synthetic", False))
-    negative_control = bool(data.get("negative_control", False))
+    # Derived from the artifact (budget divergence) as well as the flag, so a
+    # deposit that diverged but left ``negative_control`` unset cannot be cited
+    # as a §4 target-scale result (mirrors :func:`format_replay`; the gate trusts
+    # the machine-checkable budget reality over the operator-set label — see
+    # ``_negative_control_active``).
+    negative_control = _negative_control_active(data)
     full_context = bool(data.get("full_context", True))
     citable_as_target_scale = (
         not proxy_scale and not synthetic and not negative_control
