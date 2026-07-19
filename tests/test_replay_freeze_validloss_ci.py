@@ -1487,3 +1487,199 @@ class TestNineBHonestyGateReplay:
         assert "budget" in out_yes["producer_honesty_axis_failures"]
 
 
+class TestSubVerdictLabelStaleness:
+    """The replay must re-derive a 9B deposit's ``direction`` / ``baseline``
+    sub-verdicts from its stored per-arm losses (``control_losses`` /
+    ``baseline_losses``) with the producer's seed — and flag a stored sub-verdict
+    label that disagrees — rather than silently trusting the nested label.
+
+    The producer (:func:`scripts.run_freeze_validloss_ci_9b.run_ci_9b`,
+    ``run_freeze_validloss_ci_9b.py`` lines ~1715-1727) computes the
+    direction-isolation CI (candidate vs input-contiguous control) and the
+    full-backprop baseline CI (candidate vs no-freeze full-CE) with
+    ``seed=base_seed`` and stamps each as ``direction.verdict`` /
+    ``baseline.verdict``. Those losses are deposited alongside the label, so the
+    verdict is *re-derivable* GPU-free. Before this fix the replay gate never
+    re-derived them: an arbitrary (hand-edited or externally-supplied) deposit
+    whose ``baseline.verdict`` lied about its ``baseline_losses`` passed
+    completely silently — ``faithful: True`` (the lie is in the nested label, not
+    the main ``verdict``), no stale field, no prose note. This is the SAME
+    "stored-label-trusted-over-artifact-reality" class as ``_citation_label_stale``
+    (``d734327``) and its budget / full-context siblings (``9dff092`` /
+    ``bbf6e68``), now extended to the two §4 condition-(a)/(b) sub-verdicts.
+
+    The fix re-derives each sub-verdict from the stored floats (the deterministic
+    candidate-vs-arm bootstrap under ``base_seed``), cross-checks it against the
+    stored label, surfaces ``direction_verdict_stale`` / ``baseline_verdict_stale``
+    in :func:`replay_to_json`, and emits ``DIRECTION_VERDICT_STALE`` /
+    ``BASELINE_VERDICT_STALE`` notes in :func:`format_replay`.
+    """
+
+    @staticmethod
+    def _other_label(true_label):
+        # A label provably different from the true one, so the lie can never
+        # accidentally match the re-derived verdict.
+        return TIES if true_label != TIES else UNDERSHOOTS
+
+    def test_committed_deposits_sub_verdicts_match_losses(self):
+        # BYTE-IDENTICAL invariant: for every committed 9B deposit, the replay's
+        # artifact-rederived sub-verdict equals the producer's STORED label
+        # wherever the arm ran, both stale flags are False, and neither stale
+        # note appears in prose. A future deposit that legitimately diverged
+        # would trip this and force a deliberate decision rather than a silent
+        # over-claim — exactly the silent-corruption path this guard closes.
+        # (Mirrors test_every_committed_9b_deposit_effective_equals_stored for the
+        # sub-verdict axis.) Reverting the re-derivation (trusting the stored
+        # label) makes rederived follow any lie, so this still holds — the
+        # MUTATION resistance is the two hand-edited tests below.
+        for fixture in _9b_deposit_fixtures():
+            data = load_samples(fixture)
+            ci = replay_samples(data)
+            out = replay_to_json(fixture, data, ci)
+            prose = format_replay(fixture, data, ci)
+            for slot, lk in (
+                ("direction", "control_losses"),
+                ("baseline", "baseline_losses"),
+            ):
+                sub = data.get(slot)
+                if not isinstance(sub, dict):
+                    # Arm did not run (slot null): nothing to cross-check.
+                    assert out[f"{slot}_verdict_rederived"] is None
+                    assert out[f"{slot}_verdict_stale"] is False
+                    assert f"{slot.upper()}_VERDICT_STALE" not in prose
+                    continue
+                # Arm ran: re-derived verdict reproduces the stored label exactly.
+                assert out[f"{slot}_verdict_rederived"] == sub["verdict"], (
+                    f"{fixture.name}: {slot} rederived "
+                    f"({out[slot + '_verdict_rederived']!r}) != stored "
+                    f"({sub['verdict']!r})"
+                )
+                assert out[f"{slot}_verdict_stale"] is False
+                assert f"{slot.upper()}_VERDICT_STALE" not in prose
+
+    def test_hand_edited_lying_baseline_verdict_caught_and_overridden(self):
+        # MUTATION PROOF (baseline axis): a deposit whose stored ``baseline.verdict``
+        # label is hand-edited to a lie must be caught — the replay re-derives the
+        # verdict from ``baseline_losses`` (the same candidate-vs-baseline bootstrap
+        # the producer computed the sub-CI with, under base_seed), reports the TRUE
+        # verdict in ``baseline_verdict_rederived``, sets ``baseline_verdict_stale``
+        # True, and emits the BASELINE_VERDICT_STALE prose note. Reverting the fix
+        # (trust the stored label) makes rederived equal the lie and stale False.
+        # Uses the committed full-budget deposit, which has a real baseline arm.
+        data = load_samples(
+            [p for p in _9b_deposit_fixtures() if p.name.endswith("_full.json")][0]
+        )
+        assert isinstance(data.get("baseline"), dict)  # the arm ran
+        true = surrogate_valid_loss_ci(
+            data["candidate_losses"], data["baseline_losses"],
+            seed=int(data["base_seed"]),
+        ).significance_verdict
+        data["baseline"]["verdict"] = self._other_label(true)  # the lie
+        ci = replay_samples(data)
+        out = replay_to_json("<lie-baseline>", data, ci)
+        prose = format_replay("<lie-baseline>", data, ci)
+        assert out["baseline_verdict_rederived"] == true  # artifacts win
+        assert out["baseline_verdict_stale"] is True
+        assert "BASELINE_VERDICT_STALE" in prose
+        assert f"{true!r}" in prose  # the true verdict is named in the note
+
+    def test_hand_edited_lying_direction_verdict_caught_and_overridden(self):
+        # MUTATION PROOF (direction axis, symmetric): a deposit whose stored
+        # ``direction.verdict`` label is hand-edited to a lie must be caught on the
+        # direction-isolation arm too — re-derived from ``control_losses``. Proves
+        # the cross-check covers BOTH sub-verdicts, not just baseline. Uses the
+        # committed direction deposit, which has a real control arm.
+        data = load_samples(
+            [p for p in _9b_deposit_fixtures() if "direction" in p.name][0]
+        )
+        assert isinstance(data.get("direction"), dict)  # the arm ran
+        true = surrogate_valid_loss_ci(
+            data["candidate_losses"], data["control_losses"],
+            seed=int(data["base_seed"]),
+        ).significance_verdict
+        data["direction"]["verdict"] = self._other_label(true)  # the lie
+        ci = replay_samples(data)
+        out = replay_to_json("<lie-direction>", data, ci)
+        prose = format_replay("<lie-direction>", data, ci)
+        assert out["direction_verdict_rederived"] == true  # artifacts win
+        assert out["direction_verdict_stale"] is True
+        assert "DIRECTION_VERDICT_STALE" in prose
+
+    def test_sub_verdict_rederivation_uses_producer_base_seed(self):
+        # CONTRACT: the replay re-derives a sub-verdict with the deposit's
+        # ``base_seed`` (the seed the producer computed the sub-CI with), NOT the
+        # bootstrap default. Pins the seed so a deposit with a non-default seed
+        # re-derives identically to how it was stamped.
+        from scripts.replay_freeze_validloss_ci import _subverdict_rederived
+
+        data = load_samples(
+            [p for p in _9b_deposit_fixtures() if p.name.endswith("_full.json")][0]
+        )
+        seed = int(data["base_seed"])
+        direct = surrogate_valid_loss_ci(
+            data["candidate_losses"], data["baseline_losses"], seed=seed,
+        ).significance_verdict
+        assert _subverdict_rederived(data, losses_key="baseline_losses") == direct
+
+    def test_sub_verdict_skipped_when_arm_did_not_run(self):
+        # A deposit that did not run a control / baseline arm carries ``null`` for
+        # that slot (the producer stamps None when n_control=0 / n_baseline=0).
+        # The cross-check must read rederived=None / stale=False and emit NO note —
+        # it must not false-positive on a legitimately-absent arm. full.json has
+        # direction=None; direction.json has baseline=None.
+        full = load_samples(
+            [p for p in _9b_deposit_fixtures() if p.name.endswith("_full.json")][0]
+        )
+        assert full.get("direction") is None  # no control arm
+        out_f = replay_to_json("<full>", full, replay_samples(full))
+        assert out_f["direction_verdict_rederived"] is None
+        assert out_f["direction_verdict_stale"] is False
+        assert "DIRECTION_VERDICT_STALE" not in format_replay("<full>", full, replay_samples(full))
+
+        direction = load_samples(
+            [p for p in _9b_deposit_fixtures() if "direction" in p.name][0]
+        )
+        assert direction.get("baseline") is None  # no baseline arm
+        out_d = replay_to_json("<direction>", direction, replay_samples(direction))
+        assert out_d["baseline_verdict_rederived"] is None
+        assert out_d["baseline_verdict_stale"] is False
+
+    def test_prose_note_presence_matches_machine_stale_flag(self):
+        # DRIFT invariant (mirrors test_prose_invariant_holds_across_committed_
+        # 9b_deposits): the machine stale flag and the human prose note cannot
+        # drift — for every committed deposit AND for a hand-edited lie on each
+        # slot, ``<SLOT>_VERDICT_STALE in prose`` equals the JSON stale flag.
+        cases = [("committed", load_samples(p)) for p in _9b_deposit_fixtures()]
+        # Add the two mutated cases (one lie per slot).
+        full = load_samples(
+            [p for p in _9b_deposit_fixtures() if p.name.endswith("_full.json")][0]
+        )
+        full["baseline"]["verdict"] = self._other_label(
+            surrogate_valid_loss_ci(
+                full["candidate_losses"], full["baseline_losses"],
+                seed=int(full["base_seed"]),
+            ).significance_verdict
+        )
+        cases.append(("lie-baseline", full))
+        direction = load_samples(
+            [p for p in _9b_deposit_fixtures() if "direction" in p.name][0]
+        )
+        direction["direction"]["verdict"] = self._other_label(
+            surrogate_valid_loss_ci(
+                direction["candidate_losses"], direction["control_losses"],
+                seed=int(direction["base_seed"]),
+            ).significance_verdict
+        )
+        cases.append(("lie-direction", direction))
+        for name, data in cases:
+            ci = replay_samples(data)
+            out = replay_to_json(f"<{name}>", data, ci)
+            prose = format_replay(f"<{name}>", data, ci)
+            for slot in ("direction", "baseline"):
+                flag = out[f"{slot}_verdict_stale"]
+                note = f"{slot.upper()}_VERDICT_STALE" in prose
+                assert flag is note, (
+                    f"{name}: {slot} stale flag ({flag}) != prose note ({note})"
+                )
+
+

@@ -360,6 +360,76 @@ def _citation_label_stale(
     return bool(stored) != effective_citable
 
 
+def _subverdict_rederived(
+    data: dict[str, Any], *, losses_key: str
+) -> str | None:
+    """Re-derive a §4 sub-verdict (direction / baseline) from the deposit's stored
+    per-arm losses with the producer's seed (GOAL §7 citation honesty).
+
+    The producer (:func:`scripts.run_freeze_validloss_ci_9b.run_ci_9b`,
+    ``run_freeze_validloss_ci_9b.py`` lines ~1715-1727) computes each sub-CI from
+    ``candidate_losses`` against the arm's own losses with ``seed=base_seed``: the
+    direction-isolation CI from ``control_losses`` (output-contiguous vs
+    input-contiguous), the full-backprop baseline CI from ``baseline_losses``
+    (progressive-freeze candidate vs no-freeze full-CE). The replay re-derives the
+    SAME verdict from the stored floats — the same deterministic bootstrap over the
+    same per-arm losses with the same seed — so a deposit whose stored
+    ``direction.verdict`` / ``baseline.verdict`` label was hand-edited (or
+    externally supplied stale) cannot pass the citation gate silently: the label is
+    cross-checked against the artifact reality, the same "stored-label-trusted-over-
+    artifact" class as :func:`_citation_label_stale` (``d734327``) and its budget /
+    full-context siblings (``9dff092`` / ``bbf6e68``), now extended to the two §4
+    condition-(a)/(b) sub-verdicts the producer stamps beside the main verdict.
+
+    Returns the re-derived ``SURPASSES`` / ``TIES`` / ``UNDERSHOOTS`` label, or
+    ``None`` when the deposit carries no per-arm losses for that slot (the arm did
+    not run — ``control_losses`` / ``baseline_losses`` absent or empty) or no
+    candidate losses — there is nothing to re-derive, so the staleness cross-check
+    (:func:`_subverdict_stale`) reads False.
+    """
+    candidate_losses = data.get("candidate_losses")
+    arm_losses = data.get(losses_key)
+    if not isinstance(candidate_losses, list) or not candidate_losses:
+        return None
+    if not isinstance(arm_losses, list) or not arm_losses:
+        return None
+    seed = int(data.get("base_seed", 0))
+    return surrogate_valid_loss_ci(
+        candidate_losses, arm_losses, seed=seed
+    ).significance_verdict
+
+
+def _subverdict_stale(
+    data: dict[str, Any], *, slot: str, losses_key: str
+) -> bool:
+    """True when a stored §4 sub-verdict label (direction / baseline) disagrees
+    with the verdict re-derived from the deposit's per-arm losses (GOAL §7).
+
+    The deposit stamps the sub-CI's verdict as ``direction.verdict`` /
+    ``baseline.verdict`` (see :func:`scripts.run_freeze_validloss_ci_9b.
+    _direction_ci_to_json` / :func:`_baseline_ci_to_json`); :func:`_subverdict_
+    rederived` reproduces that verdict GPU-free from the stored
+    ``candidate_losses`` plus the arm's losses with the producer's seed. They agree
+    on every honest deposit; a disagreement means the stored label is stale or
+    hand-edited, and the citation gate surfaces it loud (the prose
+    :func:`format_replay` ``DIRECTION_VERDICT_STALE`` / ``BASELINE_VERDICT_STALE``
+    note) rather than silently trusting the nested label — sibling of
+    :func:`_citation_label_stale` (``d734327``). Returns False when the slot is
+    absent (the arm did not run, stamped ``null``) or carries no verdict label to
+    cross-check.
+    """
+    sub = data.get(slot)
+    if not isinstance(sub, dict):
+        return False
+    stored = sub.get("verdict")
+    if stored is None:
+        return False
+    rederived = _subverdict_rederived(data, losses_key=losses_key)
+    if rederived is None:
+        return False
+    return stored != rederived
+
+
 def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLossCI) -> str:
     """Human-readable replay block: scale, the §4 verdict, and faithfulness.
 
@@ -624,6 +694,36 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
             "complete §4 verdict. Re-stamp the deposit from a fresh producer run "
             "(or correct the stored boolean) so the label matches the artifacts."
         )
+    # §4 sub-verdict-label staleness guards (the §4 condition (a)/(b) siblings of
+    # CITATION_LABEL_STALE): a deposit whose stored ``direction.verdict`` /
+    # ``baseline.verdict`` label disagrees with the verdict re-derived from its
+    # per-arm losses (``control_losses`` / ``baseline_losses``) has a stale or
+    # hand-edited sub-verdict. The gate re-derives each from the deposit's floats
+    # with the producer's seed (the same candidate-vs-arm bootstrap the producer
+    # computed the sub-CI with) and surfaces the contradiction loud rather than
+    # silently trusting the nested label — the stored-label-trusted-over-artifact
+    # path this guard closes, sibling of :func:`_citation_label_stale`
+    # (``d734327``). Fires only when the arm ran (the slot is present and
+    # non-null); a deposit that did not run a control / baseline arm carries
+    # ``null`` and has nothing to cross-check.
+    for slot, losses_key, note in (
+        ("direction", "control_losses", "DIRECTION_VERDICT_STALE"),
+        ("baseline", "baseline_losses", "BASELINE_VERDICT_STALE"),
+    ):
+        if _subverdict_stale(data, slot=slot, losses_key=losses_key):
+            stored = data[slot]["verdict"]
+            rederived = _subverdict_rederived(data, losses_key=losses_key)
+            lines.append(
+                f"  note: {note} — the recording's stored {slot}.verdict="
+                f"{stored!r} disagrees with the verdict ({rederived!r}) "
+                f"re-derived from its stored {losses_key} (the same "
+                "candidate-vs-arm two-sample bootstrap the producer computed "
+                "the sub-CI with, under the deposit's base_seed). The replay "
+                f"trusts the artifact-derived answer over the stored label, so "
+                f"the {slot} sub-verdict is read as {rederived!r}. Re-stamp the "
+                "deposit from a fresh producer run (or correct the stored label) "
+                "so it matches the losses."
+            )
     return "\n".join(lines)
 
 
@@ -650,6 +750,14 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
       ``True`` when a stored ``citable_as_full_section4_verdict`` boolean disagrees
       with this artifact-rederived value (a stale / hand-edited label; the gate
       trusts the artifacts — see :func:`_citation_label_stale`).
+    * ``direction_verdict_stale`` / ``baseline_verdict_stale`` — the §4
+      condition-(a)/(b) sub-verdict cross-checks, siblings of
+      ``citation_label_stale``: each stored ``direction.verdict`` /
+      ``baseline.verdict`` label re-derived from ``control_losses`` /
+      ``baseline_losses`` with the producer's seed (see
+      :func:`_subverdict_rederived`). ``None`` / ``False`` when the arm did not
+      run (the slot is null); ``True`` when the nested label disagrees with the
+      losses — a stale sub-verdict the gate overrode from the artifacts.
     """
     proxy_scale = bool(data.get("proxy_scale", True))
     synthetic = bool(data.get("synthetic", False))
@@ -723,6 +831,25 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         # absent for proxy/legacy recordings that carry no stored boolean).
         "citation_label_stale": _citation_label_stale(
             data, citable_as_full_section4_verdict
+        ),
+        # §4 sub-verdict cross-checks (siblings of ``citation_label_stale``): each
+        # stored ``direction.verdict`` / ``baseline.verdict`` label re-derived from
+        # the deposit's per-arm losses with the producer's seed. A disagreement means
+        # a stale/hand-edited sub-verdict label the gate overrode from the artifacts
+        # (mirrors the prose DIRECTION_VERDICT_STALE / BASELINE_VERDICT_STALE notes;
+        # the two cannot drift — same helper, same args). ``None`` / False when the
+        # arm did not run (the slot is null and/or the per-arm losses are absent).
+        "direction_verdict_rederived": _subverdict_rederived(
+            data, losses_key="control_losses"
+        ),
+        "direction_verdict_stale": _subverdict_stale(
+            data, slot="direction", losses_key="control_losses"
+        ),
+        "baseline_verdict_rederived": _subverdict_rederived(
+            data, losses_key="baseline_losses"
+        ),
+        "baseline_verdict_stale": _subverdict_stale(
+            data, slot="baseline", losses_key="baseline_losses"
         ),
         "candidate_mean": ci.candidate_mean,
         "surrogate_mean": ci.surrogate_mean,
