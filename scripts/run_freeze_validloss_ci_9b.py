@@ -132,6 +132,25 @@ from src.tg_lora.freeze_surrogate_ci import (
     format_surrogate_valid_loss_ci,
     surrogate_valid_loss_ci,
 )
+# The §4 citation-gate honesty primitives (single source of truth, shared with
+# the GPU-free replay gate). Imported under the producer's underscore aliases so
+# the serializer call sites and the test suite's imports are unchanged; the leaf
+# is the one place the regime thresholds / reduced-budget rule / 4-conjunct gate
+# live, so producer and replay can never compute citability from divergent logic
+# (SYSTEM_CONSTITUTION Rule #3).
+from src.tg_lora.freeze_verdict_honesty import (
+    # The REGIME_* constants are re-exported (explicit ``as`` aliasing) so the
+    # test suite's ``from scripts.run_freeze_validloss_ci_9b import REGIME_*``
+    # keeps working; the runner source itself uses the underscore-aliased
+    # primitives below. The leaf remains the single source of truth.
+    REGIME_GENERALIZATION as REGIME_GENERALIZATION,
+    REGIME_MEMORIZATION as REGIME_MEMORIZATION,
+    REGIME_OVERFIT as REGIME_OVERFIT,
+    REGIME_UNKNOWN as REGIME_UNKNOWN,
+    classify_regime as _classify_regime,
+    full_section4_verdict_gate as _full_section4_verdict_gate,
+    is_reduced_budget as _is_reduced_budget,
+)
 from src.tg_lora.progressive_freeze import ProgressiveFreezeController
 from src.utils.io import _atomic_write_text
 
@@ -700,109 +719,19 @@ def build_rank_pattern(
 # ---------------------------------------------------------------------------
 
 
-def _is_reduced_budget(total_steps: int, max_steps: int) -> bool:
-    """A run is reduced-budget unless it trained for the config's full
-    ``max_steps`` (the §4 verdict's intended training length).
-
-    Keeps :data:`reduced_budget` *honest*: a hardcoded ``True`` would silently
-    lie about a future full-length run, and the citation gate
-    (:attr:`citable_as_full_section4_verdict`) that keys off it would stay
-    permanently closed no matter how long a run trained. With this, a run that
-    reaches ``max_steps`` clears the flag (and a non-thin, target-scale one
-    becomes citable). ``max_steps <= 0`` (absent / unparsed config) is treated
-    as reduced — the conservative call, never silently promoting a run.
-    """
-    if max_steps <= 0:
-        return True
-    return total_steps < max_steps
-
-
-# ── training-regime honesty ─────────────────────────────────────────────────
+# ── §4 citation-gate honesty: see src.tg_lora.freeze_verdict_honesty ─────────
 #
-# The 9th-iteration generalization-regime verdict established that the §4 A/B is
-# only externally valid when measured on a GENERALIZING model: in the
-# memorization regime (few train examples × many epochs) the adapter drives train
-# cross-entropy toward 0 and the held-out valid_loss is dominated by the frozen
-# base, so a "SURPASSES" read off a memorized model is an artifact, not the §4
-# question. The per-arm ``final_ce_train_loss`` diagnostic (mean full-CE over the
-# train set under the final adapter) makes that regime machine-readable.
-#
-# The citation gate (:func:`result_to_json`) therefore needs a REGIME axis in
-# addition to scale / budget / thin-ness: without it, a future ``--total-steps
-# 1500`` run (which clears ``reduced_budget``) paired with the default small
-# ``--train-examples`` would do tens of epochs, memorize, and STILL flip
-# ``citable_as_full_section4_verdict=True`` — silently mislabeling a
-# memorization artifact as the complete §4 verdict. The thresholds below are
-# grounded in the committed 9B deposits, not picked from thin air:
-#   * generalization-regime candidate arms (freeze_validloss_ci_9b_generalization
-#     / _baseline) have final_ce_train_loss ≈ 1.507 with valid ≈ 1.515 → gap
-#     ≈ 0.008;
-#   * the full-backprop BASELINE arm overfits with final_ce 0.77 ≪ valid 1.54
-#     → gap 0.77;
-#   * memorization-regime arms (8 train × 20 step) collapse train CE toward 0.
-# So a train-CE floor of 0.5 separates memorization (~0) from generalization
-# (~1.5) with margin, and a train-valid gap threshold of 0.5 separates
-# generalization (~0.01) from overfit (~0.77) with margin.
-REGIME_GENERALIZATION = "generalization"
-REGIME_MEMORIZATION = "memorization"
-REGIME_OVERFIT = "overfit"
-REGIME_UNKNOWN = "unknown"
-
-_MEMORIZATION_TRAIN_CE_FLOOR = 0.5
-_OVERFIT_GAP_THRESHOLD = 0.5
-
-
-def _classify_regime(final_ce_train_loss, valid_loss):
-    """Classify a run's training regime from the candidate arm's train/valid CE.
-
-    ``final_ce_train_loss`` is the candidate arm's mean full cross-entropy over
-    the *train* set under the final adapter; ``valid_loss`` is the candidate
-    arm's mean held-out valid_loss (:attr:`SurrogateValidLossCI.candidate_mean`).
-    Returns one of the :data:`REGIME_*` constants. Anything missing or
-    non-finite (e.g. a deposit recorded before the ``final_ce_train_loss``
-    diagnostic existed) classifies as :data:`REGIME_UNKNOWN` — the conservative
-    call, which never opens the full-§4 citation gate on a regime it cannot
-    verify.
-    """
-    try:
-        ce = float(final_ce_train_loss)
-        vl = float(valid_loss)
-    except (TypeError, ValueError):
-        return REGIME_UNKNOWN
-    if not (math.isfinite(ce) and math.isfinite(vl)):
-        return REGIME_UNKNOWN
-    if ce < _MEMORIZATION_TRAIN_CE_FLOOR:
-        return REGIME_MEMORIZATION
-    if (vl - ce) > _OVERFIT_GAP_THRESHOLD:
-        return REGIME_OVERFIT
-    return REGIME_GENERALIZATION
-
-
-def _full_section4_verdict_gate(
-    *, proxy_scale: bool, reduced_budget: bool, is_thin_evidence: bool, regime: str
-) -> bool:
-    """The 4-conjunct citation gate, as one source of truth.
-
-    A run is citable as the COMPLETE §4 verdict ONLY when it clears all four
-    axes: target-scale (not a proxy), full-budget (reached config ``max_steps``,
-    not reduced), non-thin (enough seeds for the bootstrap to capture variance),
-    AND in the generalization regime (the candidate generalized rather than
-    memorized — see :func:`_classify_regime`). Extracted from
-    :func:`result_to_json` so the gate is a single testable expression: the
-    serializer and the deposit self-consistency test
-    (``TestDepositGateSelfConsistency``) both call this, so a future conjunct
-    added here is the ONE place it must change, and any committed deposit whose
-    stored boolean predates the change is flagged by that test — the gate
-    definition cannot drift from the committed deposits unnoticed. The private
-    ``src.data`` quality filter is a further axis this gate cannot see on the
-    mirror; it is noted in the report, never silently assumed away.
-    """
-    return (
-        (not proxy_scale)
-        and (not reduced_budget)
-        and (not is_thin_evidence)
-        and (regime == REGIME_GENERALIZATION)
-    )
+# The reduced-budget rule (``_is_reduced_budget``), the training-regime
+# classifier (``_classify_regime``) with its grounded 0.5 / 0.5 thresholds, the
+# REGIME_* constants, and the 4-conjunct gate (``_full_section4_verdict_gate``)
+# live in the torch-free leaf ``src.tg_lora/freeze_verdict_honesty.py`` and are
+# imported here under their underscore aliases above. That leaf is the single
+# source of truth shared with the GPU-free replay gate, so a committed deposit's
+# producer-stamped ``citable_as_full_section4_verdict`` and the replay's
+# artifact-rederived verdict compute citability from the *same* thresholds and
+# rule — they cannot drift apart (SYSTEM_CONSTITUTION Rule #3). The 9th-iter
+# regime rationale (a memorized model's "SURPASSES" is an artifact, not the §4
+# question) and the deposit-grounded threshold provenance are documented there.
 
 
 def _candidate_final_ce_mean(result: dict):

@@ -1265,3 +1265,225 @@ class TestRealTargetScale9BDeposit:
         assert out["is_thin_evidence"] is False
         assert out["is_material"] is False
 
+
+# ---------------------------------------------------------------------------
+# The 9B honesty-schema four-axis gate (budget / thin / regime), re-derived
+# ---------------------------------------------------------------------------
+
+
+def _9b_deposit_fixtures():
+    """Every committed 9B §4 deposit (the runlog artifact is NOT a deposit)."""
+    fixture_dir = Path(__file__).resolve().parent / "fixtures"
+    return sorted(
+        p for p in fixture_dir.glob("freeze_validloss_ci_9b_*.json")
+        if "runlog" not in p.name
+    )
+
+
+class TestNineBHonestyGateReplay:
+    """The replay's ``citable_as_full_section4_verdict`` must reproduce the
+    PRODUCER's four-axis gate (target-scale + full-budget + non-thin +
+    generalization) from a 9B deposit's artifacts — not the 2-axis (scale +
+    context) gate it used before, which over-claimed every reduced-budget /
+    non-generalization 9B deposit as the COMPLETE §4 verdict.
+
+    Before this fix the replay gate honored only target-scale + full_context, so
+    all five committed reduced-budget 9B deposits (``total_steps`` 20/96 ≪
+    ``cfg_max_steps`` 1500) read ``citable_as_full_section4_verdict=True`` even
+    though the producer stamped ``False`` — the silent over-claim this class
+    closes. The fix re-derives the producer's budget / thin / regime axes from
+    the deposit's stored artifacts via the shared ``freeze_verdict_honesty``
+    leaf (the SAME logic the producer stamps), and a ``CITATION_LABEL_STALE``
+    cross-check flags any deposit whose stored boolean disagrees with the
+    artifact-rederived value. This is the citation-gate sibling of
+    ``_negative_control_active`` (``9dff092``) and ``_full_context_effective``
+    (``bbf6e68``): the gate trusts the machine-checkable artifact reality over
+    the operator-set / stored label.
+    """
+
+    def test_reduced_budget_9b_deposits_are_not_citable_as_full_verdict(self):
+        # PRIMARY mutation proof: the five reduced-budget 9B deposits (20/96
+        # steps vs cfg_max_steps=1500) are NOT citable as the complete §4
+        # verdict. Before the fix the replay gate honored only scale+context and
+        # read these True; the budget axis (re-derived from total_steps vs
+        # cfg_max_steps) now withholds — reverting the gate to the 2-axis form
+        # flips these back to True and fails this test.
+        reduced = [
+            p for p in _9b_deposit_fixtures()
+            if load_samples(p).get("reduced_budget") is True
+        ]
+        assert len(reduced) == 5, "expected exactly five reduced 9B deposits"
+        for fixture in reduced:
+            data = load_samples(fixture)
+            out = replay_to_json(fixture, data, replay_samples(data))
+            assert out["citable_as_full_section4_verdict"] is False, (
+                f"{fixture.name}: reduced-budget deposit must NOT be citable as "
+                "the complete §4 verdict (budget axis failed)"
+            )
+            assert "budget" in out["producer_honesty_axis_failures"], (
+                f"{fixture.name}: the budget axis must be named as the failing axis"
+            )
+
+    def test_full_budget_generalizing_9b_deposits_remain_citable(self):
+        # The two full-budget (1500==1500), non-thin (n=3/3), generalizing 9B
+        # deposits stay citable — the fix is byte-identical on the genuine
+        # complete-§4 results. (A regression that over-withholds would fail here.)
+        full = [
+            p for p in _9b_deposit_fixtures()
+            if load_samples(p).get("reduced_budget") is False
+        ]
+        assert len(full) == 2, "expected exactly two full 9B deposits"
+        for fixture in full:
+            data = load_samples(fixture)
+            out = replay_to_json(fixture, data, replay_samples(data))
+            assert out["citable_as_full_section4_verdict"] is True, (
+                f"{fixture.name}: full-budget generalizing deposit stays citable"
+            )
+            assert out["producer_honesty_axis_failures"] == []
+
+    def test_every_committed_9b_deposit_effective_equals_stored(self):
+        # INVARIANT: the replay's artifact-rederived verdict equals the producer's
+        # STORED boolean for every committed 9B deposit, and no deposit carries a
+        # stale label — the fix is byte-identical across the corpus. (Mirrors
+        # test_every_committed_deposit_effective_equals_stored for the
+        # negative-control axis.) A future deposit that legitimately diverges
+        # would trip this and force a deliberate decision rather than a silent
+        # over-claim — exactly the silent-corruption path this guard closes.
+        checked = 0
+        for fixture in _9b_deposit_fixtures():
+            data = load_samples(fixture)
+            out = replay_to_json(fixture, data, replay_samples(data))
+            stored = data.get("citable_as_full_section4_verdict")
+            assert stored is not None, f"{fixture.name}: 9B deposit must stamp the boolean"
+            assert out["citable_as_full_section4_verdict"] is bool(stored), (
+                f"{fixture.name}: effective ({out['citable_as_full_section4_verdict']}) "
+                f"!= stored ({stored}) — the replay gate drifted from the producer"
+            )
+            assert out["citation_label_stale"] is False, (
+                f"{fixture.name}: committed deposit must carry no stale label"
+            )
+            checked += 1
+        assert checked >= 7  # all 7 committed 9B deposits
+
+    def test_prose_invariant_holds_across_committed_9b_deposits(self):
+        # The machine gate and the human prose claim cannot drift: the effective
+        # verdict equals whether the prose contains "this verdict IS" for every
+        # committed 9B deposit — including the new target-scale+full-context-but-
+        # axis-failed branch (which withholds the strong claim and names the
+        # failing axis instead). Extends test_machine_gate_matches_human_prose
+        # to the 9B honesty-schema deposits it never iterated before.
+        for fixture in _9b_deposit_fixtures():
+            data = load_samples(fixture)
+            ci = replay_samples(data)
+            out = replay_to_json(fixture, data, ci)
+            prose = format_replay(fixture, data, ci)
+            assert out["citable_as_full_section4_verdict"] is (
+                "this verdict IS" in prose
+            ), f"{fixture.name}: machine gate != prose claim"
+
+    def test_hand_edited_stale_true_label_overridden_and_flagged(self):
+        # MUTATION PROOF (over-claim direction): a reduced-budget 9B deposit whose
+        # stored boolean is hand-edited to True (a stale over-claim) must STILL
+        # read effective=False — the gate derives the answer from the budget
+        # artifact (total_steps < cfg_max_steps), not the stored label — and the
+        # CITATION_LABEL_STALE cross-check fires in BOTH the machine field and the
+        # prose note. Reverting the gate to trust the stored boolean makes
+        # effective follow the lie (True); removing the cross-check drops the flag.
+        data = load_samples(_9b_deposit_fixtures()[0])  # a reduced-budget deposit
+        assert data.get("reduced_budget") is True
+        data["citable_as_full_section4_verdict"] = True  # the stale over-claim
+        ci = replay_samples(data)
+        out = replay_to_json("<stale-true>", data, ci)
+        assert out["citable_as_full_section4_verdict"] is False  # artifacts win
+        assert out["citation_label_stale"] is True
+        prose = format_replay("<stale-true>", data, ci)
+        assert "CITATION_LABEL_STALE" in prose
+        assert "NOT citable" in prose
+
+    def test_hand_edited_stale_false_label_overridden_and_flagged(self):
+        # MUTATION PROOF (under-claim direction, symmetric): a full-budget
+        # generalizing 9B deposit whose stored boolean is hand-edited to False (a
+        # stale under-claim) must STILL read effective=True — the artifacts
+        # (full budget, non-thin, generalization) earn the verdict — and the
+        # cross-check fires. Proves the gate derives from artifacts in BOTH
+        # directions, not just the over-claim one.
+        full = [
+            p for p in _9b_deposit_fixtures()
+            if load_samples(p).get("reduced_budget") is False
+        ][0]
+        data = load_samples(full)
+        data["citable_as_full_section4_verdict"] = False  # the stale under-claim
+        ci = replay_samples(data)
+        out = replay_to_json("<stale-false>", data, ci)
+        assert out["citable_as_full_section4_verdict"] is True  # artifacts win
+        assert out["citation_label_stale"] is True
+        assert "CITATION_LABEL_STALE" in format_replay("<stale-false>", data, ci)
+
+    def test_failing_axis_named_in_prose_for_reduced_deposit(self):
+        # A reduced 9B deposit is target-scale + full-context (seq_len=1024), so
+        # it reaches the NEW prose branch: the strong "this verdict IS" claim is
+        # withheld and the failing axis is named, so a reader sees WHY the
+        # four-axis gate stayed closed on a recording that looks complete.
+        data = load_samples(_9b_deposit_fixtures()[0])  # baseline: budget + regime
+        prose = format_replay("<reduced-9b>", data, replay_samples(data))
+        assert "this verdict IS" not in prose  # strong claim withheld
+        assert "NOT citable as the COMPLETE §4 verdict" in prose
+        assert "budget" in prose  # the failing axis is named
+
+    def test_thin_9b_schema_deposit_withheld_on_thin_axis(self):
+        # MUTATION PROOF (thin axis): a 9B-schema deposit that is full-budget and
+        # generalizing but THIN (< MIN_SAMPLE_FOR_BOOTSTRAP seeds in an arm) is
+        # withheld on the thin axis — a second producer axis the old 2-conjunct
+        # gate could not see. Built by trimming a full deposit's samples to 2/arm.
+        full = [
+            p for p in _9b_deposit_fixtures()
+            if load_samples(p).get("reduced_budget") is False
+        ][0]
+        data = load_samples(full)
+        data["candidate_losses"] = data["candidate_losses"][:2]  # thin arm
+        data["surrogate_losses"] = data["surrogate_losses"][:2]
+        out = replay_to_json("<thin-9b>", data, replay_samples(data))
+        assert out["citable_as_full_section4_verdict"] is False
+        assert "thin" in out["producer_honesty_axis_failures"]
+        assert out["is_thin_evidence"] is True
+
+    def test_non_generalization_9b_schema_deposit_withheld_on_regime_axis(self):
+        # MUTATION PROOF (regime axis): a 9B-schema deposit that is full-budget
+        # and non-thin but whose candidate memorized (train CE ≈ 0) is withheld on
+        # the regime axis — the third producer axis. The producer's
+        # classify_regime (shared leaf) reads the artifact over any stored label.
+        full = [
+            p for p in _9b_deposit_fixtures()
+            if load_samples(p).get("reduced_budget") is False
+        ][0]
+        data = load_samples(full)
+        data["candidate_final_ce_train_loss_mean"] = 0.01  # memorized: CE ≈ 0
+        out = replay_to_json("<memorized-9b>", data, replay_samples(data))
+        assert out["citable_as_full_section4_verdict"] is False
+        assert any(f.startswith("regime=") for f in out["producer_honesty_axis_failures"])
+
+    def test_schema_marker_governs_when_axes_honored(self):
+        # The producer axes are honored ONLY when the deposit carries the 9B
+        # honesty schema (cfg_max_steps / candidate_final_ce_train_loss_mean /
+        # regime). A target-scale + full-context recording WITHOUT the schema
+        # (a proxy-style / legacy recording) uses the scale+context gate alone —
+        # backward compatible, never over-withheld for lack of artifacts it
+        # never carried. A recording WITH the schema but reduced IS withheld.
+        from scripts.replay_freeze_validloss_ci import _carries_9b_honesty_schema
+
+        no_schema = _data([1.0] * 4, [2.0] * 4, proxy_scale=False)  # no 9B fields
+        assert _carries_9b_honesty_schema(no_schema) is False
+        out_no = replay_to_json("<no-schema>", no_schema, replay_samples(no_schema))
+        assert out_no["citable_as_full_section4_verdict"] is True  # old gate
+        assert out_no["producer_honesty_axis_failures"] == []
+
+        # Same recording shape but WITH a reduced 9B budget stamp -> withheld.
+        with_schema = dict(no_schema)
+        with_schema["cfg_max_steps"] = 1500
+        with_schema["total_steps"] = 20  # reduced
+        assert _carries_9b_honesty_schema(with_schema) is True
+        out_yes = replay_to_json("<with-schema>", with_schema, replay_samples(with_schema))
+        assert out_yes["citable_as_full_section4_verdict"] is False
+        assert "budget" in out_yes["producer_honesty_axis_failures"]
+
+

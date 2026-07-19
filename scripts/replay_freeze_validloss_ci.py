@@ -93,6 +93,17 @@ from src.tg_lora.freeze_surrogate_ci import (
     format_surrogate_valid_loss_ci,
     surrogate_valid_loss_ci,
 )
+# The §4 citation-gate honesty primitives — the SAME per-axis logic the producer
+# (scripts.run_freeze_validloss_ci_9b) uses to stamp
+# ``citable_as_full_section4_verdict``, imported here so the GPU-free replay
+# re-derives a deposit's budget / regime axes from the shared thresholds and
+# rule rather than trusting the stored boolean (single source of truth,
+# SYSTEM_CONSTITUTION Rule #3). See :func:`_producer_honesty_axes`.
+from src.tg_lora.freeze_verdict_honesty import (
+    REGIME_GENERALIZATION,
+    classify_regime,
+    is_reduced_budget,
+)
 from src.tg_lora.freeze_surrogate_gate import SURPASSES, TIES, UNDERSHOOTS
 
 # The three verdicts the §4 judge can emit (imported so ``--expected`` choices
@@ -242,6 +253,113 @@ def _full_context_effective(data: dict[str, Any]) -> bool:
     return bool(data.get("full_context", True))
 
 
+def _carries_9b_honesty_schema(data: dict[str, Any]) -> bool:
+    """True iff the deposit carries the producer's §4 honesty artifacts.
+
+    A deposit written by :func:`scripts.run_freeze_validloss_ci_9b.result_to_json`
+    stamps ``cfg_max_steps``, ``candidate_final_ce_train_loss_mean``, and
+    ``regime`` (the four-axis gate's inputs); a proxy / synthetic / legacy
+    recording does not. Only the former carries enough information to re-derive
+    the producer's four axes, so the replay honors those axes (budget / thin /
+    regime) only when this is True and otherwise falls back to the scale + context
+    gate alone — the same artifact-when-present-else-flag discipline as
+    :func:`_negative_control_active` / :func:`_full_context_effective`. This keeps
+    the gate backward-compatible for the proxy / simulated recordings that never
+    carried a training budget or a train-CE diagnostic, while closing the
+    over-claim on every genuine 9B deposit (which always stamps all three).
+    """
+    return any(
+        k in data
+        for k in ("cfg_max_steps", "candidate_final_ce_train_loss_mean", "regime")
+    )
+
+
+def _producer_honesty_axes(
+    data: dict[str, Any], ci: SurrogateValidLossCI
+) -> tuple[bool, list[str]]:
+    """Re-derive the producer's 4-conjunct gate's budget / thin / regime axes from
+    a 9B deposit's artifacts (GOAL §4 / §7 citation honesty).
+
+    The producer stamps ``citable_as_full_section4_verdict`` via its four-axis
+    gate (:func:`src.tg_lora.freeze_verdict_honesty.full_section4_verdict_gate`);
+    the replay must reproduce that answer from the deposit's stored artifacts,
+    not trust the stored boolean alone. A hand-edited or externally-supplied 9B
+    deposit that is reduced-budget (or thin, or non-generalization) yet carries a
+    stale ``citable_as_full_section4_verdict=True`` would otherwise read as the
+    COMPLETE §4 verdict — the operator-set label trusted over the
+    machine-checkable artifact reality, the same class as
+    :func:`_negative_control_active` (``9dff092``) and
+    :func:`_full_context_effective` (``bbf6e68``). The three axes derived here
+    mirror the producer verbatim via the shared leaf:
+
+    * **budget** — :func:`is_reduced_budget(total_steps, cfg_max_steps)`: the
+      deposit stamps both, so the gate never trusts a hardcoded ``reduced_budget``
+      flag (a full-length run that reached ``max_steps`` clears the axis);
+    * **thin** — ``ci.is_thin_evidence``: the bootstrap's own artifact-derived
+      flag (an arm below ``MIN_SAMPLE_FOR_BOOTSTRAP`` seeds cannot anchor a §4
+      significance statement);
+    * **regime** — :func:`classify_regime(candidate_final_ce_train_loss_mean,
+      ci.candidate_mean)`: the deposit stamps the candidate's mean train CE and
+      the candidate valid_loss is the recomputed ``ci.candidate_mean`` (identical
+      to the producer's, since the bootstrap is deterministic and the losses are
+      the stored ones) — so a memorized / overfit / UNKNOWN-regime run is withheld
+      even at full budget and full context.
+
+    Returns ``(all_hold, failures)`` where ``failures`` names every axis that
+    fails (``'budget'`` / ``'thin'`` / ``'regime=<label>'``) — the boolean drives
+    the machine gate; the list drives the prose note so a reader sees *why* a
+    target-scale, full-context deposit is still not citable as the complete §4
+    verdict. Only meaningful when :func:`_carries_9b_honesty_schema` is True.
+    """
+    try:
+        total_steps = int(data.get("total_steps"))
+    except (TypeError, ValueError):
+        # A partial 9B deposit missing total_steps reads as reduced — the
+        # conservative call that never opens the gate on an unverifiable budget,
+        # mirroring the producer (max_steps<=0 or absent -> reduced).
+        total_steps = 0
+    try:
+        cfg_max_steps = int(data.get("cfg_max_steps"))
+    except (TypeError, ValueError):
+        cfg_max_steps = 0
+    reduced = is_reduced_budget(total_steps, cfg_max_steps)
+    thin = ci.is_thin_evidence
+    regime = classify_regime(
+        data.get("candidate_final_ce_train_loss_mean"), ci.candidate_mean
+    )
+    failures: list[str] = []
+    if reduced:
+        failures.append("budget")
+    if thin:
+        failures.append("thin")
+    if regime != REGIME_GENERALIZATION:
+        failures.append(f"regime={regime}")
+    return (not failures), failures
+
+
+def _citation_label_stale(
+    data: dict[str, Any], effective_citable: bool
+) -> bool:
+    """True when a stored ``citable_as_full_section4_verdict`` boolean disagrees
+    with the artifact-rederived effective verdict (GOAL §7 citation honesty).
+
+    A 9B deposit the producer stamps always carries the stored boolean, and the
+    replay re-derives the same verdict from the deposit's artifacts (see
+    :func:`_producer_honesty_axes`); the two agree on every honest deposit. A
+    disagreement means the stored label is stale or hand-edited — the gate treats
+    the artifact-derived ``effective_citable`` as authoritative and surfaces the
+    contradiction loud (the prose :func:`format_replay` ``CITATION_LABEL_STALE``
+    note, mirroring ``BUDGET_DIVERGENCE_UNFLAGGED`` / ``FULL_CONTEXT_FLAG_REFUTED``)
+    rather than silently trusting the label. Returns False when the deposit
+    carries no stored boolean (a proxy / legacy recording) — there is nothing to
+    cross-check, and the effective verdict still governs.
+    """
+    stored = data.get("citable_as_full_section4_verdict")
+    if stored is None:
+        return False
+    return bool(stored) != effective_citable
+
+
 def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLossCI) -> str:
     """Human-readable replay block: scale, the §4 verdict, and faithfulness.
 
@@ -295,6 +413,24 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
         full_context_flag_explicit and _seq_len_refutes_full_context(data)
     )
     seq_len = data.get("seq_len")
+    # The producer's four-axis gate's budget / thin / regime axes — re-derived
+    # from the deposit's artifacts when it carries the 9B honesty schema. Drives
+    # the target-scale + full-context branch (withhold the strong "this verdict
+    # IS" claim when an axis fails) and the trailing CITATION_LABEL_STALE note.
+    # ``effective_full_section4`` mirrors the machine gate in :func:`replay_to_json`
+    # exactly (same helpers, same order) so the prose claim and the JSON field
+    # cannot drift — the invariant ``citable_as_full_section4_verdict is
+    # ("this verdict IS" in prose)`` holds across every recording type.
+    citable_as_target_scale_eff = (
+        not proxy_scale and not synthetic and not negative_control
+    )
+    producer_axes_hold, producer_axis_failures = (
+        _producer_honesty_axes(data, ci)
+        if _carries_9b_honesty_schema(data) else (True, [])
+    )
+    effective_full_section4 = (
+        citable_as_target_scale_eff and full_context and producer_axes_hold
+    )
     scale = "PROXY" if proxy_scale else "TARGET"
     recorded = data.get("verdict")
     lines = [
@@ -376,11 +512,31 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
                 "cite it as the full §4 verdict."
             )
         else:
-            lines.append(
-                "  note: TARGET_SCALE — samples are from a 9B run; this verdict "
-                "IS the §4 target-scale result. The proxy verdict upgrades to "
-                "target-scale by swapping the sample source, with no code change."
-            )
+            if producer_axes_hold:
+                lines.append(
+                    "  note: TARGET_SCALE — samples are from a 9B run; this verdict "
+                    "IS the §4 target-scale result. The proxy verdict upgrades to "
+                    "target-scale by swapping the sample source, with no code change."
+                )
+            else:
+                # Target-scale + full-context, yet a producer honesty axis
+                # (budget / thin / regime) failed: a genuine 9B run that is still
+                # NOT citable as the COMPLETE §4 verdict. Withhold the strong
+                # "this verdict IS" claim (mirrors the reduced-context branch) and
+                # name the failing axis so the reader sees *why* the four-axis
+                # gate stayed closed despite a target-scale, full-context recording.
+                axes_clause = ", ".join(producer_axis_failures)
+                lines.append(
+                    "  note: TARGET_SCALE — samples are from a 9B run and the "
+                    "recording is at target scale and full context; however a §4 "
+                    f"producer honesty axis failed ({axes_clause}), so the verdict "
+                    "is NOT citable as the COMPLETE §4 verdict. The verdict is "
+                    "faithfully recomputed from the stored floats but is a "
+                    "reduced-budget / thin / non-generalization probe, not the "
+                    "full four-axis §4 result; do not cite it as the complete §4 "
+                    "verdict. A full-budget, non-thin, generalizing run clears "
+                    "these axes and this note drops."
+                )
     # Negative-control provenance (additive — a negative control IS a real
     # measurement, just not of order). The degraded arm is named so the gap's
     # source is honest: a candidate-degraded recording's gap is from
@@ -445,6 +601,29 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
             "for a genuine full-context run, or set full_context: false to record "
             "the reduced-context probe honestly."
         )
+    # §4 verdict-label staleness guard (mirrors FULL_CONTEXT_FLAG_REFUTED /
+    # BUDGET_DIVERGENCE_UNFLAGGED): a deposit whose STORED
+    # ``citable_as_full_section4_verdict`` boolean disagrees with the artifact-
+    # rederived effective verdict has a stale or hand-edited label. The gate
+    # derives the answer from the deposit's budget / thin / regime artifacts (the
+    # producer's four-axis gate via the shared ``freeze_verdict_honesty`` leaf)
+    # over the stored boolean, and surfaces the contradiction loud rather than
+    # silently trusting the label — the stored-boolean-trusted-over-artifact path
+    # this guard closes, sibling of :func:`_full_context_effective` / ``bbf6e68``
+    # and :func:`_negative_control_active` / ``9dff092``.
+    if _citation_label_stale(data, effective_full_section4):
+        stored = data.get("citable_as_full_section4_verdict")
+        lines.append(
+            "  note: CITATION_LABEL_STALE — the recording's stored "
+            f"citable_as_full_section4_verdict={stored!r} disagrees with the "
+            f"effective verdict ({effective_full_section4}) re-derived from its "
+            "artifacts (budget / thin / regime axes, the producer's four-axis "
+            "gate). The citation gate trusts the artifact-derived answer over the "
+            "stored label, so the deposit is treated as "
+            f"{'citable' if effective_full_section4 else 'NOT citable'} as the "
+            "complete §4 verdict. Re-stamp the deposit from a fresh producer run "
+            "(or correct the stored boolean) so the label matches the artifacts."
+        )
     return "\n".join(lines)
 
 
@@ -462,8 +641,15 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
       so an unflagged degraded arm cannot slip through and be cited as an order
       result.
     * ``citable_as_full_section4_verdict`` — ``True`` only when target-scale AND
-      ``full_context``. A reduced-context probe is ``False``: it must not be
-      cited as the *full* §4 verdict (TASK-0152 lines 86-97, enforced as a field).
+      ``full_context`` AND, for a deposit carrying the 9B honesty schema, the
+      producer's budget / thin / regime axes (re-derived from the artifacts via
+      :func:`_producer_honesty_axes`, never the stored boolean). A reduced-budget,
+      thin, or non-generalization 9B deposit is ``False`` even at full context:
+      it must not be cited as the *complete* §4 verdict — the same four-axis gate
+      the producer stamps, reproduced GPU-free. ``citation_label_stale`` is
+      ``True`` when a stored ``citable_as_full_section4_verdict`` boolean disagrees
+      with this artifact-rederived value (a stale / hand-edited label; the gate
+      trusts the artifacts — see :func:`_citation_label_stale`).
     """
     proxy_scale = bool(data.get("proxy_scale", True))
     synthetic = bool(data.get("synthetic", False))
@@ -482,6 +668,21 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
     full_context = _full_context_effective(data)
     citable_as_target_scale = (
         not proxy_scale and not synthetic and not negative_control
+    )
+    # The producer's four-axis gate's budget / thin / regime axes, re-derived from
+    # the deposit's artifacts — honored ONLY when the deposit carries the 9B
+    # honesty schema (cfg_max_steps / candidate_final_ce_train_loss_mean / regime).
+    # A proxy / synthetic / legacy recording lacks those artifacts and uses the
+    # scale + context gate alone (backward compatible); a genuine 9B deposit
+    # always stamps all three, so this closes the over-claim on every one of them.
+    # See :func:`_producer_honesty_axes` (single source of truth via the shared
+    # ``freeze_verdict_honesty`` leaf — same thresholds/rule the producer stamps).
+    producer_axes_hold, producer_axis_failures = (
+        _producer_honesty_axes(data, ci)
+        if _carries_9b_honesty_schema(data) else (True, [])
+    )
+    citable_as_full_section4_verdict = (
+        citable_as_target_scale and full_context and producer_axes_hold
     )
     return {
         "replayed_verdict": ci.significance_verdict,
@@ -504,10 +705,25 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         # Citation gate level 1 (target-scale): genuine target-scale (mirrors the
         # prose "samples are from a 9B run").
         "citable_as_target_scale": citable_as_target_scale,
-        # Citation gate level 2 (full §4 verdict): target-scale AND full_context.
-        # A reduced-context probe is target-scale but NOT the full verdict
-        # (TASK-0152 lines 86-97) — so a 12GB deposit cannot be over-cited.
-        "citable_as_full_section4_verdict": citable_as_target_scale and full_context,
+        # Citation gate level 2 (full §4 verdict): target-scale AND full_context
+        # AND — for a 9B honesty-schema deposit — the producer's budget/thin/
+        # regime axes re-derived from the artifacts (NOT the stored boolean). A
+        # reduced-context probe is target-scale but NOT the full verdict
+        # (TASK-0152 lines 86-97); a reduced-budget / thin / non-generalization
+        # 9B deposit is NOT the complete verdict either — so a 12GB deposit or a
+        # reduced run cannot be over-cited.
+        "citable_as_full_section4_verdict": citable_as_full_section4_verdict,
+        # Which producer honesty axes a 9B-schema deposit failed (empty when the
+        # gate holds or the deposit carries no 9B schema). Surfaces *why* the full
+        # §4 claim is withheld so a consumer never has to reverse-engineer it.
+        "producer_honesty_axis_failures": producer_axis_failures,
+        # Cross-check: does the deposit's stored full-§4 boolean agree with the
+        # artifact-rederived value? True = stale/hand-edited label the gate
+        # overrode from the artifacts (mirrors the prose CITATION_LABEL_STALE note;
+        # absent for proxy/legacy recordings that carry no stored boolean).
+        "citation_label_stale": _citation_label_stale(
+            data, citable_as_full_section4_verdict
+        ),
         "candidate_mean": ci.candidate_mean,
         "surrogate_mean": ci.surrogate_mean,
         "point_improvement": ci.point_improvement,

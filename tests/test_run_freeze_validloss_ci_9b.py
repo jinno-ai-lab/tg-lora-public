@@ -1282,6 +1282,43 @@ class TestReducedBudgetHonest:
         assert _is_reduced_budget(total_steps=1500, max_steps=-1) is True
 
 
+# ── single source of truth: the producer delegates gate primitives to the leaf ─
+
+
+class TestGatePrimitivesAreSharedLeaf:
+    """The §4 citation-gate primitives live in ONE torch-free leaf
+    (``src.tg_lora.freeze_verdict_honesty``) shared by the producer (this runner)
+    and the GPU-free replay gate, so a regime threshold / reduced-budget rule /
+    4-conjunct gate tuned in the leaf changes BOTH at once and a committed
+    deposit's producer-stamped boolean and the replay's re-derived verdict cannot
+    drift apart (SYSTEM_CONSTITUTION Rule #3). These tests pin that the runner's
+    underscore-named primitives ARE the leaf's objects (delegation, not a
+    duplicated copy): if someone re-inlines a local ``_classify_regime`` /
+    ``_is_reduced_budget`` / ``_full_section4_verdict_gate`` here, the identity
+    check fails and forces them back to the shared leaf.
+    """
+
+    def test_classify_regime_is_the_leaf_primitive(self):
+        from src.tg_lora.freeze_verdict_honesty import classify_regime
+        assert _classify_regime is classify_regime
+
+    def test_is_reduced_budget_is_the_leaf_primitive(self):
+        from src.tg_lora.freeze_verdict_honesty import is_reduced_budget
+        assert _is_reduced_budget is is_reduced_budget
+
+    def test_full_section4_verdict_gate_is_the_leaf_primitive(self):
+        from src.tg_lora.freeze_verdict_honesty import full_section4_verdict_gate
+        assert _full_section4_verdict_gate is full_section4_verdict_gate
+
+    def test_regime_constants_are_the_leaf_constants(self):
+        from src.tg_lora import freeze_verdict_honesty as leaf
+        assert REGIME_GENERALIZATION == leaf.REGIME_GENERALIZATION
+        assert REGIME_MEMORIZATION == leaf.REGIME_MEMORIZATION
+        assert REGIME_OVERFIT == leaf.REGIME_OVERFIT
+        assert REGIME_UNKNOWN == leaf.REGIME_UNKNOWN
+
+
+
 # ── full-run gate liveness: the shipped Make flags + bound config must clear ─
 # ── the two config-determined citation-gate axes BEFORE any GPU is spent ─────
 
