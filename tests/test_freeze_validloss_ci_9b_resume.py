@@ -93,6 +93,18 @@ def test_arm_specs_match_legacy_semantics():
         assert spec["depth"] == depth
 
 
+def test_arm_specs_reject_cross_role_seed_collisions():
+    """Large sweeps must not silently reuse a LoRA init across arm roles."""
+    with pytest.raises(
+        ValueError,
+        match=r"candidate\[100\].*surrogate\[0\].*both use seed 100",
+    ):
+        _arm_specs(
+            active_indices=SCOPE, scope_sorted=SCOPE_SORTED, base_seed=0, depth=3,
+            n_candidate=101, n_surrogate=101, n_control=101, n_baseline=101,
+        )
+
+
 def test_arm_specs_execution_order_is_candidate_first():
     """Arms execute candidate → surrogate → control → baseline, matching the
     original comprehension order (so the headline A/B completes earliest)."""

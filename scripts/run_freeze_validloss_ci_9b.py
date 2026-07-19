@@ -1109,6 +1109,8 @@ def _arm_specs(
     ``base_seed + 100 + i``; control: same input-first order, seed
     ``base_seed + 200 + i``; baseline: depth-0 no-freeze, seed
     ``base_seed + 300 + i``) so a fresh run with no ledger is identical to before.
+    The fixed bands preserve all existing run/ledger identities; requested counts
+    that make them overlap are rejected instead of silently sharing a LoRA init.
     """
     cand_order = candidate_order_9b(active_indices)
     control_order = control_order_9b(active_indices)
@@ -1126,6 +1128,18 @@ def _arm_specs(
     for i in range(n_baseline):
         specs.append({"role": "baseline", "index": i, "order": tuple(scope_sorted),
                       "seed": base_seed + 300 + i, "depth": 0})
+
+    seed_owner: dict[int, tuple[str, int]] = {}
+    for spec in specs:
+        owner = seed_owner.get(spec["seed"])
+        if owner is not None:
+            raise ValueError(
+                "LoRA-init seed collision: "
+                f"{owner[0]}[{owner[1]}] and {spec['role']}[{spec['index']}] "
+                f"both use seed {spec['seed']}. Reduce the requested arm counts "
+                "so the fixed role seed bands (0/100/200/300) remain disjoint."
+            )
+        seed_owner[spec["seed"]] = (spec["role"], spec["index"])
     return specs
 
 
