@@ -16,6 +16,8 @@ tests exercise the two traps this layer keeps apart: significance vs.
 materiality, and thin-evidence honesty.
 """
 
+import math
+
 import numpy as np
 import pytest
 
@@ -192,6 +194,78 @@ class TestValidation:
     def test_zero_n_bootstrap_rejected(self):
         with pytest.raises(ValueError, match="n_bootstrap"):
             bootstrap_difference_ci(_BETTER_CANDIDATE, _BETTER_SURROGATE, n_bootstrap=0)
+
+
+class TestNonFiniteLossRejected:
+    """A NaN/inf sample must fail loud at the verdict chokepoint.
+
+    Closed corruption: a diverged training arm (gradient explosion) records a
+    NaN/inf valid_loss. Without this guard it reaches the bootstrap math, where
+    ``numpy.percentile`` over a NaN-poisoned ``improvements`` array returns NaN
+    and ``nan > 0`` / ``nan < 0`` are both ``False`` — so the verdict silently
+    falls through to ``TIES``, the *same* label both genuine full-budget §4
+    verdicts carry (corrupt-but-green, GOAL §7). The guard sits at
+    :func:`surrogate_valid_loss_ci` — the single entry every producer feeds
+    (proxy ``run_ci``, 9B ``run_ci_9b``, committed-deposit replay) — complementing
+    the formation-chokepoint guard ``756ea96`` (which keeps NaN out of a
+    *committed deposit artifact* but never sees the proxy/9B live-arm paths).
+    """
+
+    def test_nan_in_candidate_rejected(self):
+        # Without the guard this returns verdict == TIES silently (see the
+        # math-layer proof at the end of this class).
+        with pytest.raises(ValueError, match="non-finite"):
+            surrogate_valid_loss_ci([1.5, float("nan"), 1.6], _BETTER_SURROGATE)
+
+    def test_nan_in_surrogate_rejected(self):
+        with pytest.raises(ValueError, match="non-finite"):
+            surrogate_valid_loss_ci(_BETTER_CANDIDATE, [1.7, float("nan"), 1.9])
+
+    def test_positive_inf_rejected(self):
+        with pytest.raises(ValueError, match="non-finite"):
+            surrogate_valid_loss_ci([1.5, float("inf")], _BETTER_SURROGATE)
+
+    def test_negative_inf_rejected(self):
+        with pytest.raises(ValueError, match="non-finite"):
+            surrogate_valid_loss_ci(_BETTER_CANDIDATE, [1.7, float("-inf")])
+
+    def test_nan_string_coercion_rejected(self):
+        # float("nan") accepts the string form; a deposit reloaded from JSON
+        # could carry it if the formation guard (756ea96) were ever bypassed,
+        # so the coercion path must be caught too.
+        with pytest.raises(ValueError, match="non-finite"):
+            surrogate_valid_loss_ci([1.5, "nan"], _BETTER_SURROGATE)
+
+    def test_error_names_the_diverged_arm(self):
+        # The operator must see WHICH arm diverged to drop or re-run it.
+        with pytest.raises(ValueError, match="surrogate"):
+            surrogate_valid_loss_ci(_BETTER_CANDIDATE, [float("nan")])
+
+    def test_finite_samples_are_unaffected(self):
+        # The guard is transparent for valid input: a clearly-better finite
+        # candidate still clears the bar with the same verdict (byte-identical
+        # path — both committed full-budget deposits replay unchanged).
+        ci = surrogate_valid_loss_ci(_BETTER_CANDIDATE, _BETTER_SURROGATE)
+        assert ci.significance_verdict == SURPASSES
+
+    def test_corruption_mechanism_nan_silently_ties_at_math_layer(self):
+        # PROOF of the bug this verdict-entry guard closes. Feed NaN to the raw
+        # math layer (bootstrap_difference_ci, which this fix intentionally does
+        # NOT guard — surrogate_valid_loss_ci does). numpy.percentile over a
+        # NaN-poisoned improvements array returns NaN, and NaN compares False to
+        # zero in BOTH directions, so the verdict logic a NaN CI yields is TIES
+        # — silently indistinguishable from a genuine null. This is exactly why
+        # the guard must sit at the verdict entry every producer feeds, and it
+        # is mutation-stable: it exercises the unguarded math layer, so it
+        # cannot pass by accident of the guard being present or absent.
+        point, lower, upper = bootstrap_difference_ci(
+            [1.5, float("nan"), 1.6], _BETTER_SURROGATE
+        )
+        assert math.isnan(point)
+        assert math.isnan(lower)
+        assert math.isnan(upper)
+        verdict = SURPASSES if lower > 0.0 else (UNDERSHOOTS if upper < 0.0 else TIES)
+        assert verdict == TIES  # the silent corruption the guard prevents
 
 
 class TestFormatter:

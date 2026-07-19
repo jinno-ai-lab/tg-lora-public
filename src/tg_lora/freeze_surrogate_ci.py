@@ -64,10 +64,17 @@ Honesty (GOAL §7 鉄則) — this layer keeps the two traps §7 warns about apa
   confirmed significance statement — the same sample bar
   :data:`freeze_cost.MIN_SAMPLE_FOR_CONFIDENCE_BAND` applies to a confidence
   band.
+* **Non-finite input honesty**: a NaN/inf sample (a diverged arm's valid_loss)
+  is rejected loud by :func:`_require_finite_losses` rather than silently
+  producing a TIES verdict — ``numpy.percentile`` over a NaN-poisoned array
+  returns NaN, and ``nan`` compares ``False`` to zero in both directions, so
+  without this guard a gradient-explosion failure would read as the *same* null
+  label the genuine verdicts carry (corrupt-but-green, GOAL §7).
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -275,6 +282,14 @@ def surrogate_valid_loss_ci(
     surrogate = tuple(float(v) for v in surrogate_valid_losses)
     _require_non_empty(candidate)
     _require_non_empty(surrogate)
+    # A non-finite (NaN/inf) sample would silently turn the verdict into TIES
+    # (see :func:`_require_finite_losses`); reject it loud at the verdict
+    # chokepoint every producer feeds — proxy ``run_ci``, 9B ``run_ci_9b``, and
+    # the committed-deposit replay — rather than letting a diverged arm corrupt
+    # the §4 call. ``756ea96`` guards the formation artifact; this guards the
+    # computation itself.
+    _require_finite_losses(candidate, "candidate")
+    _require_finite_losses(surrogate, "surrogate")
 
     point, lower, upper = bootstrap_difference_ci(
         candidate,
@@ -356,6 +371,44 @@ def _require_non_empty(values: Sequence[float]) -> Sequence[float]:
             "got an empty candidate or surrogate sample"
         )
     return values
+
+
+def _require_finite_losses(values: Sequence[float], arm: str) -> None:
+    """Reject a non-finite (NaN/inf) sample so a diverged arm fails loud.
+
+    A training arm that diverged (gradient explosion) records a NaN/inf
+    valid_loss. Once such a value reaches :func:`bootstrap_difference_ci`,
+    ``numpy.percentile`` over the NaN-poisoned ``improvements`` draws returns
+    NaN, and ``nan > 0.0`` / ``nan < 0.0`` are both ``False`` — so the verdict
+    silently falls through to ``TIES``, the *same* label both genuine
+    full-budget §4 verdicts carry. A diverged arm would thus read as a clean
+    null instead of a failure: corrupt-but-green (GOAL §7), indistinguishable
+    from the recorded TIES verdicts without this guard.
+
+    This is the verdict-*computation* sibling of the formation-chokepoint guard
+    (:func:`scripts.form_freeze_validloss_deposit._finite_loss_or_none`,
+    ``756ea96``): that guard keeps a non-finite loss out of a *committed deposit
+    artifact*, while this one keeps it from corrupting the *verdict math* —
+    covering the proxy ``run_ci`` and 9B ``run_ci_9b`` paths that feed this layer
+    directly from live training arms and never pass through formation. Each
+    deposited entry is one arm's final result (not a per-step value), so a
+    non-finite entry means the arm diverged end-to-end: there is no honest
+    finite fallback, so the bootstrap fails loud rather than silently dropping
+    the arm (which would change ``n_candidate`` / ``n_surrogate`` and the
+    verdict — a second silent corruption).
+    """
+    for v in values:
+        f = float(v)
+        if not math.isfinite(f):
+            raise ValueError(
+                f"a bootstrap CI requires finite valid_loss samples, but the "
+                f"{arm} arm contains a non-finite value ({v!r}). A NaN/inf "
+                f"reaches here when a training arm diverged (gradient "
+                f"explosion); numpy.percentile over a NaN-poisoned array "
+                f"returns NaN and the verdict would silently read TIES "
+                f"(corrupt-but-green, GOAL §7). Drop or re-run the diverged "
+                f"arm rather than letting it corrupt the §4 verdict."
+            )
 
 
 __all__ = [
