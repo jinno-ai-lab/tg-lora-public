@@ -1683,3 +1683,205 @@ class TestSubVerdictLabelStaleness:
                 )
 
 
+class TestLedgerBinding:
+    """The deposit-vs-ledger binding: the replay re-derives the §4 verdict from a
+    deposit's per-arm losses, but the committed ledger (``ledger_witness_path``)
+    is the ground-truth record each arm's ``valid_loss`` was harvested from. The
+    replay now cross-checks the deposit's cited losses AND its stamped witness
+    hash against that ledger — the deposit-vs-ledger sibling of the intra-deposit
+    label-vs-artifact guards (``371e934`` direction/baseline, ``d734327`` the four
+    citation axes).
+
+    The gap this closes: a hand-edited deposit that is *internally* self-consistent
+    — its ``evidence_hash`` matches its edited fields, its recorded verdict matches
+    its edited losses, every intra-deposit gate stays green — yet diverges from its
+    committed ledger would re-derive a corrupt-but-green verdict with no stale
+    flag, because the ledger is the one primary record the intra-deposit gates
+    never consult. Proof of need (verified below): on the homogeneous full deposit
+    (recorded TIES, already citable) editing ``candidate_losses[0]`` by −0.05 flips
+    the replayed verdict to ``SURPASSES`` *while staying citable* — turning an
+    honest null into a claimed §4 win that no prior gate flags; only the ledger
+    binding catches it.
+    """
+
+    # The two citable full-budget deposits — the only recordings that carry a
+    # committed ledger witness — each paired with its committed JSONL ledger.
+    _FULL_PAIRS = [
+        (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json",
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full_ledger.jsonl",
+        ),
+        (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full_heterogeneous.json",
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl",
+        ),
+    ]
+
+    def test_both_ledgers_are_committed_alongside_their_deposits(self):
+        # The witness ledger is a committed repo file — the binding cross-check
+        # reads committed bytes, never a gitignored ``runs/`` path or a private
+        # stable dir. Both full deposits carry a relative ``ledger_witness_path``
+        # that resolves to a committed file next to the deposit.
+        for deposit, ledger in self._FULL_PAIRS:
+            assert ledger.exists(), (
+                f"{ledger.name} missing — the citable full deposit's ledger "
+                f"witness is not committed alongside it."
+            )
+            data = load_samples(str(deposit))
+            wit = data["ledger_witness_path"]
+            assert wit is not None and not Path(wit).is_absolute(), (
+                f"{deposit.name}: ledger_witness_path must be relative, got {wit!r}"
+            )
+
+    def test_full_deposits_bind_cleanly_to_their_ledgers(self):
+        # Byte-identical invariant: both citable full deposits' per-arm losses
+        # reconstruct from their committed ledger EXACTLY (float ==) and the
+        # stamped witness hash matches the re-derived one. A committed deposit
+        # must never carry losses that diverge from its own ledger — this is the
+        # deposit-vs-ledger analogue of the harvest-time
+        # ``test_ledger_reconstructs_deposit_loss_vectors_exactly`` witness pin.
+        for deposit, _ledger in self._FULL_PAIRS:
+            data = load_samples(str(deposit))
+            out = replay_to_json(str(deposit), data, replay_samples(data))
+            assert out["ledger_losses_stale"] == [], (
+                f"{deposit.name}: committed deposit's losses diverge from its "
+                f"ledger on roles {out['ledger_losses_stale']!r}."
+            )
+            assert out["ledger_witness_stale"] is False, (
+                f"{deposit.name}: stamped witness hash diverges from the ledger "
+                f"re-derived from {data.get('ledger_witness_path')!r}."
+            )
+
+    def test_deposits_without_a_ledger_witness_skip_cleanly(self):
+        # Backward-compat / skip discipline: a deposit that carries no committed
+        # ledger (every proxy / synthetic / reduced-budget recording, and any full
+        # deposit pre-harvest) must report CLEAN — the cross-check skips, it must
+        # not false-positive on a deposit that simply has no ledger to bind
+        # against. Every committed 9B deposit that is NOT one of the two full
+        # ones carries no ledger witness (verified: baseline / direction /
+        # generalization / heterogeneous_generalization / surrogate).
+        full_names = {p[0].name for p in self._FULL_PAIRS}
+        no_ledger = [
+            p for p in _9b_deposit_fixtures() if p.name not in full_names
+        ]
+        assert no_ledger, "expected non-full 9B deposits to exercise the skip path"
+        for deposit in no_ledger:
+            data = load_samples(str(deposit))
+            ci = replay_samples(data)
+            out = replay_to_json(str(deposit), data, ci)
+            prose = format_replay(str(deposit), data, ci)
+            assert out["ledger_losses_stale"] == [], (
+                f"{deposit.name}: a deposit without a ledger witness must skip, "
+                f"got losses_stale={out['ledger_losses_stale']!r}"
+            )
+            assert out["ledger_witness_stale"] is False, (
+                f"{deposit.name}: witness_stale must be False with no ledger"
+            )
+            assert "LEDGER_LOSSES_STALE" not in prose, (
+                f"{deposit.name}: no prose note expected without a ledger"
+            )
+            assert "LEDGER_WITNESS_STALE" not in prose
+
+    def test_hand_edited_candidate_loss_is_flagged(self):
+        # PRIMARY mutation proof (the corrupt-but-green path). The homogeneous
+        # full deposit records TIES and is citable; editing candidate_losses[0]
+        # by -0.05 flips the replayed verdict to SURPASSES while STAYING citable
+        # — an honest null turned into a claimed §4 win that every intra-deposit
+        # gate (evidence_hash, recorded-verdict, direction/baseline, the four
+        # citation axes) reads as green. Only the ledger binding names "candidate"
+        # in ledger_losses_stale and emits the LEDGER_LOSSES_STALE prose note.
+        deposit = self._FULL_PAIRS[0][0]
+        data = load_samples(str(deposit))
+        ci_clean = replay_samples(data)
+        assert ci_clean.significance_verdict == TIES  # the recorded verdict
+        # The lie: lower the candidate's first loss so the candidate "wins".
+        data["candidate_losses"][0] -= 0.05
+        ci_mut = replay_samples(data)
+        assert ci_mut.significance_verdict == SURPASSES, (
+            "mutation premise: the edited losses must flip TIES -> SURPASSES"
+        )
+        out = replay_to_json(str(deposit), data, ci_mut)
+        # The binding is the ONLY gate that fires.
+        assert out["ledger_losses_stale"] == ["candidate"], (
+            f"got {out['ledger_losses_stale']!r}, expected ['candidate']"
+        )
+        assert "LEDGER_LOSSES_STALE" in format_replay(
+            str(deposit), data, ci_mut
+        )
+
+    def test_hand_edited_surrogate_loss_is_flagged(self):
+        # Mutation proof (surrogate arm): the sibling of the candidate proof — a
+        # lie on the surrogate vector is named, not just the candidate.
+        deposit = self._FULL_PAIRS[0][0]
+        data = load_samples(str(deposit))
+        data["surrogate_losses"][1] += 0.01
+        out = replay_to_json(str(deposit), data, replay_samples(data))
+        assert "surrogate" in out["ledger_losses_stale"], (
+            f"got {out['ledger_losses_stale']!r}, expected to name 'surrogate'"
+        )
+
+    def test_dropped_arm_length_mismatch_is_flagged(self):
+        # Mutation proof (shape): a deposit that silently dropped an arm's loss
+        # (changing n_candidate and thus the verdict) diverges from the ledger in
+        # LENGTH, not just value — the cross-check catches the shape mismatch too.
+        deposit = self._FULL_PAIRS[0][0]
+        data = load_samples(str(deposit))
+        data["candidate_losses"] = data["candidate_losses"][:-1]
+        out = replay_to_json(str(deposit), data, replay_samples(data))
+        assert "candidate" in out["ledger_losses_stale"]
+
+    def test_hand_edited_witness_hash_is_flagged(self):
+        # Mutation proof (witness binding): a deposit pointed at the wrong ledger,
+        # a ledger rewritten under the same path, or a hand-edited stamp — the
+        # stamped ``ledger_witness_sha256`` no longer matches the re-derived one.
+        # The losses still match (so losses_stale stays clean) but the content
+        # binding is broken; witness_stale fires and the prose names it.
+        deposit = self._FULL_PAIRS[0][0]
+        data = load_samples(str(deposit))
+        data["ledger_witness_sha256"] = "ZZZ_NEVER_REAL"
+        ci = replay_samples(data)
+        out = replay_to_json(str(deposit), data, ci)
+        assert out["ledger_witness_stale"] is True
+        assert out["ledger_losses_stale"] == [], (
+            "a pure witness-hash lie must not also trip the losses check"
+        )
+        assert "LEDGER_WITNESS_STALE" in format_replay(str(deposit), data, ci)
+
+    def test_prose_note_presence_matches_machine_flags(self):
+        # DRIFT invariant (mirrors the direction/baseline drift test above): the
+        # machine flags and the human prose notes cannot drift. Across a committed
+        # deposit (clean) AND a hand-edited lie on each axis (candidate loss /
+        # witness hash), ``LEDGER_LOSSES_STALE in prose`` == bool(losses_stale)
+        # and ``LEDGER_WITNESS_STALE in prose`` == witness_stale.
+        deposit = self._FULL_PAIRS[0][0]
+        cases = [("committed", load_samples(str(deposit)))]
+        lie_losses = load_samples(str(deposit))
+        lie_losses["candidate_losses"][0] -= 0.05
+        cases.append(("lie-losses", lie_losses))
+        lie_wit = load_samples(str(deposit))
+        lie_wit["ledger_witness_sha256"] = "ZZZ_NEVER_REAL"
+        cases.append(("lie-witness", lie_wit))
+        for name, data in cases:
+            ci = replay_samples(data)
+            out = replay_to_json(str(deposit), data, ci)
+            prose = format_replay(str(deposit), data, ci)
+            losses_note = "LEDGER_LOSSES_STALE" in prose
+            witness_note = "LEDGER_WITNESS_STALE" in prose
+            assert losses_note is bool(out["ledger_losses_stale"]), (
+                f"{name}: losses prose ({losses_note}) != flag "
+                f"({out['ledger_losses_stale']!r})"
+            )
+            assert witness_note is out["ledger_witness_stale"], (
+                f"{name}: witness prose ({witness_note}) != flag "
+                f"({out['ledger_witness_stale']!r})"
+            )
+
+

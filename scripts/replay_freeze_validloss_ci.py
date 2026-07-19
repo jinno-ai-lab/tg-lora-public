@@ -83,6 +83,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -430,6 +431,165 @@ def _subverdict_stale(
     return stored != rederived
 
 
+# The verdict-critical per-arm loss vectors a deposit stamps, keyed by the ledger
+# role name. ``surrogate_valid_loss_ci`` draws the main verdict from the candidate
+# and surrogate vectors; the control / baseline arms feed the §4 condition (a)/(b)
+# sub-CIs. Each is reproducible from the committed ledger's per-arm ``valid_loss``,
+# so the replay can bind the deposit's cited losses to the ledger's ground truth.
+_LEDGER_ROLE_LOSS_KEYS = (
+    ("candidate", "candidate_losses"),
+    ("surrogate", "surrogate_losses"),
+    ("control", "control_losses"),
+    ("baseline", "baseline_losses"),
+)
+
+
+def _resolve_ledger_path(
+    data: dict[str, Any], deposit_path: str | Path
+) -> Path | None:
+    """Resolve a deposit's committed ledger witness file, or ``None``.
+
+    The producer stamps ``ledger_witness_path`` (a repo-root-relative path to the
+    committed per-arm ledger JSONL) only on the citable full-§4 deposits; a proxy
+    / synthetic / reduced-budget recording carries none, so this returns ``None``
+    and the ledger cross-checks skip (the artifact-when-present-else-skip discipline
+    of :func:`_carries_9b_honesty_schema`). When the path IS declared, resolve it
+    CWD-relative first (how ``make freeze-replay`` invokes the replay from the repo
+    root) and then, for a deposit passed by absolute path, against each ancestor of
+    the deposit's own directory — so the binding fires whether the replay is run
+    from the repo root or against an absolute deposit path. Returns ``None`` when
+    no candidate file exists (the ledger is not committed alongside this deposit;
+    the cross-checks skip rather than fail, the same posture as the other
+    artifact-derived gates).
+    """
+    raw = data.get("ledger_witness_path")
+    if not raw:
+        return None
+    witness = Path(raw)
+    candidates: list[Path] = [Path.cwd() / witness]
+    deposit_dir = Path(deposit_path).resolve().parent
+    for ancestor in (deposit_dir, *deposit_dir.parents):
+        candidates.append(ancestor / witness)
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _load_committed_ledger(
+    data: dict[str, Any], deposit_path: str | Path
+) -> list[dict[str, Any]] | None:
+    """Parse a deposit's committed ledger witness, or ``None`` when absent.
+
+    Returns the list of parsed JSONL records (header + per-arm rows) the producer
+    wrote alongside the deposit. ``None`` when the deposit declares no
+    ``ledger_witness_path``, the file is not committed, or a line fails to parse —
+    the cross-checks skip in every case (never trust a half-readable ledger).
+    """
+    path = _resolve_ledger_path(data, deposit_path)
+    if path is None:
+        return None
+    records: list[dict[str, Any]] = []
+    try:
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                records.append(json.loads(line))
+    except (OSError, ValueError):
+        return None
+    return records
+
+
+def _ledger_arm_losses_by_role(
+    records: list[dict[str, Any]],
+) -> dict[str, list[float]]:
+    """Per-role per-seed ``valid_loss`` vectors, ordered by the arm ``index``.
+
+    The ledger's ground-truth record: one ``valid_loss`` per arm per seed, grouped
+    by role (candidate / surrogate / control / baseline) and sorted by the arm's
+    ``index`` so the vector aligns with the deposit's ``<role>_losses`` list (which
+    the producer fills arm-by-arm in the same seed order).
+    """
+    by_role: dict[str, list[tuple[int, float]]] = {}
+    for rec in records:
+        if rec.get("type") != "arm":
+            continue
+        role = rec.get("role")
+        idx = rec.get("index")
+        vl = rec.get("valid_loss")
+        if role is None or idx is None or vl is None:
+            continue
+        by_role.setdefault(role, []).append((int(idx), float(vl)))
+    return {role: [vl for _, vl in sorted(pairs)] for role, pairs in by_role.items()}
+
+
+def _ledger_losses_stale(
+    data: dict[str, Any], records: list[dict[str, Any]]
+) -> list[str]:
+    """Roles whose deposit-stamped losses diverge from the ledger's ground truth.
+
+    The verdict (and the direction / baseline sub-verdicts) are computed from the
+    deposit's ``candidate_losses`` / ``surrogate_losses`` / ``control_losses`` /
+    ``baseline_losses``. The committed ledger records each arm's ground-truth
+    ``valid_loss`` at harvest; a hand-edited or externally-supplied deposit that is
+    internally self-consistent (``evidence_hash`` matches its own edited fields, the
+    verdict matches its edited losses) yet diverges from the ledger would otherwise
+    re-derive a corrupt-but-green verdict — the ledger is the primary record the
+    deposit was harvested from, and the replay must bind the cited artifact to it
+    (the deposit-vs-ledger sibling of the intra-deposit label-vs-losses guards
+    :func:`_subverdict_stale` / ``371e934`` and :func:`_citation_label_stale` /
+    ``d734327``). Returns the role names whose vectors differ in length or carry
+    any element-wise mismatch; empty when every role matches (or the ledger was
+    absent — see :func:`_load_committed_ledger`).
+    """
+    ledger_losses = _ledger_arm_losses_by_role(records)
+    stale: list[str] = []
+    # No committed ledger to bind against (the deposit declares none, or the file
+    # was absent / unreadable) → there is no ground-truth to diverge from, so the
+    # cross-check skips (returns clean), the same posture as every other
+    # artifact-when-present-else-skip gate. Without this a deposit that simply
+    # carries no ledger would read as fully stale on every role.
+    if not ledger_losses:
+        return stale
+    for role, key in _LEDGER_ROLE_LOSS_KEYS:
+        deposit_vec = data.get(key) or []
+        ledger_vec = ledger_losses.get(role, [])
+        # Compare whenever the role appears in EITHER source: empty==empty is a
+        # match, but a deposit that dropped (or invented) an arm's losses diverges.
+        if not deposit_vec and not ledger_vec:
+            continue
+        if len(deposit_vec) != len(ledger_vec):
+            stale.append(role)
+            continue
+        if any(float(a) != float(b) for a, b in zip(deposit_vec, ledger_vec)):
+            stale.append(role)
+    return stale
+
+
+def _ledger_witness_stale(
+    data: dict[str, Any], records: list[dict[str, Any]]
+) -> bool:
+    """True when a deposit's stamped witness hash diverges from its ledger.
+
+    The producer stamps ``ledger_witness_sha256`` (a canonical SHA-256 over the
+    parsed ledger JSONL — ``json.dumps(records, sort_keys=True, separators=...)``,
+    the same canonicalization ``TestCommittedLedgerWitness`` pins build-time) so the
+    deposit binds to a specific committed ledger by content, not filename. The
+    replay re-derives that hash from the ledger it just parsed and flags a deposit
+    whose stamp no longer matches — a hand-edited stamp, a ledger rewritten under
+    the same path, or a deposit pointed at the wrong ledger. Honored at the replay
+    chokepoint; ``False`` when the deposit declares no stamp or no ledger is
+    committed (the cross-check skips — same artifact-when-present discipline).
+    """
+    stored = data.get("ledger_witness_sha256")
+    if not stored or not records:
+        return False
+    canonical = json.dumps(records, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(canonical).hexdigest() != stored
+
+
 def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLossCI) -> str:
     """Human-readable replay block: scale, the §4 verdict, and faithfulness.
 
@@ -724,6 +884,39 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
                 "deposit from a fresh producer run (or correct the stored label) "
                 "so it matches the losses."
             )
+    # Committed-ledger binding (the deposit-vs-ledger sibling of the intra-deposit
+    # label-vs-losses guards above): the verdict is computed from the deposit's
+    # per-arm losses, but the committed ledger (``ledger_witness_path``) is the
+    # ground-truth record of each arm's valid_loss. A hand-edited deposit that
+    # diverges from its ledger would otherwise re-derive a corrupt-but-green
+    # verdict; the ledger is parsed and the deposit's losses + witness hash are
+    # cross-checked against it, surfaced loud rather than silently trusted. Skipped
+    # (no note) when the deposit carries no committed ledger — the same
+    # artifact-when-present-else-skip discipline as the 9B honesty-schema gate.
+    ledger_records = _load_committed_ledger(data, path)
+    ledger_losses_stale = _ledger_losses_stale(data, ledger_records or [])
+    if ledger_losses_stale:
+        arms = ", ".join(ledger_losses_stale)
+        lines.append(
+            "  note: LEDGER_LOSSES_STALE — the recording's stored losses for "
+            f"({arms}) disagree with the ground-truth per-arm valid_loss in its "
+            f"committed ledger (ledger_witness_path="
+            f"{data.get('ledger_witness_path')!r}). The verdict is re-derived from "
+            "the deposit's losses; a deposit that diverges from its ledger "
+            "re-derives a verdict the committed primary record does not support "
+            "(corrupt-but-green, GOAL §7). Re-harvest the deposit from a fresh "
+            "producer run so its losses match the ledger."
+        )
+    if _ledger_witness_stale(data, ledger_records or []):
+        stored = data.get("ledger_witness_sha256")
+        lines.append(
+            "  note: LEDGER_WITNESS_STALE — the recording's stamped "
+            f"ledger_witness_sha256={stored!r} disagrees with the SHA-256 "
+            "re-derived from its committed ledger. The deposit no longer binds to "
+            "the ledger by content (a rewritten ledger, a hand-edited stamp, or a "
+            "deposit pointed at the wrong ledger). Re-stamp the witness from a "
+            "fresh harvest so the hash matches the committed bytes."
+        )
     return "\n".join(lines)
 
 
@@ -792,6 +985,11 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
     citable_as_full_section4_verdict = (
         citable_as_target_scale and full_context and producer_axes_hold
     )
+    # Parse the committed ledger once and reuse it for both ledger-binding fields
+    # below (same single read the prose path in :func:`format_replay` uses, so the
+    # two JSON fields share one parse and cannot diverge if the file changes
+    # between reads). ``[]`` when the deposit declares no committed ledger.
+    ledger_records = _load_committed_ledger(data, path) or []
     return {
         "replayed_verdict": ci.significance_verdict,
         "recorded_verdict": data.get("verdict"),
@@ -851,6 +1049,17 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         "baseline_verdict_stale": _subverdict_stale(
             data, slot="baseline", losses_key="baseline_losses"
         ),
+        # Committed-ledger binding (the deposit-vs-ledger sibling of the
+        # intra-deposit cross-checks above): the verdict is computed from the
+        # deposit's per-arm losses, but the committed ledger is the ground-truth
+        # per-arm record. ``ledger_records`` is parsed once before this dict and
+        # reused by both fields (mirrors the prose LEDGER_LOSSES_STALE /
+        # LEDGER_WITNESS_STALE notes; same helpers, same ledger, one read — the two
+        # cannot drift). ``[]`` / False when the deposit carries no committed
+        # ledger — the artifact-when-present discipline, same as the 9B honesty
+        # schema gate.
+        "ledger_losses_stale": _ledger_losses_stale(data, ledger_records),
+        "ledger_witness_stale": _ledger_witness_stale(data, ledger_records),
         "candidate_mean": ci.candidate_mean,
         "surrogate_mean": ci.surrogate_mean,
         "point_improvement": ci.point_improvement,
