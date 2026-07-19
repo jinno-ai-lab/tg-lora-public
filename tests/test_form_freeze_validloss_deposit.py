@@ -32,6 +32,7 @@ The suite guards:
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -166,6 +167,101 @@ def test_extract_falls_back_when_footer_best_is_null(tmp_path: Path) -> None:
     assert prov["best_valid_loss_source"] == "min_loss_valid_step"
     assert prov["best_valid_step"] == 16
     assert prov["run_id"] == "killed_base"
+
+
+# ---------------------------------------------------------------------------
+# Non-finite loss closure — a diverged QLoRA run writes NaN/inf into loss_valid
+# / best_valid_loss (gradient explosion). float() accepts those silently, so
+# without a finiteness guard a non-finite value would enter the deposit's losses
+# arrays and poison the bootstrap verdict (numpy.mean([1.5, nan]) == nan → a
+# NaN CI → corrupt-but-green §4, GOAL §7) — the same silent-corruption class as
+# the non-Dolly schema guard (7c4aebf). These pin the closed path and each is
+# mutation-RED without the _finite_loss_or_none guard (NaN sticks / is returned).
+# ---------------------------------------------------------------------------
+
+
+def test_extract_skips_non_finite_footer_uses_step_min(tmp_path: Path) -> None:
+    # A diverged run whose footer ``best_valid_loss`` went NaN must NOT deposit
+    # NaN: the non-finite footer is treated as "no usable value" and extract
+    # falls through to the honest finite per-step minimum. Without the guard the
+    # bare ``float(nan)`` footer is returned verbatim — corrupting the verdict.
+    p = _write_run_metrics(
+        tmp_path / "diverged_footer.jsonl",
+        run_id="diverged",
+        seed=7,
+        best=float("nan"),  # diverged run: best_loss tracker went NaN
+        step_losses=[1.30, 1.06, 1.18],  # honest finite eval losses, min=1.06
+    )
+    value, prov = extract_best_valid_loss(p)
+    assert math.isfinite(value)
+    assert value == pytest.approx(1.06)
+    assert prov["best_valid_loss_source"] == "min_loss_valid_step"
+
+
+def test_extract_skips_non_finite_step_losses(tmp_path: Path) -> None:
+    # NaN/inf eval steps (transient glitch / warmup instability) must not poison
+    # the running minimum. The NaN is placed FIRST so without the guard it seeds
+    # ``min_step_loss = nan`` and every later finite comparison (``x < nan`` is
+    # False) leaves it stuck at NaN — the exact corrupt-but-green deposit the
+    # guard closes. With the guard the non-finite steps are skipped and the
+    # honest finite minimum (1.10) survives.
+    p = _write_run_metrics(
+        tmp_path / "glitched.jsonl",
+        run_id="glitch",
+        seed=8,
+        best=1.0,  # ignored — no footer written
+        step_losses=[float("nan"), 1.50, float("inf"), 1.10],
+        with_footer=False,
+    )
+    value, prov = extract_best_valid_loss(p)
+    assert math.isfinite(value)
+    assert value == pytest.approx(1.10)
+    assert prov["best_valid_loss_source"] == "min_loss_valid_step"
+
+
+def test_extract_raises_when_entire_run_non_finite(tmp_path: Path) -> None:
+    # A FULLY diverged run (every step AND the footer non-finite) has no citable
+    # arm result. Rather than silently deposit NaN it fails LOUD — the same
+    # ValueError an empty/missing-loss file raises — so the broken run surfaces
+    # instead of corrupting the §4 verdict.
+    p = _write_run_metrics(
+        tmp_path / "fully_diverged.jsonl",
+        run_id="dead",
+        seed=9,
+        best=float("nan"),
+        step_losses=[float("nan"), float("inf"), float("-inf")],
+    )
+    with pytest.raises(ValueError, match="no best_valid_loss"):
+        extract_best_valid_loss(p)
+
+
+def test_form_deposit_never_emits_non_finite_losses(tmp_path: Path) -> None:
+    # The P0 deposit-integrity property end-to-end: NO non-finite float ever
+    # reaches the candidate_losses / surrogate_losses arrays that feed the
+    # bootstrap verdict. One candidate run diverged (NaN footer, finite steps);
+    # it contributes its finite step min (1.20), not NaN, so the deposit stays
+    # bootstrap-safe. Without the guard this deposit would contain NaN.
+    cand_diverged = _write_run_metrics(
+        tmp_path / "cand_diverged.jsonl", run_id="cand_div", seed=1,
+        best=float("nan"), step_losses=[1.40, 1.20],
+    )
+    cand_ok = _write_run_metrics(
+        tmp_path / "cand_ok.jsonl", run_id="cand_ok", seed=2,
+        best=1.10, step_losses=[1.30, 1.10],
+    )
+    surr_ok = _write_run_metrics(
+        tmp_path / "surr_ok.jsonl", run_id="surr_ok", seed=3,
+        best=1.50, step_losses=[1.60, 1.50],
+    )
+    deposit = form_deposit(
+        [cand_diverged, cand_ok], [surr_ok],
+        model="Qwen/Qwen3.5-9B", device="cuda-rtx3060",
+        task="generalize", architecture="heterogeneous", total=120, seq_len=256,
+    )
+    assert all(math.isfinite(x) for x in deposit["candidate_losses"])
+    assert all(math.isfinite(x) for x in deposit["surrogate_losses"])
+    assert deposit["candidate_losses"] == pytest.approx([1.20, 1.10])
+    assert deposit["surrogate_losses"] == pytest.approx([1.50])
 
 
 def _real_producer_metrics(tmp_path: Path, run_id: str, *, with_footer: bool = False):

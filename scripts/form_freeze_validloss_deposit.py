@@ -46,9 +46,32 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any, Sequence
+
+
+def _finite_loss_or_none(value: Any) -> float | None:
+    """Coerce a loss field to float, returning ``None`` when non-finite.
+
+    ``float()`` accepts ``"nan"`` / ``"inf"`` / ``"-inf"`` silently, and a
+    diverged QLoRA run writes exactly those into ``loss_valid`` /
+    ``best_valid_loss`` (gradient explosion → a NaN/inf eval loss). A
+    non-finite float deposited into ``candidate_losses`` /
+    ``surrogate_losses`` poisons the bootstrap verdict downstream
+    (``numpy.mean([1.5, nan]) == nan`` → a NaN CI → a corrupt-but-green §4
+    verdict, GOAL §7) — the same silent-corruption class as a non-Dolly
+    schema reaching :func:`scripts.run_freeze_validloss_ci_9b._load_dolly_records`
+    (``7c4aebf``). Routing a non-finite value through the same ``None``
+    "no signal" path as a missing field means a run with an occasional
+    glitched eval step still yields its honest finite best, while a
+    fully-diverged run (every step AND the footer non-finite) hits the loud
+    ``ValueError`` in :func:`extract_best_valid_loss` instead of silently
+    depositing NaN.
+    """
+    f = float(value)
+    return f if math.isfinite(f) else None
 
 
 def extract_best_valid_loss(path: str | Path) -> tuple[float, dict[str, Any]]:
@@ -110,11 +133,17 @@ def extract_best_valid_loss(path: str | Path) -> tuple[float, dict[str, Any]]:
                 # misrepresenting what the footer's ``best_valid_loss`` would
                 # have recorded. Take the running min across both fields.
                 for field in ("loss_valid", "loss_valid_full"):
-                    candidate = record.get(field)
+                    raw = record.get(field)
+                    if raw is None:
+                        continue
+                    candidate = _finite_loss_or_none(raw)
                     if candidate is None:
+                        # Non-finite (NaN/inf from a diverged eval step) is not a
+                        # measurement — skip it like a missing field so a glitched
+                        # step never silently deposits NaN into the bootstrap.
                         continue
                     if min_step_loss is None or candidate < min_step_loss:
-                        min_step_loss = float(candidate)
+                        min_step_loss = candidate
                         min_step = record.get("step")
             elif rtype == "run_footer":
                 # Arm identity lives on the footer regardless of whether the run
@@ -133,10 +162,16 @@ def extract_best_valid_loss(path: str | Path) -> tuple[float, dict[str, Any]]:
                 # An interrupted run writes a footer with ``best_valid_loss: null``
                 # (best_loss never updated) — treat that as "no footer value" and
                 # fall through to the per-step minimum rather than crashing on
-                # ``float(None)``.
-                if record.get("best_valid_loss") is not None:
-                    footer_value = float(record["best_valid_loss"])
-                    footer_step = record.get("best_valid_step")
+                # ``float(None)``. A NON-FINITE footer (``nan`` / ``inf`` — a
+                # diverged run whose best_loss tracker went non-finite) is treated
+                # the same way: it is not a citable arm result, so it falls through
+                # to the per-step min rather than silently depositing NaN (see
+                # :func:`_finite_loss_or_none`).
+                raw_best = record.get("best_valid_loss")
+                if raw_best is not None:
+                    footer_value = _finite_loss_or_none(raw_best)
+                    if footer_value is not None:
+                        footer_step = record.get("best_valid_step")
 
     if footer_value is not None:
         value, best_step, source_kind = footer_value, footer_step, "run_footer"
