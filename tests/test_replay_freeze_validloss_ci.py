@@ -2564,4 +2564,233 @@ class TestTargetScaleLabelBinding:
             )
 
 
+class TestSignificantSurpassesBinding:
+    """The stored-``significant_surpasses``-vs-rederived-``ci`` binding: the
+    producer stamps ``significant_surpasses`` straight from the ``ci`` it computed
+    the verdict from (``"significant_surpasses": ci.significant_surpasses`` — the
+    §7 *statistical* axis, ``significance_verdict == SURPASSES``, deliberately
+    separated from the margin-dependent *practical* axis ``is_material``). It is
+    the boolean a reader / table / downstream consumer cites as "is the lead
+    statistically significant?", distinct from the verdict STRING and from the CI
+    FLOATS.
+
+    The gap this closes: ``faithful`` binds the verdict LABEL (``verdict ==
+    ci.significance_verdict``) and ``ci_stats_stale`` / ``6ed0f69`` binds the
+    verdict's QUANTITATIVE backing (``lower`` / ``upper`` / means / point
+    improvement / confidence / sample sizes / thin-evidence) — but NEITHER binds
+    the ``significant_surpasses`` BOOLEAN (it is not in ``_CI_STAT_BINDINGS``,
+    which excludes the margin-dependent ``is_material`` / ``passes`` but never
+    listed this margin-INvariant boolean either). So a hand-edited deposit that
+    flips ``significant_surpasses`` while leaving the verdict STRING and the CI
+    FLOATS honest — over-claiming statistical significance on a TIES /
+    UNDERSHOOTS recording (``stored=True`` while ``verdict != SURPASSES`` and
+    ``lower <= 0``), or under-claiming a genuine SURPASSES — passes every prior
+    gate silently. Proof of need (verified below): on the homogeneous full deposit
+    (recorded TIES, ``significant_surpasses=False``) flipping the boolean to
+    ``True`` keeps ``faithful=True`` and ``ci_stats_stale=[]`` (and every other
+    gate green), yet the deposit's statistical-significance claim is a lie; only
+    this guard catches it.
+    """
+
+    @staticmethod
+    def _deposits_with_flag():
+        # Every committed sample deposit that stamps ``significant_surpasses`` —
+        # all three verdict classes (SURPASSES-stored-True, TIES-stored-False,
+        # UNDERSHOOTS-stored-False) and both scales (9B + proxy) — so the
+        # byte-identical invariant is proven in every direction, not just the
+        # SURPASSES one. The runlog is a different schema (no sample lists) and is
+        # skipped the same way TestTargetScaleLabelBinding skips it.
+        fixture_dir = Path(__file__).resolve().parent / "fixtures"
+        out = []
+        for p in sorted(fixture_dir.glob("freeze_validloss*.json")):
+            if "runlog" in p.name:
+                continue
+            try:
+                if "significant_surpasses" in json.loads(p.read_text()):
+                    out.append(p)
+            except Exception:
+                continue
+        return out
+
+    def test_committed_deposits_flag_matches_ci(self):
+        # Byte-identical invariant: every committed deposit that stores the
+        # significance boolean must re-derive to ``significant_surpasses_stale is
+        # False`` — the producer stamps it from ``ci.significant_surpasses``, so the
+        # replay reproduces it from the deposit's own losses bit-for-bit. A future
+        # deposit whose stamped boolean drifted from its re-derived significance
+        # verdict (a botched harvest, a hand-edit) trips this and the silent
+        # significance repaint is prevented. Covers all three verdict classes.
+        assert self._deposits_with_flag(), "expected committed flagged deposits"
+        for deposit in self._deposits_with_flag():
+            data = load_samples(str(deposit))
+            ci = replay_samples(data)
+            out = replay_to_json(str(deposit), data, ci)
+            assert out["significant_surpasses_stale"] is False, (
+                f"{deposit.name}: stored significant_surpasses="
+                f"{data.get('significant_surpasses')!r} disagrees with "
+                f"ci.significant_surpasses={ci.significant_surpasses!r} "
+                f"(verdict={data.get('verdict')!r})."
+            )
+            assert "SIGNIFICANT_SURPASSES_STALE" not in format_replay(
+                str(deposit), data, ci
+            )
+
+    def test_recording_without_flag_skips_cleanly(self):
+        # Skip / false-positive discipline: a recording that carries the sample
+        # lists but stamps NO ``significant_surpasses`` boolean (a legacy / minimal
+        # recording that predates the field) must report CLEAN — the cross-check
+        # skips, it must not false-positive on a deposit that simply has no
+        # significance boolean to bind.
+        path = "legacy-no-significance-flag.json"
+        data = {
+            "candidate_losses": [1.0, 1.0, 1.0],
+            "surrogate_losses": [2.0, 2.0, 2.0],
+            "base_seed": 0,
+        }
+        ci = replay_samples(data)
+        out = replay_to_json(path, data, ci)
+        assert out["significant_surpasses_stale"] is False, (
+            "a flag-less recording must skip, got a stale flag"
+        )
+        assert "SIGNIFICANT_SURPASSES_STALE" not in format_replay(path, data, ci)
+
+    def test_hand_edited_overclaim_is_flagged(self):
+        # PRIMARY mutation proof (over-claim axis — the dangerous direction). The
+        # homogeneous full deposit is a recorded TIES (``significant_surpasses=
+        # False``, ``lower < 0``); flipping the stored boolean to ``True``
+        # OVER-CLAIMS statistical significance on a recording whose CI straddles
+        # zero. The losses (and thus the verdict STRING and the CI FLOATS) are
+        # untouched, so ``faithful`` and ``ci_stats_stale`` stay clean — yet the
+        # boolean no longer matches ``ci.significant_surpasses``. ONLY this guard
+        # fires.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        ci = replay_samples(data)
+        assert data["significant_surpasses"] is False
+        assert ci.significant_surpasses is False
+        data["significant_surpasses"] = True  # the lie: claim significance on a TIES
+        out = replay_to_json(str(deposit), data, ci)
+        assert out["significant_surpasses_stale"] is True
+        assert "SIGNIFICANT_SURPASSES_STALE" in format_replay(str(deposit), data, ci)
+
+    def test_hand_edited_underclaim_is_flagged(self):
+        # Mutation proof (under-claim axis). A recorded SURPASSES deposit carries
+        # ``significant_surpasses=True`` (``lower > 0``); flipping the stored
+        # boolean to ``False`` UNDER-CLAIMS a genuine statistically-significant
+        # lead. Caught symmetrically; the binding is not over-claim-only.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_baseline.json"
+        )
+        data = load_samples(str(deposit))
+        ci = replay_samples(data)
+        assert data["significant_surpasses"] is True
+        assert ci.significant_surpasses is True
+        data["significant_surpasses"] = False  # the lie: hide a real significance
+        out = replay_to_json(str(deposit), data, ci)
+        assert out["significant_surpasses_stale"] is True
+        assert "SIGNIFICANT_SURPASSES_STALE" in format_replay(str(deposit), data, ci)
+
+    def test_independent_of_verdict_label_and_ci_stats(self):
+        # DISTINCTION proof (not redundant with ``faithful`` OR ``ci_stats_stale``).
+        # ``faithful`` binds the verdict STRING and ``ci_stats_stale`` binds the CI
+        # FLOATS; the ``significant_surpasses`` BOOLEAN is in NEITHER binding list.
+        # A deposit whose verdict STRING is honest (``faithful``) and whose CI
+        # FLOATS are honest (``ci_stats_stale``) yet whose significance BOOLEAN was
+        # hand-edited passes both — proving the three are independent and this
+        # guard closes a distinct, reachable path they both leave open.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        ci = replay_samples(data)
+        data["significant_surpasses"] = True  # flip the boolean ONLY
+        out = replay_to_json(str(deposit), data, ci)
+        assert out["faithful"] is True, (
+            "verdict STRING untouched -> faithful must NOT fire"
+        )
+        assert out["ci_stats_stale"] == [], (
+            "CI FLOATS untouched and the boolean is not in _CI_STAT_BINDINGS -> "
+            "ci_stats_stale must NOT fire"
+        )
+        assert out["significant_surpasses_stale"] is True, (
+            "the flipped significance boolean is the distinct path this gate closes"
+        )
+
+    def test_corrupt_flag_passes_every_other_gate(self):
+        # REACHABILITY proof (the silent path this guard closes). A deposit whose
+        # stored significance boolean is flipped but whose losses / verdict / CI
+        # floats / labels stay honest passes EVERY prior gate — faithful,
+        # ci_stats_stale, evidence_hash, the citation labels, the ledger, the
+        # sub-verdicts — and is caught ONLY by significant_surpasses_stale. This is
+        # the corrupt-but-green §7 statistical-significance-claim path, made loud.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        data["significant_surpasses"] = True  # flip the significance boolean only
+        out = replay_to_json(str(deposit), data, replay_samples(data))
+        assert out["faithful"] is True, "verdict STRING untouched -> still matches"
+        assert out["ci_stats_stale"] == [], (
+            "CI FLOATS untouched and boolean not in binding list -> stays clean"
+        )
+        assert out["evidence_hash_stale"] is False, (
+            "gate labels are not evidence bytes -> stamp stays clean"
+        )
+        assert out["citation_label_stale"] is False
+        assert out["target_scale_label_stale"] is False
+        assert out["ledger_losses_stale"] == []
+        assert out["direction_verdict_stale"] is False
+        assert out["significant_surpasses_stale"] is True, (
+            "the flipped significance boolean must be the ONE gate that fires"
+        )
+
+    def test_prose_note_presence_matches_machine_flag(self):
+        # DRIFT invariant (mirrors TestCiStatsBinding / TestTargetScaleLabelBinding
+        # / TestLedgerBinding / TestEvidenceHashBinding): the machine flag and the
+        # human prose note cannot drift. Across a committed deposit (clean) AND a
+        # hand-edited lie on each axis (over-claim / under-claim), the prose note
+        # presence == the machine flag.
+        full = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        surpasses = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_baseline.json"
+        )
+        full_base = load_samples(str(full))
+        surpasses_base = load_samples(str(surpasses))
+        cases = [
+            ("committed-ties", str(full), full_base),
+            ("committed-surpasses", str(surpasses), surpasses_base),
+            ("lie-overclaim", str(full), {**full_base, "significant_surpasses": True}),
+            (
+                "lie-underclaim",
+                str(surpasses),
+                {**surpasses_base, "significant_surpasses": False},
+            ),
+        ]
+        for name, path, data in cases:
+            ci = replay_samples(data)
+            out = replay_to_json(path, data, ci)
+            prose = format_replay(path, data, ci)
+            note = "SIGNIFICANT_SURPASSES_STALE" in prose
+            assert note is out["significant_surpasses_stale"], (
+                f"{name}: prose ({note}) != flag "
+                f"({out['significant_surpasses_stale']!r})"
+            )
+
+
 

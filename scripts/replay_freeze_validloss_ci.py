@@ -426,6 +426,78 @@ def _target_scale_label_stale(data: dict[str, Any]) -> bool:
     return bool(stored) != (not proxy_scale)
 
 
+def _significant_surpasses_stale(
+    data: dict[str, Any], ci: SurrogateValidLossCI
+) -> bool:
+    """True when a stored ``significant_surpasses`` boolean disagrees with the
+    artifact-rederived significance verdict (GOAL §7 citation honesty).
+
+    The producer stamps ``significant_surpasses`` straight from the ``ci`` it
+    computed the verdict from (:func:`scripts.run_freeze_validloss_ci_9b.
+    result_to_json`, ``"significant_surpasses": ci.significant_surpasses``) — the
+    §7 *statistical* axis, the property
+    :attr:`src.tg_lora.freeze_surrogate_ci.SurrogateValidLossCI.significant_surpasses`
+    (``significance_verdict == SURPASSES``, i.e. the bootstrap CI excludes zero on
+    the candidate's side). §7 deliberately separates this statistical axis from
+    the *practical* axis :attr:`~SurrogateValidLossCI.is_material` (point lead
+    clears the material margin): a recording can read ``significant_surpasses=True``
+    yet ``is_material=False`` — the 2.6σ-but-useless case §7 refuses to let a paper
+    claim as a win. ``significant_surpasses`` is the boolean a reader / table /
+    downstream consumer cites as "is the lead statistically significant?", distinct
+    from the verdict STRING and from the CI FLOATS.
+
+    The gap this closes: ``faithful`` (:func:`replay_samples`) binds the verdict
+    LABEL — ``data["verdict"] == ci.significance_verdict`` — and
+    :func:`_ci_stats_stale` / ``6ed0f69`` binds the verdict's QUANTITATIVE backing
+    (``lower`` / ``upper`` / means / point improvement / confidence / sample sizes
+    / thin-evidence), but NEITHER binds the ``significant_surpasses`` BOOLEAN. It is
+    not in :data:`_CI_STAT_BINDINGS` (which holds the margin-invariant statistics
+    the verdict label and CI floats already imply, deliberately excluding the
+    margin-dependent ``is_material`` / ``passes``). So a hand-edited or
+    externally-supplied deposit that flips ``significant_surpasses`` while leaving
+    the verdict STRING and the CI FLOATS honest — over-claiming statistical
+    significance on a TIES / UNDERSHOOTS recording (``stored=True`` while
+    ``verdict != SURPASSES`` and ``lower <= 0``), or under-claiming a genuine
+    SURPASSES — passes every existing gate silently: ``faithful=True`` (the verdict
+    label is untouched), ``ci_stats_stale=[]`` (``lower`` / ``upper`` untouched and
+    the boolean is not in the binding list), ``evidence_hash_stale=False`` (gate
+    labels are not evidence bytes), every citation / ledger / sub-verdict gate
+    green. The published deposit JSON then carries a corrupt §7
+    statistical-significance claim no gate surfaces (the proof-of-need
+    :class:`tests.test_replay_freeze_validloss_ci.TestSignificantSurpassesBinding`
+    reproduces).
+
+    This binds the stored boolean to ``ci.significant_surpasses`` — the value the
+    replay's own ``ci`` recomputed from the SAME losses + seed the producer used
+    (the EXACT margin-invariant property the producer stamps, so it can never
+    false-positive on an honest producer-stamped deposit — verified byte-identical
+    across every committed fixture that stamps the field, in all three verdict
+    classes: SURPASSES-stored-True, TIES-stored-False, UNDERSHOOTS-stored-False)
+    — and surfaces a disagreement loud (the prose :func:`format_replay`
+    ``SIGNIFICANT_SURPASSES_STALE`` note, the significance-axis sibling of
+    ``CI_STATS_STALE`` and ``TARGET_SCALE_LABEL_STALE``) rather than silently
+    trusting the boolean. The threat model mirrors :func:`_ci_stats_stale` /
+    :func:`_target_scale_label_stale` exactly: it catches the simple hand-edit
+    (flip the derived boolean without flipping the verdict label or the CI bounds
+    it derives from), the same stored-boolean-trusted-over-artifact class; a
+    coordinated flip of the verdict STRING and the CI bounds TOGETHER with the
+    boolean is a distinct, harder attack outside this gate's scope (as it is
+    outside ``_ci_stats_stale``'s, whose losses are themselves bound by
+    :func:`_evidence_hash_stale` / :func:`_ledger_losses_stale`). ``is_material``
+    and ``passes`` (= ``significant_surpasses and is_material``) stay UNBOUND —
+    both are margin-dependent and the material margin is not stamped, the same
+    reason :data:`_CI_STAT_BINDINGS` excludes ``is_material``. Returns False when
+    the deposit carries no stored boolean (a recording that predates the field) —
+    there is nothing to cross-check, and the artifact-rederived value still governs
+    (artifact-when-present-else-skip, same as :func:`_ci_stats_stale` /
+    :func:`_target_scale_label_stale`).
+    """
+    stored = data.get("significant_surpasses")
+    if stored is None:
+        return False
+    return bool(stored) != ci.significant_surpasses
+
+
 def _subverdict_rederived(
     data: dict[str, Any], *, losses_key: str
 ) -> str | None:
@@ -1113,6 +1185,40 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
             "numbers over the stored ones. Re-stamp the deposit from a fresh "
             "producer run so the statistics match the losses (GOAL §7)."
         )
+    # §4 significance-axis staleness guard (the significance-boolean sibling of
+    # CI_STATS_STALE above): a deposit whose STORED ``significant_surpasses``
+    # boolean disagrees with ``ci.significant_surpasses`` — the value the replay's
+    # own ``ci`` recomputed from the stored losses, = ``significance_verdict ==
+    # SURPASSES`` (the §7 *statistical* axis, deliberately separated from the
+    # margin-dependent ``is_material``) — has a stale or hand-edited significance
+    # claim. ``faithful`` binds only the verdict STRING and ``ci_stats_stale``
+    # binds only the CI FLOATS (``lower`` / ``upper``); the BOOLEAN a reader / table
+    # cites as "is the lead statistically significant?" is in neither binding list,
+    # so a hand-edited deposit that flips ``significant_surpasses`` while leaving
+    # the verdict label and the CI bounds honest (over-claiming significance on a
+    # TIES / UNDERSHOOTS recording, or under-claiming a SURPASSES) passes every
+    # existing gate silently. The replay re-derives the boolean from the SAME
+    # losses + seed and surfaces the contradiction loud rather than silently
+    # trusting the stored boolean — the stored-boolean-trusted-over-artifact path
+    # this guard closes, the significance-axis sibling of :func:`_ci_stats_stale`
+    # (``6ed0f69``) and :func:`_target_scale_label_stale` (``37db498``).
+    if _significant_surpasses_stale(data, ci):
+        stored = data.get("significant_surpasses")
+        lines.append(
+            "  note: SIGNIFICANT_SURPASSES_STALE — the recording's stored "
+            f"significant_surpasses={stored!r} disagrees with the value "
+            f"({ci.significant_surpasses!r}) re-derived from its stored losses "
+            "(the same deterministic bootstrap the producer computed "
+            "significance_verdict with, under the deposit's base_seed; "
+            "significant_surpasses is significance_verdict == SURPASSES, the §7 "
+            "statistical axis — distinct from the verdict STRING faithful binds "
+            "and the CI FLOATS ci_stats_stale binds). The replay trusts the "
+            "artifact-derived answer over the stored boolean, so the recording's "
+            "statistical significance is read as "
+            f"{'significant (SURPASSES)' if ci.significant_surpasses else 'NOT significant'}. "
+            "Re-stamp the deposit from a fresh producer run (or correct the stored "
+            "boolean) so it matches significance_verdict."
+        )
     # Committed-ledger binding (the deposit-vs-ledger sibling of the intra-deposit
     # label-vs-losses guards above): the verdict is computed from the deposit's
     # per-arm losses, but the committed ledger (``ledger_witness_path``) is the
@@ -1350,6 +1456,20 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         # cross-check that reaches the cited CI NUMBERS the verdict label and the
         # raw evidence hash both deliberately skip.
         "ci_stats_stale": _ci_stats_stale(data, ci),
+        # §4 significance-axis cross-check (the significance-boolean sibling of
+        # ``ci_stats_stale``): does the deposit's stored ``significant_surpasses``
+        # boolean agree with ``ci.significant_surpasses`` — the value re-derived
+        # from the stored losses (= ``significance_verdict == SURPASSES``, the §7
+        # statistical axis, distinct from the margin-dependent ``is_material``)? A
+        # deposit whose verdict STRING is honest (``faithful``) and whose CI FLOATS
+        # are honest (``ci_stats_stale``) yet whose significance BOOLEAN was
+        # hand-edited passes both — the boolean is in neither binding list — so
+        # this is the one gate that flags a flipped statistical-significance claim
+        # (mirrors the prose SIGNIFICANT_SURPASSES_STALE note; same helper — the
+        # two cannot drift). ``False`` when the deposit carries no stored boolean
+        # (a recording that predates the field — the artifact-when-present
+        # discipline, same as ``ci_stats_stale``).
+        "significant_surpasses_stale": _significant_surpasses_stale(data, ci),
         "candidate_mean": ci.candidate_mean,
         "surrogate_mean": ci.surrogate_mean,
         "point_improvement": ci.point_improvement,
