@@ -488,14 +488,15 @@ def _significant_surpasses_stale(
     ``material_margin``, so it is bound by its own margin-aware gate
     :func:`_is_material_stale` (the materiality-axis sibling of THIS gate) rather
     than by :data:`_CI_STAT_BINDINGS` (it is still excluded THERE — it is
-    margin-dependent, not a margin-invariant statistic). Only ``passes``
-    (= ``significant_surpasses and is_material``) stays unbound, and it is fully
-    determined by the two booleans this gate and :func:`_is_material_stale` now
-    bind. Returns False when
-    the deposit carries no stored boolean (a recording that predates the field) —
-    there is nothing to cross-check, and the artifact-rederived value still governs
-    (artifact-when-present-else-skip, same as :func:`_ci_stats_stale` /
-    :func:`_target_scale_label_stale`).
+    margin-dependent, not a margin-invariant statistic). The composite
+    ``passes`` (= ``significant_surpasses and is_material``) is bound by its OWN
+    composite gate :func:`_passes_stale`: the two component gates bind each
+    boolean to its OWN artifact, neither checks ``stored passes == (stored_sig
+    AND stored_mat)``, so a flip of ``passes`` alone evades both. Returns False
+    when the deposit carries no stored boolean (a recording that predates the
+    field) — there is nothing to cross-check, and the artifact-rederived value
+    still governs (artifact-when-present-else-skip, same as :func:`_ci_stats_stale`
+    / :func:`_target_scale_label_stale`).
     """
     stored = data.get("significant_surpasses")
     if stored is None:
@@ -572,6 +573,74 @@ def _is_material_stale(
     if stored is None or margin is None:
         return False
     rederived = ci.point_improvement >= margin
+    return bool(stored) != rederived
+
+
+def _passes_stale(
+    data: dict[str, Any], ci: SurrogateValidLossCI
+) -> bool:
+    """True when a stored ``passes`` boolean disagrees with the
+    artifact-rederived composite §7 verdict (GOAL §7 citation honesty).
+
+    The producer stamps ``passes`` straight from the ``ci`` it computed the
+    verdict from (:func:`scripts.run_freeze_validloss_ci_9b.result_to_json`,
+    ``"passes": ci.passes``) — the §7 *composite* verdict, the property
+    :attr:`src.tg_lora.freeze_surrogate_ci.SurrogateValidLossCI.passes`
+    (``significant_surpasses and is_material``: the lead is BOTH statistically
+    significant AND materially positive). It is the headline boolean a reader /
+    table / downstream consumer cites as "does this result clear §7?", the
+    natural single-boolean summary of the two axes
+    :func:`_significant_surpasses_stale` and :func:`_is_material_stale` bind.
+
+    The gap this closes: ``significant_surpasses`` (``3e3aca6``) and
+    ``is_material`` (``1ed2def``) are each bound to their OWN artifact-rederived
+    truth, but NEITHER gate checks ``stored passes == (stored_sig AND
+    stored_mat)`` — each only checks its own component against its own artifact.
+    So a hand-edited or externally-supplied deposit that flips ``passes`` while
+    leaving the verdict STRING, the CI FLOATS, and BOTH component booleans honest
+    — over-claiming §7 on a TIES / UNDERSHOOTS recording (``stored=True`` while
+    ``significant_surpasses=False`` and/or ``is_material=False``), or
+    under-claiming a genuine SURPASSES — passes every existing gate silently:
+    ``faithful=True`` (verdict label untouched), ``ci_stats_stale=[]``
+    (``passes`` is margin-dependent, not in :data:`_CI_STAT_BINDINGS`),
+    ``significant_surpasses_stale=False`` (the statistical component is
+    untouched), ``is_material_stale=False`` (the materiality component is
+    untouched), ``evidence_hash_stale=False`` (gate labels are not evidence
+    bytes), every citation / ledger / sub-verdict gate green. The TASK-0177 note
+    that ``passes`` is "fully determined by the two booleans" is the SAME
+    transitive-coverage argument TASK-0176 explicitly rejected to justify
+    binding ``significant_surpasses`` (a stored boolean implied by other bound
+    fields is still independently flippable); the composite is the distinct
+    reachable path the two component gates leave open (the proof-of-need
+    :class:`tests.test_replay_freeze_validloss_ci.TestPassesBinding` reproduces:
+    flipping ``passes`` alone on the citable full TIES deposit keeps
+    ``citable_as_full_section4_verdict=True`` and every gate green).
+
+    This binds the stored boolean to ``ci.significant_surpasses and
+    (ci.point_improvement >= stamped material_margin)`` — the value the replay's
+    own ``ci`` recomputed from the SAME losses + seed the producer used, combined
+    under the stamped margin (the EXACT composite the producer stamps, so it can
+    never false-positive on an honest producer-stamped deposit — verified
+    byte-identical across every committed fixture that stamps the field, in all
+    verdict classes: SURPASSES-stored-True, TIES-stored-False,
+    UNDERSHOOTS-stored-False) — and surfaces a disagreement loud (the prose
+    :func:`format_replay` ``PASSES_STALE`` note, the composite-axis sibling of
+    ``SIGNIFICANT_SURPASSES_STALE`` and ``IS_MATERIAL_STALE``) rather than
+    silently trusting the boolean. The threat model mirrors the two component
+    gates exactly: it catches the simple hand-edit (flip the composite boolean
+    without flipping either component), the same stored-boolean-trusted-over-
+    artifact class; a coordinated flip of a component TOGETHER with the composite
+    is a distinct, harder attack already caught by that component's own gate.
+    Returns False when the deposit carries no stored boolean OR no stamped margin
+    (a recording that predates either field) — there is nothing to cross-check,
+    and the artifact-rederived value still governs (artifact-when-present-else-
+    skip, same as :func:`_is_material_stale` / :func:`_ci_stats_stale`).
+    """
+    stored = data.get("passes")
+    margin = data.get("material_margin")
+    if stored is None or margin is None:
+        return False
+    rederived = ci.significant_surpasses and (ci.point_improvement >= margin)
     return bool(stored) != rederived
 
 
@@ -1338,6 +1407,35 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
             "stamped margin) so it matches point_improvement under the stamped "
             "margin."
         )
+    # §4 composite-axis cross-check (the composite-boolean sibling of
+    # SIGNIFICANT_SURPASSES_STALE / IS_MATERIAL_STALE): the deposit's stored
+    # ``passes`` boolean — ``significant_surpasses and is_material``, the headline
+    # §7 verdict a reader cites as "does this result clear §7?" — was hand-edited.
+    # The two component booleans are bound individually
+    # (significant_surpasses_stale / is_material_stale), but each binds its OWN
+    # boolean to its OWN artifact — NEITHER checks ``stored passes == (stored_sig
+    # AND stored_mat)``, so a flip of ``passes`` ALONE evades both (the same
+    # stored-boolean-trusted-over-artifact path this family closes; the
+    # TASK-0177 "fully determined by the two booleans" note is the transitive-
+    # coverage argument this gate refutes). Skipped (no note) when the deposit
+    # carries no stored composite boolean or no stamped margin.
+    if _passes_stale(data, ci):
+        stored = data.get("passes")
+        margin = data.get("material_margin")
+        rederived = ci.significant_surpasses and (ci.point_improvement >= margin)
+        lines.append(
+            "  note: PASSES_STALE — the recording's stored "
+            f"passes={stored!r} disagrees with the value ({rederived!r}) "
+            "re-derived as significant_surpasses AND is_material under its stored "
+            f"losses and stamped material_margin={margin!r} (significant_surpasses "
+            "and is_material are each bound by their OWN component gates, but the "
+            "composite boolean is in NEITHER — a flip of passes alone evades both). "
+            "The replay trusts the artifact-derived composite over the stored "
+            "boolean, so the recording's §7 verdict is read as "
+            f"{'PASSES' if rederived else 'does NOT pass'} §7. Re-stamp the deposit "
+            "from a fresh producer run (or correct the stored passes boolean) so it "
+            "matches significant_surpasses and is_material."
+        )
     # Committed-ledger binding (the deposit-vs-ledger sibling of the intra-deposit
     # label-vs-losses guards above): the verdict is computed from the deposit's
     # per-arm losses, but the committed ledger (``ledger_witness_path``) is the
@@ -1608,6 +1706,24 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         # the one §7 axis left unbound until TASK-0177 (margin-dependent; the
         # producer now stamps ``material_margin``, resolving the blocker).
         "is_material_stale": _is_material_stale(data, ci),
+        # §4 composite-axis cross-check (the composite-boolean sibling of
+        # ``significant_surpasses_stale`` / ``is_material_stale``): does the
+        # deposit's stored ``passes`` boolean agree with
+        # ``significant_surpasses and is_material`` — the value re-derived as the
+        # conjunction of the two component gates under the SAME stamped margin
+        # (the §7 headline verdict a reader cites as "does this result clear
+        # §7?")? A deposit whose verdict STRING (``faithful``), CI FLOATS
+        # (``ci_stats_stale``), and BOTH component booleans
+        # (``significant_surpasses_stale`` / ``is_material_stale``) are all honest
+        # yet whose composite BOOLEAN was hand-edited passes them all — the two
+        # component gates bind each boolean to its OWN artifact, neither checks
+        # ``stored passes == (stored_sig AND stored_mat)`` — so this is the one
+        # gate that flags a flipped composite claim (mirrors the prose
+        # PASSES_STALE note; same helper — the two cannot drift). ``False`` when
+        # the deposit carries no stored composite boolean or no stamped margin (a
+        # recording that predates either field — the artifact-when-present
+        # discipline, same as ``is_material_stale``).
+        "passes_stale": _passes_stale(data, ci),
         "candidate_mean": ci.candidate_mean,
         "surrogate_mean": ci.surrogate_mean,
         "point_improvement": ci.point_improvement,

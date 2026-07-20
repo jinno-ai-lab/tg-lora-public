@@ -3051,3 +3051,259 @@ class TestIsMaterialBinding:
                 f"{name}: prose ({note}) != flag ({out['is_material_stale']!r})"
             )
 
+
+class TestPassesBinding:
+    """The stored-``passes``-vs-rederived binding: the producer stamps
+    ``passes`` straight from the ``ci`` it computed the verdict from
+    (``"passes": ci.passes`` — the §7 *composite* verdict,
+    ``significant_surpasses and is_material``, the headline boolean a reader /
+    table / downstream consumer cites as "does this result clear §7 — significant
+    AND material?"). It is the natural single-boolean summary of the two §7 axes.
+
+    The gap this closes: ``significant_surpasses`` (TASK-0176) and ``is_material``
+    (TASK-0177) are each bound to their OWN artifact-rederived truth, but NEITHER
+    gate checks ``stored passes == (stored_sig AND stored_mat)`` — each only checks
+    its own component against its own artifact. So a hand-edited deposit that flips
+    ``passes`` ALONE — over-claiming §7 on a TIES / UNDERSHOOTS recording
+    (``stored=True`` while ``significant_surpasses=False`` and/or
+    ``is_material=False``), or under-claiming a genuine SURPASSES — passed every
+    existing gate silently: ``faithful=True`` (verdict STRING untouched),
+    ``ci_stats_stale=[]`` (``passes`` is not in ``_CI_STAT_BINDINGS``),
+    ``significant_surpasses_stale=False`` (the statistical boolean is untouched),
+    ``is_material_stale=False`` (the materiality boolean is untouched),
+    ``evidence_hash_stale=False`` (gate labels are not evidence bytes), every
+    citation / ledger / sub-verdict gate green. The TASK-0177 note that ``passes``
+    is "fully determined by the two booleans" is the same transitive-coverage
+    argument TASK-0176 explicitly REJECTED to justify binding
+    ``significant_surpasses`` (a stored boolean implied by other bound fields is
+    still independently flippable). Proof of need (verified below): on the
+    homogeneous full deposit (recorded TIES, ``passes=False``) flipping the
+    composite boolean to ``True`` keeps every existing gate green and the deposit
+    stays ``citable_as_full_section4_verdict=True``, yet its §7 verdict is a lie;
+    only this guard catches it.
+    """
+
+    @staticmethod
+    def _deposits_with_passes_and_margin():
+        # Every committed sample deposit that stamps BOTH ``passes`` AND
+        # ``material_margin`` — both directions (True-on-SURPASSES across 9B +
+        # proxy scales, AND False-on-TIES / UNDERSHOOTS) — so the byte-identical
+        # invariant is proven in both directions. The runlog is a different
+        # schema (no sample lists) and is skipped, same as the sibling bindings.
+        fixture_dir = Path(__file__).resolve().parent / "fixtures"
+        out = []
+        for p in sorted(fixture_dir.glob("freeze_validloss*.json")):
+            if "runlog" in p.name:
+                continue
+            try:
+                blob = json.loads(p.read_text())
+                if "passes" in blob and "material_margin" in blob:
+                    out.append(p)
+            except Exception:
+                continue
+        return out
+
+    def test_committed_deposits_flag_matches_ci(self):
+        # Byte-identical invariant: every committed deposit that stores the
+        # composite boolean AND its margin must re-derive to ``passes_stale is
+        # False`` — the producer stamps ``passes = (significant_surpasses and
+        # is_material)``, so the replay reproduces it from the deposit's own
+        # re-derived ``significant_surpasses`` (margin-invariant, ci_stats-bound)
+        # AND ``point_improvement >= stamped_margin`` under the SAME stamped
+        # margin, bit-for-bit. Covers both directions incl. the TIES False and
+        # UNDERSHOOTS negative-control False cases.
+        assert self._deposits_with_passes_and_margin(), (
+            "expected committed passes+margin-stamped deposits"
+        )
+        for deposit in self._deposits_with_passes_and_margin():
+            data = load_samples(str(deposit))
+            ci = replay_samples(data)
+            out = replay_to_json(str(deposit), data, ci)
+            assert out["passes_stale"] is False, (
+                f"{deposit.name}: stored passes={data.get('passes')!r} disagrees "
+                f"with the re-derived value "
+                f"({ci.significant_surpasses and (ci.point_improvement >= data['material_margin'])!r} "
+                f"= significant_surpasses={ci.significant_surpasses!r} AND "
+                f"point_improvement={ci.point_improvement!r} >= "
+                f"material_margin={data['material_margin']!r}, "
+                f"verdict={data.get('verdict')!r})."
+            )
+            assert "PASSES_STALE" not in format_replay(str(deposit), data, ci)
+
+    def test_recording_without_margin_skips_cleanly(self):
+        # Skip / false-positive discipline: a recording that stamps the composite
+        # boolean but NO ``material_margin`` (a legacy recording that predates
+        # TASK-0177) must report CLEAN — the cross-check skips rather than
+        # false-positive on a deposit that has no stamped margin to re-derive
+        # ``is_material`` against.
+        path = "legacy-no-margin.json"
+        data = {
+            "candidate_losses": [1.0, 1.0, 1.0],
+            "surrogate_losses": [2.0, 2.0, 2.0],
+            "base_seed": 0,
+            "passes": True,  # stamped composite boolean, but NO margin
+        }
+        ci = replay_samples(data)
+        out = replay_to_json(path, data, ci)
+        assert out["passes_stale"] is False, (
+            "a margin-less recording must skip, got a stale flag"
+        )
+        assert "PASSES_STALE" not in format_replay(path, data, ci)
+
+    def test_recording_without_boolean_skips_cleanly(self):
+        # Skip discipline (the symmetric absence): a recording that stamps a margin
+        # but NO ``passes`` boolean must also skip cleanly — there is no stored
+        # composite boolean to disagree with the re-derived value.
+        path = "legacy-no-passes.json"
+        data = {
+            "candidate_losses": [1.0, 1.0, 1.0],
+            "surrogate_losses": [2.0, 2.0, 2.0],
+            "base_seed": 0,
+            "material_margin": 0.0,  # stamped margin, but NO composite boolean
+        }
+        ci = replay_samples(data)
+        out = replay_to_json(path, data, ci)
+        assert out["passes_stale"] is False, (
+            "a composite-boolean-less recording must skip, got a stale flag"
+        )
+        assert "PASSES_STALE" not in format_replay(path, data, ci)
+
+    def test_hand_edited_overclaim_is_flagged(self):
+        # PRIMARY mutation proof (over-claim axis — the dangerous direction). The
+        # homogeneous full deposit is recorded TIES with ``passes=False``
+        # (``significant_surpasses=False`` so the composite is False even though
+        # ``is_material=True``); flipping the stored composite boolean to ``True``
+        # OVER-CLAIMS §7 — asserts a TIES result clears §7 (significant AND
+        # material). The verdict STRING, the CI FLOATS, and BOTH component
+        # booleans are untouched, so ``faithful`` / ``ci_stats_stale`` /
+        # ``significant_surpasses_stale`` / ``is_material_stale`` all stay clean —
+        # yet the composite no longer matches. ONLY this guard fires.
+        deposit = (
+            Path(__file__).resolve().parent / "fixtures" / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        ci = replay_samples(data)
+        assert data["passes"] is False
+        data["passes"] = True  # the lie: paint a TIES result as passing §7
+        out = replay_to_json(str(deposit), data, ci)
+        assert out["passes_stale"] is True
+        assert "PASSES_STALE" in format_replay(str(deposit), data, ci)
+
+    def test_hand_edited_underclaim_is_flagged(self):
+        # Mutation proof (under-claim axis — the symmetric direction). The
+        # baseline deposit is recorded SURPASSES with ``passes=True``
+        # (``significant_surpasses=True`` AND ``is_material=True``); flipping the
+        # stored composite boolean to ``False`` UNDER-CLAIMS §7 — hides a genuine
+        # §7 pass. Both component booleans are untouched so the component gates
+        # stay clean; only this guard fires.
+        deposit = (
+            Path(__file__).resolve().parent / "fixtures" / "freeze_validloss_ci_9b_baseline.json"
+        )
+        data = load_samples(str(deposit))
+        ci = replay_samples(data)
+        assert data["passes"] is True
+        data["passes"] = False  # the lie: hide a real §7 pass
+        out = replay_to_json(str(deposit), data, ci)
+        assert out["passes_stale"] is True
+        assert "PASSES_STALE" in format_replay(str(deposit), data, ci)
+
+    def test_independent_of_component_booleans(self):
+        # DISTINCTION proof (NOT transitively covered by the two component gates).
+        # Flipping ``passes`` ALONE leaves ``significant_surpasses`` and
+        # ``is_material`` untouched — proving the component gates
+        # (``significant_surpasses_stale`` / ``is_material_stale``) bind each
+        # boolean to its OWN artifact but do NOT check ``stored passes ==
+        # (stored_sig AND stored_mat)``. The composite is a distinct, reachable
+        # path both component gates leave open; this guard closes it. (This is the
+        # explicit refutation of the TASK-0177 "fully determined by the two
+        # booleans" note.)
+        deposit = (
+            Path(__file__).resolve().parent / "fixtures" / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        ci = replay_samples(data)
+        data["passes"] = not data["passes"]  # flip the composite ONLY
+        out = replay_to_json(str(deposit), data, ci)
+        assert out["significant_surpasses_stale"] is False, (
+            "the statistical component boolean is untouched"
+        )
+        assert out["is_material_stale"] is False, (
+            "the materiality component boolean is untouched"
+        )
+        assert out["passes_stale"] is True, (
+            "the flipped composite is the distinct path this gate closes"
+        )
+
+    def test_corrupt_flag_passes_every_other_gate(self):
+        # REACHABILITY proof (the silent path this guard closes). A deposit whose
+        # stored composite boolean is flipped but whose losses / verdict / CI
+        # floats / component booleans / labels / ledger / sub-verdicts stay honest
+        # passes EVERY prior gate — faithful, ci_stats_stale,
+        # significant_surpasses_stale, is_material_stale, evidence_hash, the
+        # citation labels, the ledger, the sub-verdicts — and is caught ONLY by
+        # passes_stale. This is the corrupt-but-green §7 composite-verdict path
+        # (a TIES result silently citable as a full §4 "passes" verdict), made
+        # loud.
+        deposit = (
+            Path(__file__).resolve().parent / "fixtures" / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        data["passes"] = True  # flip the composite boolean only (TIES -> "passes" lie)
+        out = replay_to_json(str(deposit), data, replay_samples(data))
+        assert out["faithful"] is True, "verdict STRING untouched -> still matches"
+        assert out["ci_stats_stale"] == [], (
+            "CI FLOATS untouched and composite not in binding list -> stays clean"
+        )
+        assert out["significant_surpasses_stale"] is False, (
+            "the statistical component boolean is untouched"
+        )
+        assert out["is_material_stale"] is False, (
+            "the materiality component boolean is untouched"
+        )
+        assert out["evidence_hash_stale"] is False, (
+            "gate labels are not evidence bytes -> stamp stays clean"
+        )
+        assert out["citation_label_stale"] is False
+        assert out["target_scale_label_stale"] is False
+        assert out["ledger_losses_stale"] == []
+        assert out["direction_verdict_stale"] is False
+        assert out["baseline_verdict_stale"] is False
+        assert out["passes_stale"] is True, (
+            "the flipped composite boolean must be the ONE gate that fires"
+        )
+
+    def test_prose_note_presence_matches_machine_flag(self):
+        # DRIFT invariant (mirrors TestIsMaterialBinding /
+        # TestSignificantSurpassesBinding / TestCiStatsBinding / TestLedgerBinding):
+        # the machine flag and the human prose note cannot drift. Across a
+        # committed deposit in each direction (passes-True the baseline SURPASSES,
+        # passes-False the full TIES) AND a hand-edited lie on each axis
+        # (over-claim the composite / under-claim the composite), the prose note
+        # presence == the machine flag.
+        baseline = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_baseline.json"  # passes=True (SURPASSES)
+        )
+        full = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"  # passes=False (TIES)
+        )
+        baseline_base = load_samples(str(baseline))
+        full_base = load_samples(str(full))
+        cases = [
+            ("committed-passes-true", str(baseline), baseline_base),
+            ("committed-passes-false", str(full), full_base),
+            ("lie-overclaim", str(full), {**full_base, "passes": True}),
+            ("lie-underclaim", str(baseline), {**baseline_base, "passes": False}),
+        ]
+        for name, path, data in cases:
+            ci = replay_samples(data)
+            out = replay_to_json(path, data, ci)
+            prose = format_replay(path, data, ci)
+            note = "PASSES_STALE" in prose
+            assert note is out["passes_stale"], (
+                f"{name}: prose ({note}) != flag ({out['passes_stale']!r})"
+            )
+
