@@ -2246,14 +2246,17 @@ class TestCiStatsBinding:
             f"got {out['ci_stats_stale']!r}"
         )
 
-    def test_is_material_is_not_bound(self):
+    def test_is_material_excluded_from_ci_stats_but_bound_by_own_gate(self):
         # SCOPE pin: ``is_material`` is the ONE margin-dependent statistic
-        # (``point_improvement >= material_margin``), and the margin is NOT
-        # stamped in the deposit — so binding it strictly would false-positive on
-        # a producer run that used a non-zero margin. It is therefore
-        # intentionally excluded from ``_CI_STAT_BINDINGS``: mutating it ALONE
-        # must not trip ci_stats_stale. (Guards against a maintainer wrongly
-        # "completing" the binding by adding the margin-dependent field back.)
+        # (``point_improvement >= material_margin``), so it is excluded from
+        # ``_CI_STAT_BINDINGS`` (margin-invariant statistics only) — mutating it
+        # ALONE must NOT trip ``ci_stats_stale``. Since ``TASK-0177`` the producer
+        # stamps ``material_margin``, so ``is_material`` IS bound — but by its OWN
+        # margin-aware gate ``_is_material_stale`` (see ``TestIsMaterialBinding``),
+        # not by the ci_stats list. This test pins the SPLIT: ci_stats stays clean
+        # while the dedicated gate fires, so a maintainer cannot wrongly re-merge
+        # the margin-dependent field into ``_CI_STAT_BINDINGS`` (which would
+        # false-positive on a producer run that used a non-zero margin).
         deposit = (
             Path(__file__).resolve().parent
             / "fixtures"
@@ -2263,8 +2266,11 @@ class TestCiStatsBinding:
         data["is_material"] = not data["is_material"]
         out = replay_to_json(str(deposit), data, replay_samples(data))
         assert out["ci_stats_stale"] == [], (
-            f"is_material is margin-dependent and must NOT be bound; got "
-            f"{out['ci_stats_stale']!r}"
+            f"is_material is margin-dependent and must NOT be in "
+            f"_CI_STAT_BINDINGS; got {out['ci_stats_stale']!r}"
+        )
+        assert out["is_material_stale"] is True, (
+            "is_material IS bound — by its own margin-aware gate, not ci_stats"
         )
 
     def test_corrupt_stats_pass_every_other_gate(self):
@@ -2793,4 +2799,255 @@ class TestSignificantSurpassesBinding:
             )
 
 
+class TestIsMaterialBinding:
+    """The stored-``is_material``-vs-rederived binding: the producer stamps
+    ``is_material`` straight from the ``ci`` it computed the verdict from
+    (``"is_material": ci.is_material`` — the §7 *practical* axis,
+    ``point_improvement >= material_margin``, deliberately separated from the
+    *statistical* axis ``significant_surpasses``). It is the boolean a reader /
+    table / downstream consumer cites as "is the lead *materially* positive?",
+    distinct from the verdict STRING, the CI FLOATS, and the
+    statistical-significance boolean.
+
+    The gap this closes: ``is_material`` was the ONE §7 significance axis left
+    unbound — excluded from ``_CI_STAT_BINDINGS`` (margin-dependent) and untouched
+    by ``faithful`` / ``ci_stats_stale`` / ``significant_surpasses_stale`` —
+    because the material margin was NOT stamped, so a strict cross-check would
+    false-positive on a producer run that used a non-zero margin. ``TASK-0177``
+    resolves the blocker: the producer now stamps ``material_margin`` (provenance
+    only, absent from ``EVIDENCE_HASH_KEYS``), so a hand-edited deposit that flips
+    ``is_material`` while leaving the verdict STRING, the CI FLOATS, and
+    ``significant_surpasses`` honest — over-claiming materiality on a recording
+    whose ``point_improvement`` is below the margin, or under-claiming a genuine
+    material lead — no longer passes every gate silently. Proof of need (verified
+    below): on the homogeneous full deposit (recorded TIES, ``is_material=True``
+    under margin 0.0) flipping the boolean to ``False`` keeps ``faithful=True``,
+    ``ci_stats_stale=[]`` and ``significant_surpasses_stale=False`` (and every
+    other gate green), yet the deposit's materiality claim is a lie; only this
+    guard catches it.
+    """
+
+    @staticmethod
+    def _deposits_with_margin():
+        # Every committed sample deposit that stamps BOTH ``is_material`` AND
+        # ``material_margin`` — both directions (True-on-positive across 9B + proxy
+        # scales, AND False-on-negative the negative-control case) — so the
+        # byte-identical invariant is proven in both directions, not just the
+        # material one. The runlog is a different schema (no sample lists) and is
+        # skipped the same way TestSignificantSurpassesBinding skips it.
+        fixture_dir = Path(__file__).resolve().parent / "fixtures"
+        out = []
+        for p in sorted(fixture_dir.glob("freeze_validloss*.json")):
+            if "runlog" in p.name:
+                continue
+            try:
+                blob = json.loads(p.read_text())
+                if "is_material" in blob and "material_margin" in blob:
+                    out.append(p)
+            except Exception:
+                continue
+        return out
+
+    def test_committed_deposits_flag_matches_ci(self):
+        # Byte-identical invariant: every committed deposit that stores the
+        # materiality boolean AND its margin must re-derive to
+        # ``is_material_stale is False`` — the producer stamps
+        # ``is_material = (point_improvement >= margin)``, so the replay reproduces
+        # it from the deposit's own re-derived ``point_improvement``
+        # (margin-invariant, ci_stats-bound) under the SAME stamped margin,
+        # bit-for-bit. Covers both directions incl. the negative-control False case.
+        assert self._deposits_with_margin(), "expected committed margin-stamped deposits"
+        for deposit in self._deposits_with_margin():
+            data = load_samples(str(deposit))
+            ci = replay_samples(data)
+            out = replay_to_json(str(deposit), data, ci)
+            assert out["is_material_stale"] is False, (
+                f"{deposit.name}: stored is_material={data.get('is_material')!r} "
+                f"disagrees with the re-derived value "
+                f"({ci.point_improvement >= data['material_margin']!r} = "
+                f"point_improvement={ci.point_improvement!r} >= "
+                f"material_margin={data['material_margin']!r}, "
+                f"verdict={data.get('verdict')!r})."
+            )
+            assert "IS_MATERIAL_STALE" not in format_replay(str(deposit), data, ci)
+
+    def test_recording_without_margin_skips_cleanly(self):
+        # Skip / false-positive discipline: a recording that stamps the boolean but
+        # NO ``material_margin`` (a legacy recording that predates TASK-0177) must
+        # report CLEAN — the cross-check skips rather than false-positive on a
+        # deposit that has no stamped margin to re-derive against.
+        path = "legacy-no-margin.json"
+        data = {
+            "candidate_losses": [1.0, 1.0, 1.0],
+            "surrogate_losses": [2.0, 2.0, 2.0],
+            "base_seed": 0,
+            "is_material": True,  # stamped boolean, but NO margin
+        }
+        ci = replay_samples(data)
+        out = replay_to_json(path, data, ci)
+        assert out["is_material_stale"] is False, (
+            "a margin-less recording must skip, got a stale flag"
+        )
+        assert "IS_MATERIAL_STALE" not in format_replay(path, data, ci)
+
+    def test_recording_without_boolean_skips_cleanly(self):
+        # Skip discipline (the symmetric absence): a recording that stamps a margin
+        # but NO ``is_material`` boolean must also skip cleanly — there is no
+        # stored boolean to disagree with the re-derived value.
+        path = "legacy-no-boolean.json"
+        data = {
+            "candidate_losses": [1.0, 1.0, 1.0],
+            "surrogate_losses": [2.0, 2.0, 2.0],
+            "base_seed": 0,
+            "material_margin": 0.0,  # stamped margin, but NO boolean
+        }
+        ci = replay_samples(data)
+        out = replay_to_json(path, data, ci)
+        assert out["is_material_stale"] is False, (
+            "a boolean-less recording must skip, got a stale flag"
+        )
+        assert "IS_MATERIAL_STALE" not in format_replay(path, data, ci)
+
+    def test_hand_edited_underclaim_is_flagged(self):
+        # PRIMARY mutation proof (under-claim axis). The homogeneous full deposit is
+        # recorded TIES with ``is_material=True`` (point_improvement=0.001318 >= the
+        # stamped margin 0.0); flipping the stored boolean to ``False`` UNDER-CLAIMS
+        # a genuine material lead. The losses (verdict STRING, CI FLOATS) and
+        # ``significant_surpasses`` are untouched, so ``faithful`` /
+        # ``ci_stats_stale`` / ``significant_surpasses_stale`` stay clean — yet the
+        # boolean no longer matches. ONLY this guard fires.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        ci = replay_samples(data)
+        assert data["is_material"] is True
+        assert (ci.point_improvement >= data["material_margin"]) is True
+        data["is_material"] = False  # the lie: hide a real material lead
+        out = replay_to_json(str(deposit), data, ci)
+        assert out["is_material_stale"] is True
+        assert "IS_MATERIAL_STALE" in format_replay(str(deposit), data, ci)
+
+    def test_hand_edited_overclaim_via_margin_is_flagged(self):
+        # Mutation proof (over-claim axis, AND the gate reads the STAMPED margin).
+        # Raising the stamped ``material_margin`` above the deposit's
+        # ``point_improvement`` (0.001318 -> margin 0.01) makes the re-derived
+        # ``is_material`` False, but the stored boolean stays True — an OVER-CLAIM
+        # of materiality (claiming a material lead the margin now rejects).
+        # ``point_improvement`` is untouched so ``ci_stats_stale`` stays clean; only
+        # this guard fires. This also proves the gate binds against the STAMPED
+        # margin, not the replay's own ``--material-margin`` (which defaults to 0.0
+        # and would otherwise mask a margin hand-edit).
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        ci = replay_samples(data)
+        assert data["is_material"] is True
+        data["material_margin"] = 0.01  # the lie: a margin the lead no longer clears
+        out = replay_to_json(str(deposit), data, ci)
+        assert out["is_material_stale"] is True
+        assert "IS_MATERIAL_STALE" in format_replay(str(deposit), data, ci)
+        assert out["ci_stats_stale"] == [], (
+            "point_improvement untouched -> ci_stats must stay clean"
+        )
+
+    def test_independent_of_verdict_ci_stats_and_significance(self):
+        # DISTINCTION proof (not redundant with ``faithful`` OR ``ci_stats_stale``
+        # OR ``significant_surpasses_stale``). Flipping ``is_material`` alone leaves
+        # the verdict STRING (``faithful``), the CI FLOATS (``ci_stats_stale``),
+        # and the statistical boolean (``significant_surpasses_stale``) all honest —
+        # proving the four are independent and this guard closes a distinct,
+        # reachable path they all leave open.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        ci = replay_samples(data)
+        data["is_material"] = not data["is_material"]  # flip the boolean ONLY
+        out = replay_to_json(str(deposit), data, ci)
+        assert out["faithful"] is True, "verdict STRING untouched -> faithful clean"
+        assert out["ci_stats_stale"] == [], (
+            "CI FLOATS untouched and boolean not in _CI_STAT_BINDINGS -> clean"
+        )
+        assert out["significant_surpasses_stale"] is False, (
+            "the statistical boolean is untouched"
+        )
+        assert out["is_material_stale"] is True, (
+            "the flipped materiality boolean is the distinct path this gate closes"
+        )
+
+    def test_corrupt_flag_passes_every_other_gate(self):
+        # REACHABILITY proof (the silent path this guard closes). A deposit whose
+        # stored materiality boolean is flipped but whose losses / verdict / CI
+        # floats / labels stay honest passes EVERY prior gate — faithful,
+        # ci_stats_stale, significant_surpasses_stale, evidence_hash, the citation
+        # labels, the ledger, the sub-verdicts — and is caught ONLY by
+        # is_material_stale. This is the corrupt-but-green §7 materiality-claim
+        # path, made loud.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        data["is_material"] = not data["is_material"]  # flip the materiality boolean only
+        out = replay_to_json(str(deposit), data, replay_samples(data))
+        assert out["faithful"] is True, "verdict STRING untouched -> still matches"
+        assert out["ci_stats_stale"] == [], (
+            "CI FLOATS untouched and boolean not in binding list -> stays clean"
+        )
+        assert out["significant_surpasses_stale"] is False, (
+            "the statistical boolean is untouched"
+        )
+        assert out["evidence_hash_stale"] is False, (
+            "gate labels are not evidence bytes -> stamp stays clean"
+        )
+        assert out["citation_label_stale"] is False
+        assert out["target_scale_label_stale"] is False
+        assert out["ledger_losses_stale"] == []
+        assert out["direction_verdict_stale"] is False
+        assert out["is_material_stale"] is True, (
+            "the flipped materiality boolean must be the ONE gate that fires"
+        )
+
+    def test_prose_note_presence_matches_machine_flag(self):
+        # DRIFT invariant (mirrors TestSignificantSurpassesBinding /
+        # TestCiStatsBinding / TestLedgerBinding / TestEvidenceHashBinding): the
+        # machine flag and the human prose note cannot drift. Across a committed
+        # deposit in each direction (material / NOT-material the negative-control)
+        # AND a hand-edited lie on each axis (under-claim the boolean / over-claim
+        # via the margin), the prose note presence == the machine flag.
+        full = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        neg = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_negative_control_proxy.json"  # is_material=False
+        )
+        full_base = load_samples(str(full))
+        neg_base = load_samples(str(neg))
+        cases = [
+            ("committed-material", str(full), full_base),
+            ("committed-not-material", str(neg), neg_base),
+            ("lie-underclaim", str(full), {**full_base, "is_material": False}),
+            ("lie-overclaim-margin", str(full), {**full_base, "material_margin": 0.01}),
+        ]
+        for name, path, data in cases:
+            ci = replay_samples(data)
+            out = replay_to_json(path, data, ci)
+            prose = format_replay(path, data, ci)
+            note = "IS_MATERIAL_STALE" in prose
+            assert note is out["is_material_stale"], (
+                f"{name}: prose ({note}) != flag ({out['is_material_stale']!r})"
+            )
 

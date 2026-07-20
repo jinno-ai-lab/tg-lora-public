@@ -3,6 +3,7 @@
   "passes": false,
   "significant_surpasses": false,
   "is_material": false,
+  "material_margin": 0.0,
   "is_thin_evidence": false,
   "candidate_mean": 1.7185380935668946,
   "surrogate_mean": 0.4349759817123413,

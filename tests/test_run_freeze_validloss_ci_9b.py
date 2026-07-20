@@ -517,6 +517,7 @@ def _stub_ci(**overrides):
         passes=True,
         significant_surpasses=True,
         is_material=True,
+        material_margin=0.0,
         is_thin_evidence=True,
         candidate_mean=1.625,
         surrogate_mean=1.704,

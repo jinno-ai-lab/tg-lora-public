@@ -483,10 +483,15 @@ def _significant_surpasses_stale(
     coordinated flip of the verdict STRING and the CI bounds TOGETHER with the
     boolean is a distinct, harder attack outside this gate's scope (as it is
     outside ``_ci_stats_stale``'s, whose losses are themselves bound by
-    :func:`_evidence_hash_stale` / :func:`_ledger_losses_stale`). ``is_material``
-    and ``passes`` (= ``significant_surpasses and is_material``) stay UNBOUND —
-    both are margin-dependent and the material margin is not stamped, the same
-    reason :data:`_CI_STAT_BINDINGS` excludes ``is_material``. Returns False when
+    :func:`_evidence_hash_stale` / :func:`_ledger_losses_stale`).
+    ``is_material`` is NO LONGER UNBOUND: since ``TASK-0177`` the producer stamps
+    ``material_margin``, so it is bound by its own margin-aware gate
+    :func:`_is_material_stale` (the materiality-axis sibling of THIS gate) rather
+    than by :data:`_CI_STAT_BINDINGS` (it is still excluded THERE — it is
+    margin-dependent, not a margin-invariant statistic). Only ``passes``
+    (= ``significant_surpasses and is_material``) stays unbound, and it is fully
+    determined by the two booleans this gate and :func:`_is_material_stale` now
+    bind. Returns False when
     the deposit carries no stored boolean (a recording that predates the field) —
     there is nothing to cross-check, and the artifact-rederived value still governs
     (artifact-when-present-else-skip, same as :func:`_ci_stats_stale` /
@@ -496,6 +501,78 @@ def _significant_surpasses_stale(
     if stored is None:
         return False
     return bool(stored) != ci.significant_surpasses
+
+
+def _is_material_stale(
+    data: dict[str, Any], ci: SurrogateValidLossCI
+) -> bool:
+    """True when a stored ``is_material`` boolean disagrees with the
+    artifact-rederived materiality verdict (GOAL §7 citation honesty).
+
+    The producer stamps ``is_material`` straight from the ``ci`` it computed the
+    verdict from (:func:`scripts.run_freeze_validloss_ci_9b.result_to_json`,
+    ``"is_material": ci.is_material``) — the §7 *practical* axis, the property
+    :attr:`src.tg_lora.freeze_surrogate_ci.SurrogateValidLossCI.is_material`
+    (``point_improvement >= material_margin``: the lead clears a material, not
+    merely statistically-non-zero, margin). §7 deliberately separates this
+    practical axis from the *statistical* axis
+    :attr:`~SurrogateValidLossCI.significant_surpasses` (CI excludes zero, bound
+    by :func:`_significant_surpasses_stale` / ``3e3aca6``): a recording can read
+    ``significant_surpasses=True`` yet ``is_material=False`` — the 2.6σ-but-useless
+    case §7 refuses to let a paper claim as a win. ``is_material`` is the boolean a
+    reader / table / downstream consumer cites as "is the lead *materially*
+    positive?", distinct from the verdict STRING, the CI FLOATS, and the
+    statistical-significance boolean.
+
+    The gap this closes: ``is_material`` was the ONE §7 significance axis left
+    unbound — deliberately excluded from :data:`_CI_STAT_BINDINGS` (which holds
+    only margin-invariant statistics) because it depends on ``material_margin``,
+    and until ``TASK-0177`` the margin was NOT stamped in the deposit, so a strict
+    cross-check would false-positive on a producer run that used a non-zero margin.
+    So a hand-edited or externally-supplied deposit that flips ``is_material``
+    while leaving the verdict STRING, the CI FLOATS, and ``significant_surpasses``
+    honest — over-claiming materiality on a TIES recording whose
+    ``point_improvement`` is below the margin, or under-claiming a genuine
+    material lead — passed every existing gate silently: ``faithful=True`` (verdict
+    label untouched), ``ci_stats_stale=[]`` (``point_improvement`` untouched and
+    ``is_material`` is not in the binding list), ``significant_surpasses_stale=
+    False`` (the statistical boolean is untouched), ``evidence_hash_stale=False``
+    (gate labels are not evidence bytes), every citation / ledger / sub-verdict
+    gate green. The published deposit JSON then carried a corrupt §7
+    materiality claim no gate surfaced (the proof-of-need
+    :class:`tests.test_replay_freeze_validloss_ci.TestIsMaterialBinding`
+    reproduces).
+
+    The resolution (``TASK-0177``): the producer now stamps ``material_margin``
+    alongside ``is_material`` (provenance only — a caller-set threshold, NOT in
+    :data:`EVIDENCE_HASH_KEYS`, so the evidence hash is unaffected). The replay
+    therefore re-derives ``is_material`` from the SAME two artifact-true inputs
+    the producer used — the replay's ``ci.point_improvement`` (margin-invariant,
+    already bound by :func:`_ci_stats_stale`) compared against the deposit's
+    STAMPED ``material_margin`` (the exact margin the producer ran with) — so it
+    faithfully reproduces ``ci.is_material`` and can never false-positive on an
+    honest producer-stamped deposit (verified byte-identical on every committed
+    fixture that stamps the field). It surfaces a disagreement loud (the prose
+    :func:`format_replay` ``IS_MATERIAL_STALE`` note, the materiality-axis sibling
+    of ``SIGNIFICANT_SURPASSES_STALE`` and ``CI_STATS_STALE``) rather than silently
+    trusting the boolean. The threat model mirrors :func:`_significant_surpasses_
+    stale` exactly: it catches the simple hand-edit (flip the derived boolean
+    without flipping ``point_improvement`` or ``material_margin``), the same
+    stored-boolean-trusted-over-artifact class; a coordinated flip of
+    ``point_improvement`` TOGETHER with the boolean is a distinct, harder attack
+    outside this gate's scope (as it is outside :func:`_significant_surpasses_
+    stale`'s, whose CI bounds are themselves bound by :func:`_ci_stats_stale`).
+    Returns False when the deposit carries no stored boolean OR no stamped margin
+    (a recording that predates either field) — there is nothing to cross-check,
+    and the artifact-rederived value still governs (artifact-when-present-else-
+    skip, same as :func:`_significant_surpasses_stale` / :func:`_ci_stats_stale`).
+    """
+    stored = data.get("is_material")
+    margin = data.get("material_margin")
+    if stored is None or margin is None:
+        return False
+    rederived = ci.point_improvement >= margin
+    return bool(stored) != rederived
 
 
 def _subverdict_rederived(
@@ -816,8 +893,10 @@ def _ci_stats_stale(
     EVIDENCE hash). Returns the names of the disagreeing statistics; empty when
     every stamped statistic matches, or when the deposit stamps none of them (a
     proxy / legacy recording — the artifact-when-present-else-skip discipline,
-    same as :func:`_carries_9b_honesty_schema`). ``is_material`` is intentionally
-    not bound (margin-dependent; see :data:`_CI_STAT_BINDINGS`).
+    same as :func:`_carries_9b_honesty_schema`). ``is_material`` is excluded from
+    THIS list (margin-dependent, not a margin-invariant statistic) but is bound by
+    its OWN margin-aware gate :func:`_is_material_stale` (the producer now stamps
+    ``material_margin``, ``TASK-0177``).
     """
     stale: list[str] = []
     for stored_key, ci_attr in _CI_STAT_BINDINGS:
@@ -1169,8 +1248,10 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
     # artifact path this guard closes, sibling of :func:`_citation_label_stale`
     # (the citability BOOLEAN) and :func:`_evidence_hash_stale` (the raw EVIDENCE
     # hash). Skips statistics the deposit does not stamp (artifact-when-present-
-    # else-skip); ``is_material`` is intentionally excluded (margin-dependent,
-    # margin not stamped — see :data:`_CI_STAT_BINDINGS`).
+    # else-skip); ``is_material`` is excluded HERE (margin-dependent, not a
+    # margin-invariant statistic — see :data:`_CI_STAT_BINDINGS`) but is bound by
+    # its OWN margin-aware gate :func:`_is_material_stale` below (the producer
+    # now stamps ``material_margin``, ``TASK-0177``).
     ci_stats_stale = _ci_stats_stale(data, ci)
     if ci_stats_stale:
         stats_clause = ", ".join(ci_stats_stale)
@@ -1218,6 +1299,44 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
             f"{'significant (SURPASSES)' if ci.significant_surpasses else 'NOT significant'}. "
             "Re-stamp the deposit from a fresh producer run (or correct the stored "
             "boolean) so it matches significance_verdict."
+        )
+    # §4 materiality-axis cross-check (the materiality-boolean sibling of
+    # SIGNIFICANT_SURPASSES_STALE): the deposit's stored ``is_material`` boolean
+    # — re-derived from its stored point_improvement under the SAME stamped
+    # material_margin the producer used (``point_improvement >= material_margin``,
+    # the §7 *practical* axis, deliberately separated from the statistical
+    # ``significant_surpasses``) — has a stale or hand-edited materiality claim.
+    # ``faithful`` binds the verdict STRING, ``ci_stats_stale`` binds the CI
+    # FLOATS, ``significant_surpasses_stale`` binds the statistical BOOLEAN; the
+    # materiality BOOLEAN a reader cites as "is the lead *materially* positive?"
+    # is in none of them. ``is_material`` was the ONE §7 axis left unbound until
+    # TASK-0177 (margin-dependent, and the margin was not stamped); the producer
+    # now stamps ``material_margin``, so the replay re-derives the boolean from
+    # the margin-invariant ``point_improvement`` (ci_stats_stale-bound) and the
+    # stamped margin, and surfaces the contradiction loud rather than silently
+    # trusting the stored boolean — the stored-boolean-trusted-over-artifact path
+    # this guard closes, the materiality-axis sibling of
+    # SIGNIFICANT_SURPASSES_STALE (``3e3aca6``). Skipped (no note) when the
+    # deposit carries no stamped margin or no stored boolean.
+    if _is_material_stale(data, ci):
+        stored = data.get("is_material")
+        margin = data.get("material_margin")
+        rederived = ci.point_improvement >= margin
+        lines.append(
+            "  note: IS_MATERIAL_STALE — the recording's stored "
+            f"is_material={stored!r} disagrees with the value ({rederived!r}) "
+            "re-derived from its stored point_improvement under the SAME stamped "
+            f"material_margin={margin!r} the producer used (point_improvement is "
+            "margin-invariant and ci_stats_stale-bound, so the re-derivation is "
+            "faithful; is_material is point_improvement >= material_margin, the "
+            "§7 practical axis — distinct from the verdict STRING faithful binds, "
+            "the CI FLOATS ci_stats_stale binds, and the statistical "
+            "significant_surpasses). The replay trusts the artifact-derived "
+            "answer over the stored boolean, so the recording's materiality is "
+            f"read as {'material' if rederived else 'NOT material'}. Re-stamp the "
+            "deposit from a fresh producer run (or correct the stored boolean / "
+            "stamped margin) so it matches point_improvement under the stamped "
+            "margin."
         )
     # Committed-ledger binding (the deposit-vs-ledger sibling of the intra-deposit
     # label-vs-losses guards above): the verdict is computed from the deposit's
@@ -1451,8 +1570,10 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         # cites (mirrors the prose CI_STATS_STALE note; same helper — the two
         # cannot drift). Empty when every stamped statistic matches or the deposit
         # stamps none (a proxy / legacy recording — the artifact-when-present
-        # discipline). ``is_material`` is intentionally excluded (margin-dependent,
-        # margin not stamped — see :data:`_CI_STAT_BINDINGS`). This is the one
+        # discipline). ``is_material`` is excluded HERE (margin-dependent, not a
+        # margin-invariant statistic — see :data:`_CI_STAT_BINDINGS`) but is bound
+        # by its OWN margin-aware gate ``is_material_stale`` below (the producer
+        # now stamps ``material_margin``, ``TASK-0177``). This is the one
         # cross-check that reaches the cited CI NUMBERS the verdict label and the
         # raw evidence hash both deliberately skip.
         "ci_stats_stale": _ci_stats_stale(data, ci),
@@ -1470,6 +1591,23 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         # (a recording that predates the field — the artifact-when-present
         # discipline, same as ``ci_stats_stale``).
         "significant_surpasses_stale": _significant_surpasses_stale(data, ci),
+        # §4 materiality-axis cross-check (the materiality-boolean sibling of
+        # ``significant_surpasses_stale``): does the deposit's stored
+        # ``is_material`` boolean agree with ``point_improvement >= stamped
+        # material_margin`` — the value re-derived from its stored losses under
+        # the SAME margin the producer used (the §7 *practical* axis, deliberately
+        # separated from the statistical ``significant_surpasses``)? A deposit
+        # whose verdict STRING (``faithful``), CI FLOATS (``ci_stats_stale``), and
+        # statistical BOOLEAN (``significant_surpasses_stale``) are all honest yet
+        # whose materiality BOOLEAN was hand-edited passes them all — so this is
+        # the one gate that flags a flipped materiality claim (mirrors the prose
+        # IS_MATERIAL_STALE note; same helper — the two cannot drift). ``False``
+        # when the deposit carries no stored boolean or no stamped margin (a
+        # recording that predates either field — the artifact-when-present
+        # discipline, same as ``significant_surpasses_stale``). ``is_material`` was
+        # the one §7 axis left unbound until TASK-0177 (margin-dependent; the
+        # producer now stamps ``material_margin``, resolving the blocker).
+        "is_material_stale": _is_material_stale(data, ci),
         "candidate_mean": ci.candidate_mean,
         "surrogate_mean": ci.surrogate_mean,
         "point_improvement": ci.point_improvement,

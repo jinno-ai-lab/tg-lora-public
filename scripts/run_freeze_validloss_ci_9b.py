@@ -1991,6 +1991,14 @@ def result_to_json(result: dict) -> dict:
         "passes": ci.passes,
         "significant_surpasses": ci.significant_surpasses,
         "is_material": ci.is_material,
+        # The material margin the producer actually used (default 0.0). Provenance
+        # only — NOT evidence, so it is absent from ``EVIDENCE_HASH_KEYS`` (a
+        # caller-set threshold, like ``confidence`` / ``n_bootstrap``, never a raw
+        # measurement). Stamped so the torch-free replay can re-derive
+        # ``is_material`` (= ``point_improvement >= material_margin``) from the
+        # SAME margin the producer did, cross-checking the stored boolean instead
+        # of trusting it (see ``_is_material_stale`` / TASK-0177).
+        "material_margin": ci.material_margin,
         "is_thin_evidence": ci.is_thin_evidence,
         "candidate_mean": ci.candidate_mean,
         "surrogate_mean": ci.surrogate_mean,
