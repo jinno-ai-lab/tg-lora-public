@@ -1885,3 +1885,215 @@ class TestLedgerBinding:
             )
 
 
+class TestEvidenceHashBinding:
+    """The deposit-vs-its-own-evidence binding: the producer stamps
+    ``evidence_hash`` (a SHA-256 over the deposit's raw measurements +
+    run-determining config — never the derived verdict/gate/regime labels) so a
+    coordinated repaint that edits the floats + verdict + provenance TOGETHER
+    (which passes every DERIVED check), or any accidental byte drift, moves the
+    stamp. The replay now re-derives that hash from the SAME key list +
+    canonicalization (the shared :mod:`src.tg_lora.freeze_evidence_hash` leaf) and
+    flags a deposit whose stamp no longer matches — the deposit-vs-its-own-
+    evidence sibling of :class:`TestLedgerBinding` (which binds the deposit to an
+    EXTERNAL ledger by content hash; this binds it to its OWN evidence block).
+
+    The gap this closes: the ledger binding reaches only the TWO citable
+    full-budget deposits that carry a committed ledger witness. The OTHER FIVE
+    committed 9B deposits (direction / baseline / surrogate / generalization /
+    heterogeneous_generalization) carry an ``evidence_hash`` but NO ledger, so
+    without this guard their committed bytes have no integrity binding at the
+    torch-free replay chokepoint at all — a hand-edit to their freeze order,
+    provenance, or run config passes every prior gate (faithful, the four
+    citation axes, the direction/baseline sub-verdicts) silently. Proof of need
+    (verified below): on the surrogate deposit (recorded SURPASSES, ledger-less)
+    reversing ``candidate_order`` — the freeze order the §4 verdict is ABOUT —
+    leaves the verdict faithful (losses untouched) and every ledger check clean
+    (no ledger), yet the stamped ``evidence_hash`` is provably stale; only this
+    guard catches it.
+    """
+
+    def test_committed_deposits_match_their_stamps(self):
+        # Byte-identical invariant: every committed 9B deposit that carries an
+        # ``evidence_hash`` must re-derive to ``evidence_hash_stale is False`` —
+        # the replay reproduces the producer's stamp from the SAME leaf, so a
+        # committed deposit never reads as stale. A future deposit whose
+        # committed bytes drifted from its stamp (a botched harvest, a formatter)
+        # trips this and the silent flip is prevented.
+        for deposit in _9b_deposit_fixtures():
+            data = load_samples(str(deposit))
+            if "evidence_hash" not in data:
+                continue  # the runlog artifact aside, all 7 carry a stamp
+            ci = replay_samples(data)
+            out = replay_to_json(str(deposit), data, ci)
+            assert out["evidence_hash_stale"] is False, (
+                f"{deposit.name}: committed evidence_hash is stale against its "
+                f"own bytes — the deposit and its stamp have diverged."
+            )
+            assert "EVIDENCE_HASH_STALE" not in format_replay(str(deposit), data, ci)
+
+    def test_deposits_without_a_stamp_skip_cleanly(self):
+        # Skip / false-positive discipline: a proxy / synthetic / legacy
+        # recording that carries no ``evidence_hash`` must report CLEAN — the
+        # cross-check skips, it must not false-positive on a deposit that simply
+        # has no stamp to bind. The committed proxy recording has none.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_generalize_proxy.json"
+        )
+        data = load_samples(str(deposit))
+        assert "evidence_hash" not in data, "premise: the proxy deposit has no stamp"
+        ci = replay_samples(data)
+        out = replay_to_json(str(deposit), data, ci)
+        assert out["evidence_hash_stale"] is False
+        assert "EVIDENCE_HASH_STALE" not in format_replay(str(deposit), data, ci)
+
+    def test_hand_edited_freeze_order_is_flagged_on_a_ledgerless_deposit(self):
+        # PRIMARY mutation proof (the corrupt-but-green path the ledger binding
+        # cannot reach). The surrogate deposit records SURPASSES and is
+        # ledger-less, so no ledger gate can bind its bytes. Reversing
+        # ``candidate_order`` — the freeze order the §4 verdict is ABOUT — leaves
+        # the verdict faithful (losses untouched) and every ledger check clean,
+        # yet the stamped evidence_hash is provably stale: the deposit's recorded
+        # order no longer matches the order its verdict claims. ONLY this guard
+        # names the corruption.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_surrogate.json"
+        )
+        data = load_samples(str(deposit))
+        assert data.get("ledger_witness_path") in (None, ""), (
+            "premise: the surrogate deposit is ledger-less"
+        )
+        ci_clean = replay_samples(data)
+        assert ci_clean.significance_verdict == SURPASSES  # the recorded verdict
+        # The lie: invert the recorded freeze order (an evidence key, not a loss).
+        data["candidate_order"] = list(reversed(data["candidate_order"]))
+        ci_mut = replay_samples(data)
+        assert ci_mut.significance_verdict == SURPASSES, (
+            "the order edit must not change the verdict (losses are untouched)"
+        )
+        out = replay_to_json(str(deposit), data, ci_mut)
+        # The ledger binding is silent (no ledger); evidence_hash is the ONLY
+        # gate that fires.
+        assert out["ledger_losses_stale"] == []
+        assert out["evidence_hash_stale"] is True, (
+            "a reversed freeze order must stale the stamped evidence_hash"
+        )
+        assert "EVIDENCE_HASH_STALE" in format_replay(str(deposit), data, ci_mut)
+
+    def test_hand_edited_run_config_is_flagged(self):
+        # Mutation proof (run-config axis): a hand-edit to a run-determining
+        # config field (``total_steps``) — which would misrepresent WHICH run
+        # produced the measurements — stales the stamp. ``total_steps`` also
+        # feeds the producer's budget axis, but the replay already re-derives
+        # THAT axis from the artifact; the evidence_hash guard is the one that
+        # flags the byte drift itself.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_direction.json"
+        )
+        data = load_samples(str(deposit))
+        data["total_steps"] = int(data["total_steps"]) + 1
+        out = replay_to_json(str(deposit), data, replay_samples(data))
+        assert out["evidence_hash_stale"] is True
+
+    def test_hand_edited_provenance_is_flagged(self):
+        # Mutation proof (provenance axis): a hand-edit to a per-arm provenance
+        # dict (which layers froze) — an evidence key no other replay check
+        # binds — stales the stamp.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_baseline.json"
+        )
+        data = load_samples(str(deposit))
+        data["candidate_provenance"] = {"ZZZ_NEVER_REAL": True}
+        out = replay_to_json(str(deposit), data, replay_samples(data))
+        assert out["evidence_hash_stale"] is True
+
+    def test_hand_edited_stamp_is_flagged_but_bytes_stay_consistent(self):
+        # Mutation proof (stamp lie): a forged / hand-edited stamp that no longer
+        # matches the (unchanged) committed bytes — a deposit pointed at the
+        # wrong harvest, or a stamp pasted from another run. The bytes are clean
+        # (so no OTHER staleness axis fires); only the evidence_hash binding
+        # catches the broken stamp.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_surrogate.json"
+        )
+        data = load_samples(str(deposit))
+        data["evidence_hash"] = "ZZZ_NEVER_REAL"
+        ci = replay_samples(data)
+        out = replay_to_json(str(deposit), data, ci)
+        assert out["evidence_hash_stale"] is True
+        assert "EVIDENCE_HASH_STALE" in format_replay(str(deposit), data, ci)
+
+    def test_stamp_covers_evidence_not_derived_labels(self):
+        # Invariant (mirrors the producer's ``test_hash_is_over_evidence_not_
+        # derived_labels``): the hash freezes EVIDENCE, never the derived labels,
+        # so editing any derived label (verdict / regime / gate / CI statistics)
+        # must NOT stale the stamp — otherwise the integrity check would be
+        # circular. A label edit reads clean here; only an EVIDENCE edit stales.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_surrogate.json"
+        )
+        data = load_samples(str(deposit))
+        for label_key in (
+            "verdict", "passes", "significant_surpasses", "is_material",
+            "citable_as_full_section4_verdict", "citable_as_target_scale",
+            "regime", "point_improvement", "lower", "upper",
+            "candidate_mean", "surrogate_mean",
+        ):
+            mutated = dict(data)
+            current = data.get(label_key)
+            mutated[label_key] = (
+                "ZZZ_NEVER_REAL" if isinstance(current, str) else (not current)
+            )
+            out = replay_to_json(str(deposit), mutated, replay_samples(mutated))
+            assert out["evidence_hash_stale"] is False, (
+                f"evidence_hash leaked the derived label '{label_key}' — the "
+                f"hash must cover only raw evidence, never labels."
+            )
+
+    def test_prose_note_presence_matches_machine_flag(self):
+        # DRIFT invariant (mirrors TestLedgerBinding's): the machine flag and the
+        # human prose note cannot drift. Across a committed deposit (clean) AND a
+        # hand-edited lie on each axis (freeze order / run config / provenance /
+        # stamp), ``EVIDENCE_HASH_STALE in prose`` == ``evidence_hash_stale``.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_surrogate.json"
+        )
+        base = load_samples(str(deposit))
+        cases = [("committed", base)]
+        for name, mutate in (
+            ("lie-order", lambda d: d.__setitem__(
+                "candidate_order", list(reversed(d["candidate_order"])))),
+            ("lie-config", lambda d: d.__setitem__(
+                "total_steps", int(d["total_steps"]) + 1)),
+            ("lie-provenance", lambda d: d.__setitem__(
+                "candidate_provenance", {"ZZZ": True})),
+            ("lie-stamp", lambda d: d.__setitem__(
+                "evidence_hash", "ZZZ_NEVER_REAL")),
+        ):
+            d = dict(base)
+            mutate(d)
+            cases.append((name, d))
+        for name, data in cases:
+            ci = replay_samples(data)
+            out = replay_to_json(str(deposit), data, ci)
+            prose = format_replay(str(deposit), data, ci)
+            note = "EVIDENCE_HASH_STALE" in prose
+            assert note is out["evidence_hash_stale"], (
+                f"{name}: prose ({note}) != flag ({out['evidence_hash_stale']})"
+            )
+
+
+

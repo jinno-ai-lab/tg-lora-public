@@ -151,6 +151,18 @@ from src.tg_lora.freeze_verdict_honesty import (
     full_section4_verdict_gate as _full_section4_verdict_gate,
     is_reduced_budget as _is_reduced_budget,
 )
+# The §7 evidence-hash primitives (single source of truth, shared with the
+# GPU-free replay gate). Imported under the producer's underscore aliases so the
+# stamping call site (``deposit["evidence_hash"] = _evidence_hash(deposit)``) and
+# the test suite's ``from scripts.run_freeze_validloss_ci_9b import _evidence_hash,
+# EVIDENCE_HASH_KEYS`` are unchanged; the leaf is the one place the evidence key
+# list + canonicalization live, so the producer's stamp and the replay's
+# re-derivation can never diverge (SYSTEM_CONSTITUTION Rule #3) — same leaf
+# pattern as ``freeze_verdict_honesty`` above.
+from src.tg_lora.freeze_evidence_hash import (
+    EVIDENCE_HASH_KEYS as EVIDENCE_HASH_KEYS,
+    evidence_hash as _evidence_hash,
+)
 from src.tg_lora.progressive_freeze import ProgressiveFreezeController
 from src.utils.io import _atomic_write_text
 
@@ -1819,11 +1831,13 @@ def run_ci_9b(
 # painted on that disagrees with the stored floats fails red. What those tests
 # cannot catch is a COORDINATED repaint: editing the committed floats, their CI
 # bounds, the verdict label, and the per-arm provenance TOGETHER so every
-# derived check still passes. :func:`_evidence_hash` freezes the EVIDENCE
-# bytes (the raw measurements a real run produced, never the self-declared
-# verdict/gate/regime labels) behind a content hash pinned in the test suite,
-# so any such repaint — or any accidental byte drift — becomes a visible,
-# reviewable test change instead of silent source-of-truth erosion.
+# derived check still passes. :func:`_evidence_hash` (now in the torch-free leaf
+# :mod:`src.tg_lora.freeze_evidence_hash`, imported above and shared with the
+# GPU-free replay gate) freezes the EVIDENCE bytes (the raw measurements a real
+# run produced, never the self-declared verdict/gate/regime labels) behind a
+# content hash, so any such repaint — or any accidental byte drift — becomes a
+# visible, reviewable stale-stamp at BOTH the test suite and the replay
+# chokepoint instead of silent source-of-truth erosion.
 #
 # This is the "attach a content hash so the verdict is independently
 # reproducible" guard. It does NOT certify that a GPU produced the bytes (only
@@ -1831,36 +1845,11 @@ def run_ci_9b(
 # no surviving log and the GPU was contended this iteration, recorded openly as
 # the next action); it certifies the COMMITTED bytes are the immutable,
 # auditable record every derived claim rests on.
-EVIDENCE_HASH_KEYS = (
-    # Raw held-out measurements + the freeze orders they were taken under.
-    "candidate_losses", "surrogate_losses", "control_losses", "baseline_losses",
-    "candidate_order", "control_order",
-    # Per-arm provenance: which layers froze, how many params trained, and the
-    # train-CE diagnostics that classify the regime — all run-determined.
-    "candidate_provenance", "surrogate_provenance",
-    "control_provenance", "baseline_provenance",
-    # Run-determining config: identifies WHICH run produced these measurements.
-    "model", "architecture", "lora_rank_pattern", "dataset",
-    "total_steps", "warmup_steps", "depth", "spacing",
-    "active_scope", "seq_len", "train_examples", "valid_examples",
-    "n_candidate", "n_surrogate", "n_control", "n_baseline", "base_seed",
-)
-
-
-def _evidence_hash(deposit: dict) -> str:
-    """SHA-256 hex over the deposit's evidence bytes, for reproducibility pinning.
-
-    Canonicalizes a fixed, ordered subset of EVIDENCE keys (see
-    :data:`EVIDENCE_HASH_KEYS`) — the raw measurements and run-determining
-    config, never the derived verdict/gate/regime labels — to a stable JSON
-    encoding (sorted keys, compact separators) and returns the SHA-256 hex.
-    ``evidence_hash`` is itself absent from :data:`EVIDENCE_HASH_KEYS`, so
-    stamping it is idempotent: a key missing from an older deposit contributes
-    ``None`` and the hash never includes itself.
-    """
-    payload = {k: deposit.get(k) for k in EVIDENCE_HASH_KEYS}
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+#
+# ``EVIDENCE_HASH_KEYS`` and :func:`_evidence_hash` are re-exported here (via the
+# import at the top of this module) for back-compat with the test suite's
+# ``from scripts.run_freeze_validloss_ci_9b import _evidence_hash,
+# EVIDENCE_HASH_KEYS``; the leaf remains the single source of truth.
 
 
 # GOAL §7 reproducibility — the run-log / loss-curve artifact. ``evidence_hash``

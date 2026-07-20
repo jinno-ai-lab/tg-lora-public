@@ -105,6 +105,13 @@ from src.tg_lora.freeze_verdict_honesty import (
     classify_regime,
     is_reduced_budget,
 )
+# The §7 evidence-hash leaf (single source of truth, shared with the producer —
+# see :func:`scripts.run_freeze_validloss_ci_9b._evidence_hash`). The replay
+# re-derives the deposit's stamped ``evidence_hash`` from the SAME key list +
+# canonicalization the producer stamped, so a hand-edited / externally-supplied
+# deposit whose committed evidence bytes drifted from its stamp is surfaced loud
+# at the GPU-free chokepoint rather than silently trusted.
+from src.tg_lora.freeze_evidence_hash import evidence_hash
 from src.tg_lora.freeze_surrogate_gate import SURPASSES, TIES, UNDERSHOOTS
 
 # The three verdicts the §4 judge can emit (imported so ``--expected`` choices
@@ -590,6 +597,36 @@ def _ledger_witness_stale(
     return hashlib.sha256(canonical).hexdigest() != stored
 
 
+def _evidence_hash_stale(data: dict[str, Any]) -> bool:
+    """True when a deposit's stamped ``evidence_hash`` diverges from the hash
+    re-derived from its OWN evidence bytes (GOAL §7 citation honesty).
+
+    The producer (:func:`scripts.run_freeze_validloss_ci_9b._evidence_hash`, via
+    the shared :mod:`src.tg_lora.freeze_evidence_hash` leaf) stamps
+    ``evidence_hash`` as a SHA-256 over the deposit's raw measurements +
+    run-determining config (the EVIDENCE keys — losses, freeze orders,
+    provenance, run config) — never the derived verdict/gate/regime labels — so
+    a coordinated repaint that edits the floats, their CI bounds, the verdict
+    label, and the per-arm provenance TOGETHER (which passes every DERIVED
+    check), or any accidental byte drift, moves the stamp. The replay re-derives
+    that hash from the SAME key list + canonicalization and flags a deposit
+    whose stamp no longer matches — the deposit-vs-its-own-evidence sibling of
+    :func:`_ledger_witness_stale` (which binds the deposit to an EXTERNAL ledger
+    by content hash; this binds it to its OWN evidence block). This is the one
+    cross-check that reaches the five committed 9B deposits that carry an
+    ``evidence_hash`` but no committed ledger (direction / baseline / surrogate
+    / generalization / heterogeneous_generalization) — the ledger binding skips
+    them, so without this guard their committed bytes have no integrity binding
+    at the torch-free chokepoint at all. Honored at the replay gate; ``False``
+    when the deposit carries no stamp (a proxy / synthetic / legacy recording —
+    the artifact-when-present-else-skip discipline, same as the ledger gate).
+    """
+    stored = data.get("evidence_hash")
+    if not isinstance(stored, str) or not stored:
+        return False
+    return evidence_hash(data) != stored
+
+
 def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLossCI) -> str:
     """Human-readable replay block: scale, the §4 verdict, and faithfulness.
 
@@ -917,6 +954,31 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
             "deposit pointed at the wrong ledger). Re-stamp the witness from a "
             "fresh harvest so the hash matches the committed bytes."
         )
+    # Evidence-hash staleness guard (the deposit-vs-its-own-evidence sibling of
+    # LEDGER_WITNESS_STALE): the producer stamps ``evidence_hash`` over the
+    # deposit's raw measurements + run-determining config, so any byte drift in
+    # those evidence fields (a hand-edit, a formatter, a botched merge — or a
+    # coordinated repaint that touches the floats + verdict + provenance
+    # together and passes every DERIVED check) leaves the stamp stale. The
+    # replay re-derives the hash from the SAME key list (the shared
+    # ``freeze_evidence_hash`` leaf) and surfaces the contradiction loud rather
+    # than silently trusting the stale stamp — the one integrity binding that
+    # reaches the five committed 9B deposits that carry an ``evidence_hash`` but
+    # no committed ledger. Fires only when the deposit carries a stamp; a
+    # proxy / synthetic / legacy recording has none and the check skips.
+    if _evidence_hash_stale(data):
+        lines.append(
+            "  note: EVIDENCE_HASH_STALE — the recording's stamped "
+            f"evidence_hash={data.get('evidence_hash')!r} disagrees with the "
+            "SHA-256 re-derived from its own evidence bytes (the raw measurements "
+            "+ run-determining config — losses, freeze orders, provenance, run "
+            "config — never the verdict/gate/regime labels). The committed "
+            "evidence block has been altered without refreshing the stamp (a "
+            "hand-edit, a formatter, a botched merge, or a coordinated repaint "
+            "that passes every derived check), so the bytes the verdict rests on "
+            "no longer match the pinned record (GOAL §7). Re-stamp the deposit "
+            "from a fresh producer run so the hash matches the committed evidence."
+        )
     return "\n".join(lines)
 
 
@@ -1060,6 +1122,18 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         # schema gate.
         "ledger_losses_stale": _ledger_losses_stale(data, ledger_records),
         "ledger_witness_stale": _ledger_witness_stale(data, ledger_records),
+        # Evidence-hash staleness (the deposit-vs-its-own-evidence sibling of the
+        # ledger binding above): the producer stamps ``evidence_hash`` over the
+        # deposit's raw measurements + run-determining config; the replay
+        # re-derives it from the SAME key list (the shared ``freeze_evidence_hash``
+        # leaf) and flags a deposit whose stamp no longer matches its committed
+        # evidence bytes (mirrors the prose EVIDENCE_HASH_STALE note; same
+        # helper — the two cannot drift). ``False`` when the deposit carries no
+        # stamp (a proxy / synthetic / legacy recording — the
+        # artifact-when-present discipline). This is the one integrity binding
+        # that reaches the five committed 9B deposits that carry an
+        # ``evidence_hash`` but no committed ledger.
+        "evidence_hash_stale": _evidence_hash_stale(data),
         "candidate_mean": ci.candidate_mean,
         "surrogate_mean": ci.surrogate_mean,
         "point_improvement": ci.point_improvement,
