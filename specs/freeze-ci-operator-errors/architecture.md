@@ -261,3 +261,13 @@ tests/
 - 🔴 赤信号: 0件 (0%)
 
 **品質評価**: 高品質
+
+
+<!-- spine:references:begin -->
+## Spine: external references
+
+- [TASK-0180: `scripts/replay_freeze_validloss_ci.py` を TASK-0179 が新設した leaf `src/utils/cli_errors.py` で wire し、`load_samples()` 周辺の 2 種類の operator error（`MissingConfigError`〔`--samples-file` 欠落〕+ `MalformedEvalResultsError`〔JSON parse 失敗 / 必須 key 欠落 / 型不一致〕）をそれぞれ別個の message + exit code 78 で fail-loud する — `argparse.error`（exit 2）path は不変・`--expected` 不一致（exit 2）path も不変・`replay_to_json` / `format_replay` の既存 verdict honesty gate（TASK-0171..0178 が bind した 9 axis）は無変更で **直交**](tasks/TASK-0180.md)
+- [TASK-0181: `scripts/run_freeze_validloss_ci_9b.py` を TASK-0179 leaf `src/utils/cli_errors.py` で wire し、`OmegaConf.load()`（line 2673/2705 周辺）+ `load_and_validate_config()`（line 2705 周辺）の 3 種類の operator error（`MissingConfigError`〔`--config` 欠落〕+ `MalformedYAMLError`〔YAML parse 失敗〕+ `AppConfigValidationError`〔Pydantic schema 違反〕）をそれぞれ別個の message + exit code 78 で fail-loud する — 既存 `--json` mode が producer 側にも必要（REQ-502）なので `argparse` に `--json` flag 新設・既存 9B producer cluster（`test_run_freeze_validloss_ci_9b_*.py`）の GPU-free smoke test 群は無変更で **直交**・TASK-0180 が replay 側 wire-up で確立した outer try/except pattern を **同形で適用**](tasks/TASK-0181.md)
+- [TASK-0182: `scripts/launch_freeze_ci_9b_full.py` の `classify_exit_code()` に **新規 exit code 78**（`sysexits.h` `EX_CONFIG` 由来 = TASK-0179 が leaf `src/utils/cli_errors.py::EXIT_OPERATOR_ERROR` で定義・TASK-0180/0181 が producer / replay 側で発生させる operator error 終端値）→ `Decision(Action.FATAL, "operator_error", 0.0)` 分岐を追加し、worker `exit 78` を launcher の **retry 不能 / deadline 強制** 経路として surface する — 既存 4 worker exit code（`EXIT_DONE/UNEXPECTED/CUDA_DOWN/INCOMPLETE_RESUME = 0/1/2/3`）+ `GPU_TEMPFAIL=75` + signal-kill RETRY + `tests/test_worker_launcher_exit_contract.py` 4 個 worker 契約 は **無変更**で **直交**。`ad8c84a` で pin された `tests/test_worker_launcher_exit_contract.py` 整合](tasks/TASK-0182.md)
+
+<!-- spine:references:end -->

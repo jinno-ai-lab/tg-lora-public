@@ -497,3 +497,13 @@
 - TC-NFR-101-01..02, TC-NFR-201-01..02, TC-NFR-202-01..02, TC-EDGE-002-01, TC-EDGE-102-01
 - 優先度: Should Have
 - 実施予定: TASK-0179 iter 内
+
+
+<!-- spine:references:begin -->
+## Spine: external references
+
+- [freeze-ci-operator-errors — コンテキストノート](note.md)
+- [TASK-0179: freeze-ci-9b entrypoint 3 本が operator（開発者・CI）から投入される **4 種類の distinct な error class**（missing config / malformed YAML / AppConfig validation failure / malformed eval results）を それぞれ別個の `OperatorError` subtype + 別個の message + 共通 exit code 78（sysexits.h `EX_CONFIG` 由来）で fail-loud する leaf module `src/utils/cli_errors.py` を新設する — 直前 TASK-0175..0178 が replay-gate の stored boolean axis を 9 軸 bind 済で「stored vs artifact-rederived 真値」silent corruption を chokepoint 化したのに対し、本 TASK は「operator 入力 vs 内部 state」silent corruption の chokepoint を直交 axis として leaf 化する。AI_HUB_MAKE_RUN_FEEDBACK「operator-facing follow-up: implement distinct handling for missing config, malformed YAML, AppConfig validation failures, and malformed eval results with specified messages and exit statuses, then retain these tests as regressions」の **leaf 側 prereq**（直交 axis の核）](tasks/TASK-0179.md)
+- [TASK-0183: TASK-0179（leaf）/ TASK-0180（replay wire-up）/ TASK-0181（producer wire-up）/ TASK-0182（launcher wire-up）が個別に pin した test 群を **統合 test layer** として consolidate し、operator-error axis 全体の **NFR-101 mutation 証明**（4 wrapper 個別 neutralize しても leaf invariant 群は GREEN）+ **zero-regression** 統合（既存 9 axis verdict honesty gate + 4 worker exit code + 5 launch-honesty + 32 config launchability + 8 producer smoke の **5 cluster** byte-identical）+ **NFR-201/202/203** message 品質 + **EDGE-102/103** boundary を **1 つの regression net として test_cluster を統合** する — 直前 4 TASK が個別に打った pin の **consolidation commit**（新 production code 変更なし・新 test 11 個追加・既存 test cluster 緑確認のみ・`b8ee35c` assembled launch-honesty dry-run pattern 整合）](tasks/TASK-0183.md)
+
+<!-- spine:references:end -->

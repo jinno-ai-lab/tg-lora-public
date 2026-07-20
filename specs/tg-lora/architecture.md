@@ -733,6 +733,13 @@ make paper-memory SEEDS='42 43 44' TARGET_BP=240 MAX_SEQ_LEN=1024 \
 - [TG-LoRA 要件定義書](requirements.md)
 - [TG-LoRA タスク概要](tasks/overview.md)
 - [TG-LoRA ユーザストーリー](user-stories.md)
+- [freeze-ci-operator-errors 受け入れ基準](/home/jinno/tg-lora-public/specs/freeze-ci-operator-errors/acceptance-criteria.md)
+- [freeze-ci-operator-errors アーキテクチャ設計](/home/jinno/tg-lora-public/specs/freeze-ci-operator-errors/architecture.md)
+- [freeze-ci-operator-errors データフロー図](/home/jinno/tg-lora-public/specs/freeze-ci-operator-errors/dataflow.md)
+- [freeze-ci-operator-errors 設計自動分析記録](/home/jinno/tg-lora-public/specs/freeze-ci-operator-errors/design-interview.md)
+- [freeze-ci-operator-errors 自動分析記録](/home/jinno/tg-lora-public/specs/freeze-ci-operator-errors/interview-record.md)
+- [freeze-ci-operator-errors 要件定義書](/home/jinno/tg-lora-public/specs/freeze-ci-operator-errors/requirements.md)
+- [freeze-ci-operator-errors タスク概要](/home/jinno/tg-lora-public/specs/freeze-ci-operator-errors/tasks/overview.md)
 
 <!-- spine:children:end -->
 
@@ -740,6 +747,7 @@ make paper-memory SEEDS='42 43 44' TARGET_BP=240 MAX_SEQ_LEN=1024 \
 <!-- spine:references:begin -->
 ## Spine: external references
 
+- [freeze-ci-operator-errors ユーザストーリー](/home/jinno/tg-lora-public/specs/freeze-ci-operator-errors/user-stories.md)
 - [TASK-0001: build_seed_dataset ユニットテスト追加](tasks/TASK-0001.md)
 - [TASK-0002: filter_dataset, dedup, provenance ユニットテスト追加](tasks/TASK-0002.md)
 - [TASK-0003: load_model, lora_utils ユニットテスト追加](tasks/TASK-0003.md)
@@ -879,5 +887,29 @@ make paper-memory SEEDS='42 43 44' TARGET_BP=240 MAX_SEQ_LEN=1024 \
 - [TASK-0152: 9B target-scale 決定的検証 — Tier-1 turnkey 計測 + §4 verdict gate 拡張 gap](tasks/TASK-0152.md)
 - [TASK-0153: torn-write 整合性軸の LOAD 側閉包 — `trajectory_delta_artifact` + integrity primitives の zero-dep leaf 化](tasks/TASK-0153.md)
 - [TASK-0154: Category-C 9B target-scale verdict の EARS 要件形式化 + GPU-free dry-run 検証路の硬化](tasks/TASK-0154.md)
+- [TASK-0155: 9B suffix-only config の経験的 GPU memory-frontier 計測 — seq1024 memory block の撤去証明](tasks/TASK-0155.md)
+- [TASK-0156: real-9B §4 A/B の memorization-robustness — generalization regime での verdict 再取得 + `final_ce_train_loss` 診断](tasks/TASK-0156.md)
+- [TASK-0157: real-9B §4 A/B condition (a) — candidate vs **FULL-backprop baseline** verdict（no-freeze arm 追加）+ freeze-as-regularizer 機構](tasks/TASK-0157.md)
+- [TASK-0158: resumable per-arm ledger for the full-budget §4 verdict run — 9 arms × 1500 step の中断耐性（GPU 抢占/OOM/session end で bank した arm を引き継ぐ）](tasks/TASK-0158.md)
+- [TASK-0159: §4 verdict deposit の再現性 provenance（evidence content-hash）と heterogeneous run-log artifact gap の誠実な記録](tasks/TASK-0159.md)
+- [TASK-0160: citable full-budget §4 verdict への committed ledger witness 付与（独立再現性の完遂）+ heterogeneous run-log witness の LANDED（fresh real-9B run が SURPASSES を再現）](tasks/TASK-0160.md)
+- [TASK-0161: full-budget × heterogeneous §4 leg の launch path 配線 + honest-gate 検証（GPU-free）— feedback phantom lever 検証と open leg の unblock](tasks/TASK-0161.md)
+- [TASK-0162: open §4 leg（heterogeneous × generalize full-budget）を robust 発火 + run-time CUDA-OOM を tempfail に分類して launcher が contended GPU を生き残るように修正（実 OOM で生産証明）](tasks/TASK-0162.md)
+- [TASK-0163: citable §4 verdict deposit + run-log + io-leaf JSON を atomic write 化（torn-deposit/harvest-during-write 保護）](tasks/TASK-0163.md)
+- [TASK-0164: freeze-ci-9b `--output` deposit を常に canonical JSON 化（`--json` から decouple・torn-deposit/parse-failure 保護）](tasks/TASK-0164.md)
+- [TASK-0165: assembled resume-ledger fidelity（matching fingerprint → fresh verdict を byte 再現・multi-window verdict の基盤 property を invariant 化）](tasks/TASK-0165.md)
+- [TASK-0166: launcher signal-kill（負の returncode = ホスト SIGKILL）を tempfail に分類 — contended-host で OOM-killer に殺された worker を生き残らせる（4afc5e9 OOM-tempfail の sibling・GOAL §7 silent contract-break の生産経路閉鎖）](tasks/TASK-0166.md)
+- [TASK-0167: `extract_best_valid_loss` が非有限（NaN/inf）loss を黙って deposit する silent-corruption 経路を閉鎖 — diverged QLoRA run が corrupt-but-green §4 verdict を成立させるのを fail-loud 化（7c4aebf Dolly-schema guard と同 class・GOAL §7 silent contract-break の生産経路閉鎖）](tasks/TASK-0167.md)
+- [TASK-0168: `surrogate_valid_loss_ci` が非有限（NaN/inf）loss を黙って TIES にする verdict-computation 経路の silent-corruption を閉鎖 — diverged arm が corrupt-but-green §4 verdict を成立させるのを fail-loud 化（756ea96 形成側 guard と対・GOAL §7 silent contract-break・verdict 計算 chokepoint）](tasks/TASK-0168.md)
+- [TASK-0169: replay citation gate が operator-set `negative_control` boolean を budget reality より信頼する silent-corruption 経路を閉鎖 — divergent-budget（degraded arm）deposit が flag 欠落でも citable §4 target-scale に見えるのを gate chokepoint で fail-loud 化（TASK-0152 手書き `best_valid_loss` / swapped-arm guard `5ed3380` と同 class・GOAL §7 silent contract-break）](tasks/TASK-0169.md)
+- [TASK-0170: `_load_dolly_records` が present-but-empty 値（空 instruction/response TEXT）を黙って通す silent-corruption 経路を閉鎖 — schema guard(`7c4aebf`)が閉じた missing-FIELD 扉と**同一 hazard**・empty-VALUE 扉の第二経路（DATA 軸・GOAL §7 corrupt-but-green）](tasks/TASK-0170.md)
+- [TASK-0171: replay citation gate が producer の §4 条件(a)/(b) sub-verdict label（`direction.verdict`/`baseline.verdict`）を per-arm losses より信頼する silent-corruption 経路を閉鎖 — nested label が `control_losses`/`baseline_losses` と不一致でも silent に通るのを gate chokepoint で fail-loud 化（`d734327` の top-level boolean cross-check を nested sub-verdict に延長・同「label trusted over artifact reality」class・GOAL §7）](tasks/TASK-0171.md)
+- [TASK-0172: replay gate が deposit の per-arm losses を committed ledger の ground-truth per-arm `valid_loss` に bind しない silent-corruption 経路を閉鎖 — 内部的に整合した hand-edited deposit が ledger と乖離しても silent に corrupt-but-green verdict を通すのを gate chokepoint で fail-loud 化（`371e934`/`d734327` の intra-deposit label-vs-artifact cross-check を **deposit-vs-ledger binding**・新 class・に延長・GOAL §7）](tasks/TASK-0172.md)
+- [TASK-0173: replay gate が deposit の stamped `evidence_hash` を再導出して照合しない silent-corruption 経路を閉鎖 — 内部的に整合した hand-edited deposit が自身の evidence bytes と乖離しても silent に corrupt-but-green verdict を通すのを gate chokepoint で fail-loud 化（`47226b9` の deposit-vs-ledger binding の **deposit-vs-own-evidence** sibling・GOAL §7）](tasks/TASK-0173.md)
+- [TASK-0174: replay gate が deposit の stamped **derived §4 statistics**（means / CI bounds / point improvement）を再導出して照合しない silent-corruption 経路を閉鎖 — verdict *label* は `faithful` に・raw *evidence* は `evidence_hash` に bind されるが、**cited される derived 統計量**はどちらの gate にも覆われず hand-edit で corrupt-but-green に通るのを gate chokepoint で fail-loud 化（`79577a5`/`47226b9`/`d734327` とは**異 class**・同 chokepoint・GOAL §7）](tasks/TASK-0174.md)
+- [TASK-0175: replay gate が deposit の stamped **Level-1 citation boolean** `citable_as_target_scale` を `not proxy_scale`（producer の 1-term 契約）に bind しない silent-corruption 経路を閉鎖 — Level-2 boolean `citable_as_full_section4_verdict` は `d734327` に bind されるが**Level-1 boolean はどの gate にも覆われず** hand-edit で corrupt-but-green に通るのを gate chokepoint で fail-loud 化（`d734327` の**直接 Level-1 sibling**・同 chokepoint・GOAL §7）](tasks/TASK-0175.md)
+- [TASK-0176: replay gate が deposit の stamped **§7 statistical-significance boolean** `significant_surpasses` を `ci.significant_surpasses`（= `significance_verdict == SURPASSES`・CI が zero を排除）に bind しない silent-corruption 経路を閉鎖 — verdict STRING は `faithful` が・CI FLOATS は `6ed0f69` が bind するが**significance BOOLEAN はどの gate にも覆われず** hand-edit で corrupt-but-green に通るのを gate chokepoint で fail-loud 化（`6ed0f69` derived 統計量の**直接 sibling**・`37db498` Level-1 boolean と**同 class**・同 chokepoint・GOAL §7）](tasks/TASK-0176.md)
+- [TASK-0177: replay gate が deposit の stamped **§7 practical-materiality boolean** `is_material` を artifact-rederived 真値（`point_improvement >= material_margin`）に bind しない silent-corruption 経路を閉鎖 — producer が `material_margin` を stamp しなかったので意図的に unbound だった **TASK-0176 が命名した最後の §7 axis** を、margin provenance を stamp して解決（`3e3aca6` significance 統計軸 boolean と**対をなす実用軸** sibling・同 chokepoint・GOAL §7）](tasks/TASK-0177.md)
+- [TASK-0178: replay gate が deposit の stamped **§4 composite verdict boolean** `passes`（= `significant_surpasses and is_material`・reader/table が「candidate は §4 gate を pass したか」と cite する first-class claim）を artifact-rederived 真値に bind しない silent-corruption 経路を閉鎖 — 直前 TASK-0177 が §7 双軸 boolean を bind しつつ composite `passes` を「両 boolean で transitively に検証され unbound のまま」と**明記残置**した named residual を閉鎖。これは TASK-0177 自身の transitive-coverage 主張が、TASK-0176 が `significant_surpasses` に関して**既に拒否したのと同一の flawed argument**（stored boolean は他の bound field が imply しても独立 field なので hand-edit で反転可能 = transitive coverage は成り立たない）であることを実証（同 chokepoint・GOAL §7）](tasks/TASK-0178.md)
 
 <!-- spine:references:end -->

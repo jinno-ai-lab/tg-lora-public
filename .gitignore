@@ -109,3 +109,5 @@ paper_evidence/*
 
 # MLX jsonex symlink dir (regenerated at runtime)
 data_mlx_jsonex/
+# ai-hub tool-internal state
+.ai/
