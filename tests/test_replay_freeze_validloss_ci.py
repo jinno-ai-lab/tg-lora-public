@@ -2328,4 +2328,240 @@ class TestCiStatsBinding:
             )
 
 
+class TestTargetScaleLabelBinding:
+    """The deposit-vs-its-own-``proxy_scale`` Level-1 citation binding: the
+    producer stamps ``citable_as_target_scale`` as a deterministic function of the
+    deposit's own ``proxy_scale`` field — ``not result["proxy_scale"]``
+    (:func:`scripts.run_freeze_validloss_ci_9b.result_to_json`, the 1-term Level-1
+    citation contract). It is the Level-1 citation boolean a reader checks first
+    ("is this a genuine target-scale 9B recording?"), the prerequisite the Level-2
+    ``citable_as_full_section4_verdict`` gate composes on top of.
+
+    The gap this closes: ``citation_label_stale`` / :class:`TestNineBHonestyGateReplay`
+    / ``d734327`` binds the Level-2 ``citable_as_full_section4_verdict`` boolean by
+    re-deriving the full four-conjunct gate — but that gate can be honestly
+    ``False`` for reasons UNRELATED to target-scale (reduced context / thin /
+    non-generalization), so it does NOT transitively bind this Level-1 boolean. And
+    ``evidence_hash`` / :class:`TestEvidenceHashBinding` / ``79577a5`` deliberately
+    never covers gate labels (only raw measurements + run config), so a hand-edited
+    deposit that flips ``citable_as_target_scale`` — over-claiming target scale on a
+    proxy recording (``stored=True`` while ``proxy_scale=True``), or under-claiming a
+    genuine 9B run — while leaving ``proxy_scale`` honest passes every prior gate
+    silently. Proof of need (verified below): on the homogeneous full deposit
+    (recorded TIES, 9B, ``citable_as_target_scale=True``) flipping the boolean to
+    ``False`` keeps ``faithful=True``, ``evidence_hash_stale=False``, and — critically
+    — ``citation_label_stale=False`` (the Level-2 boolean is untouched), yet the
+    deposit's Level-1 citation claim is a lie; only this guard catches it.
+    """
+
+    @staticmethod
+    def _deposits_with_label():
+        # Every committed fixture that stamps ``citable_as_target_scale`` — both
+        # the 9B deposits (stored ``True``) and the proxy recordings (stored
+        # ``False``) — so the byte-identical invariant is proven in BOTH
+        # directions, not just the target-scale one.
+        fixture_dir = Path(__file__).resolve().parent / "fixtures"
+        out = []
+        for p in sorted(fixture_dir.glob("freeze_validloss*.json")):
+            if "runlog" in p.name:
+                continue
+            try:
+                if "citable_as_target_scale" in json.loads(p.read_text()):
+                    out.append(p)
+            except Exception:
+                continue
+        return out
+
+    def test_committed_deposits_label_matches_not_proxy_scale(self):
+        # Byte-identical invariant: every committed deposit that stores the Level-1
+        # citation boolean must re-derive to ``target_scale_label_stale is False`` —
+        # the producer stamps it as ``not proxy_scale``, so the replay reproduces it
+        # from the deposit's own ``proxy_scale`` bit-for-bit. A future deposit whose
+        # stamped boolean drifted from its ``proxy_scale`` (a botched harvest, a
+        # hand-edit) trips this and the silent Level-1 citation repaint is
+        # prevented. Covers both stored-True (9B) and stored-False (proxy).
+        assert self._deposits_with_label(), "expected committed labeled deposits"
+        for deposit in self._deposits_with_label():
+            data = load_samples(str(deposit))
+            ci = replay_samples(data)
+            out = replay_to_json(str(deposit), data, ci)
+            assert out["target_scale_label_stale"] is False, (
+                f"{deposit.name}: stored citable_as_target_scale="
+                f"{data.get('citable_as_target_scale')!r} disagrees with not "
+                f"proxy_scale={not bool(data.get('proxy_scale', True))!r}."
+            )
+            assert "TARGET_SCALE_LABEL_STALE" not in format_replay(
+                str(deposit), data, ci
+            )
+
+    def test_recording_without_label_skips_cleanly(self):
+        # Skip / false-positive discipline: a recording that carries the sample
+        # lists but stamps NO ``citable_as_target_scale`` boolean (a legacy /
+        # minimal recording that predates the field) must report CLEAN — the
+        # cross-check skips, it must not false-positive on a deposit that simply
+        # has no Level-1 label to bind.
+        path = "legacy-no-target-scale-label.json"
+        data = {
+            "candidate_losses": [1.0, 1.0, 1.0],
+            "surrogate_losses": [2.0, 2.0, 2.0],
+            "base_seed": 0,
+        }
+        ci = replay_samples(data)
+        out = replay_to_json(path, data, ci)
+        assert out["target_scale_label_stale"] is False, (
+            "a label-less recording must skip, got a stale flag"
+        )
+        assert "TARGET_SCALE_LABEL_STALE" not in format_replay(path, data, ci)
+
+    def test_hand_edited_label_underclaim_is_flagged(self):
+        # PRIMARY mutation proof (under-claim axis). The homogeneous full deposit
+        # is a 9B run (``citable_as_target_scale=True``, ``proxy_scale=False``);
+        # flipping the stored boolean to ``False`` under-claims a genuine target-
+        # scale recording. The losses (and thus the verdict) are untouched, the
+        # evidence hash stays clean (gate labels are not evidence), and the Level-2
+        # citation label is untouched — yet the Level-1 boolean no longer matches
+        # ``not proxy_scale``. ONLY this guard fires.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        ci = replay_samples(data)
+        assert data["citable_as_target_scale"] is True
+        assert data["proxy_scale"] is False
+        data["citable_as_target_scale"] = False  # the lie: under-claim a 9B run
+        out = replay_to_json(str(deposit), data, ci)
+        assert out["target_scale_label_stale"] is True
+        assert "TARGET_SCALE_LABEL_STALE" in format_replay(str(deposit), data, ci)
+
+    def test_hand_edited_label_overclaim_is_flagged(self):
+        # Mutation proof (over-claim axis). A proxy recording carries
+        # ``citable_as_target_scale=False`` (``proxy_scale=True``); flipping the
+        # stored boolean to ``True`` OVER-CLAIMS target scale on a proxy run — the
+        # more dangerous direction (a proxy verdict dressed as a 9B result). Caught
+        # symmetrically; the binding is not under-claim-only.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_heterogeneous_generalize_proxy.json"
+        )
+        data = load_samples(str(deposit))
+        ci = replay_samples(data)
+        assert data["citable_as_target_scale"] is False
+        assert data["proxy_scale"] is True
+        data["citable_as_target_scale"] = True  # the lie: dress a proxy run as 9B
+        out = replay_to_json(str(deposit), data, ci)
+        assert out["target_scale_label_stale"] is True
+        assert "TARGET_SCALE_LABEL_STALE" in format_replay(str(deposit), data, ci)
+
+    def test_hand_edited_proxy_scale_is_flagged(self):
+        # Mutation proof (input axis). The deposit's ``proxy_scale`` is the input
+        # the producer derives the label from; flipping ``proxy_scale`` while
+        # leaving the stored label unchanged is the symmetric corruption (the input
+        # moved, the label did not follow). Caught from the input side, not just the
+        # label side — the binding reads ``proxy_scale`` directly.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        data["proxy_scale"] = True  # the lie: claim the 9B run was a proxy run
+        out = replay_to_json(str(deposit), data, replay_samples(data))
+        assert out["target_scale_label_stale"] is True, (
+            "flipping proxy_scale (stored label now stale) must fire"
+        )
+
+    def test_independent_of_level2_citation_label(self):
+        # DISTINCTION proof (not redundant with ``citation_label_stale``). The
+        # Level-2 boolean ``citable_as_full_section4_verdict`` can be honestly
+        # ``False`` for reasons unrelated to target-scale (reduced context / thin /
+        # non-generalization), so it does NOT transitively bind the Level-1
+        # boolean. A deposit whose Level-2 label is honestly ``False`` yet whose
+        # Level-1 ``citable_as_target_scale`` was hand-edited passes
+        # ``citation_label_stale`` (Level-2 stored == re-derived) but trips this
+        # gate — proving the two are independent fields and this guard closes a
+        # distinct, reachable path the Level-2 gate leaves open.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_heterogeneous_generalize_proxy.json"
+        )
+        data = load_samples(str(deposit))
+        # The proxy recording's Level-2 label is honestly False; flip ONLY the
+        # Level-1 boolean.
+        data["citable_as_target_scale"] = not data["citable_as_target_scale"]
+        out = replay_to_json(str(deposit), data, replay_samples(data))
+        assert out["citation_label_stale"] is False, (
+            "Level-2 label untouched -> the Level-2 gate must NOT fire"
+        )
+        assert out["target_scale_label_stale"] is True, (
+            "the flipped Level-1 label is the distinct path this gate closes"
+        )
+
+    def test_corrupt_label_passes_every_other_gate(self):
+        # REACHABILITY proof (the silent path this guard closes). A deposit whose
+        # stored Level-1 boolean is flipped but whose losses / verdict / proxy_scale
+        # / Level-2 label stay honest passes EVERY prior gate — faithful,
+        # evidence_hash, the Level-2 citation label, the ledger, the sub-verdicts —
+        # and is caught ONLY by target_scale_label_stale. This is the
+        # corrupt-but-green Level-1 citation-claim path, made loud.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        data["citable_as_target_scale"] = False  # flip Level-1 only
+        out = replay_to_json(str(deposit), data, replay_samples(data))
+        assert out["faithful"] is True, "losses untouched -> verdict still matches"
+        assert out["evidence_hash_stale"] is False, (
+            "gate labels are not evidence bytes -> stamp stays clean"
+        )
+        assert out["citation_label_stale"] is False, (
+            "Level-2 boolean untouched -> Level-2 gate stays clean"
+        )
+        assert out["ledger_losses_stale"] == []
+        assert out["direction_verdict_stale"] is False
+        assert out["target_scale_label_stale"] is True, (
+            "the flipped Level-1 label must be the ONE gate that fires"
+        )
+
+    def test_prose_note_presence_matches_machine_flag(self):
+        # DRIFT invariant (mirrors TestCiStatsBinding / TestLedgerBinding /
+        # TestEvidenceHashBinding): the machine flag and the human prose note cannot
+        # drift. Across a committed deposit (clean) AND a hand-edited lie on each
+        # axis (label under-claim / label over-claim / proxy_scale flip),
+        # ``TARGET_SCALE_LABEL_STALE in prose`` == ``target_scale_label_stale``.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        base = load_samples(str(deposit))
+        proxy = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_heterogeneous_generalize_proxy.json"
+        )
+        proxy_base = load_samples(str(proxy))
+        cases = [
+            ("committed-9b", str(deposit), base),
+            ("committed-proxy", str(proxy), proxy_base),
+            ("lie-underclaim", str(deposit), {**base, "citable_as_target_scale": False}),
+            ("lie-overclaim", str(proxy), {**proxy_base, "citable_as_target_scale": True}),
+            ("lie-proxy-scale", str(deposit), {**base, "proxy_scale": True}),
+        ]
+        for name, path, data in cases:
+            ci = replay_samples(data)
+            out = replay_to_json(path, data, ci)
+            prose = format_replay(path, data, ci)
+            note = "TARGET_SCALE_LABEL_STALE" in prose
+            assert note is out["target_scale_label_stale"], (
+                f"{name}: prose ({note}) != flag "
+                f"({out['target_scale_label_stale']!r})"
+            )
+
+
 

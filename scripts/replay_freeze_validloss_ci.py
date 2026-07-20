@@ -368,6 +368,64 @@ def _citation_label_stale(
     return bool(stored) != effective_citable
 
 
+def _target_scale_label_stale(data: dict[str, Any]) -> bool:
+    """True when a stored ``citable_as_target_scale`` boolean disagrees with the
+    artifact-rederived value ``not proxy_scale`` (GOAL §7 citation honesty).
+
+    The producer stamps ``citable_as_target_scale`` as a deterministic function of
+    the deposit's own ``proxy_scale`` field — ``not result["proxy_scale"]``
+    (:func:`scripts.run_freeze_validloss_ci_9b.result_to_json`, the 1-term Level-1
+    citation contract distinct from the replay's own stricter 3-term
+    ``citable_as_target_scale`` output, which additionally withholds synthetic /
+    negative-control recordings). It is the Level-1 citation boolean a reader checks
+    first ("is this a genuine target-scale 9B recording?"), the prerequisite the
+    Level-2 ``citable_as_full_section4_verdict`` gate composes on top of.
+
+    :func:`_citation_label_stale` (``d734327``) binds the Level-2 boolean by
+    re-deriving the full four-conjunct gate from the artifacts, but it does NOT
+    transitively bind this Level-1 boolean: a deposit whose Level-2 label is
+    honestly ``False`` (reduced context / thin / non-generalization) yet whose
+    Level-1 ``citable_as_target_scale`` was hand-edited to over-claim (e.g. a proxy
+    recording stamped ``citable_as_target_scale=True``) passes
+    ``citation_label_stale`` — the two fields are independent, computed from
+    different conjuncts. ``evidence_hash`` does not reach it either: the evidence
+    hash deliberately covers raw measurements + run config and NEVER gate labels
+    (see :data:`src.tg_lora.freeze_evidence_hash.EVIDENCE_HASH_KEYS`), and
+    ``citable_as_target_scale`` is a gate label. So a hand-edited or
+    externally-supplied deposit that flips the Level-1 citation boolean while
+    leaving ``proxy_scale`` honest — over-claiming target scale on a proxy run, or
+    under-claiming a genuine 9B run — passes every existing gate silently: the
+    published deposit JSON carries a corrupt Level-1 citation claim no gate surfaces
+    (the proof-of-need :class:`tests.test_replay_freeze_validloss_ci.
+    TestTargetScaleLabelBinding` reproduces — a flipped deposit keeps
+    ``faithful=True``, ``evidence_hash_stale=False``, ``citation_label_stale=False``
+    and every ledger / sub-verdict gate green).
+
+    This binds the stored boolean to ``not proxy_scale`` re-derived from the
+    deposit's own ``proxy_scale`` field — the EXACT 1-term invariant the producer
+    stamps, so it can never false-positive on an honest producer-stamped deposit
+    (verified byte-identical across every committed 9B / proxy fixture) — and
+    surfaces a disagreement loud (the prose :func:`format_replay`
+    ``TARGET_SCALE_LABEL_STALE`` note, the Level-1 sibling of
+    ``CITATION_LABEL_STALE``) rather than silently trusting the label. The threat
+    model mirrors :func:`_citation_label_stale` exactly: it catches the simple
+    hand-edit (flip the gate label without flipping its input), the same
+    stored-boolean-trusted-over-artifact class; a coordinated flip of BOTH
+    ``proxy_scale`` and the label is a distinct, harder attack outside this gate's
+    scope (as it is outside ``_citation_label_stale``'s, whose ``proxy_scale`` /
+    ``cfg_max_steps`` / train-CE inputs are likewise not in the evidence hash).
+    Returns False when the deposit carries no stored boolean (a recording that
+    predates the field) — there is nothing to cross-check, and the
+    artifact-rederived value still governs (artifact-when-present-else-skip, same as
+    :func:`_citation_label_stale`).
+    """
+    stored = data.get("citable_as_target_scale")
+    if stored is None:
+        return False
+    proxy_scale = bool(data.get("proxy_scale", True))
+    return bool(stored) != (not proxy_scale)
+
+
 def _subverdict_rederived(
     data: dict[str, Any], *, losses_key: str
 ) -> str | None:
@@ -962,6 +1020,38 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
             "complete §4 verdict. Re-stamp the deposit from a fresh producer run "
             "(or correct the stored boolean) so the label matches the artifacts."
         )
+    # §4 Level-1 target-scale-label staleness guard (the Level-1 sibling of
+    # CITATION_LABEL_STALE above): a deposit whose STORED
+    # ``citable_as_target_scale`` boolean disagrees with ``not proxy_scale`` — the
+    # exact 1-term contract the producer stamps
+    # (:func:`scripts.run_freeze_validloss_ci_9b.result_to_json`,
+    # ``citable_as_target_scale = not result["proxy_scale"]``) — has a stale or
+    # hand-edited Level-1 citation label. ``citation_label_stale`` binds only the
+    # Level-2 ``citable_as_full_section4_verdict`` boolean (which can be honestly
+    # ``False`` for reasons unrelated to target-scale — reduced context / thin /
+    # non-generalization — so it does not transitively bind this Level-1 boolean),
+    # and ``evidence_hash`` deliberately never covers gate labels, so a hand-edited
+    # deposit that flips the Level-1 boolean (over-claiming target scale on a proxy
+    # recording, or under-claiming a genuine 9B run) while leaving ``proxy_scale``
+    # honest passes every existing gate silently. The replay re-derives ``not
+    # proxy_scale`` from the deposit's own ``proxy_scale`` field and surfaces the
+    # contradiction loud rather than silently trusting the label — the
+    # stored-boolean-trusted-over-artifact path this guard closes, the Level-1
+    # sibling of :func:`_citation_label_stale` (``d734327``, the Level-2 boolean).
+    if _target_scale_label_stale(data):
+        stored = data.get("citable_as_target_scale")
+        proxy_scale = bool(data.get("proxy_scale", True))
+        lines.append(
+            "  note: TARGET_SCALE_LABEL_STALE — the recording's stored "
+            f"citable_as_target_scale={stored!r} disagrees with the value "
+            f"(not proxy_scale={not proxy_scale!r}) re-derived from its own "
+            f"proxy_scale={proxy_scale!r} (the producer's 1-term Level-1 citation "
+            "contract). The citation gate trusts the artifact-derived answer over "
+            "the stored label, so the deposit is treated as "
+            f"{'target-scale' if (not proxy_scale) else 'proxy-scale'} for "
+            "citation. Re-stamp the deposit from a fresh producer run (or correct "
+            "the stored boolean) so it matches proxy_scale."
+        )
     # §4 sub-verdict-label staleness guards (the §4 condition (a)/(b) siblings of
     # CITATION_LABEL_STALE): a deposit whose stored ``direction.verdict`` /
     # ``baseline.verdict`` label disagrees with the verdict re-derived from its
@@ -1194,6 +1284,16 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         "citation_label_stale": _citation_label_stale(
             data, citable_as_full_section4_verdict
         ),
+        # Cross-check (the Level-1 sibling of ``citation_label_stale``): does the
+        # deposit's stored ``citable_as_target_scale`` boolean agree with ``not
+        # proxy_scale`` — the producer's exact 1-term Level-1 citation contract? A
+        # deposit whose Level-2 label is honestly ``False`` (reduced context / thin
+        # / non-generalization) yet whose Level-1 boolean was hand-edited passes
+        # ``citation_label_stale`` (independent fields) and ``evidence_hash`` (gate
+        # labels are not evidence), so this is the one gate that flags a flipped
+        # Level-1 citation claim (mirrors the prose TARGET_SCALE_LABEL_STALE note;
+        # absent for recordings that carry no stored boolean).
+        "target_scale_label_stale": _target_scale_label_stale(data),
         # §4 sub-verdict cross-checks (siblings of ``citation_label_stale``): each
         # stored ``direction.verdict`` / ``baseline.verdict`` label re-derived from
         # the deposit's per-arm losses with the producer's seed. A disagreement means
