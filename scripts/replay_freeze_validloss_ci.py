@@ -627,6 +627,77 @@ def _evidence_hash_stale(data: dict[str, Any]) -> bool:
     return evidence_hash(data) != stored
 
 
+# The main verdict's margin-invariant derived statistics a deposit stamps, keyed
+# to the attribute on the recomputed ``ci`` (``SurrogateValidLossCI``). The
+# producer (:func:`scripts.run_freeze_validloss_ci_9b.result_to_json`) writes
+# each straight from the ``ci`` object it computed the verdict from (lines
+# ~1995-2000), so on an honest deposit every one is bit-identical to the replay's
+# re-derived ``ci`` — the bootstrap is deterministic over the same losses +
+# ``base_seed``. ``is_material`` is DELIBERATELY EXCLUDED: it is the one statistic
+# that depends on ``material_margin`` (``point_improvement >= material_margin``,
+# see :func:`src.tg_lora.freeze_surrogate_ci.SurrogateValidLossCI.is_material`),
+# the margin is NOT stamped in the deposit, so binding it strictly would
+# false-positive on a producer run that used a non-zero margin. The nine keys
+# here are all margin-invariant, so they bind cleanly across every committed
+# deposit (verified byte-identical by ``TestCiStatsBinding``).
+_CI_STAT_BINDINGS: tuple[tuple[str, str], ...] = (
+    ("candidate_mean", "candidate_mean"),
+    ("surrogate_mean", "surrogate_mean"),
+    ("point_improvement", "point_improvement"),
+    ("lower", "lower"),
+    ("upper", "upper"),
+    ("confidence", "confidence"),
+    ("is_thin_evidence", "is_thin_evidence"),
+    ("n_candidate", "n_candidate"),
+    ("n_surrogate", "n_surrogate"),
+)
+
+
+def _ci_stats_stale(
+    data: dict[str, Any], ci: SurrogateValidLossCI
+) -> list[str]:
+    """Stored derived §4 statistics that disagree with the replay's ``ci``.
+
+    The verdict LABEL is already bound (:func:`replay_samples`' ``faithful``
+    cross-check) and the raw EVIDENCE is already bound (:func:`_evidence_hash_stale`
+    over the losses + run config). But the verdict's QUANTITATIVE backing — the
+    candidate / surrogate means, the point improvement, the bootstrap CI bounds,
+    the confidence, the sample sizes, the thin-evidence flag — is stamped in the
+    deposit and cited as the §4 result's numbers, yet NEITHER of those gates
+    reaches it: ``evidence_hash`` deliberately covers only raw measurements +
+    run config (NEVER the derived statistics — see
+    :func:`scripts.run_freeze_validloss_ci_9b._evidence_hash` / the producer's
+    ``test_hash_is_over_evidence_not_derived_labels``), and ``faithful`` covers
+    only the verdict label. A hand-edited or externally-supplied deposit can
+    therefore store, say, ``point_improvement=0.05`` / ``lower=0.02`` /
+    ``upper=0.08`` (a confidently-positive result) while the stored losses still
+    re-derive the honest ``TIES`` verdict bit-for-bit — ``faithful=True``,
+    ``evidence_hash_stale=False``, every label / ledger gate green — and the
+    corrupt cited numbers pass silently (the proof-of-need the
+    ``TestCiStatsBinding`` mutation test reproduces).
+
+    This binds each margin-invariant statistic the deposit stamps to the value
+    the replay's ``ci`` recomputed from the SAME losses + seed the producer used,
+    surfacing a disagreement loud (the prose :func:`format_replay`
+    ``CI_STATS_STALE`` note — the stored-derived-statistic-trusted-over-artifact
+    path this guard closes, a distinct class from
+    :func:`_citation_label_stale` / ``d734327`` which binds the citability
+    BOOLEAN, and :func:`_evidence_hash_stale` / ``79577a5`` which binds the raw
+    EVIDENCE hash). Returns the names of the disagreeing statistics; empty when
+    every stamped statistic matches, or when the deposit stamps none of them (a
+    proxy / legacy recording — the artifact-when-present-else-skip discipline,
+    same as :func:`_carries_9b_honesty_schema`). ``is_material`` is intentionally
+    not bound (margin-dependent; see :data:`_CI_STAT_BINDINGS`).
+    """
+    stale: list[str] = []
+    for stored_key, ci_attr in _CI_STAT_BINDINGS:
+        if stored_key not in data:
+            continue
+        if data[stored_key] != getattr(ci, ci_attr):
+            stale.append(stored_key)
+    return stale
+
+
 def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLossCI) -> str:
     """Human-readable replay block: scale, the §4 verdict, and faithfulness.
 
@@ -921,6 +992,37 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
                 "deposit from a fresh producer run (or correct the stored label) "
                 "so it matches the losses."
             )
+    # §4 verdict-statistics staleness guard (sibling of CITATION_LABEL_STALE and
+    # the sub-verdict guards above): the deposit stamps the main verdict's
+    # QUANTITATIVE backing — candidate / surrogate means, point improvement,
+    # bootstrap CI bounds, confidence, sample sizes, thin-evidence flag — straight
+    # from the ``ci`` the producer computed the verdict from. ``faithful`` binds
+    # only the verdict LABEL and ``evidence_hash`` binds only the raw EVIDENCE
+    # bytes (losses + config, deliberately NOT the derived statistics), so a
+    # hand-edited deposit that repaints the cited CI numbers while leaving the
+    # honest losses — and thus the honest verdict label — untouched passes every
+    # existing gate. The replay re-derives each margin-invariant statistic from
+    # the SAME losses + seed and surfaces a disagreement loud rather than silently
+    # trusting the stored numbers — the stored-derived-statistic-trusted-over-
+    # artifact path this guard closes, sibling of :func:`_citation_label_stale`
+    # (the citability BOOLEAN) and :func:`_evidence_hash_stale` (the raw EVIDENCE
+    # hash). Skips statistics the deposit does not stamp (artifact-when-present-
+    # else-skip); ``is_material`` is intentionally excluded (margin-dependent,
+    # margin not stamped — see :data:`_CI_STAT_BINDINGS`).
+    ci_stats_stale = _ci_stats_stale(data, ci)
+    if ci_stats_stale:
+        stats_clause = ", ".join(ci_stats_stale)
+        lines.append(
+            "  note: CI_STATS_STALE — the recording's stored §4 statistics "
+            f"({stats_clause}) disagree with the values re-derived from its stored "
+            "losses (the same deterministic bootstrap the producer computed them "
+            "with, under the deposit's base_seed). The verdict label and the raw "
+            "losses may still be honest (so `faithful` and `evidence_hash` stay "
+            "clean) — only the cited quantitative backing (means, CI bounds, point "
+            "improvement) was repainted. The replay trusts the artifact-derived "
+            "numbers over the stored ones. Re-stamp the deposit from a fresh "
+            "producer run so the statistics match the losses (GOAL §7)."
+        )
     # Committed-ledger binding (the deposit-vs-ledger sibling of the intra-deposit
     # label-vs-losses guards above): the verdict is computed from the deposit's
     # per-arm losses, but the committed ledger (``ledger_witness_path``) is the
@@ -1134,6 +1236,20 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         # that reaches the five committed 9B deposits that carry an
         # ``evidence_hash`` but no committed ledger.
         "evidence_hash_stale": _evidence_hash_stale(data),
+        # §4 verdict-statistics staleness (sibling of the label / ledger / evidence
+        # bindings above): the deposit stamps the main verdict's QUANTITATIVE
+        # backing (means, CI bounds, point improvement, confidence, sample sizes,
+        # thin-evidence flag) straight from the producer's ``ci``; the replay
+        # re-derives each margin-invariant statistic from the SAME losses + seed
+        # and flags a deposit whose stored numbers no longer match the losses it
+        # cites (mirrors the prose CI_STATS_STALE note; same helper — the two
+        # cannot drift). Empty when every stamped statistic matches or the deposit
+        # stamps none (a proxy / legacy recording — the artifact-when-present
+        # discipline). ``is_material`` is intentionally excluded (margin-dependent,
+        # margin not stamped — see :data:`_CI_STAT_BINDINGS`). This is the one
+        # cross-check that reaches the cited CI NUMBERS the verdict label and the
+        # raw evidence hash both deliberately skip.
+        "ci_stats_stale": _ci_stats_stale(data, ci),
         "candidate_mean": ci.candidate_mean,
         "surrogate_mean": ci.surrogate_mean,
         "point_improvement": ci.point_improvement,

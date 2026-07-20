@@ -2096,4 +2096,236 @@ class TestEvidenceHashBinding:
             )
 
 
+class TestCiStatsBinding:
+    """The deposit-vs-its-own-derived-statistics binding: the producer stamps the
+    main verdict's QUANTITATIVE backing — candidate / surrogate means, point
+    improvement, bootstrap CI bounds, confidence, sample sizes, thin-evidence flag
+    — straight from the ``ci`` it computed the verdict from
+    (:func:`scripts.run_freeze_validloss_ci_9b.result_to_json` lines ~1995-2000).
+    The replay re-derives each margin-invariant statistic from the SAME losses +
+    seed and flags a deposit whose stored numbers no longer match the losses it
+    cites — the stored-derived-statistic-trusted-over-artifact path this guard
+    closes, a DISTINCT class from :class:`TestSubVerdictLabelStaleness` /
+    ``371e934`` (the verdict LABEL), :class:`TestNineBHonestyGateReplay` /
+    ``d734327`` (the citability BOOLEAN), and :class:`TestEvidenceHashBinding` /
+    ``79577a5`` (the raw EVIDENCE hash).
+
+    The gap this closes: ``faithful`` binds only the verdict LABEL and
+    ``evidence_hash`` binds only the raw EVIDENCE bytes (losses + run config,
+    DELIBERATELY not the derived statistics — see the producer's
+    ``test_hash_is_over_evidence_not_derived_labels``), so a hand-edited deposit
+    that repaints the CITED CI numbers while leaving the honest losses — and thus
+    the honest verdict label — untouched passes every prior gate silently. Proof
+    of need (verified below): on the homogeneous full deposit (recorded TIES,
+    already citable) editing ``point_improvement``/``lower``/``upper`` to a
+    confidently-positive result keeps ``faithful=True`` and
+    ``evidence_hash_stale=False`` — every label / ledger / evidence gate green —
+    yet the cited numbers are a lie; only this guard catches it.
+    """
+
+    def test_committed_deposits_stats_match_rederived(self):
+        # Byte-identical invariant: every committed deposit that stores these §4
+        # statistics must re-derive to ``ci_stats_stale == []`` — the producer
+        # stamps each from the ``ci`` the deterministic bootstrap produced, so the
+        # replay reproduces them bit-for-bit from the same losses + seed. A future
+        # deposit whose stamped numbers drifted from its losses (a botched harvest,
+        # a hand-edit) trips this and the silent repaint is prevented.
+        seen = False
+        for deposit in _9b_deposit_fixtures():
+            data = load_samples(str(deposit))
+            if not any(
+                k in data for k in (
+                    "candidate_mean", "point_improvement", "lower", "upper",
+                )
+            ):
+                continue  # not a stats-stamping deposit
+            seen = True
+            ci = replay_samples(data)
+            out = replay_to_json(str(deposit), data, ci)
+            assert out["ci_stats_stale"] == [], (
+                f"{deposit.name}: committed derived statistics diverge from the "
+                f"re-derived ci on {out['ci_stats_stale']!r}."
+            )
+            assert "CI_STATS_STALE" not in format_replay(str(deposit), data, ci)
+        assert seen, "expected at least one stats-stamping committed deposit"
+
+    def test_recording_without_stats_skips_cleanly(self):
+        # Skip / false-positive discipline: a recording that carries the sample
+        # lists but stamps NONE of the derived statistics (a legacy / minimal
+        # recording) must report CLEAN — the cross-check skips, it must not
+        # false-positive on a deposit that simply has no statistics to bind.
+        path = "synthetic-no-stats.json"
+        data = {
+            "candidate_losses": [1.0, 1.0, 1.0],
+            "surrogate_losses": [2.0, 2.0, 2.0],
+            "base_seed": 0,
+        }
+        ci = replay_samples(data)
+        out = replay_to_json(path, data, ci)
+        assert out["ci_stats_stale"] == [], (
+            f"a stat-less recording must skip, got {out['ci_stats_stale']!r}"
+        )
+        assert "CI_STATS_STALE" not in format_replay(path, data, ci)
+
+    def test_hand_edited_point_improvement_is_flagged(self):
+        # PRIMARY mutation proof (the corrupt-but-green path). The homogeneous
+        # full deposit records TIES and is citable; editing ``point_improvement``
+        # to a large positive value — repainting the cited improvement the §4
+        # result reports — keeps the verdict faithful (losses untouched) and the
+        # evidence hash clean (derived statistics are not evidence), yet the
+        # stored number no longer matches the losses. ONLY this guard names
+        # "point_improvement" in ci_stats_stale and emits the CI_STATS_STALE note.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        ci_clean = replay_samples(data)
+        assert ci_clean.significance_verdict == TIES  # the recorded verdict
+        # The lie: claim a 5% improvement the stored losses do not support.
+        data["point_improvement"] = 0.05
+        ci_mut = replay_samples(data)
+        assert ci_mut.significance_verdict == TIES, (
+            "the stat edit must not change the verdict (losses are untouched)"
+        )
+        out = replay_to_json(str(deposit), data, ci_mut)
+        assert out["ci_stats_stale"] == ["point_improvement"], (
+            f"got {out['ci_stats_stale']!r}, expected ['point_improvement']"
+        )
+        assert "CI_STATS_STALE" in format_replay(str(deposit), data, ci_mut)
+
+    def test_hand_edited_ci_bounds_are_flagged(self):
+        # Mutation proof (CI bounds axis): repainting the bootstrap CI bounds —
+        # the [lower, upper] interval cited beside the verdict — is caught
+        # symmetrically; not just the point estimate.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        data["lower"] = 0.02
+        data["upper"] = 0.08
+        out = replay_to_json(str(deposit), data, replay_samples(data))
+        assert set(out["ci_stats_stale"]) == {"lower", "upper"}, (
+            f"got {out['ci_stats_stale']!r}"
+        )
+
+    def test_hand_edited_candidate_mean_is_flagged(self):
+        # Mutation proof (means axis): repainting the candidate's valid-loss mean
+        # — the absolute loss a paper cites — is caught. The candidate mean feeds
+        # the point improvement, so it is named.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        data["candidate_mean"] = 1.50  # the stored losses re-derive ~1.695
+        out = replay_to_json(str(deposit), data, replay_samples(data))
+        assert "candidate_mean" in out["ci_stats_stale"], (
+            f"got {out['ci_stats_stale']!r}, expected to name 'candidate_mean'"
+        )
+
+    def test_hand_edited_surrogate_mean_and_counts_are_flagged(self):
+        # Mutation proof (surrogate mean + sample-size axes): repainting the
+        # surrogate mean or the sample counts is caught — the binding is not
+        # candidate-only, and covers the structural counts too.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        data["surrogate_mean"] = data["surrogate_mean"] + 0.1
+        data["n_candidate"] = data["n_candidate"] + 1
+        out = replay_to_json(str(deposit), data, replay_samples(data))
+        assert "surrogate_mean" in out["ci_stats_stale"]
+        assert "n_candidate" in out["ci_stats_stale"], (
+            f"got {out['ci_stats_stale']!r}"
+        )
+
+    def test_is_material_is_not_bound(self):
+        # SCOPE pin: ``is_material`` is the ONE margin-dependent statistic
+        # (``point_improvement >= material_margin``), and the margin is NOT
+        # stamped in the deposit — so binding it strictly would false-positive on
+        # a producer run that used a non-zero margin. It is therefore
+        # intentionally excluded from ``_CI_STAT_BINDINGS``: mutating it ALONE
+        # must not trip ci_stats_stale. (Guards against a maintainer wrongly
+        # "completing" the binding by adding the margin-dependent field back.)
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        data["is_material"] = not data["is_material"]
+        out = replay_to_json(str(deposit), data, replay_samples(data))
+        assert out["ci_stats_stale"] == [], (
+            f"is_material is margin-dependent and must NOT be bound; got "
+            f"{out['ci_stats_stale']!r}"
+        )
+
+    def test_corrupt_stats_pass_every_other_gate(self):
+        # REACHABILITY proof (the silent path this guard closes). A deposit whose
+        # stored CI numbers are repainted but whose losses (and thus verdict) stay
+        # honest passes EVERY prior gate — faithful, evidence_hash, the citation
+        # label, the ledger — and is caught ONLY by ci_stats_stale. This is the
+        # corrupt-but-green §4 quantitative-claim path, made loud.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        data = load_samples(str(deposit))
+        data["point_improvement"] = 0.05
+        data["lower"] = 0.02
+        data["upper"] = 0.08
+        ci = replay_samples(data)
+        out = replay_to_json(str(deposit), data, ci)
+        assert out["faithful"] is True, "losses are honest -> verdict still matches"
+        assert out["evidence_hash_stale"] is False, (
+            "derived statistics are not evidence bytes -> stamp stays clean"
+        )
+        assert out["citation_label_stale"] is False
+        assert out["ledger_losses_stale"] == []
+        assert out["ci_stats_stale"], (
+            "the repainted CI numbers must be the ONE gate that fires"
+        )
+
+    def test_prose_note_presence_matches_machine_flag(self):
+        # DRIFT invariant (mirrors TestLedgerBinding / TestEvidenceHashBinding):
+        # the machine flag and the human prose note cannot drift. Across a
+        # committed deposit (clean) AND a hand-edited lie on each axis (point
+        # improvement / CI bounds / candidate mean / sample counts),
+        # ``CI_STATS_STALE in prose`` == ``bool(ci_stats_stale)``.
+        deposit = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "freeze_validloss_ci_9b_full.json"
+        )
+        base = load_samples(str(deposit))
+        cases = [("committed", base)]
+        for name, mutate in (
+            ("lie-point", lambda d: d.__setitem__("point_improvement", 0.05)),
+            ("lie-bounds", lambda d: (
+                d.__setitem__("lower", 0.02), d.__setitem__("upper", 0.08))),
+            ("lie-mean", lambda d: d.__setitem__("candidate_mean", 1.50)),
+            ("lie-counts", lambda d: d.__setitem__("n_candidate",
+                                                   d["n_candidate"] + 1)),
+        ):
+            d = dict(base)
+            mutate(d)
+            cases.append((name, d))
+        for name, data in cases:
+            ci = replay_samples(data)
+            out = replay_to_json(str(deposit), data, ci)
+            prose = format_replay(str(deposit), data, ci)
+            note = "CI_STATS_STALE" in prose
+            assert note is bool(out["ci_stats_stale"]), (
+                f"{name}: prose ({note}) != flag ({out['ci_stats_stale']!r})"
+            )
+
+
 
