@@ -113,6 +113,13 @@ from src.tg_lora.freeze_verdict_honesty import (
 # at the GPU-free chokepoint rather than silently trusted.
 from src.tg_lora.freeze_evidence_hash import evidence_hash
 from src.tg_lora.freeze_surrogate_gate import SURPASSES, TIES, UNDERSHOOTS
+from src.utils.cli_errors import (
+    EXIT_OPERATOR_ERROR,
+    OperatorError,
+    emit_operator_error,
+    raise_malformed_eval_results,
+    raise_missing_config,
+)
 
 # The three verdicts the §4 judge can emit (imported so ``--expected`` choices
 # are the exact labels the bootstrap layer returns, not a parallel vocabulary).
@@ -128,17 +135,34 @@ def load_samples(path: str | Path) -> dict[str, Any]:
     are required and must be non-empty; every other field (``verdict``,
     ``base_seed``, ``proxy_scale``, ``synthetic``, ``task``, ...) is optional
     provenance the report surfaces when present.
+
+    The four operator-input failure modes a malformed samples file can hit —
+    file missing, JSON unparseable, a required key absent, a required key of the
+    wrong type / empty — each raise a distinct :class:`OperatorError` subtype
+    (``MissingConfigError`` / ``MalformedEvalResultsError``) so the operator
+    sees *which* input was wrong in one read instead of a bare
+    ``FileNotFoundError`` / ``json.JSONDecodeError`` / ``ValueError`` traceback.
     """
     p = Path(path)
-    with p.open() as fh:
-        data = json.load(fh)
+    try:
+        fh = p.open()
+    except FileNotFoundError:
+        raise_missing_config(path, kind="samples file")
+    with fh:
+        try:
+            data = json.load(fh)
+        except json.JSONDecodeError as exc:
+            raise_malformed_eval_results("json parse error", str(exc))
     for key in ("candidate_losses", "surrogate_losses"):
-        value = data.get(key)
-        if not isinstance(value, list) or not value:
-            raise ValueError(
-                f"{p}: missing non-empty '{key}' — not a recorded-sample file "
-                f"(expected the schema from `run_freeze_validloss_ci --json`)"
+        if key not in data:
+            raise_malformed_eval_results(f"missing key: {key}")
+        value = data[key]
+        if not isinstance(value, list):
+            raise_malformed_eval_results(
+                f"invalid type for {key}: expected list, got {type(value).__name__}"
             )
+        if not value:
+            raise_malformed_eval_results(f"empty list: {key}")
     return data
 
 
@@ -1775,20 +1799,31 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # parse_args stays OUTSIDE the try: an argparse usage error exits 2 (REQ-601
+    # / TC-704-05) and must not be reclassified as an operator error.
     args = build_parser().parse_args(argv)
-    data = load_samples(args.samples_file)
-    ci = replay_samples(data, material_margin=args.material_margin, seed=args.seed)
-    if args.json:
-        print(json.dumps(replay_to_json(args.samples_file, data, ci), indent=2))
-    else:
-        print(format_replay(args.samples_file, data, ci))
-    if args.expected is not None and ci.significance_verdict != args.expected:
-        print(
-            f"replay: EXPECTED {args.expected} but got {ci.significance_verdict}",
-            file=sys.stderr,
-        )
-        return 2
-    return 0
+    try:
+        data = load_samples(args.samples_file)
+        ci = replay_samples(data, material_margin=args.material_margin, seed=args.seed)
+        if args.json:
+            print(json.dumps(replay_to_json(args.samples_file, data, ci), indent=2))
+        else:
+            print(format_replay(args.samples_file, data, ci))
+        if args.expected is not None and ci.significance_verdict != args.expected:
+            print(
+                f"replay: EXPECTED {args.expected} but got {ci.significance_verdict}",
+                file=sys.stderr,
+            )
+            return 2
+        return 0
+    except OperatorError as exc:
+        # A distinct operator error (missing samples file / malformed eval
+        # results) is emitted to the operator-facing stream and exits 78
+        # (sysexits.h EX_CONFIG) — never a retryable tempfail. The verdict /
+        # honesty gate (TASK-0171..0178) is untouched: the error fires in
+        # load_samples, before replay_samples ever runs.
+        emit_operator_error(exc, json_mode=args.json)
+        return EXIT_OPERATOR_ERROR
 
 
 if __name__ == "__main__":

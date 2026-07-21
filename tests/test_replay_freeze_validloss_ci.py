@@ -52,6 +52,10 @@ from scripts.replay_freeze_validloss_ci import (
     replay_samples,
     replay_to_json,
 )
+from src.utils.cli_errors import (
+    MalformedEvalResultsError,
+    MissingConfigError,
+)
 
 # The committed real-GPU recording: a ``--task generalize`` run on the RTX
 # 3060 (verdict TIES, candidate_mean≈2.529, surrogate_mean≈2.648,
@@ -199,19 +203,21 @@ class TestImportHealth:
 
 class TestLoadSamples:
     def test_rejects_missing_file(self):
-        with pytest.raises(FileNotFoundError):
+        # TASK-0180: a missing samples file is now a distinct
+        # MissingConfigError (was a bare FileNotFoundError).
+        with pytest.raises(MissingConfigError, match="samples file not found"):
             load_samples("/nonexistent/path/to/samples.json")
 
     def test_rejects_malformed_json(self, tmp_path):
         bad = tmp_path / "bad.json"
         bad.write_text("{not valid json")
-        with pytest.raises(json.JSONDecodeError):
+        with pytest.raises(MalformedEvalResultsError, match="json parse error"):
             load_samples(bad)
 
     def test_rejects_missing_sample_keys(self, tmp_path):
         bad = tmp_path / "no_samples.json"
         bad.write_text(json.dumps({"verdict": "TIES", "device": "cuda"}))
-        with pytest.raises(ValueError, match="candidate_losses"):
+        with pytest.raises(MalformedEvalResultsError, match="missing key: candidate_losses"):
             load_samples(bad)
 
     def test_rejects_empty_sample_list(self, tmp_path):
@@ -219,7 +225,7 @@ class TestLoadSamples:
         bad.write_text(
             json.dumps({"candidate_losses": [], "surrogate_losses": [1.0, 2.0]})
         )
-        with pytest.raises(ValueError, match="candidate_losses"):
+        with pytest.raises(MalformedEvalResultsError, match="empty list: candidate_losses"):
             load_samples(bad)
 
     def test_loads_committed_fixture(self):
@@ -3307,3 +3313,158 @@ class TestPassesBinding:
                 f"{name}: prose ({note}) != flag ({out['passes_stale']!r})"
             )
 
+
+
+# ---------------------------------------------------------------------------
+# TASK-0180 — operator-error entrypoint integration (replay side)
+#
+# ``load_samples`` now raises distinct OperatorError subtypes; ``main`` wraps the
+# body in an outer try/except that emits the error to the operator-facing stream
+# and exits 78 (sysexits.h EX_CONFIG). These pin the entrypoint contract:
+# missing samples file / malformed eval results -> exit 78, ``--expected``
+# mismatch -> exit 2 (unchanged), argparse usage error -> exit 2 (unchanged),
+# normal path -> exit 0 (unchanged). Mutating the leaf wrappers to ``pass``
+# makes the detection tests RED (DID NOT RAISE), so the wrap is structural.
+# ---------------------------------------------------------------------------
+
+
+class TestReplayEntrypointIntegration:
+    """The 4 operator-error axes at the replay ``main()`` boundary."""
+
+    def test_samples_file_not_found_exits_78(self, capsys, tmp_path):
+        missing = tmp_path / "nope.json"
+        assert main([str(missing)]) == 78
+        err = capsys.readouterr().err
+        assert err.startswith("MissingConfigError: ")
+        assert "samples file not found" in err and str(missing) in err
+
+    def test_json_parse_error_exits_78(self, capsys, tmp_path):
+        f = tmp_path / "bad.json"
+        f.write_text("{not valid json")
+        assert main([str(f)]) == 78
+        assert "MalformedEvalResultsError: json parse error" in capsys.readouterr().err
+
+    def test_missing_key_candidate_losses_exits_78(self, capsys, tmp_path):
+        f = tmp_path / "empty.json"
+        f.write_text(json.dumps({"surrogate_losses": [1.0, 2.0]}))
+        assert main([str(f)]) == 78
+        assert "missing key: candidate_losses" in capsys.readouterr().err
+
+    def test_missing_key_surrogate_losses_exits_78(self, capsys, tmp_path):
+        f = tmp_path / "nosurr.json"
+        f.write_text(json.dumps({"candidate_losses": [1.0, 2.0]}))
+        assert main([str(f)]) == 78
+        assert "missing key: surrogate_losses" in capsys.readouterr().err
+
+    def test_invalid_type_samples_exits_78(self, capsys, tmp_path):
+        f = tmp_path / "wrongtype.json"
+        f.write_text(json.dumps({"candidate_losses": "not a list",
+                                 "surrogate_losses": [1.0, 2.0]}))
+        assert main([str(f)]) == 78
+        assert "invalid type for candidate_losses: expected list, got str" in capsys.readouterr().err
+
+    def test_empty_samples_list_exits_78(self, capsys, tmp_path):
+        f = tmp_path / "emptylist.json"
+        f.write_text(json.dumps({"candidate_losses": [], "surrogate_losses": [1.0, 2.0]}))
+        assert main([str(f)]) == 78
+        assert "empty list: candidate_losses" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "payload, prefix",
+        [
+            (None, "MissingConfigError:"),
+            ("{bad json", "MalformedEvalResultsError:"),
+            ('{"surrogate_losses": [1.0]}', "MalformedEvalResultsError:"),
+        ],
+    )
+    def test_operator_error_stderr_starts_with_class_name(
+        self, capsys, tmp_path, payload, prefix
+    ):
+        # NFR-202 — every operator-error stderr line is greppable by class name.
+        f = tmp_path / "x.json"
+        if payload is None:
+            f = tmp_path / "absent.json"
+        else:
+            f.write_text(payload)
+        assert main([str(f)]) == 78
+        assert capsys.readouterr().err.startswith(prefix)
+
+    def test_operator_error_message_format_is_concise(self, capsys, tmp_path):
+        # NFR-203 — the message *format* (class prefix + template, excluding the
+        # operator-controlled, unbounded path) is well under 120 chars. The path
+        # alone can exceed the bound on a long tmp/CI path; the leaf-level test
+        # pins the absolute bound for a representative path.
+        f = tmp_path / "freeze_validloss_ci_9b_full.json"
+        assert main([str(f)]) == 78
+        msg = capsys.readouterr().err.rstrip("\n")
+        # ``msg == "<Class>: samples file not found: <path>"`` -> strip the path.
+        overhead = len(msg) - len(str(f))
+        assert overhead <= 120
+
+    def test_operator_error_no_ansi_codes(self, capsys, tmp_path):
+        # EDGE-103.
+        f = tmp_path / "absent.json"
+        assert main([str(f)]) == 78
+        assert "\x1b[" not in capsys.readouterr().err
+
+    def test_argparse_error_exit_code_unchanged(self):
+        # REQ-601 / TC-704-05 — argparse usage error still exits 2, OUTSIDE the
+        # operator-error try/except.
+        with pytest.raises(SystemExit) as ei:
+            main(["--no-such-flag"])
+        assert ei.value.code == 2
+
+    def test_expected_mismatch_exit_code_unchanged(self, tmp_path):
+        # REQ-602 / TC-704-06 — the --expected assertion is a separate path.
+        f = tmp_path / "good.json"
+        f.write_text(json.dumps(_data([1.0] * 4, [2.0] * 4)))  # replays SURPASSES
+        assert main([str(f), "--expected", TIES]) == 2
+
+    def test_normal_path_unaffected(self, capsys, tmp_path):
+        # TC-704-01 / zero regression — a good file exits 0.
+        f = tmp_path / "good.json"
+        f.write_text(json.dumps(_data([1.0] * 4, [2.0] * 4)))
+        assert main([str(f)]) == 0
+        assert "SURPASSES" in capsys.readouterr().out
+
+    def test_json_mode_operator_error_stdout_single_line(self, capsys, tmp_path):
+        # TC-501-01 / EDGE-102 — --json emits a single JSON line on stdout.
+        f = tmp_path / "absent.json"
+        assert main([str(f), "--json"]) == 78
+        captured = capsys.readouterr()
+        out, err = captured.out, captured.err
+        assert out.endswith("\n")
+        assert out.count("\n") == 1  # trailing newline only — single line
+        loaded = json.loads(out)
+        assert loaded["error"] == "MissingConfigError"
+        assert loaded["exit_status"] == 78
+        assert "samples file not found" in loaded["detail"]
+        assert err == ""
+
+    def test_json_mode_operator_error_stderr_empty(self, capsys, tmp_path):
+        # TC-501-02 — stderr stays empty in --json mode.
+        f = tmp_path / "absent.json"
+        main([str(f), "--json"])
+        assert capsys.readouterr().err == ""
+
+    def test_json_mode_normal_path_unchanged(self, capsys, tmp_path):
+        # TC-501-03 / zero regression — a good file in --json still emits the
+        # existing replay_to_json payload.
+        f = tmp_path / "good.json"
+        f.write_text(json.dumps(_data([1.0] * 4, [2.0] * 4)))
+        main([str(f), "--json"])
+        out = capsys.readouterr().out
+        loaded = json.loads(out)
+        assert loaded["replayed_verdict"] == SURPASSES
+        assert loaded["faithful"] is True
+
+    def test_operator_error_does_not_invoke_verdict_gate(self, tmp_path):
+        # The error fires inside load_samples, before replay_samples — so the
+        # TASK-0171..0178 verdict / honesty gate (the orthogonal axis) is never
+        # reached on a malformed samples file.
+        f = tmp_path / "absent.json"
+        # If the verdict gate were reached, replay_samples would run on a
+        # missing file and raise before any stale check; here we simply assert
+        # the distinct exit 78, which only load_samples' OperatorError can
+        # produce (the gate returns 0 / 2, never 78).
+        assert main([str(f)]) == 78
