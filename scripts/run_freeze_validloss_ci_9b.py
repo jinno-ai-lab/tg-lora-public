@@ -105,6 +105,7 @@ os.environ.setdefault(
 from pathlib import Path
 
 import torch
+import yaml
 from omegaconf import OmegaConf
 
 # Shared A/B instrument pieces (the harness this deposits through).
@@ -164,6 +165,14 @@ from src.tg_lora.freeze_evidence_hash import (
     evidence_hash as _evidence_hash,
 )
 from src.tg_lora.progressive_freeze import ProgressiveFreezeController
+from src.utils.cli_errors import (
+    EXIT_OPERATOR_ERROR,
+    MalformedYAMLError,
+    OperatorError,
+    emit_operator_error,
+    raise_malformed_yaml,
+    raise_missing_config,
+)
 from src.utils.io import _atomic_write_text
 
 logger = logging.getLogger("freeze-validloss-ci-9b")
@@ -2617,6 +2626,40 @@ def _ensure_output_parent_dirs(
                 pass
 
 
+def _load_cfg(path: str | Path):
+    """Load the operator-supplied ``--config``, surfacing operator-input
+    failures as distinct OperatorError subtypes.
+
+    The two REAL ``OmegaConf.load`` failure modes — a missing file
+    (``FileNotFoundError``) and unparseable YAML (``yaml.YAMLError``, e.g. a
+    tab/space mix) — become :class:`MissingConfigError` /
+    :class:`MalformedYAMLError`. An empty (0-byte) file parses to an empty
+    mapping under OmegaConf rather than raising, so it is caught explicitly
+    (EDGE-002) instead of failing later with a cryptic
+    ``MissingMandatoryValue`` on the first field access. Pydantic schema
+    validation is NOT done by this producer (it reads the OmegaConf struct
+    directly); the :class:`AppConfigValidationError` axis is therefore
+    delivered at the leaf level (see ``src/utils/cli_errors.py`` and its
+    tests), not here.
+    """
+    try:
+        cfg = OmegaConf.load(path)
+    except FileNotFoundError:
+        raise_missing_config(path, kind="config")
+    except IsADirectoryError:
+        # ``--config <directory>``: route through the same wrapper so the leaf
+        # appends the "(is a directory)" suffix (EDGE-001).
+        raise_missing_config(path, kind="config")
+    except yaml.YAMLError as exc:
+        raise_malformed_yaml(path, exc)
+    try:
+        if Path(path).stat().st_size == 0:
+            raise MalformedYAMLError(f"yaml parse error in {path}: file is empty")
+    except OSError:
+        pass
+    return cfg
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -2669,45 +2712,54 @@ def main(argv: Sequence[str] | None = None) -> int:
     # otherwise.
     seal = None
     cfg = None
-    if args.ledger is not None and Path(args.ledger).exists():
-        cfg = OmegaConf.load(args.config)
-        seal = _ledger_seal_ready(
-            args.ledger,
-            total_steps=args.total_steps, warmup_steps=args.warmup_steps,
-            depth=args.depth, spacing=args.spacing, seq_len=args.seq_len,
-            train_examples=args.train_examples, valid_examples=args.valid_examples,
-            model=cfg.model.name_or_path,
-            scope_label=cfg.training.get("trainable_lora_scope", "all"),
-            dataset=args.dataset, max_dataset_rows=args.max_dataset_rows,
-            use_local_loss=not args.no_local_loss, base_seed=args.base_seed,
-            architecture=args.architecture,
-            learning_rate=float(cfg.training.learning_rate), lora_r=int(cfg.lora.r),
-            lora_alpha=float(cfg.lora.alpha), lora_dropout=float(cfg.lora.dropout),
-            lora_target_modules=cfg.lora.target_modules, n_candidate=args.n_candidate,
-            n_surrogate=args.n_surrogate, n_control=args.n_control,
-            n_baseline=args.n_baseline,
-        )
+    try:
+        if args.ledger is not None and Path(args.ledger).exists():
+            cfg = _load_cfg(args.config)
+            seal = _ledger_seal_ready(
+                args.ledger,
+                total_steps=args.total_steps, warmup_steps=args.warmup_steps,
+                depth=args.depth, spacing=args.spacing, seq_len=args.seq_len,
+                train_examples=args.train_examples, valid_examples=args.valid_examples,
+                model=cfg.model.name_or_path,
+                scope_label=cfg.training.get("trainable_lora_scope", "all"),
+                dataset=args.dataset, max_dataset_rows=args.max_dataset_rows,
+                use_local_loss=not args.no_local_loss, base_seed=args.base_seed,
+                architecture=args.architecture,
+                learning_rate=float(cfg.training.learning_rate), lora_r=int(cfg.lora.r),
+                lora_alpha=float(cfg.lora.alpha), lora_dropout=float(cfg.lora.dropout),
+                lora_target_modules=cfg.lora.target_modules, n_candidate=args.n_candidate,
+                n_surrogate=args.n_surrogate, n_control=args.n_control,
+                n_baseline=args.n_baseline,
+            )
 
-    if seal is None:
-        if not torch.cuda.is_available():
-            logger.error("CUDA not available — a real 9B run requires a GPU. Aborting.")
-            return EXIT_CUDA_DOWN
+        if seal is None:
+            if not torch.cuda.is_available():
+                logger.error("CUDA not available — a real 9B run requires a GPU. Aborting.")
+                return EXIT_CUDA_DOWN
 
-        deferred = gpu_free_memory_deferred(args.min_free_gib)
-        if deferred is not None:
-            logger.error("%s", deferred)
-            return EXIT_GPU_TEMPFAIL
+            deferred = gpu_free_memory_deferred(args.min_free_gib)
+            if deferred is not None:
+                logger.error("%s", deferred)
+                return EXIT_GPU_TEMPFAIL
 
-        # Live-GPU path: load the config now that the guards have passed (this
-        # is the original position, preserving "guards fire before config load"
-        # for the no-ledger / non-sealed case).
-        if cfg is None:
-            cfg = OmegaConf.load(args.config)
-    else:
-        logger.info(
-            "Ledger fully banks every arm (seal ready) — skipping the CUDA / "
-            "free-memory pre-flight gates; the verdict assembles CPU-only."
-        )
+            # Live-GPU path: load the config now that the guards have passed (this
+            # is the original position, preserving "guards fire before config load"
+            # for the no-ledger / non-sealed case).
+            if cfg is None:
+                cfg = _load_cfg(args.config)
+        else:
+            logger.info(
+                "Ledger fully banks every arm (seal ready) — skipping the CUDA / "
+                "free-memory pre-flight gates; the verdict assembles CPU-only."
+            )
+    except OperatorError as exc:
+        # A missing / malformed / empty --config is a distinct operator error,
+        # not a retryable tempfail: emit it to the operator-facing stream and
+        # exit 78 (sysexits.h EX_CONFIG). parse_args already ran outside this
+        # try, so argparse usage errors keep exit 2 (REQ-601).
+        emit_operator_error(exc, json_mode=args.json)
+        return EXIT_OPERATOR_ERROR
+
 
     # The citable §4 deposit (``--output``) is the ENTIRE point of executing
     # ``run_ci_9b`` — the multi-hour, multi-arm GPU sweep whose result is
