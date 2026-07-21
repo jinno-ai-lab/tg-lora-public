@@ -4,7 +4,7 @@
 > **Spine anchor**: [TG-LoRA アーキテクチャ設計](../tg-lora/architecture.md)
 >
 > - parent: `tg-lora/architecture.md`
-> - role: `detailed`
+> - role: `system`
 > - status: `canonical_child`
 <!-- spine:anchor:end -->
 
