@@ -133,6 +133,62 @@ class TestClassifyExitCode:
             assert d.sleep_seconds == 120  # wait for a free-GPU / stable window
 
 
+class TestLauncherExit78Classification:
+    """Worker exit 78 (sysexits.h ``EX_CONFIG``) is an operator-input error.
+
+    TASK-0180/0181 made the producer / replay emit exit 78 for the four
+    distinct operator-error classes (missing config / malformed YAML / AppConfig
+    validation / malformed eval results). Without this branch the launcher
+    routed 78 to the ``unknown`` RETRY default and retried an operator-fixable
+    error forever — burning the attempt budget on an identical, non-transient
+    failure (the silent-cost class this branch closes, TASK-0182).
+
+    These pin the classify-side: 78 → ``Action.FATAL("operator_error", 0.0)``,
+    distinct from the existing 4 worker exit codes, the ``unknown`` default, and
+    the signal-kill RETRY path. The assembled run-loop + main() behaviour is
+    pinned in ``test_run_loop_surfaces_78_as_fatal`` /
+    ``test_main_mirrors_worker_operator_error_exit``.
+    """
+
+    def test_exit_78_is_fatal_not_retriable(self):
+        # The whole point: an operator-fixable error must NOT be retried.
+        d = classify_exit_code(78, resume_sleep=30, tempfail_sleep=120)
+        assert d.action is Action.FATAL
+        assert d.action is not Action.RETRY
+
+    def test_exit_78_kind_is_operator_error(self):
+        # A DISTINCT reason string so an operator reading the log sees the
+        # class (not the generic "unknown" / "cuda_down" / "unexpected").
+        d = classify_exit_code(78, resume_sleep=30, tempfail_sleep=120)
+        assert d.kind == "operator_error"
+
+    def test_exit_78_sleep_seconds_is_zero(self):
+        # Not retried, so no backoff is scheduled.
+        d = classify_exit_code(78, resume_sleep=30, tempfail_sleep=120)
+        assert d.sleep_seconds == 0.0
+
+    def test_exit_78_takes_precedence_over_unknown_default(self):
+        # 78 is matched by its OWN branch, not the catch-all ``unknown`` default.
+        # A genuinely-unknown positive code (127) still falls through to
+        # ``unknown`` — proving the 78 branch shadows the default for 78 only.
+        d78 = classify_exit_code(78, resume_sleep=30, tempfail_sleep=120)
+        d127 = classify_exit_code(127, resume_sleep=30, tempfail_sleep=120)
+        assert d78.kind == "operator_error"
+        assert d127.kind == "unknown"
+        assert d78.kind != d127.kind
+
+    def test_exit_78_independent_from_signal_kill(self):
+        # 78 is a POSITIVE code, so the ``code < 0`` signal-kill RETRY branch
+        # is untouched: a SIGKILLed worker (returncode -9) still classifies as
+        # RETRY/"signal" — the contended-host-kill recovery is preserved.
+        d_signal = classify_exit_code(-9, resume_sleep=30, tempfail_sleep=120)
+        d78 = classify_exit_code(78, resume_sleep=30, tempfail_sleep=120)
+        assert d_signal.action is Action.RETRY
+        assert d_signal.kind == "signal"
+        assert d78.action is Action.FATAL
+        assert d78.kind == "operator_error"
+
+
 class TestRunLoop:
     def _loop(self, runner, *, clock=None, sleep=None, **kw):
         defaults = dict(
@@ -268,6 +324,24 @@ class TestRunLoop:
         self._loop(runner, module_argv=flags)
         assert runner.calls[0][3:] == flags
 
+    def test_run_loop_surfaces_78_as_fatal(self):
+        # The assembled operator-error path: the worker exits 78 (a missing
+        # config / malformed YAML / schema violation), and the launcher stops
+        # immediately — FATAL on the first attempt, no backoff sleep — instead
+        # of burning the retry budget on an operator-fixable, non-transient
+        # error. last_code=78 surfaces the operator-error code to an outer
+        # scheduler (TASK-0182).
+        runner = _FakeRunner([78])
+        sleeps: list[float] = []
+        result = self._loop(runner, sleep=sleeps.append)
+        assert result.outcome is Outcome.FATAL
+        assert result.last_code == 78
+        assert result.attempts == 1
+        assert sleeps == []  # operator error is NOT retried — no backoff
+        assert len(runner.calls) == 1  # launched once, then stopped
+
+
+
 
 class TestMainDryRun:
     def test_dry_run_assembles_command_from_python_venv_and_does_not_launch(self, monkeypatch, capsys):
@@ -327,3 +401,14 @@ class TestMainDryRun:
             assert exc.code == 2
         else:
             raise AssertionError("expected SystemExit for missing worker flags")
+
+    def test_main_mirrors_worker_operator_error_exit(self, monkeypatch):
+        # Assembled end-to-end: the worker exits 78 (operator error), the
+        # launcher classifies it FATAL and mirrors the worker's own 78 back to
+        # its own process exit — so an outer scheduler / cron sees the
+        # operator-error code (78), not a generic failure, and an operator
+        # fixes the config / YAML / samples file before re-firing (TASK-0182).
+        monkeypatch.setenv("PYTHON_VENV", "/torch/venv/bin/python")
+        monkeypatch.setattr(launcher.subprocess, "run", lambda argv, **kw: _proc(78))
+        rc = main(["--max-attempts", "3", "--", "--seq-len", "1024"])
+        assert rc == 78

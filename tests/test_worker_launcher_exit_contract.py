@@ -41,6 +41,7 @@ from scripts.launch_freeze_ci_9b_full import (
     EXIT_DONE,
     EXIT_GPU_TEMPFAIL,
     EXIT_INCOMPLETE_RESUME,
+    EXIT_OPERATOR_ERROR,
     EXIT_UNEXPECTED,
     Action,
     classify_exit_code,
@@ -50,12 +51,20 @@ WORKER_SOURCE = Path(worker.__file__).read_text(encoding="utf-8")
 
 # (constant_on_each_module, documented_value, launcher_action, launcher_kind)
 # — the single table both modules must agree on.
+#
+# The first five rows are the worker↔launcher retry contract (0/1/2/3/75). The
+# sixth row is exit 78 (sysexits.h ``EX_CONFIG``): the operator-input error the
+# producer emits for a missing config / malformed YAML / schema violation
+# (TASK-0180/0181). The worker sources it from the leaf
+# (``from src.utils.cli_errors import EXIT_OPERATOR_ERROR``), so
+# ``worker.EXIT_OPERATOR_ERROR`` resolves and the same four-way pin applies.
 _CONTRACT = [
     (worker.EXIT_DONE, EXIT_DONE, 0, Action.DONE, "success"),
     (worker.EXIT_GPU_TEMPFAIL, EXIT_GPU_TEMPFAIL, 75, Action.RETRY, "tempfail"),
     (worker.EXIT_INCOMPLETE_RESUME, EXIT_INCOMPLETE_RESUME, 3, Action.RETRY, "resume"),
     (worker.EXIT_CUDA_DOWN, EXIT_CUDA_DOWN, 2, Action.FATAL, "cuda_down"),
     (worker.EXIT_UNEXPECTED, EXIT_UNEXPECTED, 1, Action.FATAL, "unexpected"),
+    (worker.EXIT_OPERATOR_ERROR, EXIT_OPERATOR_ERROR, 78, Action.FATAL, "operator_error"),
 ]
 
 
@@ -65,6 +74,7 @@ def test_contract_table_is_complete():
     assert {c[0] for c in _CONTRACT} == {
         worker.EXIT_DONE, worker.EXIT_UNEXPECTED, worker.EXIT_CUDA_DOWN,
         worker.EXIT_INCOMPLETE_RESUME, worker.EXIT_GPU_TEMPFAIL,
+        worker.EXIT_OPERATOR_ERROR,
     }
 
 
@@ -78,6 +88,7 @@ def test_worker_constants_pin_documented_values():
     assert worker.EXIT_CUDA_DOWN == 2
     assert worker.EXIT_INCOMPLETE_RESUME == 3
     assert worker.EXIT_GPU_TEMPFAIL == 75  # sysexits.h EX_TEMPFAIL
+    assert worker.EXIT_OPERATOR_ERROR == 78  # sysexits.h EX_CONFIG (TASK-0182)
 
 
 def test_launcher_constants_match_worker():
@@ -88,6 +99,7 @@ def test_launcher_constants_match_worker():
     assert EXIT_CUDA_DOWN == worker.EXIT_CUDA_DOWN
     assert EXIT_INCOMPLETE_RESUME == worker.EXIT_INCOMPLETE_RESUME
     assert EXIT_GPU_TEMPFAIL == worker.EXIT_GPU_TEMPFAIL
+    assert EXIT_OPERATOR_ERROR == worker.EXIT_OPERATOR_ERROR
 
 
 def test_classify_routes_each_code_to_its_documented_action():
@@ -124,10 +136,15 @@ def test_worker_main_returns_named_constants_not_bare_literals():
     assert "return EXIT_CUDA_DOWN" in WORKER_SOURCE
     assert "return EXIT_UNEXPECTED" in WORKER_SOURCE
     assert "return EXIT_GPU_TEMPFAIL" in WORKER_SOURCE
+    assert "return EXIT_OPERATOR_ERROR" in WORKER_SOURCE, (
+        "main()'s operator-error path must `return EXIT_OPERATOR_ERROR`, not a "
+        "bare `return 78` — a bare literal drifts from the 78 the launcher "
+        "classifies as FATAL/operator_error (TASK-0182, GOAL §7)."
+    )
     # And the bare literals the constants replaced must NOT remain on a contract
     # path. (`return 0` at end-of-main and the exception-handler returns are the
     # contract sites; their absence here confirms the named-constant wiring.)
-    for bare in ("return 0\n", "return 1\n", "return 2\n", "return 3\n"):
+    for bare in ("return 0\n", "return 1\n", "return 2\n", "return 3\n", "return 78\n"):
         assert bare not in WORKER_SOURCE, (
             f"bare `{bare.strip()}` remains in the worker — a contract exit code "
             "is emitted as a magic literal instead of its named constant; the "

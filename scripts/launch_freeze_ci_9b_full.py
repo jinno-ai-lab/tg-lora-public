@@ -77,6 +77,11 @@ EXIT_UNEXPECTED = 1
 EXIT_CUDA_DOWN = 2
 EXIT_INCOMPLETE_RESUME = 3
 EXIT_GPU_TEMPFAIL = 75  # sysexits.h EX_TEMPFAIL — re-exported for clarity
+EXIT_OPERATOR_ERROR = 78  # sysexits.h EX_CONFIG — operator-input error (TASK-0179
+# leaf contract, ``src.utils.cli_errors.EXIT_OPERATOR_ERROR``). The launcher is
+# deliberately torch-free so it can poll a busy card, so it mirrors the leaf's
+# constant by value rather than importing it; the drift is pinned in
+# ``tests/test_cli_operator_errors.py`` and ``tests/test_worker_launcher_exit_contract.py``.
 
 
 class Action(str, Enum):
@@ -138,6 +143,15 @@ def classify_exit_code(code: int, *, resume_sleep: float, tempfail_sleep: float)
         return Decision(Action.FATAL, "cuda_down", 0.0)
     if code == EXIT_UNEXPECTED:
         return Decision(Action.FATAL, "unexpected", 0.0)
+    if code == EXIT_OPERATOR_ERROR:
+        # Operator-facing config / YAML / schema / samples-file error (worker
+        # exit 78). An operator can fix this in ONE pass (a missing flag, a typo
+        # in the YAML), so retrying it just burns the attempt budget on an
+        # identical, non-transient failure — classify FATAL and surface the code
+        # so the launcher stops instead of spinning on a config error. Mirrors
+        # the cuda_down / unexpected FATAL branches; the kind string is distinct
+        # so an operator reading the log sees "operator_error" (TASK-0182).
+        return Decision(Action.FATAL, "operator_error", 0.0)
     if code < 0:
         # Signal-kill: transient host event (OOM-killer / host SIGTERM), NOT a
         # logic error — retry the next window; the --ledger banks progress. The
