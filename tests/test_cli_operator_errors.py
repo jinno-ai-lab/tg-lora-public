@@ -299,3 +299,165 @@ class TestLeafIndependence:
     @pytest.mark.parametrize("cls", SUBTYPES)
     def test_all_subtypes_exit_status_78_by_default(self, cls):
         assert cls("x").exit_status == 78
+
+
+# ---------------------------------------------------------------------------
+# TASK-0182 — launcher ↔ leaf ↔ worker constant agreement (drift detection)
+# ---------------------------------------------------------------------------
+
+
+class TestLauncherExitCodeIntegration:
+    """The launcher mirrors the leaf's ``EXIT_OPERATOR_ERROR`` by VALUE.
+
+    The launcher (``scripts.launch_freeze_ci_9b_full``) is deliberately
+    torch-free so it can poll a busy card, so it does not IMPORT the leaf — it
+    redeclares ``EXIT_OPERATOR_ERROR = 78`` and branches on it in
+    ``classify_exit_code`` (TASK-0182). The worker (producer) DOES import the
+    leaf constant. So the SAME integer lives in three places: the leaf
+    (definition), the worker (imported), the launcher (mirrored). Without this
+    pin, a unilateral value change on one side would drift silently.
+
+    The cross-module equality is *transitively* pinned by
+    ``test_worker_launcher_exit_contract.py`` (launcher == worker == 78), but
+    that chain only holds while the worker keeps importing the leaf — this test
+    pins the launcher↔leaf leg directly so a maintainer who later inlines the
+    worker's constant is still caught.
+    """
+
+    def test_launcher_matches_leaf_constant(self):
+        import scripts.launch_freeze_ci_9b_full as launcher
+
+        assert launcher.EXIT_OPERATOR_ERROR == EXIT_OPERATOR_ERROR == 78
+
+    def test_launcher_constant_is_the_leaf_constant_value(self):
+        # Explicit non-transitive pin: the launcher's literal is the leaf's
+        # value, the contract the launcher's classify branch was written against.
+        import scripts.launch_freeze_ci_9b_full as launcher
+
+        assert launcher.EXIT_OPERATOR_ERROR is not None
+        assert int(launcher.EXIT_OPERATOR_ERROR) == int(EXIT_OPERATOR_ERROR)
+
+
+# ---------------------------------------------------------------------------
+# TASK-0183 — NFR-101 axis-wide mutation proof
+#
+# TestWrapperMutation (above) pins the POSITIVE: each wrapper raises its exact
+# subtype. These pin the NEGATIVE: if a maintainer neutralizes a wrapper body
+# (``pass`` / ``return None``), the wrapper returns instead of raising and the
+# operator-error class is SILENTLY DROPPED — i.e. each detection test is
+# mutation-sensitive. Consolidated here so the four-axis sensitivity is visible
+# in one place rather than scattered across the entrypoint test files.
+# ---------------------------------------------------------------------------
+
+
+class TestOperatorErrorAxisMutationProof:
+    @pytest.mark.parametrize(
+        ("wrapper_name", "subtype"),
+        [
+            ("raise_missing_config", MissingConfigError),
+            ("raise_malformed_yaml", MalformedYAMLError),
+            ("raise_app_config_validation", AppConfigValidationError),
+            ("raise_malformed_eval_results", MalformedEvalResultsError),
+        ],
+    )
+    def test_neutralized_wrapper_drops_detection(self, monkeypatch, wrapper_name, subtype):
+        # NFR-101 axis-wide mutation proof. TestWrapperMutation (above) pins the
+        # POSITIVE — each wrapper's real body raises its exact subtype via
+        # ``pytest.raises``. This pins the NEGATIVE: if a maintainer neutralizes
+        # a wrapper body (``pass`` / ``return None``), the wrapper returns
+        # instead of raising and the operator-error class is SILENTLY DROPPED —
+        # exactly the corruption mode the axis exists to close, and the reason
+        # each detection test goes RED under the mutation. ``subtype`` is in the
+        # parametrize so a wrapper that raises the WRONG subtype is caught too.
+        import src.utils.cli_errors as leaf
+
+        monkeypatch.setattr(leaf, wrapper_name, lambda *a, **k: None)
+        wrapper = getattr(leaf, wrapper_name)
+        # The neutralized wrapper swallows any call. If it still raised the
+        # subtype, the call below would propagate it and this test would ERROR
+        # rather than pass — that is the mutation-sensitivity being pinned.
+        assert wrapper("/nope.yaml") is None
+        assert wrapper("x.yaml", Exception("bad")) is None
+        assert wrapper("missing key: candidate_total") is None
+
+
+# ---------------------------------------------------------------------------
+# TASK-0183 — assembled wiring regression net (the b8ee35c-analog)
+#
+# ``b8ee35c`` drove the REAL assembled heterogeneous §4 path end-to-end and
+# asserted the 5 per-commit honesty invariants at integration scale in ONE
+# test. This is the operator-error-axis mirror: it pins, at the SOURCE level,
+# that all THREE entrypoints wire the operator-error axis (import the leaf +
+# emit/route operator errors) — so a future change that silently unwires one
+# entrypoint is caught here without re-deriving the per-entrypoint integration
+# tests. GPU-free, torch-free (reads source text only); deliberately NOT a
+# brittle test-count assertion.
+# ---------------------------------------------------------------------------
+
+
+class TestOperatorErrorWiringAssembled:
+    """All three freeze-ci-9b entrypoints wire the operator-error leaf.
+
+    The axis is only as strong as its WEAKEST entrypoint: if any one of the
+    producer / replay / launcher stops importing the leaf or routing exit 78,
+    that entrypoint silently reverts to an undifferentiated traceback (the
+    pre-axis state). This pins the wiring is present in all three in one net.
+    """
+
+    def _src(self, rel_path: str) -> str:
+        # Read source by PATH (not import) so this leaf test file stays
+        # torch-free: importing ``scripts.run_freeze_validloss_ci_9b`` would
+        # drag the worker's torch/peft graph into the leaf test session.
+        import os
+        from pathlib import Path
+
+        repo_root = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        return (repo_root / rel_path).read_text(encoding="utf-8")
+
+    def test_producer_wires_operator_error_axis(self):
+        # scripts/run_freeze_validloss_ci_9b.py (the worker the launcher spawns).
+        src = self._src("scripts/run_freeze_validloss_ci_9b.py")
+        assert "from src.utils.cli_errors import" in src
+        assert "EXIT_OPERATOR_ERROR" in src
+        assert "emit_operator_error(" in src
+        assert "return EXIT_OPERATOR_ERROR" in src  # named constant, not bare 78
+
+    def test_replay_wires_operator_error_axis(self):
+        # scripts/replay_freeze_validloss_ci.py (standalone replay gate).
+        src = self._src("scripts/replay_freeze_validloss_ci.py")
+        assert "from src.utils.cli_errors import" in src
+        assert "EXIT_OPERATOR_ERROR" in src
+        assert "emit_operator_error(" in src
+        assert "raise_malformed_eval_results" in src  # the replay-specific class 4
+
+    def test_launcher_routes_operator_error_exit_code(self):
+        # scripts/launch_freeze_ci_9b_full.py — classifies worker exit 78 FATAL.
+        src = self._src("scripts/launch_freeze_ci_9b_full.py")
+        assert "EXIT_OPERATOR_ERROR = 78" in src
+        assert "if code == EXIT_OPERATOR_ERROR" in src
+        assert '"operator_error"' in src  # the distinct classify kind
+
+    def test_wired_entrypoints_raise_distinct_classes(self):
+        # Three of the four operator-error classes are wired into entrypoint
+        # main flows; the fourth lives at the leaf-wrapper level only.
+        #
+        #   raise_missing_config        -> producer (--config) + replay (--samples-file)
+        #   raise_malformed_yaml        -> producer (--config YAML parse)
+        #   raise_malformed_eval_results-> replay (samples-file schema)
+        #   raise_app_config_validation -> LEAF wrapper ONLY (not wired into an
+        #       entrypoint main: the producer reads OmegaConf directly and does
+        #       NOT Pydantic-validate, so wiring it into config_schema would
+        #       break the existing ``pytest.raises(ValidationError)`` pins — the
+        #       documented REQ-301 honest note, pinned at the wrapper level in
+        #       TestWrapperMutation / the producer test).
+        producer = self._src("scripts/run_freeze_validloss_ci_9b.py")
+        replay = self._src("scripts/replay_freeze_validloss_ci.py")
+        assert "raise_missing_config" in producer
+        assert "raise_missing_config" in replay
+        assert "raise_malformed_yaml" in producer
+        assert "raise_malformed_eval_results" in replay
+        # AppConfigValidationError is deliberately NOT raised in either
+        # entrypoint main — confirm that contract so a future "wire it in"
+        # change is a conscious decision, not a drift.
+        assert "raise_app_config_validation(" not in producer
+        assert "raise_app_config_validation(" not in replay

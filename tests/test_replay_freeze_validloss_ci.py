@@ -3369,6 +3369,28 @@ class TestReplayEntrypointIntegration:
         assert main([str(f)]) == 78
         assert "empty list: candidate_losses" in capsys.readouterr().err
 
+    def test_json_mode_operator_error_is_single_line_stdout_stderr_empty(
+        self, capsys, tmp_path
+    ):
+        # TC-501-01 / TC-501-02 / EDGE-102 — in --json mode an operator error is
+        # emitted as ONE JSON line on stdout (the machine-parseable contract),
+        # and stderr stays empty. The replay wires ``emit_operator_error(exc,
+        # json_mode=args.json)`` (scripts/replay_freeze_validloss_ci.py); this
+        # pins the assembled main() --json path end-to-end (the leaf emitter is
+        # parametrized-proven in tests/test_cli_operator_errors.py::TestEmitter).
+        f = tmp_path / "bad.json"
+        f.write_text("{not valid json")
+        assert main([str(f), "--json"]) == 78
+        captured = capsys.readouterr()
+        out, err = captured.out, captured.err
+        assert err == ""  # TC-501-02
+        assert out.endswith("\n")
+        assert out.count("\n") == 1  # EDGE-102 — trailing newline only
+        loaded = json.loads(out)  # TC-501-01 — one valid JSON line
+        assert loaded["error"] == "MalformedEvalResultsError"
+        assert loaded["exit_status"] == 78
+        assert "json parse error" in loaded["detail"]
+
     @pytest.mark.parametrize(
         "payload, prefix",
         [
