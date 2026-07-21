@@ -95,19 +95,34 @@ def _cpu_cfg(*, max_steps: int = 6, base_rank: int = 16, lr: float = 1e-4):
     (``load_in_4bit=False`` skips bnb/GPU). Carries every key run_ci_9b and
     apply_lora read, so the assembled path needs no real 9B config file. ``lr``
     is exposed so a resume-fingerprint test can vary the learning rate (the
-    optimizer ``lr`` every arm's ``AdamW`` reads) against a shared ledger."""
+    optimizer ``lr`` every arm's ``AdamW`` reads) against a shared ledger.
+
+    The ``experiment`` / ``data`` / ``logging`` sections and
+    ``training.batch_size`` / ``grad_accumulation`` are present ONLY so the cfg
+    clears ``BaselineConfig`` validation in the producer's ``_load_cfg`` (the
+    assembled tests that route through ``main(["--config", ...])``); none are
+    read by ``run_ci_9b`` / ``apply_lora`` and none is a fingerprint field, so
+    the replay / fingerprint checks are byte-identical to before."""
     return OmegaConf.create({
+        "experiment": {"name": "stub", "seed": 0},
         "model": {"name_or_path": "tiny-llama-stub", "load_in_4bit": False},
         "training": {
             "trainable_lora_scope": "last_25_percent",
             "learning_rate": lr,
             "max_steps": max_steps,
             "gradient_checkpointing": False,
+            "batch_size": 1,
+            "grad_accumulation": 1,
         },
         "lora": {
             "r": base_rank, "alpha": 32, "dropout": 0.0,
             "target_modules": "all-linear",
         },
+        "data": {
+            "train_path": "stub", "valid_quick_path": "stub",
+            "valid_full_path": "stub",
+        },
+        "logging": {"run_dir": "runs/stub"},
     })
 
 
@@ -710,12 +725,19 @@ def _cfg_full(**deep_overrides):
     ``_cpu_cfg``'s shape exactly (the baseline path here is byte-identical to a
     ``_cpu_cfg(max_steps=6, base_rank=16)`` run)."""
     base = {
+        "experiment": {"name": "stub", "seed": 0},
         "model": {"name_or_path": "tiny-llama-stub", "load_in_4bit": False},
         "training": {
             "trainable_lora_scope": "last_25_percent",
             "learning_rate": 1e-4, "max_steps": 6, "gradient_checkpointing": False,
+            "batch_size": 1, "grad_accumulation": 1,
         },
         "lora": {"r": 16, "alpha": 32, "dropout": 0.0, "target_modules": "all-linear"},
+        "data": {
+            "train_path": "stub", "valid_quick_path": "stub",
+            "valid_full_path": "stub",
+        },
+        "logging": {"run_dir": "runs/stub"},
     }
     for section, overrides in deep_overrides.items():
         base[section] = {**base.get(section, {}), **overrides}

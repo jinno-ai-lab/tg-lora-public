@@ -11,12 +11,18 @@ raising). ``main``'s outer try/except emits the error and exits 78.
 
 Two honest notes reflected below (and in acceptance-criteria.md):
 
-* The producer does NOT Pydantic-validate the config (it reads the OmegaConf
-  struct directly), so :class:`AppConfigValidationError` is exercised at the
-  leaf-wrapper level against a REAL ``pydantic.ValidationError`` — not wired
-  into ``config_schema.load_and_validate_config`` (doing so would break the
-  existing ``pytest.raises(ValidationError)`` pins in test_config_schema /
-  test_script_config_validation).
+* The producer DOES Pydantic-validate the config (TASK-0184): ``_load_cfg``
+  runs the parsed mapping through ``config_schema.validate_config_data`` and
+  converts a ``pydantic.ValidationError`` → :class:`AppConfigValidationError`
+  (exit 78) AT THE PRODUCER LEVEL ONLY. ``config_schema`` itself is untouched
+  — it keeps raising the raw ``pydantic.ValidationError``, so the existing
+  ``pytest.raises(ValidationError)`` pins in test_config_schema /
+  test_script_config_validation stay green. The ``AppConfigValidationError``
+  wrapper is still pinned directly below against a REAL
+  ``pydantic.ValidationError`` (the unit the producer conversion calls), and
+  the ``_load_cfg`` / ``main`` integration tests pin the end-to-end exit-78
+  path for an extra field (TC-301-01), a missing required field (TC-301-02),
+  and a type mismatch (TC-301-03).
 * In the no-ledger / non-sealed path the CUDA / free-memory guards fire
   BEFORE the config load (the documented "guards fire before config load"
   invariant). The config load therefore happens first only on the
@@ -198,3 +204,162 @@ class TestAppConfigValidationWrapper:
             assert f"{n} errors" in str(ei.value)
         else:  # pragma: no cover
             pytest.fail("expected ValidationError")
+
+
+# ---------------------------------------------------------------------------
+# REQ-301 — _load_cfg Pydantic validation gate (TC-301-01/02/03/B01, TASK-0184)
+#
+# _load_cfg now runs the parsed mapping through config_schema.validate_config_data
+# and converts pydantic.ValidationError → AppConfigValidationError (exit 78). The
+# fixtures below are minimal REAL-shape BaselineConfig YAMLs (the producer's
+# default config family — the same schema the training loop uses) with one
+# violation injected, so the first error is deterministic and the tests exercise
+# the genuine schema, not a toy.
+# ---------------------------------------------------------------------------
+
+# A minimal config that PASSES BaselineConfig validation. Each test injects ONE
+# violation into the relevant section so the first error is deterministic.
+_VALID_BASELINE = """\
+experiment: {name: t, seed: 1}
+model: {name_or_path: m}
+lora: {r: 1, alpha: 1, dropout: 0.0}
+data: {train_path: a, valid_quick_path: b, valid_full_path: c}
+training: {batch_size: 1, grad_accumulation: 1, learning_rate: 1.0e-4, max_steps: 10}
+logging: {run_dir: r}
+"""
+
+_EXTRA_FIELD = "logging:\n  run_dir: r\n  rogue_extra: 1"
+_MISSING_REQ = "logging: {}"
+_TYPE_MISMATCH = "lora:\n  r: not-an-int\n  alpha: 1\n  dropout: 0.0"
+
+
+def _write_cfg(tmp_path: Path, body: str) -> Path:
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(body)
+    return cfg
+
+
+class TestLoadCfgPydanticValidation:
+    """_load_cfg converts a Pydantic schema violation into
+    AppConfigValidationError (the producer side of REQ-301)."""
+
+    def test_extra_forbidden_field_raises_app_config(self, tmp_path):
+        # TC-301-01 — an undeclared field under logging is rejected.
+        body = _VALID_BASELINE.replace("logging: {run_dir: r}", _EXTRA_FIELD)
+        with pytest.raises(AppConfigValidationError, match="schema validation failed") as ei:
+            _load_cfg(_write_cfg(tmp_path, body))
+        detail = str(ei.value)
+        assert "BaselineConfig" in detail
+        assert "1 errors" in detail
+        assert "logging.rogue_extra" in detail
+        assert "extra_forbidden" in detail  # pydantic v2 type
+
+    def test_missing_required_field_raises_app_config(self, tmp_path):
+        # TC-301-02 — logging has no required run_dir.
+        body = _VALID_BASELINE.replace("logging: {run_dir: r}", _MISSING_REQ)
+        with pytest.raises(AppConfigValidationError, match="schema validation failed") as ei:
+            _load_cfg(_write_cfg(tmp_path, body))
+        detail = str(ei.value)
+        assert "logging.run_dir" in detail
+        assert "missing" in detail  # pydantic v2 error type
+
+    def test_type_mismatch_raises_app_config(self, tmp_path):
+        # TC-301-03 — lora.r is a string, not an int.
+        body = _VALID_BASELINE.replace(
+            "lora: {r: 1, alpha: 1, dropout: 0.0}", _TYPE_MISMATCH
+        )
+        with pytest.raises(AppConfigValidationError, match="schema validation failed") as ei:
+            _load_cfg(_write_cfg(tmp_path, body))
+        detail = str(ei.value)
+        assert "lora.r" in detail
+        assert "int_parsing" in detail  # pydantic v2 type-mismatch type
+
+    def test_baseline_config_class_name_in_detail(self, tmp_path):
+        # TC-301-B01 — the producer's default family is BaselineConfig; its name
+        # appears in the message so an operator knows which schema failed.
+        body = _VALID_BASELINE.replace("logging: {run_dir: r}", _EXTRA_FIELD)
+        with pytest.raises(AppConfigValidationError) as ei:
+            _load_cfg(_write_cfg(tmp_path, body))
+        assert "schema validation failed for BaselineConfig" in str(ei.value)
+
+    def test_tg_lora_config_class_dispatch(self, tmp_path):
+        # The class name follows ValidationError.title automatically: a
+        # tg_lora-bearing config resolves to TGLoRAConfig (no dispatch dup). The
+        # params are deliberately incomplete so validation fails under
+        # TGLoRAConfig — proving the class name tracks the dispatched model.
+        body = _VALID_BASELINE + "tg_lora: {K_initial: 1}\n"
+        with pytest.raises(AppConfigValidationError) as ei:
+            _load_cfg(_write_cfg(tmp_path, body))
+        assert "schema validation failed for TGLoRAConfig" in str(ei.value)
+
+    def test_valid_config_loads_unchanged(self, tmp_path):
+        # Happy path: a schema-valid config returns the OmegaConf struct with NO
+        # mutation (the producer reads cfg.model / cfg.lora / cfg.training
+        # directly). This is the zero-regression guard for the new gate.
+        cfg = _load_cfg(_write_cfg(tmp_path, _VALID_BASELINE))
+        assert cfg.model.name_or_path == "m"
+        assert cfg.lora.r == 1
+        assert cfg.training.learning_rate == 1.0e-4
+
+    def test_validation_is_load_bearing(self, tmp_path, monkeypatch):
+        # Mutation proof: neutralize the producer's validate_config_data and the
+        # schema-invalid config must NO LONGER raise AppConfigValidationError —
+        # proving the 78 path is produced by the gate, not by accident.
+        import scripts.run_freeze_validloss_ci_9b as mod
+
+        body = _VALID_BASELINE.replace("logging: {run_dir: r}", _EXTRA_FIELD)
+        monkeypatch.setattr(mod, "validate_config_data", lambda data: None)
+        cfg = _load_cfg(_write_cfg(tmp_path, body))
+        # Without the gate the config loads without raising (OmegaConf keeps the
+        # extra field; the producer reads the fields it needs regardless).
+        assert cfg.model.name_or_path == "m"
+
+
+class TestProducerMainAppConfigValidation:
+    """main() exits 78 + emits AppConfigValidationError for a schema-invalid
+    config (the --ledger config-load-first path, GPU-independent)."""
+
+    def _run(self, tmp_path, body, *extra):
+        ledger = _dummy_ledger(tmp_path)
+        return main(
+            ["--config", str(_write_cfg(tmp_path, body)), "--ledger", str(ledger), *extra]
+        )
+
+    def test_extra_field_exits_78(self, capsys, tmp_path):
+        # TC-301-01.
+        assert self._run(tmp_path, _VALID_BASELINE.replace("logging: {run_dir: r}", _EXTRA_FIELD)) == 78
+        err = capsys.readouterr().err
+        assert "AppConfigValidationError:" in err
+        assert "schema validation failed" in err
+
+    def test_missing_required_field_exits_78(self, capsys, tmp_path):
+        # TC-301-02 (producer side; the launcher assembled mirror is
+        # test_main_mirrors_worker_operator_error_exit in test_launch_freeze_ci_9b_full).
+        assert self._run(tmp_path, _VALID_BASELINE.replace("logging: {run_dir: r}", _MISSING_REQ)) == 78
+        assert "missing" in capsys.readouterr().err
+
+    def test_type_mismatch_exits_78(self, capsys, tmp_path):
+        # TC-301-03.
+        body = _VALID_BASELINE.replace("lora: {r: 1, alpha: 1, dropout: 0.0}", _TYPE_MISMATCH)
+        assert self._run(tmp_path, body) == 78
+        assert "int_parsing" in capsys.readouterr().err
+
+    def test_app_config_error_stderr_has_class_name_line(self, capsys, tmp_path):
+        # NFR-202 — a line greppable by class name.
+        self._run(tmp_path, _VALID_BASELINE.replace("logging: {run_dir: r}", _EXTRA_FIELD))
+        err = capsys.readouterr().err
+        assert any(line.startswith("AppConfigValidationError: ") for line in err.splitlines())
+
+    def test_json_mode_app_config_error_single_line(self, capsys, tmp_path):
+        # REQ-501 / EDGE-102 — --json emits a single JSON line on stdout, stderr empty.
+        body = _VALID_BASELINE.replace("logging: {run_dir: r}", _EXTRA_FIELD)
+        assert self._run(tmp_path, body, "--json") == 78
+        captured = capsys.readouterr()
+        out, err = captured.out, captured.err
+        assert out.endswith("\n")
+        assert out.count("\n") == 1
+        loaded = json.loads(out)
+        assert loaded["error"] == "AppConfigValidationError"
+        assert loaded["exit_status"] == 78
+        assert "schema validation failed" in loaded["detail"]
+        assert err == ""

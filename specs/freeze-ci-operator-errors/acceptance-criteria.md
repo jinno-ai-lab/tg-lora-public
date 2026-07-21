@@ -209,23 +209,23 @@
 
 #### 正常系
 
-- [ ] **TC-301-01**: producer で `extra="forbid"` 違反が exit 78 🔵
+- [x] **TC-301-01**: producer で `extra="forbid"` 違反が exit 78 🔵
   - **入力**: `LoggingConfig` に未宣言 field を追加した YAML
-  - **期待結果**: `exit_code == 78`, `AppConfigValidationError: schema validation failed for TGLoRAConfig: 1 errors; first: logging <field_name> extra fields not permitted (value_error.extra)`
+  - **期待結果**: `exit_code == 78`, `AppConfigValidationError: schema validation failed for <ConfigClass>: 1 errors; first: logging.<field_name> Extra inputs are not permitted (extra_forbidden)`
   - **信頼性**: 🔵 *REQ-301, REQ-302, REQ-303*
-  - **ブロッカー（verified reality）**: producer は config を Pydantic validate **しない**（OmegaConf struct を直接読む）。`AppConfigValidationError` は **leaf wrapper level** でのみ交付される（TASK-0181 の意図的設計 — `config_schema.load_and_validate_config` に wire すると既存 `pytest.raises(ValidationError)` pin を破壊するため）。message 形式・exit 78・error_count は TC-301-04 / wrapper test で verified 済だが、**producer main からの exit-78 経路は未実装**。本 criterion を [x] にするには producer に Pydantic validation gate を新設する別 TASK が必要。
+  - **検証（TASK-0184 resolved）**: producer `_load_cfg` が `config_schema.validate_config_data` で Pydantic validate し、`pydantic.ValidationError` → `raise_app_config_validation(exc.title, exc)` で exit 78 経路を新設。unit `TestLoadCfgPydanticValidation::test_extra_forbidden_field_raises_app_config` + integration `TestProducerMainAppConfigValidation::test_extra_field_exits_78`。class 名は `tg_lora` key 有無で dispatch（producer 既定 config 群は `BaselineConfig`、`tg_lora` 含む config は `TGLoRAConfig`）→ `test_tg_lora_config_class_dispatch` + `test_baseline_config_class_name_in_detail` で両方 pin。pydantic v2 error type は `extra_forbidden`（旧 `value_error.extra` は pydantic v1 表記）。
 
-- [ ] **TC-301-02**: launcher で必須 field 欠落が exit 78 🔵
+- [x] **TC-301-02**: launcher で必須 field 欠落が exit 78 🔵
   - **入力**: 必須 field を削除した YAML
-  - **期待結果**: `exit_code == 78`, `AppConfigValidationError: schema validation failed for <ConfigClass>: ...; first: <field> field required (value_error.missing)`
+  - **期待結果**: `exit_code == 78`, `AppConfigValidationError: schema validation failed for <ConfigClass>: ...; first: <field> Field required (missing)`
   - **信頼性**: 🔵 *REQ-301*
-  - **ブロッカー**: TC-301-01 と同根。launcher も worker も config を Pydantic validate しない。worker が Pydantic 違反で `exit 78` を出す経路が未実装（TC-301-01 blocker 参照）。
+  - **検証（TASK-0184 resolved）**: producer 側 `TestLoadCfgPydanticValidation::test_missing_required_field_raises_app_config` + `TestProducerMainAppConfigValidation::test_missing_required_field_exits_78`（pydantic v2 type `missing`）。launcher assembled 経路は worker（producer）が Pydantic 違反で `exit 78` を出すと `classify_exit_code(78) → FATAL("operator_error")` で launcher `main()` が 78 を mirror → `tests/test_launch_freeze_ci_9b_full.py::test_main_mirrors_worker_operator_error_exit`（class 非依存・worker exit 78 → launcher 78）。
 
-- [ ] **TC-301-03**: producer で型不一致が exit 78 🔵
+- [x] **TC-301-03**: producer で型不一致が exit 78 🔵
   - **入力**: 期待型 `int` だが `str` を代入した YAML
-  - **期待結果**: `exit_code == 78`, `AppConfigValidationError: ...; first: <field> ... (type_error)`
+  - **期待結果**: `exit_code == 78`, `AppConfigValidationError: ...; first: <field> Input should be a valid integer, unable to parse string as an integer (int_parsing)`
   - **信頼性**: 🔵 *REQ-301*
-  - **ブロッカー**: TC-301-01 と同根（producer は Pydantic validate しない）。
+  - **検証（TASK-0184 resolved）**: producer `TestLoadCfgPydanticValidation::test_type_mismatch_raises_app_config` + `TestProducerMainAppConfigValidation::test_type_mismatch_exits_78`（pydantic v2 type `int_parsing`）。
 
 - [x] **TC-301-04**: `error_count` が Pydantic の `len(errors())` と一致 🔵
   - **入力**: 複数の field 違反
@@ -235,11 +235,11 @@
 
 #### 境界値
 
-- [ ] **TC-301-B01**: `BaselineConfig` 違反も `AppConfigValidationError` を発火 🔵
+- [x] **TC-301-B01**: `BaselineConfig` 違反も `AppConfigValidationError` を発火 🔵
   - **入力**: `9b_baseline.yaml` 系の違反
   - **期待結果**: `BaselineConfig` class 名が stderr に出力
   - **信頼性**: 🔵 *REQ-303*
-  - **ブロッカー**: TC-301-01 と同根。wrapper 自体は class 名を param で受け取るので `BaselineConfig` でも動作するが、producer/launcher main からの発火経路が未実装。
+  - **検証（TASK-0184 resolved）**: producer 既定 config 群（`9b_baseline_suffix_only_last25.yaml`）は `BaselineConfig` に dispatch → `TestLoadCfgPydanticValidation::test_baseline_config_class_name_in_detail`（`schema validation failed for BaselineConfig`）+ integration `TestProducerMainAppConfigValidation::test_app_config_error_stderr_has_class_name_line`。
 
 #### mutation 証明
 
@@ -500,12 +500,13 @@
 
 ## テストケースサマリー
 
-> **【2026-07-21 verified status】** 全 criteria 中 **42 [x] verified** / **4 [ ] blocked**。
-> 残る 4 は REQ-301 の producer/launcher main からの Pydantic 違反 exit-78 経路
-> （TC-301-01 / 02 / 03 / B01）— producer は OmegaConf を直接読み Pydantic validate **しない**
-> （TASK-0181 の意図的設計・`config_schema` の既存 `ValidationError` pin を破壊しないため）。
-> `AppConfigValidationError` は **leaf wrapper level** で完全 verified（TC-301-04 / TC-301-M01 green）。
-> 4 criterion を [x] にするには producer に Pydantic validation gate を新設する別 TASK が必要（scope 外）。
+> **【2026-07-22 verified status】** 全 criteria 中 **46 [x] verified** / **0 [ ] blocked** — axis COMPLETE。
+> TASK-0184 resolved the last 4 (TC-301-01/02/03/B01): producer `_load_cfg`
+> が `config_schema.validate_config_data` で Pydantic validate し、`pydantic.ValidationError`
+> → `raise_app_config_validation(exc.title, exc)` で exit-78 経路を新設。変換は producer
+> level のみ（`config_schema` 自体は未改修・raw `ValidationError` を維持 → 既存
+> `pytest.raises(ValidationError)` pin は不変 green）。launcher assembled mirror 経路
+> （TC-301-02）は worker exit 78 → `classify_exit_code(78) → FATAL` → launcher 78。
 
 ### カテゴリ別件数
 
@@ -545,7 +546,7 @@
 - TC-001-01..E01, TC-101-01..M01, TC-201-01..M01, TC-301-01..M01, TC-401-01..M01
 - 優先度: Must Have
 - 実施予定: TASK-0179 iter 内
-- **状態**: green（TC-301-01/02/03/B01 以外 — producer-main Pydantic gate 未実装・上記 verified status 参照）
+- **状態**: green — 全 criteria verified（TC-301-01/02/03/B01 は TASK-0184 で producer `_load_cfg` Pydantic gate により [x] 化・上記 verified status 参照）
 
 ### Phase 2: 統合 / regression test
 

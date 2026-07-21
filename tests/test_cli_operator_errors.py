@@ -438,26 +438,29 @@ class TestOperatorErrorWiringAssembled:
         assert '"operator_error"' in src  # the distinct classify kind
 
     def test_wired_entrypoints_raise_distinct_classes(self):
-        # Three of the four operator-error classes are wired into entrypoint
-        # main flows; the fourth lives at the leaf-wrapper level only.
+        # All four operator-error classes are wired into entrypoint main flows.
         #
         #   raise_missing_config        -> producer (--config) + replay (--samples-file)
         #   raise_malformed_yaml        -> producer (--config YAML parse)
         #   raise_malformed_eval_results-> replay (samples-file schema)
-        #   raise_app_config_validation -> LEAF wrapper ONLY (not wired into an
-        #       entrypoint main: the producer reads OmegaConf directly and does
-        #       NOT Pydantic-validate, so wiring it into config_schema would
-        #       break the existing ``pytest.raises(ValidationError)`` pins — the
-        #       documented REQ-301 honest note, pinned at the wrapper level in
-        #       TestWrapperMutation / the producer test).
+        #   raise_app_config_validation -> producer (--config Pydantic schema,
+        #       TASK-0184): wired at the producer ``_load_cfg`` level ONLY.
+        #       ``_load_cfg`` runs ``config_schema.validate_config_data`` on the
+        #       parsed mapping and converts the raw ``pydantic.ValidationError``
+        #       to AppConfigValidationError; ``config_schema`` itself is
+        #       UNTOUCHED (keeps raising raw ValidationError), so the existing
+        #       ``pytest.raises(ValidationError)`` pins stay green. Replay does
+        #       NOT wire it — replay validates a samples JSON via
+        #       MalformedEvalResultsError, not a training config.
         producer = self._src("scripts/run_freeze_validloss_ci_9b.py")
         replay = self._src("scripts/replay_freeze_validloss_ci.py")
         assert "raise_missing_config" in producer
         assert "raise_missing_config" in replay
         assert "raise_malformed_yaml" in producer
         assert "raise_malformed_eval_results" in replay
-        # AppConfigValidationError is deliberately NOT raised in either
-        # entrypoint main — confirm that contract so a future "wire it in"
-        # change is a conscious decision, not a drift.
-        assert "raise_app_config_validation(" not in producer
+        # AppConfigValidationError is now wired into the PRODUCER only (the one
+        # entrypoint that loads a Pydantic-validated training config). Replay has
+        # no training config, so it must stay unwired — pin that asymmetry so a
+        # future change to either side is a conscious decision, not a drift.
+        assert "raise_app_config_validation(" in producer
         assert "raise_app_config_validation(" not in replay

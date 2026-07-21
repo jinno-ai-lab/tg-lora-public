@@ -107,6 +107,7 @@ from pathlib import Path
 import torch
 import yaml
 from omegaconf import OmegaConf
+from pydantic import ValidationError
 
 # Shared A/B instrument pieces (the harness this deposits through).
 from scripts.run_freeze_validloss_ci import resolve_device
@@ -165,11 +166,20 @@ from src.tg_lora.freeze_evidence_hash import (
     evidence_hash as _evidence_hash,
 )
 from src.tg_lora.progressive_freeze import ProgressiveFreezeController
+# The Pydantic config schema (single source of truth shared with the training
+# loop) — used ONLY to validate the operator-supplied --config here and convert
+# a schema violation to an :class:`AppConfigValidationError` (exit 78). This
+# wrap is the SOLE place a raw ``pydantic.ValidationError`` becomes an
+# OperatorError; ``config_schema.validate_config_data`` keeps raising it raw so
+# the existing ``pytest.raises(ValidationError)`` pins in test_config_schema /
+# test_script_config_validation stay green (REQ-301, TASK-0184).
+from src.training.config_schema import validate_config_data
 from src.utils.cli_errors import (
     EXIT_OPERATOR_ERROR,
     MalformedYAMLError,
     OperatorError,
     emit_operator_error,
+    raise_app_config_validation,
     raise_malformed_yaml,
     raise_missing_config,
 )
@@ -2636,11 +2646,22 @@ def _load_cfg(path: str | Path):
     :class:`MalformedYAMLError`. An empty (0-byte) file parses to an empty
     mapping under OmegaConf rather than raising, so it is caught explicitly
     (EDGE-002) instead of failing later with a cryptic
-    ``MissingMandatoryValue`` on the first field access. Pydantic schema
-    validation is NOT done by this producer (it reads the OmegaConf struct
-    directly); the :class:`AppConfigValidationError` axis is therefore
-    delivered at the leaf level (see ``src/utils/cli_errors.py`` and its
-    tests), not here.
+    ``MissingMandatoryValue`` on the first field access.
+
+    A file that PARSES but violates the Pydantic config schema (an ``extra``
+    field, a missing required field, a type mismatch) is validated here against
+    :func:`src.training.config_schema.validate_config_data` and converted to an
+    :class:`AppConfigValidationError` (exit 78) carrying the config-class name,
+    the error count, and the first error — so an operator fixes the config in
+    one pass (REQ-301 / NFR-201). The conversion is at THIS producer level only:
+    ``validate_config_data`` keeps raising the raw ``pydantic.ValidationError``
+    (its ``pytest.raises(ValidationError)`` pins stay green), and the original
+    OmegaConf struct is returned UNCHANGED on success, so a valid config reaches
+    the run loop byte-identically to before. The producer's default config
+    family (``9b_baseline_suffix_only_last25.yaml``) resolves to
+    :class:`BaselineConfig`; a ``tg_lora``-bearing config resolves to
+    :class:`TGLoRAConfig` — the class name follows ``ValidationError.title``
+    automatically, so no dispatch is duplicated.
     """
     try:
         cfg = OmegaConf.load(path)
@@ -2657,6 +2678,20 @@ def _load_cfg(path: str | Path):
             raise MalformedYAMLError(f"yaml parse error in {path}: file is empty")
     except OSError:
         pass
+    # Pydantic schema validation (REQ-301): a parsed-but-schema-invalid config
+    # surfaces as AppConfigValidationError + exit 78. Only a mapping (the shape
+    # every real config has) is validated; a non-mapping config falls through to
+    # the producer's existing attribute access unchanged (no regression — it is
+    # a different operator-input edge, not a Pydantic schema violation).
+    data = OmegaConf.to_container(cfg, resolve=True)
+    if isinstance(data, dict):
+        try:
+            validate_config_data(data)
+        except ValidationError as exc:
+            # exc.title is the model class name (BaselineConfig / TGLoRAConfig),
+            # so the operator-facing message names the exact schema that failed
+            # without duplicating the ``tg_lora``-key dispatch.
+            raise_app_config_validation(exc.title, exc)
     return cfg
 
 
