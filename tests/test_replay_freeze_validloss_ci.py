@@ -3044,6 +3044,151 @@ class TestRegimeLabelBinding:
         assert "REGIME_LABEL_STALE" in format_replay("<lie-regime-overclaim>", data, ci)
 
 
+class TestTrainValidGapBinding:
+    """The candidate arm's train-valid GAP float binding: the producer stamps
+    ``candidate_train_valid_gap`` straight from ``candidate_valid -
+    candidate_ce_mean`` (``candidate_valid = ci.candidate_mean``, ``candidate_ce_mean``
+    the candidate's mean final train CE) — the precise generalization-posture gap
+    whose SIGN and MAGNITUDE a reader cites, and the FLOAT the regime axis
+    discretizes (``classify_regime`` thresholds this same gap at 0.5). The replay
+    now re-derives that float from the deposit's own ``candidate_mean`` +
+    train-CE artifacts and flags a deposit whose stored gap no longer matches
+    them — the stored-derived-float-trusted-over-artifact path this guard closes,
+    the quantitative sibling of :class:`TestRegimeLabelBinding` / ``fd8c370``
+    (which binds the DISCRETE label this float underlies) and the
+    ``_CI_STAT_BINDINGS``-outlier sibling of :class:`TestCiStatsBinding` /
+    ``6ed0f69`` (which binds the nine top-level CI statistics but does NOT
+    enumerate this train-CE-derived float).
+
+    The gap this closes: :func:`_regime_label_stale` binds the regime label by
+    re-deriving ``classify_regime(ce, candidate_mean)`` — but the discretization
+    THROWS AWAY the precise gap value, so a repaint that keeps the regime honest
+    yet moves the cited gap across an interpretation boundary (e.g. a genuine
+    +0.01 generalization gap repainted to +0.49, still under the 0.5 overfit
+    threshold so ``regime`` stays ``'generalization'``) passes it silently; the
+    nine-stat ``_ci_stats_stale`` does not enumerate this float; ``evidence_hash``
+    never covers derived statistics. So a hand-edited deposit that repaints the
+    cited gap while leaving ``candidate_mean`` / ``candidate_final_ce_train_loss_
+    mean`` honest passes every existing gate silently, and on a CITABLE deposit
+    the stored gap directly contradicts the gate's own re-derived gap in the same
+    replay output. Proof of need (verified below): exactly that edit on the
+    committed citable full deposit keeps ``citable_as_full_section4_verdict=True``,
+    ``regime_label_stale=False``, ``faithful=True``, ``ci_stats_stale=[]``,
+    ``evidence_hash_stale=False``; only this guard names the lie.
+    """
+
+    def test_committed_deposits_gap_matches_artifacts(self):
+        # BYTE-IDENTICAL invariant: for every committed 9B deposit, the stored
+        # ``candidate_train_valid_gap`` re-derives to ``train_valid_gap_stale=
+        # False`` — the producer stamps it from ``ci.candidate_mean -
+        # candidate_ce_mean``, so the replay reproduces it bit-for-bit from the
+        # same artifacts (``ci.candidate_mean`` binds byte-identical to
+        # ``_ci_stats_stale``; the stamped train-CE mean is read back verbatim).
+        # A deposit that does not stamp the gap (a legacy / proxy recording, or
+        # one lacking the train-CE diagnostic) reports ``False`` with no note
+        # (artifact-when-present-else-skip, never a false-positive).
+        seen = False
+        for fixture in _9b_deposit_fixtures():
+            data = load_samples(fixture)
+            ci = replay_samples(data)
+            out = replay_to_json(fixture, data, ci)
+            prose = format_replay(fixture, data, ci)
+            if data.get("candidate_train_valid_gap") is None or data.get(
+                "candidate_final_ce_train_loss_mean"
+            ) is None:
+                assert out["train_valid_gap_stale"] is False
+                assert "TRAIN_VALID_GAP_STALE" not in prose
+                continue
+            seen = True
+            rederived = ci.candidate_mean - data["candidate_final_ce_train_loss_mean"]
+            assert out["train_valid_gap_stale"] is False, (
+                f"{fixture.name}: committed candidate_train_valid_gap="
+                f"{data['candidate_train_valid_gap']!r} diverges from the re-derived "
+                f"{rederived!r} (candidate_mean={ci.candidate_mean!r} - "
+                f"candidate_final_ce_train_loss_mean="
+                f"{data['candidate_final_ce_train_loss_mean']!r})."
+            )
+            assert "TRAIN_VALID_GAP_STALE" not in prose
+        assert seen, "expected at least one gap-stamping committed deposit"
+
+    def test_recording_without_gap_skips_cleanly(self):
+        # SKIP / false-positive discipline: a recording that carries sample lists
+        # and a main verdict but stamps NO ``candidate_train_valid_gap`` (a legacy
+        # / minimal recording) must report CLEAN.
+        path = "synthetic-no-gap.json"
+        data = {
+            "candidate_losses": [1.0, 1.0, 1.0],
+            "surrogate_losses": [2.0, 2.0, 2.0],
+            "base_seed": 0,
+        }
+        ci = replay_samples(data)
+        out = replay_to_json(path, data, ci)
+        assert out["train_valid_gap_stale"] is False
+        assert "TRAIN_VALID_GAP_STALE" not in format_replay(path, data, ci)
+
+    def test_hand_edited_gap_underclaim_is_flagged(self):
+        # PRIMARY mutation proof (the corrupt-but-green path, the worst case).
+        # The citable full deposit records ``candidate_train_valid_gap`` ~+0.329
+        # (train CE ~1.366 vs valid ~1.695 — generalization, but a sizeable gap):
+        # editing the cited gap down to ``0.01`` — claiming a textbook-tight
+        # generalization — keeps the regime label honest (0.01 is still well under
+        # the 0.5 overfit threshold, so ``classify_regime`` still returns
+        # ``'generalization'`` and ``regime_label_stale`` stays ``False``), keeps
+        # the composite gate clean (the four-axis gate re-derives the regime from
+        # the untouched artifacts, so ``citable_as_full_section4_verdict`` stays
+        # ``True`` and ``citation_label_stale`` stays ``False``), ``faithful=True``,
+        # the CI statistics clean (the top-level floats are untouched), the
+        # evidence hash clean (derived floats are not evidence), yet the stored
+        # gap no longer matches the artifacts AND the deposit STAYS citable with a
+        # contradictory cited gap. ONLY this guard fires and emits the
+        # TRAIN_VALID_GAP_STALE note.
+        data = load_samples(
+            [p for p in _9b_deposit_fixtures() if p.name.endswith("_full.json")][0]
+        )
+        original = data["candidate_train_valid_gap"]
+        assert original > 0.3  # genuinely a sizeable (not textbook-tight) gap
+        data["candidate_train_valid_gap"] = 0.01  # the lie: textbook-tight gap
+        ci = replay_samples(data)
+        out = replay_to_json("<lie-gap-underclaim>", data, ci)
+        # The regime label AND the COMPOSITE gate are untouched — the artifact-
+        # derived regime still says generalization (0.01 < 0.5), so the deposit
+        # STAYS citable and the regime / composite cross-checks stay clean (the
+        # silent-corruption path: a citable deposit lying about its gap).
+        assert out["citable_as_full_section4_verdict"] is True
+        assert out["regime_label_stale"] is False
+        assert out["citation_label_stale"] is False
+        assert out["faithful"] is True
+        assert out["ci_stats_stale"] == []
+        assert out["evidence_hash_stale"] is False
+        # ONLY this guard names the stored-gap lie.
+        assert out["train_valid_gap_stale"] is True
+        assert "TRAIN_VALID_GAP_STALE" in format_replay(
+            "<lie-gap-underclaim>", data, ci
+        )
+
+    def test_hand_edited_gap_overclaim_is_flagged(self):
+        # Mutation proof (symmetric direction): the heterogeneous_generalization
+        # deposit records a NEGATIVE gap (~-0.033 — the candidate did marginally
+        # BETTER on held-out than train); repainting it to a large positive value
+        # is caught the same way (the symmetric lie), proving the guard is not
+        # sign-specific and fires on a non-citable heterogeneous deposit too.
+        data = load_samples(
+            [
+                p
+                for p in _9b_deposit_fixtures()
+                if p.name.endswith("_heterogeneous_generalization.json")
+            ][0]
+        )
+        assert data["candidate_train_valid_gap"] < 0  # genuinely negative
+        data["candidate_train_valid_gap"] = 0.42  # the lie: claim a large gap
+        ci = replay_samples(data)
+        out = replay_to_json("<lie-gap-overclaim>", data, ci)
+        assert out["train_valid_gap_stale"] is True
+        assert "TRAIN_VALID_GAP_STALE" in format_replay(
+            "<lie-gap-overclaim>", data, ci
+        )
+
+
 class TestSignificantSurpassesBinding:
     """The stored-``significant_surpasses``-vs-rederived-``ci`` binding: the
     producer stamps ``significant_surpasses`` straight from the ``ci`` it computed

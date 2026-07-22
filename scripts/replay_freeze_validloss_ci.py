@@ -597,6 +597,84 @@ def _regime_label_stale(
     return stored != classify_regime(ce, ci.candidate_mean)
 
 
+def _train_valid_gap_stale(
+    data: dict[str, Any], ci: SurrogateValidLossCI
+) -> bool:
+    """True when a stored ``candidate_train_valid_gap`` float disagrees with
+    ``candidate_mean - candidate_final_ce_train_loss_mean`` re-derived from the
+    deposit's artifacts (GOAL §7 citation honesty).
+
+    The producer stamps ``candidate_train_valid_gap`` straight from the candidate
+    arm's held-out valid_loss minus its mean train cross-entropy
+    (:func:`scripts.run_freeze_validloss_ci_9b.result_to_json`,
+    ``candidate_train_valid_gap = candidate_valid - candidate_ce_mean`` where
+    ``candidate_valid = ci.candidate_mean`` and ``candidate_ce_mean`` is the
+    candidate's mean final train CE) — the precise train-valid gap whose SIGN and
+    MAGNITUDE a reader cites as the run's generalization posture (a small / negative
+    gap is textbook generalization; a large positive gap is overfit). It is the
+    FLOAT the regime axis discretizes: :func:`classify_regime` (and therefore the
+    stored ``regime`` label, bound by :func:`_regime_label_stale`) thresholds this
+    exact gap at ``_OVERFIT_GAP_THRESHOLD`` (0.5) — so the regime is a coarse read
+    off the SAME artifact pair the gap is the precise read off.
+
+    The gap this closes: :func:`_regime_label_stale` (``fd8c370``) binds the
+    DISCRETE regime label by re-deriving ``classify_regime(ce, candidate_mean)``
+    from the artifacts, but the discretization THROWS AWAY the precise gap value —
+    any repaint that keeps the regime label honest yet moves the cited gap across
+    an interpretation boundary (e.g. a genuine generalization gap of +0.01
+    repainted to +0.49, still under the 0.5 overfit threshold so ``regime`` stays
+    ``'generalization'`` and ``regime_label_stale`` stays ``False``) passes every
+    existing gate silently. :func:`_ci_stats_stale` / ``6ed0f69`` reaches only the
+    nine margin-invariant top-level statistics it enumerates
+    (:data:`_CI_STAT_BINDINGS`); ``candidate_train_valid_gap`` is deliberately not
+    among them (it is a train-CE-derived float, not a loss-derived CI statistic),
+    so it is unbound THERE. ``evidence_hash`` deliberately never covers derived
+    statistics (see :data:`src.tg_lora.freeze_evidence_hash.EVIDENCE_HASH_KEYS`),
+    and the train-CE mean the gap subtracts is itself a derived (not raw) field.
+    So a hand-edited or externally-supplied deposit that repaints the cited gap
+    while leaving ``candidate_mean`` / ``candidate_final_ce_train_loss_mean`` honest
+    — claiming a textbook-tight gap on a mildly-overfit run, or vice-versa — passes
+    every existing gate silently, AND on a citable deposit the stored gap directly
+    contradicts the gate's own re-derived gap in the same replay output (the
+    proof-of-need :class:`tests.test_replay_freeze_validloss_ci.
+    TestTrainValidGapBinding` reproduces — a repainted gap on the committed citable
+    full deposit keeps ``citable_as_full_section4_verdict=True``, ``regime_label_
+    stale=False``, ``faithful=True``, ``ci_stats_stale=[]``,
+    ``evidence_hash_stale=False`` and every gate green).
+
+    This binds the stored float to ``ci.candidate_mean -
+    float(candidate_final_ce_train_loss_mean)`` — the EXACT subtraction the producer
+    stamps (``ci.candidate_mean`` is reproduced bit-for-bit by the deterministic
+    bootstrap — :func:`_ci_stats_stale` already verifies ``candidate_mean`` binds
+    byte-identical — and the stamped train-CE mean is read back verbatim, so the
+    subtraction is bit-identical: verified across every committed deposit that
+    stamps the field, in both signs the committed deposits exercise, including the
+    negative-gap heterogeneous case), so it can never false-positive on an honest
+    producer-stamped deposit — and surfaces a disagreement loud (the prose
+    :func:`format_replay` ``TRAIN_VALID_GAP_STALE`` note, the quantitative sibling
+    of ``REGIME_LABEL_STALE``) rather than silently trusting the cited number. The
+    threat model mirrors :func:`_ci_stats_stale` / :func:`_regime_label_stale`
+    exactly: it catches the simple hand-edit (repaint the cited float without
+    repainting ``candidate_final_ce_train_loss_mean`` or the losses); a coordinated
+    repaint of the train-CE artifact TOGETHER with the gap is a distinct, harder
+    attack already caught by :func:`_regime_label_stale` (a train-CE repaint moves
+    the re-derived regime, so ``regime_label_stale`` fires) and — for raw evidence
+    bytes — by :func:`_evidence_hash_stale`. Returns False when the deposit carries
+    no stored gap or no train-CE mean (a recording that predates either field —
+    artifact-when-present-else-skip, same as :func:`_regime_label_stale` /
+    :func:`_ci_stats_stale`).
+    """
+    stored = data.get("candidate_train_valid_gap")
+    ce = data.get("candidate_final_ce_train_loss_mean")
+    if stored is None or ce is None:
+        return False
+    try:
+        rederived = ci.candidate_mean - float(ce)
+    except (TypeError, ValueError):
+        return False
+    return stored != rederived
+
+
 def _significant_surpasses_stale(
     data: dict[str, Any], ci: SurrogateValidLossCI
 ) -> bool:
@@ -1622,6 +1700,45 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
             "axis. Re-stamp the deposit from a fresh producer run (or correct the "
             "stored label) so it matches the train-CE + valid-loss artifacts."
         )
+    # §4 train-valid-gap staleness guard (the quantitative sibling of
+    # REGIME_LABEL_STALE above): a deposit whose STORED
+    # ``candidate_train_valid_gap`` float disagrees with
+    # ``candidate_mean - candidate_final_ce_train_loss_mean`` re-derived from its
+    # own artifacts has a stale or hand-edited cited gap. ``regime_label_stale``
+    # binds the DISCRETE regime label (re-derived via ``classify_regime``, which
+    # thresholds this same gap) but the discretization throws away the precise
+    # value — a repaint that keeps the regime honest yet moves the cited gap (e.g.
+    # a +0.01 generalization gap repainted to +0.49, still under the 0.5 overfit
+    # threshold) passes ``regime_label_stale`` silently; ``ci_stats_stale`` does
+    # not enumerate this train-CE-derived float; ``evidence_hash`` never covers
+    # derived statistics. So a hand-edited deposit that repaints the cited gap
+    # while leaving ``candidate_mean`` / ``candidate_final_ce_train_loss_mean``
+    # honest passes every existing gate silently, and on a citable deposit the
+    # stored gap directly contradicts the gate's own re-derived gap in this same
+    # report. The replay re-derives the gap from the SAME subtraction the producer
+    # stamped (``ci.candidate_mean`` reproduced bit-for-bit by the deterministic
+    # bootstrap; the stamped train-CE mean read back verbatim) and surfaces the
+    # contradiction loud rather than silently trusting the cited number — the
+    # stored-derived-float-trusted-over-artifact path this guard closes, the
+    # quantitative sibling of :func:`_regime_label_stale` (``fd8c370``) and
+    # :func:`_ci_stats_stale` (``6ed0f69``).
+    if _train_valid_gap_stale(data, ci):
+        stored = data.get("candidate_train_valid_gap")
+        ce = data.get("candidate_final_ce_train_loss_mean")
+        rederived = ci.candidate_mean - float(ce)
+        lines.append(
+            "  note: TRAIN_VALID_GAP_STALE — the recording's stored "
+            f"candidate_train_valid_gap={stored!r} disagrees with the value "
+            f"({rederived!r}) re-derived from its own candidate_mean="
+            f"{ci.candidate_mean!r} - candidate_final_ce_train_loss_mean={ce!r} "
+            "(the producer stamps the gap as the candidate's held-out valid_loss "
+            "minus its mean train CE — the precise generalization posture the "
+            "regime axis discretizes). The citation gate trusts the "
+            "artifact-derived answer over the stored float, so the cited gap is "
+            f"read as {rederived!r}. Re-stamp the deposit from a fresh producer "
+            "run (or correct the stored float) so it matches the candidate-mean + "
+            "train-CE artifacts."
+        )
     # §4 sub-verdict-label staleness guards (the §4 condition (a)/(b) siblings of
     # CITATION_LABEL_STALE): a deposit whose stored ``direction.verdict`` /
     # ``baseline.verdict`` label disagrees with the verdict re-derived from its
@@ -2044,6 +2161,23 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         # scale (``target_scale_label_stale``) + thin (``ci_stats_stale``) + budget
         # (here) + regime (here) all bound to their artifact-rederived truth.
         "regime_label_stale": _regime_label_stale(data, ci),
+        # §4 train-valid-gap staleness (the quantitative sibling of
+        # ``regime_label_stale`` above): the deposit stamps the candidate arm's
+        # held-out valid_loss minus its mean train CE — the precise
+        # generalization-posture gap whose SIGN and MAGNITUDE a reader cites; the
+        # replay re-derives it from ``ci.candidate_mean -
+        # candidate_final_ce_train_loss_mean`` (the SAME subtraction the producer
+        # stamps, bit-identical since ``candidate_mean`` reproduces byte-exact and
+        # the train-CE mean is read back verbatim) and flags a deposit whose cited
+        # gap no longer matches those artifacts (mirrors the prose
+        # TRAIN_VALID_GAP_STALE note; same helper — the two cannot drift).
+        # ``regime_label_stale`` binds only the DISCRETE regime label (which
+        # thresholds this gap and so is invariant under same-regime repaints);
+        # ``ci_stats_stale`` does not enumerate this train-CE-derived float. This
+        # is the one cross-check that reaches the cited gap float both skip.
+        # ``False`` when the deposit carries no stored gap or no train-CE mean (a
+        # recording that predates either field — artifact-when-present-else-skip).
+        "train_valid_gap_stale": _train_valid_gap_stale(data, ci),
         # §4 sub-verdict cross-checks (siblings of ``citation_label_stale``): each
         # stored ``direction.verdict`` / ``baseline.verdict`` label re-derived from
         # the deposit's per-arm losses with the producer's seed. A disagreement means
