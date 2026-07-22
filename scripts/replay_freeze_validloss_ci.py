@@ -85,6 +85,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -671,6 +672,102 @@ def _train_valid_gap_stale(
     try:
         rederived = ci.candidate_mean - float(ce)
     except (TypeError, ValueError):
+        return False
+    return stored != rederived
+
+
+def _candidate_final_ce_mean_from_deposit(data: dict[str, Any]) -> float | None:
+    """Re-derive the candidate arms' mean final train CE from the deposit's
+    ``candidate_provenance``, mirroring the producer's
+    :func:`scripts.run_freeze_validloss_ci_9b._candidate_final_ce_mean` bit-for-bit
+    (``float()``-coerce + ``math.isfinite`` skip + ``sum`` / ``len`` — arms
+    recorded before the diagnostic existed are skipped, not counted as 0).
+    Returns ``None`` when no candidate arm recorded a finite train CE. The
+    producer stamps ``candidate_provenance`` verbatim into the deposit, so this
+    reproduces the producer's stamped mean byte-identical (verified across every
+    committed deposit that stamps the field). Shared by the staleness check and
+    its prose note so the two cannot drift.
+    """
+    fces: list[float] = []
+    for prov in data.get("candidate_provenance") or []:
+        try:
+            fv = float(prov.get("final_ce_train_loss"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fv):
+            fces.append(fv)
+    if not fces:
+        return None
+    return sum(fces) / len(fces)
+
+
+def _candidate_final_ce_train_loss_mean_stale(data: dict[str, Any]) -> bool:
+    """True when a stored ``candidate_final_ce_train_loss_mean`` float disagrees
+    with the mean re-derived from the deposit's ``candidate_provenance`` (GOAL §7
+    citation honesty).
+
+    The producer stamps ``candidate_final_ce_train_loss_mean`` straight from the
+    candidate arms' recorded ``final_ce_train_loss``
+    (:func:`scripts.run_freeze_validloss_ci_9b._candidate_final_ce_mean` — the
+    arithmetic mean of every candidate arm's finite final train CE) — the
+    candidate's mean train cross-entropy under the final adapter. It is the
+    artifact BOTH the regime axis (:func:`_regime_label_stale`, via
+    :func:`classify_regime`'s 0.5 train-CE floor and 0.5 train-valid-gap threshold)
+    AND the cited gap (:func:`_train_valid_gap_stale`, via ``candidate_mean -
+    ce_mean``) derive from — the minuend the just-bound gap subtracts.
+
+    The gap this closes: ``candidate_provenance`` is hash-bound EVIDENCE
+    (:data:`src.tg_lora.freeze_evidence_hash.EVIDENCE_HASH_KEYS`), so each arm's
+    ``final_ce_train_loss`` byte cannot be repainted without tripping
+    :func:`_evidence_hash_stale`. But the TOP-LEVEL ``candidate_final_ce_train_
+    loss_mean`` is a DERIVED SUMMARY (deliberately not evidence — the same class
+    as the other derived statistics :func:`_evidence_hash_stale` skips), so the
+    evidence hash never reaches it. And :func:`_regime_label_stale` /
+    :func:`_train_valid_gap_stale` both READ the stored top-level mean as an INPUT
+    — neither compares it to the provenance it summarizes. So a hand-edited or
+    externally-supplied deposit that repaints the cited mean TOGETHER WITH
+    ``candidate_train_valid_gap`` (kept consistent: ``new_gap = candidate_mean -
+    new_ce``) and within the SAME regime bucket (a repaint that keeps
+    ``classify_regime(new_ce, candidate_mean) == stored regime`` — e.g. a sizeable
+    generalization gap of +0.33 repainted to +0.02, both well under the 0.5
+    overfit threshold) passes every existing gate silently:
+    ``train_valid_gap_stale=False`` (the gap was repainted to match the new mean),
+    ``regime_label_stale=False`` (the regime bucket is unchanged),
+    ``ci_stats_stale=[]`` (``candidate_mean`` untouched),
+    ``evidence_hash_stale=False`` (the provenance is untouched — only the derived
+    summary and the derived gap were repainted), ``faithful=True`` (the verdict
+    label is untouched). The published citable deposit then carries a corrupt
+    generalization-posture claim no gate surfaces (the proof-of-need
+    :class:`tests.test_replay_freeze_validloss_ci.TestCandidateFinalCeMeanBinding`
+    reproduces — a repainted mean on the committed citable full deposit keeps
+    ``citable_as_full_section4_verdict=True`` and every gate green). This is the
+    "coordinated repaint of the train-CE artifact together with the label" attack
+    the :func:`_train_valid_gap_stale` / :func:`_regime_label_stale` docstrings
+    describe as caught by :func:`_evidence_hash_stale` — but that defense holds
+    ONLY when the attacker touches the PROVENANCE; repainting the DERIVED SUMMARY
+    (not evidence) evades it, the precise asymmetry this guard closes.
+
+    This re-derives the mean from ``candidate_provenance`` with the EXACT
+    arithmetic the producer stamps (:func:`_candidate_final_ce_mean_from_deposit`)
+    — bit-identical since ``candidate_provenance`` is stamped verbatim (verified
+    across every committed deposit that stamps the field) — and surfaces a
+    disagreement loud (the prose :func:`format_replay`
+    ``CANDIDATE_FINAL_CE_TRAIN_LOSS_MEAN_STALE`` note, the provenance-summary
+    sibling of ``TRAIN_VALID_GAP_STALE``) rather than silently trusting the cited
+    mean. The threat model mirrors :func:`_train_valid_gap_stale` /
+    :func:`_ci_stats_stale`: it catches the simple hand-edit (repaint the cited
+    summary without repainting the per-arm provenance); a coordinated repaint of
+    the PROVENANCE bytes together with the summary is the distinct, harder attack
+    already caught by :func:`_evidence_hash_stale`. Returns False when the deposit
+    carries no stored mean or no candidate arm recorded a finite train CE (a
+    recording that predates the field — artifact-when-present-else-skip, same as
+    :func:`_train_valid_gap_stale` / :func:`_ci_stats_stale`).
+    """
+    stored = data.get("candidate_final_ce_train_loss_mean")
+    if stored is None:
+        return False
+    rederived = _candidate_final_ce_mean_from_deposit(data)
+    if rederived is None:
         return False
     return stored != rederived
 
@@ -1739,6 +1836,43 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
             "run (or correct the stored float) so it matches the candidate-mean + "
             "train-CE artifacts."
         )
+    # §4 candidate-train-CE-mean staleness guard (the provenance-summary sibling of
+    # TRAIN_VALID_GAP_STALE above): a deposit whose STORED
+    # ``candidate_final_ce_train_loss_mean`` disagrees with the mean re-derived from
+    # its own ``candidate_provenance`` (each arm's ``final_ce_train_loss``) has a
+    # stale or hand-edited cited train-CE. ``candidate_provenance`` is hash-bound
+    # EVIDENCE, so the per-arm train CE cannot be repainted without tripping
+    # ``evidence_hash_stale`` — but the TOP-LEVEL mean is a derived SUMMARY (not
+    # evidence), and ``regime_label_stale`` / ``train_valid_gap_stale`` both READ
+    # the stored mean as an INPUT rather than comparing it to the provenance it
+    # summarizes. So a coordinated repaint of the mean TOGETHER WITH
+    # ``candidate_train_valid_gap`` (kept consistent and within the same regime
+    # bucket) passes every existing gate silently: ``train_valid_gap_stale=False``
+    # (gap repainted to match), ``regime_label_stale=False`` (bucket unchanged),
+    # ``ci_stats_stale=[]``, ``evidence_hash_stale=False`` (provenance untouched),
+    # ``faithful=True`` — and on a citable deposit the stored mean directly
+    # contradicts the gate's own provenance-derived mean in this same report. The
+    # replay re-derives the mean with the EXACT arithmetic the producer stamps
+    # (``float()``-coerce + ``math.isfinite`` skip + ``sum/len`` over
+    # ``candidate_provenance``) and surfaces the contradiction loud rather than
+    # silently trusting the cited number — the stored-derived-summary-trusted-over-
+    # provenance path this guard closes, the provenance-summary sibling of
+    # :func:`_train_valid_gap_stale` (``2d56d59``) and :func:`_regime_label_stale`
+    # (``fd8c370``).
+    if _candidate_final_ce_train_loss_mean_stale(data):
+        stored = data.get("candidate_final_ce_train_loss_mean")
+        rederived = _candidate_final_ce_mean_from_deposit(data)
+        lines.append(
+            "  note: CANDIDATE_FINAL_CE_TRAIN_LOSS_MEAN_STALE — the recording's "
+            f"stored candidate_final_ce_train_loss_mean={stored!r} disagrees with "
+            f"the mean ({rederived!r}) re-derived from its own candidate_provenance "
+            "(the arithmetic mean of each candidate arm's finite "
+            "final_ce_train_loss — the artifact the regime axis thresholds and the "
+            "cited gap subtracts). The citation gate trusts the provenance-derived "
+            f"answer over the stored summary, so the cited train-CE mean is read as "
+            f"{rederived!r}. Re-stamp the deposit from a fresh producer run (or "
+            "correct the stored mean) so it matches the candidate_provenance."
+        )
     # §4 sub-verdict-label staleness guards (the §4 condition (a)/(b) siblings of
     # CITATION_LABEL_STALE): a deposit whose stored ``direction.verdict`` /
     # ``baseline.verdict`` label disagrees with the verdict re-derived from its
@@ -2178,6 +2312,27 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         # ``False`` when the deposit carries no stored gap or no train-CE mean (a
         # recording that predates either field — artifact-when-present-else-skip).
         "train_valid_gap_stale": _train_valid_gap_stale(data, ci),
+        # §4 candidate-train-CE-mean staleness (the provenance-summary sibling of
+        # ``train_valid_gap_stale`` above): the deposit stamps the candidate arms'
+        # mean final train CE straight from the producer's
+        # ``_candidate_final_ce_mean`` — the artifact BOTH the regime axis (via
+        # ``classify_regime``) and the cited gap (via ``candidate_mean - ce_mean``)
+        # derive from. ``candidate_provenance`` is hash-bound evidence, so the
+        # per-arm train CE cannot be repainted without tripping
+        # ``evidence_hash_stale`` — but the TOP-LEVEL mean is a derived summary (not
+        # evidence), and the regime / gap gates READ it as an input rather than
+        # comparing it to the provenance it summarizes. So a coordinated repaint of
+        # the mean + the cited gap (kept consistent, within the same regime bucket)
+        # passes every prior gate silently; the replay re-derives the mean from
+        # ``candidate_provenance`` with the producer's exact arithmetic and flags a
+        # deposit whose cited mean no longer matches the provenance (mirrors the
+        # prose CANDIDATE_FINAL_CE_TRAIN_LOSS_MEAN_STALE note; same helper — the two
+        # cannot drift). ``False`` when the deposit carries no stored mean or no
+        # candidate arm recorded a finite train CE (a recording that predates the
+        # field — artifact-when-present-else-skip).
+        "candidate_final_ce_train_loss_mean_stale": (
+            _candidate_final_ce_train_loss_mean_stale(data)
+        ),
         # §4 sub-verdict cross-checks (siblings of ``citation_label_stale``): each
         # stored ``direction.verdict`` / ``baseline.verdict`` label re-derived from
         # the deposit's per-arm losses with the producer's seed. A disagreement means
