@@ -29,6 +29,14 @@ _INREPO_TOPLEVELS = ("src", "scripts")
 # ``src.data`` is the private data pipeline, absent from this public mirror; its
 # absence is a mirror limitation, not a bootstrap regression.
 _PRIVATE_INREPO_MODULES = ("src.data",)
+# A private-pipeline frame in an import traceback: either the missing module is
+# itself under ``src.data`` (``No module named 'src.data.build_seed_dataset'``)
+# or a private ``src/data/*.py`` file appears in the chain. The upstream venv
+# leaks the private ``src`` into the namespace, so a script that imports
+# ``src.data.<x>`` runs a private ``src/data/<x>.py`` frame whose *downstream*
+# imports (e.g. ``src.utils.io``) then fail in the split namespace — the root
+# cause is the absent private pipeline, not the downstream module name.
+_PRIVATE_PIPELINE_ORIGIN = re.compile(r"\bsrc\.data\.\w+|src/data/\w+\.py")
 
 
 def _classify_cli_help_failure(stderr: str) -> str:
@@ -55,10 +63,38 @@ def _classify_cli_help_failure(stderr: str) -> str:
     module = match.group(1)
     if module in _PRIVATE_INREPO_MODULES:
         return "known_unavailable"
+    # A missing ``src.*`` module is normally a bootstrap defect — UNLESS the
+    # import chain runs through the private ``src.data`` pipeline, in which case
+    # the root cause is the absent private pipeline (a mirror limitation), not a
+    # repo-root resolution break. This catches the downstream shape the direct
+    # ``module in _PRIVATE_INREPO_MODULES`` check misses: e.g. ``src.utils.io``
+    # failing *inside* a private ``src/data/build_seed_dataset.py`` frame.
+    if _failure_originates_from_private_pipeline(stderr):
+        return "known_unavailable"
     top_level = module.split(".", 1)[0]
     if top_level in _INREPO_TOPLEVELS:
         return "bootstrap_defect"
     return "known_unavailable"
+
+
+def _failure_originates_from_private_pipeline(stderr: str) -> bool:
+    """True when the failing import chain runs through the private ``src.data``.
+
+    The private data pipeline (``src/data/*.py``) is stripped from this public
+    mirror. When the upstream venv leaks the private ``src`` into the namespace,
+    a script importing ``src.data.<x>`` executes a private ``src/data/<x>.py``
+    frame whose downstream imports then fail in a split namespace (e.g.
+    ``src.utils.io`` unresolvable there). The final ``ModuleNotFoundError``
+    names the downstream module, not ``src.data`` — so the direct check in
+    :func:`_classify_cli_help_failure` misses it and would wrongly flag a
+    bootstrap defect. This attributes the failure to its private-pipeline root
+    cause so the canary ``xfail``s the mirror limitation instead of failing.
+
+    A genuine in-repo import break (e.g. ``No module named 'src.model'`` with no
+    ``src.data`` in its traceback) does NOT match, so real bootstrap defects are
+    still surfaced — this is root-cause attribution, not masking.
+    """
+    return bool(_PRIVATE_PIPELINE_ORIGIN.search(stderr))
 
 # Scripts using argparse (exit 0 on --help)
 ARGPARSE_SCRIPTS = [
@@ -186,6 +222,56 @@ class TestClassifyCliHelpFailure:
 
     def test_private_src_data_pipeline_is_known_unavailable(self):
         assert _classify_cli_help_failure("No module named 'src.data'") == "known_unavailable"
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            # Direct private-submodule absence (clean public mirror, no private
+            # venv leak): the missing module is itself under src.data.
+            "No module named 'src.data.build_seed_dataset'",
+            "No module named 'src.data.filter_records'",
+            # The precompute_prefix_cache_parallel.py failure on the upstream
+            # venv: the script imports src.data.build_seed_dataset (private),
+            # whose frame then imports src.utils.io, which fails in the split
+            # namespace. The final error names src.utils.io, but the traceback
+            # chain runs through src/data/build_seed_dataset.py — root cause is
+            # the absent private pipeline.
+            (
+                "Traceback (most recent call last):\n"
+                "  File \"scripts/precompute_prefix_cache_parallel.py\", line 27, in <module>\n"
+                "    from src.data.build_seed_dataset import load_dataset\n"
+                "  File \"/home/jinno/tg-lora/src/data/build_seed_dataset.py\", line 7, in <module>\n"
+                "    from src.utils.io import load_jsonl\n"
+                "ModuleNotFoundError: No module named 'src.utils.io'"
+            ),
+        ],
+        ids=["src.data.submodule", "src.data.other-submod", "precompute-downstream"],
+    )
+    def test_private_pipeline_origin_is_known_unavailable(self, stderr):
+        # Regression for the precompute canary: a downstream src.* failure whose
+        # chain runs through the private src.data pipeline must xfail, not flag a
+        # bootstrap defect. Before the root-cause-attribution fix this was RED.
+        assert _classify_cli_help_failure(stderr) == "known_unavailable"
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            # Same downstream module name (src.utils.io) but NO src.data frame —
+            # a genuine in-repo import break, which must STILL fail the suite.
+            # Proves the downstream attribution is root-cause-based, not masking.
+            "No module named 'src.utils.io'",
+            "No module named 'src.model'",
+            (
+                "Traceback (most recent call last):\n"
+                "  File \"scripts/foo.py\", line 3, in <module>\n"
+                "    from src.model.lora_utils import iter_lora_params\n"
+                "ModuleNotFoundError: No module named 'src.model'"
+            ),
+        ],
+        ids=["src.utils.io-bare", "src.model-bare", "src.model-in-chain"],
+    )
+    def test_downstream_attribution_does_not_mask_real_inrepo_defect(self, stderr):
+        assert _classify_cli_help_failure(stderr) == "bootstrap_defect"
 
     @pytest.mark.parametrize(
         "stderr",
