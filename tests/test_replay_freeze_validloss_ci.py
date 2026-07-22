@@ -2797,6 +2797,253 @@ class TestTargetScaleLabelBinding:
             )
 
 
+class TestReducedBudgetLabelBinding:
+    """The four-axis gate's *budget* conjunct stored-label binding: the producer
+    stamps ``reduced_budget`` straight from ``is_reduced_budget(total_steps,
+    cfg_max_steps)`` (the §4 budget axis, one of the four conjuncts
+    :func:`full_section4_verdict_gate` ANDs). The replay now re-derives that
+    boolean from the deposit's own ``total_steps`` / ``cfg_max_steps`` artifacts
+    and flags a deposit whose stored ``reduced_budget`` no longer matches them —
+    the stored-axis-label-trusted-over-artifact path this guard closes, the
+    budget-axis sibling of :class:`TestTargetScaleLabelBinding` / ``37db498``
+    (the scale-axis label) and the budget counterpart of :class:`TestRegimeLabelBinding`
+    below. Completes the four-conjunct label family: scale (``proxy_scale``) +
+    thin (``is_thin_evidence``, via :class:`TestCiStatsBinding`) were already
+    bound; the budget and regime conjuncts were the two left unbound.
+
+    The gap this closes: :func:`_citation_label_stale` binds only the COMPOSITE
+    ``citable_as_full_section4_verdict`` boolean (which the producer's four-axis
+    gate re-derives from the artifacts, so a stored ``reduced_budget`` flip leaves
+    citability — and the composite gate — clean). So a hand-edited deposit that
+    flips ``reduced_budget`` while leaving ``total_steps`` / ``cfg_max_steps``
+    honest (over-claiming a full-budget run, or under-claiming a reduced one)
+    passes every existing gate silently. Proof of need (verified below): exactly
+    that edit on the committed baseline deposit keeps ``faithful=True``,
+    ``citation_label_stale=False``, ``ci_stats_stale=[]``,
+    ``evidence_hash_stale=False``; only this guard names the lie.
+    """
+
+    def test_committed_deposits_reduced_budget_matches_artifacts(self):
+        # BYTE-IDENTICAL invariant: for every committed 9B deposit, the stored
+        # ``reduced_budget`` boolean re-derives to ``reduced_budget_label_stale=False``
+        # — the producer stamps it from ``is_reduced_budget(total_steps, cfg_max_steps)``,
+        # so the replay reproduces it bit-for-bit from the same budget pair. A
+        # deposit that does not stamp the field (a proxy / legacy recording, or one
+        # lacking the budget artifacts) reports ``False`` with no note (the
+        # artifact-when-present-else-skip discipline, never a false-positive). A
+        # future deposit whose stamped boolean drifted from its budget (a botched
+        # harvest, a hand-edit) trips this. Reverting the re-derivation to trust
+        # the stored boolean makes every lie read as matching — the MUTATION
+        # resistance is the hand-edited tests below.
+        seen = False
+        for fixture in _9b_deposit_fixtures():
+            data = load_samples(fixture)
+            ci = replay_samples(data)
+            out = replay_to_json(fixture, data, ci)
+            prose = format_replay(fixture, data, ci)
+            if "reduced_budget" not in data:
+                assert out["reduced_budget_label_stale"] is False
+                assert "REDUCED_BUDGET_LABEL_STALE" not in prose
+                continue
+            seen = True
+            assert out["reduced_budget_label_stale"] is False, (
+                f"{fixture.name}: committed reduced_budget={data['reduced_budget']!r} "
+                f"diverges from is_reduced_budget({data.get('total_steps')!r}, "
+                f"{data.get('cfg_max_steps')!r})."
+            )
+            assert "REDUCED_BUDGET_LABEL_STALE" not in prose
+        assert seen, "expected at least one reduced_budget-stamping committed deposit"
+
+    def test_recording_without_reduced_budget_skips_cleanly(self):
+        # SKIP / false-positive discipline: a recording that carries sample lists
+        # and a main verdict but stamps NO ``reduced_budget`` (a legacy / minimal
+        # recording) must report CLEAN — the cross-check skips, never false-positives
+        # on a deposit that simply has no budget boolean to bind.
+        path = "synthetic-no-budget.json"
+        data = {
+            "candidate_losses": [1.0, 1.0, 1.0],
+            "surrogate_losses": [2.0, 2.0, 2.0],
+            "base_seed": 0,
+        }
+        ci = replay_samples(data)
+        out = replay_to_json(path, data, ci)
+        assert out["reduced_budget_label_stale"] is False
+        assert "REDUCED_BUDGET_LABEL_STALE" not in format_replay(path, data, ci)
+
+    def test_hand_edited_reduced_budget_underclaim_is_flagged(self):
+        # PRIMARY mutation proof (the corrupt-but-green path). The baseline deposit
+        # records ``reduced_budget=True`` (total_steps=96 << cfg_max_steps=1500):
+        # editing it to ``False`` — over-claiming a FULL-budget run the result was
+        # never — keeps the composite gate clean (the producer's four-axis gate
+        # re-derives ``reduced=True`` from the untouched budget pair, so
+        # ``citable_as_full_section4_verdict`` is unchanged and
+        # ``citation_label_stale`` stays ``False``), ``faithful=True``, the evidence
+        # hash clean (gate labels are not evidence), yet the stored boolean no longer
+        # matches the artifacts. ONLY this guard fires and emits the
+        # REDUCED_BUDGET_LABEL_STALE note.
+        data = load_samples(
+            [p for p in _9b_deposit_fixtures() if p.name.endswith("_baseline.json")][0]
+        )
+        assert data["reduced_budget"] is True  # the deposit is genuinely reduced
+        data["reduced_budget"] = False  # the lie: claim full-budget
+        ci = replay_samples(data)
+        out = replay_to_json("<lie-budget-underclaim>", data, ci)
+        # The COMPOSITE gate is untouched — the artifact-derived budget still says
+        # reduced, so citability and the composite-label cross-check stay clean.
+        assert out["citation_label_stale"] is False
+        assert out["faithful"] is True
+        assert out["ci_stats_stale"] == []
+        assert out["evidence_hash_stale"] is False
+        # ONLY this guard names the stored-boolean lie.
+        assert out["reduced_budget_label_stale"] is True
+        assert "REDUCED_BUDGET_LABEL_STALE" in format_replay(
+            "<lie-budget-underclaim>", data, ci
+        )
+
+    def test_hand_edited_reduced_budget_overclaim_is_flagged(self):
+        # Mutation proof (symmetric direction): the citable FULL deposit records
+        # ``reduced_budget=False`` (total_steps=1500 == cfg_max_steps=1500).
+        # Editing it to ``True`` — under-claiming a reduced run — is caught the
+        # same way (the symmetric lie), and crucially the deposit STAYS citable
+        # (the gate uses the artifact-derived budget), proving a stored-boolean
+        # flip never silently changes the §4 verdict while still corrupting the
+        # published budget claim.
+        data = load_samples(
+            [p for p in _9b_deposit_fixtures() if p.name.endswith("_full.json")][0]
+        )
+        assert data["reduced_budget"] is False  # genuinely full-budget
+        data["reduced_budget"] = True  # the lie: claim reduced
+        out = replay_to_json("<lie-budget-overclaim>", data, replay_samples(data))
+        assert out["reduced_budget_label_stale"] is True
+        # The deposit STAYS citable — the gate used the artifact-derived budget,
+        # not the flipped stored boolean — yet the published boolean now lies.
+        assert out["citable_as_full_section4_verdict"] is True
+        assert out["citation_label_stale"] is False
+
+
+class TestRegimeLabelBinding:
+    """The four-axis gate's *regime* conjunct stored-label binding: the producer
+    stamps ``regime`` straight from ``classify_regime(candidate_final_ce_train_loss_mean,
+    candidate_valid)`` (the §4 regime axis — generalization vs memorization vs
+    overfit — via the shared ``freeze_verdict_honesty`` leaf, imported ``as
+    _classify_regime`` into the producer so the producer and replay share ONE
+    classifier). The replay now re-derives that label from the deposit's own
+    train-CE + candidate-mean artifacts and flags a deposit whose stored
+    ``regime`` no longer matches them — the stored-axis-label-trusted-over-artifact
+    path this guard closes, the regime-axis sibling of
+    :class:`TestTargetScaleLabelBinding` / ``37db498`` (the scale-axis label) and
+    :class:`TestReducedBudgetLabelBinding` above (the budget-axis label).
+
+    The gap this closes: :func:`_producer_honesty_axes` already re-derives the
+    regime to feed the composite gate, and :func:`_citation_label_stale` binds
+    that COMPOSITE — but NEITHER compares the stored ``regime`` LABEL to the
+    re-derived label. So a hand-edited deposit that repaints ``regime`` while
+    leaving the train-CE artifact honest — over-claiming generalization on a
+    memorized run — passes every existing gate silently, and on a CITABLE deposit
+    the stored label directly contradicts the gate's own re-derived regime in the
+    same replay output. Proof of need (verified below): exactly that edit on the
+    committed citable full deposit keeps ``citable_as_full_section4_verdict=True``,
+    ``citation_label_stale=False``, ``faithful=True``, ``ci_stats_stale=[]``,
+    ``evidence_hash_stale=False``; only this guard names the lie.
+    """
+
+    def test_committed_deposits_regime_label_matches_artifacts(self):
+        # BYTE-IDENTICAL invariant: for every committed 9B deposit, the stored
+        # ``regime`` label re-derives to ``regime_label_stale=False`` — the
+        # producer stamps it from ``classify_regime`` (the shared leaf), so the
+        # replay reproduces it bit-for-bit from the same train-CE + candidate-mean
+        # artifacts. A deposit that does not stamp the label (a legacy / proxy
+        # recording, or one lacking the train-CE diagnostic) reports ``False`` with
+        # no note (artifact-when-present-else-skip, never a false-positive).
+        seen = False
+        for fixture in _9b_deposit_fixtures():
+            data = load_samples(fixture)
+            ci = replay_samples(data)
+            out = replay_to_json(fixture, data, ci)
+            prose = format_replay(fixture, data, ci)
+            if data.get("regime") is None or data.get(
+                "candidate_final_ce_train_loss_mean"
+            ) is None:
+                assert out["regime_label_stale"] is False
+                assert "REGIME_LABEL_STALE" not in prose
+                continue
+            seen = True
+            assert out["regime_label_stale"] is False, (
+                f"{fixture.name}: committed regime={data['regime']!r} diverges "
+                f"from classify_regime({data.get('candidate_final_ce_train_loss_mean')!r}, "
+                f"{ci.candidate_mean!r})."
+            )
+            assert "REGIME_LABEL_STALE" not in prose
+        assert seen, "expected at least one regime-stamping committed deposit"
+
+    def test_recording_without_regime_skips_cleanly(self):
+        # SKIP / false-positive discipline: a recording that carries sample lists
+        # and a main verdict but stamps NO ``regime`` (a legacy / minimal
+        # recording) must report CLEAN.
+        path = "synthetic-no-regime.json"
+        data = {
+            "candidate_losses": [1.0, 1.0, 1.0],
+            "surrogate_losses": [2.0, 2.0, 2.0],
+            "base_seed": 0,
+        }
+        ci = replay_samples(data)
+        out = replay_to_json(path, data, ci)
+        assert out["regime_label_stale"] is False
+        assert "REGIME_LABEL_STALE" not in format_replay(path, data, ci)
+
+    def test_hand_edited_regime_underclaim_is_flagged(self):
+        # PRIMARY mutation proof (the corrupt-but-green path, the worst case). The
+        # citable full deposit records ``regime='generalization'`` (train CE ~1.366
+        # vs valid ~1.695 -> generalization): editing the label to ``'memorization'``
+        # — claiming the run memorized — keeps the composite gate clean (the
+        # producer's four-axis gate re-derives ``regime='generalization'`` from the
+        # untouched train-CE artifact, so ``citable_as_full_section4_verdict`` stays
+        # ``True`` and ``citation_label_stale`` stays ``False``), ``faithful=True``,
+        # the evidence hash clean (gate labels are not evidence), yet the stored
+        # label no longer matches the artifacts AND the deposit STAYS citable as the
+        # complete §4 verdict with a contradictory regime claim. ONLY this guard
+        # fires and emits the REGIME_LABEL_STALE note.
+        data = load_samples(
+            [p for p in _9b_deposit_fixtures() if p.name.endswith("_full.json")][0]
+        )
+        assert data["regime"] == "generalization"  # genuinely generalizing
+        data["regime"] = "memorization"  # the lie: claim the run memorized
+        ci = replay_samples(data)
+        out = replay_to_json("<lie-regime-underclaim>", data, ci)
+        # The COMPOSITE gate is untouched — the artifact-derived regime still says
+        # generalization, so the deposit STAYS citable and the composite cross-check
+        # stays clean (the silent-corruption path: a citable deposit lying about
+        # its regime).
+        assert out["citable_as_full_section4_verdict"] is True
+        assert out["citation_label_stale"] is False
+        assert out["faithful"] is True
+        assert out["ci_stats_stale"] == []
+        assert out["evidence_hash_stale"] is False
+        assert out["producer_honesty_axis_failures"] == []  # gate used the artifact
+        # ONLY this guard names the stored-label lie.
+        assert out["regime_label_stale"] is True
+        assert "REGIME_LABEL_STALE" in format_replay("<lie-regime-underclaim>", data, ci)
+
+    def test_hand_edited_regime_overclaim_is_flagged(self):
+        # Mutation proof (symmetric direction): the heterogeneous_generalization
+        # deposit records ``regime='generalization'``; repainting it to
+        # ``'overfit'`` is caught the same way (the symmetric lie), proving the
+        # guard is not direction-specific.
+        data = load_samples(
+            [
+                p
+                for p in _9b_deposit_fixtures()
+                if p.name.endswith("_heterogeneous_generalization.json")
+            ][0]
+        )
+        assert data["regime"] == "generalization"
+        data["regime"] = "overfit"
+        ci = replay_samples(data)
+        out = replay_to_json("<lie-regime-overclaim>", data, ci)
+        assert out["regime_label_stale"] is True
+        assert "REGIME_LABEL_STALE" in format_replay("<lie-regime-overclaim>", data, ci)
+
+
 class TestSignificantSurpassesBinding:
     """The stored-``significant_surpasses``-vs-rederived-``ci`` binding: the
     producer stamps ``significant_surpasses`` straight from the ``ci`` it computed

@@ -450,6 +450,153 @@ def _target_scale_label_stale(data: dict[str, Any]) -> bool:
     return bool(stored) != (not proxy_scale)
 
 
+def _reduced_budget_label_stale(data: dict[str, Any]) -> bool:
+    """True when a stored ``reduced_budget`` boolean disagrees with
+    ``is_reduced_budget(total_steps, cfg_max_steps)`` re-derived from the
+    deposit's artifacts (GOAL §7 citation honesty).
+
+    The producer stamps ``reduced_budget`` straight from the four-axis gate's
+    budget conjunct (:func:`scripts.run_freeze_validloss_ci_9b.result_to_json`,
+    ``"reduced_budget": reduced`` where ``reduced = is_reduced_budget(total_steps,
+    cfg_max_steps)``) — the §4 *budget* axis, one of the four conjuncts
+    :func:`full_section4_verdict_gate` ANDs together. The replay re-derives the
+    SAME boolean from the deposit's own ``total_steps`` / ``cfg_max_steps`` via
+    the shared leaf (see :func:`_producer_honesty_axes`, which already feeds the
+    artifact-derived ``reduced`` into the composite
+    ``citable_as_full_section4_verdict`` gate) — so a deposit whose stored
+    ``reduced_budget`` was hand-edited (or externally supplied stale) cannot lie
+    about its budget at the citation gate. This is the *budget-axis* sibling of
+    :func:`_target_scale_label_stale` (``37db498``, the scale-axis stored label)
+    and completes the four-conjunct label family: scale (``proxy_scale`` →
+    :func:`_target_scale_label_stale`) and thin (``is_thin_evidence`` →
+    :data:`_CI_STAT_BINDINGS` / :func:`_ci_stats_stale`) were already bound; the
+    budget and regime conjuncts were not.
+
+    The gap this closes: :func:`_citation_label_stale` (``d734327``) binds the
+    *composite* ``citable_as_full_section4_verdict`` boolean (re-derived from the
+    four axes' artifacts), and :func:`_producer_honesty_axes` re-derives
+    ``reduced`` from the artifacts to feed that composite — but NEITHER compares
+    the stored ``reduced_budget`` BOOLEAN to ``is_reduced_budget(total_steps,
+    cfg_max_steps)``. So a hand-edited or externally-supplied deposit that flips
+    ``reduced_budget`` while leaving ``total_steps`` / ``cfg_max_steps`` honest —
+    over-claiming a full-budget run (``stored=False`` while ``total_steps <
+    cfg_max_steps``), or under-claiming a reduced one — passes every existing
+    gate silently: the composite uses the artifact-derived ``reduced`` (so
+    ``citable_as_full_section4_verdict`` is unchanged and
+    ``citation_label_stale`` stays ``False``), ``faithful=True`` (verdict label
+    untouched), ``ci_stats_stale=[]``, ``evidence_hash_stale=False`` (gate labels
+    are not evidence bytes). The published deposit JSON then carries a corrupt
+    budget claim no gate surfaces (the proof-of-need
+    :class:`tests.test_replay_freeze_validloss_ci.TestReducedBudgetLabelBinding`
+    reproduces — a flipped ``reduced_budget`` on the committed baseline deposit
+    keeps every gate green).
+
+    This binds the stored boolean to ``is_reduced_budget(total_steps,
+    cfg_max_steps)`` — re-derived with the SAME int-coercion the composite gate
+    uses (absent / unparsed → 0 → reduced, the conservative call), so it can never
+    false-positive on an honest producer-stamped deposit (verified byte-identical
+    across every committed fixture that stamps the field) — and surfaces a
+    disagreement loud (the prose :func:`format_replay` ``REDUCED_BUDGET_LABEL_STALE``
+    note, the budget-axis sibling of ``TARGET_SCALE_LABEL_STALE``) rather than
+    silently trusting the label. The threat model mirrors
+    :func:`_target_scale_label_stale` exactly: it catches the simple hand-edit
+    (flip the derived boolean without flipping ``total_steps`` / ``cfg_max_steps``);
+    a coordinated flip of those integers TOGETHER with the boolean is a distinct,
+    harder attack already caught by :func:`_evidence_hash_stale` (those integers
+    ARE evidence bytes). Returns False when the deposit carries no stored boolean
+    or no parseable budget pair (a recording that predates the field, or a proxy
+    / legacy recording — artifact-when-present-else-skip, same as
+    :func:`_target_scale_label_stale` / :func:`_ci_stats_stale`).
+    """
+    if "reduced_budget" not in data:
+        return False
+    try:
+        total_steps = int(data.get("total_steps"))
+    except (TypeError, ValueError):
+        total_steps = 0
+    try:
+        cfg_max_steps = int(data.get("cfg_max_steps"))
+    except (TypeError, ValueError):
+        cfg_max_steps = 0
+    # The budget pair must be present to bind: a deposit that stamps
+    # ``reduced_budget`` always stamps both integers (the producer derives the
+    # boolean from them). Absent integers → nothing to re-derive → skip (never
+    # false-positive on a deposit that simply lacks the budget artifacts).
+    if "total_steps" not in data or "cfg_max_steps" not in data:
+        return False
+    return bool(data.get("reduced_budget")) != is_reduced_budget(total_steps, cfg_max_steps)
+
+
+def _regime_label_stale(
+    data: dict[str, Any], ci: SurrogateValidLossCI
+) -> bool:
+    """True when a stored ``regime`` label disagrees with ``classify_regime``
+    re-derived from the deposit's artifacts (GOAL §7 citation honesty).
+
+    The producer stamps ``regime`` straight from the four-axis gate's regime
+    conjunct (:func:`scripts.run_freeze_validloss_ci_9b.result_to_json`,
+    ``"regime": _classify_regime(candidate_ce_mean, candidate_valid)``) — and
+    ``_classify_regime`` IS the shared leaf's :func:`classify_regime` (imported
+    ``as _classify_regime`` at the top of the producer), so the producer and the
+    replay compute the §4 *regime* axis (generalization / memorization / overfit /
+    unknown) from the SAME thresholds + rule. The regime axis is the one a bare
+    budget/scale gate would miss — a full-budget run that *memorized* (train CE →
+    0) must not be citable as the complete §4 verdict even at target scale and
+    full budget — so its stored label is load-bearing provenance a reader cites
+    as "did this run genuinely generalize?". The replay re-derives the SAME label
+    from the deposit's ``candidate_final_ce_train_loss_mean`` (the candidate arm's
+    mean train CE) compared against ``ci.candidate_mean`` (the recomputed
+    candidate valid_loss, identical to the producer's — the bootstrap is
+    deterministic over the stored losses). This is the *regime-axis* sibling of
+    :func:`_target_scale_label_stale` (``37db498``, the scale-axis stored label)
+    and :func:`_reduced_budget_label_stale` (the budget-axis stored label),
+    completing the four-conjunct label family the composite
+    :func:`_citation_label_stale` gate leaves per-axis-unbound.
+
+    The gap this closes: :func:`_producer_honesty_axes` already re-derives the
+    regime (``classify_regime(candidate_final_ce_train_loss_mean, ci.candidate_mean)``)
+    to feed the composite ``citable_as_full_section4_verdict`` gate, and
+    :func:`_citation_label_stale`` binds that COMPOSITE — but NEITHER compares the
+    stored ``regime`` LABEL to the re-derived label. So a hand-edited or
+    externally-supplied deposit that repaints ``regime`` while leaving the train-CE
+    artifact honest — over-claiming generalization on a memorized run, or
+    under-claiming a genuine one — passes every existing gate silently: the
+    composite uses the artifact-derived regime (so citability is unchanged and
+    ``citation_label_stale`` stays ``False``), ``faithful=True`` (verdict label
+    untouched), ``ci_stats_stale=[]``, ``evidence_hash_stale=False`` (the regime
+    label is a derived gate label, not evidence bytes — see
+    :data:`src.tg_lora.freeze_evidence_hash.EVIDENCE_HASH_KEYS`). The published
+    deposit JSON then carries a corrupt regime claim no gate surfaces, AND — on a
+    citable deposit — the stored ``regime`` directly contradicts the gate's own
+    re-derived regime in the same replay output (the proof-of-need
+    :class:`tests.test_replay_freeze_validloss_ci.TestRegimeLabelBinding`
+    reproduces — a flipped ``regime`` on the committed citable full deposit keeps
+    ``citable_as_full_section4_verdict=True`` and every gate green).
+
+    This binds the stored label to ``classify_regime(candidate_final_ce_train_loss_mean,
+    ci.candidate_mean)`` — the EXACT conjunct the producer stamps via the shared
+    leaf, so it can never false-positive on an honest producer-stamped deposit
+    (verified byte-identical across every committed fixture that stamps the field,
+    in all three regimes the committed deposits exercise) — and surfaces a
+    disagreement loud (the prose :func:`format_replay` ``REGIME_LABEL_STALE``
+    note, the regime-axis sibling of ``TARGET_SCALE_LABEL_STALE``) rather than
+    silently trusting the label. The threat model mirrors
+    :func:`_target_scale_label_stale` exactly: it catches the simple hand-edit
+    (flip the derived label without flipping ``candidate_final_ce_train_loss_mean``
+    or the losses); a coordinated flip of the train-CE artifact TOGETHER with the
+    label is a distinct, harder attack already caught by :func:`_evidence_hash_stale`
+    (the train-CE artifact IS an evidence byte). Returns False when the deposit
+    carries no stored label or no train-CE artifact (a recording that predates the
+    diagnostic — artifact-when-present-else-skip, same as
+    :func:`_target_scale_label_stale` / :func:`_reduced_budget_label_stale`).
+    """
+    stored = data.get("regime")
+    ce = data.get("candidate_final_ce_train_loss_mean")
+    if stored is None or ce is None:
+        return False
+    return stored != classify_regime(ce, ci.candidate_mean)
+
+
 def _significant_surpasses_stale(
     data: dict[str, Any], ci: SurrogateValidLossCI
 ) -> bool:
@@ -1406,6 +1553,75 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
             "citation. Re-stamp the deposit from a fresh producer run (or correct "
             "the stored boolean) so it matches proxy_scale."
         )
+    # §4 four-axis budget-conjunct staleness guard (the budget-axis sibling of
+    # TARGET_SCALE_LABEL_STALE above and CITATION_LABEL_STALE): a deposit whose
+    # STORED ``reduced_budget`` boolean disagrees with ``is_reduced_budget(total_steps,
+    # cfg_max_steps)`` re-derived from its own budget artifacts has a stale or
+    # hand-edited budget claim. ``citation_label_stale`` binds only the COMPOSITE
+    # ``citable_as_full_section4_verdict`` (which the producer's four-axis gate
+    # re-derives from the artifacts, so citability is unaffected by a stored-label
+    # flip and the composite stays clean); ``evidence_hash`` deliberately never
+    # covers gate labels. So a hand-edited deposit that flips ``reduced_budget``
+    # while leaving ``total_steps`` / ``cfg_max_steps`` honest (over-claiming a
+    # full-budget run, or under-claiming a reduced one) passes every existing gate
+    # silently. The replay re-derives the boolean from the SAME budget pair the
+    # producer stamped it from and surfaces the contradiction loud rather than
+    # silently trusting the label — the stored-axis-label-trusted-over-artifact
+    # path this guard closes, the budget-axis sibling of :func:`_target_scale_label_stale`
+    # (``37db498``, the scale-axis label).
+    if _reduced_budget_label_stale(data):
+        stored = data.get("reduced_budget")
+        total_steps = data.get("total_steps")
+        cfg_max_steps = data.get("cfg_max_steps")
+        rederived = is_reduced_budget(
+            int(total_steps) if total_steps is not None else 0,
+            int(cfg_max_steps) if cfg_max_steps is not None else 0,
+        )
+        lines.append(
+            "  note: REDUCED_BUDGET_LABEL_STALE — the recording's stored "
+            f"reduced_budget={stored!r} disagrees with the value ({rederived!r}) "
+            f"re-derived from its own total_steps={total_steps!r} / "
+            f"cfg_max_steps={cfg_max_steps!r} (the producer's four-axis gate's "
+            "budget conjunct, = is_reduced_budget(total_steps, cfg_max_steps)). "
+            "The citation gate trusts the artifact-derived answer over the stored "
+            f"label, so the run is read as {'reduced' if rederived else 'full'}-"
+            "budget for the §4 budget axis. Re-stamp the deposit from a fresh "
+            "producer run (or correct the stored boolean) so it matches the budget."
+        )
+    # §4 four-axis regime-conjunct staleness guard (the regime-axis sibling of
+    # REDUCED_BUDGET_LABEL_STALE / TARGET_SCALE_LABEL_STALE above and
+    # CITATION_LABEL_STALE): a deposit whose STORED ``regime`` label disagrees
+    # with ``classify_regime(candidate_final_ce_train_loss_mean, candidate_mean)``
+    # re-derived from its own train-CE + valid-loss artifacts has a stale or
+    # hand-edited regime claim. ``citation_label_stale`` binds only the COMPOSITE
+    # gate (whose regime input the producer re-derives from the artifacts, so a
+    # stored-label flip leaves citability — and the composite gate — clean);
+    # ``evidence_hash`` deliberately never covers gate labels. So a hand-edited
+    # deposit that repaints ``regime`` while leaving ``candidate_final_ce_train_loss_mean``
+    # honest — over-claiming generalization on a memorized run, or under-claiming a
+    # genuine one — passes every existing gate silently, and on a citable deposit
+    # the stored label directly contradicts the gate's own re-derived regime in
+    # this same report. The replay re-derives the label from the SAME artifacts
+    # the producer stamped it from (via the shared ``freeze_verdict_honesty`` leaf)
+    # and surfaces the contradiction loud rather than silently trusting the label —
+    # the stored-axis-label-trusted-over-artifact path this guard closes, the
+    # regime-axis sibling of :func:`_target_scale_label_stale` (``37db498``).
+    if _regime_label_stale(data, ci):
+        stored = data.get("regime")
+        ce = data.get("candidate_final_ce_train_loss_mean")
+        rederived = classify_regime(ce, ci.candidate_mean)
+        lines.append(
+            "  note: REGIME_LABEL_STALE — the recording's stored "
+            f"regime={stored!r} disagrees with the value ({rederived!r}) "
+            f"re-derived from its own candidate_final_ce_train_loss_mean={ce!r} "
+            f"vs candidate_mean={ci.candidate_mean!r} (the producer's four-axis "
+            "gate's regime conjunct, = classify_regime via the shared leaf; the "
+            "regime axis separates a generalizing run from one that memorized). "
+            "The citation gate trusts the artifact-derived answer over the stored "
+            f"label, so the run is read as regime={rederived!r} for the §4 regime "
+            "axis. Re-stamp the deposit from a fresh producer run (or correct the "
+            "stored label) so it matches the train-CE + valid-loss artifacts."
+        )
     # §4 sub-verdict-label staleness guards (the §4 condition (a)/(b) siblings of
     # CITATION_LABEL_STALE): a deposit whose stored ``direction.verdict`` /
     # ``baseline.verdict`` label disagrees with the verdict re-derived from its
@@ -1791,6 +2007,43 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
         # Level-1 citation claim (mirrors the prose TARGET_SCALE_LABEL_STALE note;
         # absent for recordings that carry no stored boolean).
         "target_scale_label_stale": _target_scale_label_stale(data),
+        # §4 four-axis budget-conjunct cross-check (the budget-axis sibling of
+        # ``citation_label_stale`` / ``target_scale_label_stale``): does the
+        # deposit's stored ``reduced_budget`` boolean agree with
+        # ``is_reduced_budget(total_steps, cfg_max_steps)`` re-derived from its
+        # own budget artifacts (the producer's four-axis gate's budget conjunct)?
+        # ``citation_label_stale`` binds only the COMPOSITE gate (whose budget
+        # input the producer re-derives from the artifacts, so citability is
+        # unaffected by a stored-boolean flip); ``evidence_hash`` never covers gate
+        # labels. So a hand-edited deposit that flips ``reduced_budget`` while
+        # leaving ``total_steps`` / ``cfg_max_steps`` honest passes every existing
+        # gate silently — this is the one cross-check that flags a flipped budget
+        # claim (mirrors the prose REDUCED_BUDGET_LABEL_STALE note; same helper —
+        # the two cannot drift). ``False`` when the deposit carries no stored
+        # boolean or no parseable budget pair (a recording that predates the field
+        # — the artifact-when-present discipline, same as ``target_scale_label_stale``).
+        "reduced_budget_label_stale": _reduced_budget_label_stale(data),
+        # §4 four-axis regime-conjunct cross-check (the regime-axis sibling of
+        # ``reduced_budget_label_stale`` / ``target_scale_label_stale``): does the
+        # deposit's stored ``regime`` label agree with ``classify_regime`` re-derived
+        # from its own ``candidate_final_ce_train_loss_mean`` vs ``candidate_mean``
+        # (the producer's four-axis gate's regime conjunct, via the shared
+        # ``freeze_verdict_honesty`` leaf — the SAME ``_classify_regime`` the
+        # producer stamps)? ``citation_label_stale`` binds only the COMPOSITE gate
+        # (whose regime input the producer re-derives from the artifacts); a
+        # stored-label flip leaves citability and the composite clean, and
+        # ``evidence_hash`` never covers gate labels — so a hand-edited deposit that
+        # repaints ``regime`` while leaving the train-CE artifact honest passes every
+        # existing gate silently (and on a citable deposit the stored label directly
+        # contradicts the gate's re-derived regime). This is the one cross-check that
+        # flags a flipped regime claim (mirrors the prose REGIME_LABEL_STALE note;
+        # same helper — the two cannot drift). ``False`` when the deposit carries no
+        # stored label or no train-CE artifact (a recording that predates the
+        # diagnostic — the artifact-when-present discipline, same as
+        # ``reduced_budget_label_stale``). Completes the four-conjunct label family:
+        # scale (``target_scale_label_stale``) + thin (``ci_stats_stale``) + budget
+        # (here) + regime (here) all bound to their artifact-rederived truth.
+        "regime_label_stale": _regime_label_stale(data, ci),
         # §4 sub-verdict cross-checks (siblings of ``citation_label_stale``): each
         # stored ``direction.verdict`` / ``baseline.verdict`` label re-derived from
         # the deposit's per-arm losses with the producer's seed. A disagreement means
