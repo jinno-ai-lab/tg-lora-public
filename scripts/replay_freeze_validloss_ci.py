@@ -668,10 +668,10 @@ def _passes_stale(
     return bool(stored) != rederived
 
 
-def _subverdict_rederived(
+def _subverdict_ci(
     data: dict[str, Any], *, losses_key: str
-) -> str | None:
-    """Re-derive a §4 sub-verdict (direction / baseline) from the deposit's stored
+) -> SurrogateValidLossCI | None:
+    """Re-derive a §4 sub-CI (direction / baseline) from the deposit's stored
     per-arm losses with the producer's seed (GOAL §7 citation honesty).
 
     The producer (:func:`scripts.run_freeze_validloss_ci_9b.run_ci_9b`,
@@ -680,20 +680,22 @@ def _subverdict_rederived(
     direction-isolation CI from ``control_losses`` (output-contiguous vs
     input-contiguous), the full-backprop baseline CI from ``baseline_losses``
     (progressive-freeze candidate vs no-freeze full-CE). The replay re-derives the
-    SAME verdict from the stored floats — the same deterministic bootstrap over the
-    same per-arm losses with the same seed — so a deposit whose stored
-    ``direction.verdict`` / ``baseline.verdict`` label was hand-edited (or
-    externally supplied stale) cannot pass the citation gate silently: the label is
-    cross-checked against the artifact reality, the same "stored-label-trusted-over-
-    artifact" class as :func:`_citation_label_stale` (``d734327``) and its budget /
-    full-context siblings (``9dff092`` / ``bbf6e68``), now extended to the two §4
-    condition-(a)/(b) sub-verdicts the producer stamps beside the main verdict.
+    SAME CI from the stored floats — the same deterministic bootstrap over the same
+    per-arm losses with the same seed — so a deposit whose stored
+    ``direction.verdict`` / ``baseline.verdict`` label, OR whose stored sub-CI
+    FLOATS, were hand-edited (or externally supplied stale) cannot pass the
+    citation gate silently: both are cross-checked against the artifact reality,
+    the same "stored-X-trusted-over-artifact" class as :func:`_citation_label_stale`
+    (``d734327``) and :func:`_ci_stats_stale` (``6ed0f69``), now extended to the two
+    §4 condition-(a)/(b) sub-verdicts the producer stamps beside the main verdict.
 
-    Returns the re-derived ``SURPASSES`` / ``TIES`` / ``UNDERSHOOTS`` label, or
-    ``None`` when the deposit carries no per-arm losses for that slot (the arm did
-    not run — ``control_losses`` / ``baseline_losses`` absent or empty) or no
-    candidate losses — there is nothing to re-derive, so the staleness cross-check
-    (:func:`_subverdict_stale`) reads False.
+    Returns the full re-derived :class:`~src.tg_lora.freeze_surrogate_ci.
+    SurrogateValidLossCI` (whose ``.significance_verdict`` / ``.lower`` / ``.upper``
+    / means / ... the label and float gates compare against), or ``None`` when the
+    deposit carries no per-arm losses for that slot (the arm did not run —
+    ``control_losses`` / ``baseline_losses`` absent or empty) or no candidate losses
+    — there is nothing to re-derive, so both staleness cross-checks
+    (:func:`_subverdict_stale`, :func:`_subverdict_ci_stats_stale`) read False.
     """
     candidate_losses = data.get("candidate_losses")
     arm_losses = data.get(losses_key)
@@ -702,9 +704,23 @@ def _subverdict_rederived(
     if not isinstance(arm_losses, list) or not arm_losses:
         return None
     seed = int(data.get("base_seed", 0))
-    return surrogate_valid_loss_ci(
-        candidate_losses, arm_losses, seed=seed
-    ).significance_verdict
+    return surrogate_valid_loss_ci(candidate_losses, arm_losses, seed=seed)
+
+
+def _subverdict_rederived(
+    data: dict[str, Any], *, losses_key: str
+) -> str | None:
+    """The significance verdict re-derived from the deposit's per-arm losses.
+
+    Thin wrapper over :func:`_subverdict_ci` that returns just the
+    ``significance_verdict`` label the label-staleness cross-check
+    (:func:`_subverdict_stale`) compares against; the full CI object is kept by
+    :func:`_subverdict_ci` so :func:`_subverdict_ci_stats_stale` can also bind the
+    nested CI FLOATS. Returns ``None`` when the arm did not run (see
+    :func:`_subverdict_ci`).
+    """
+    ci = _subverdict_ci(data, losses_key=losses_key)
+    return None if ci is None else ci.significance_verdict
 
 
 def _subverdict_stale(
@@ -736,6 +752,100 @@ def _subverdict_stale(
     if rederived is None:
         return False
     return stored != rederived
+
+
+# Each §4 sub-verdict's margin-invariant derived statistic, keyed by the slot the
+# producer stamps it under (``direction`` / ``baseline``), paired with the
+# attribute of the re-derived :class:`~SurrogateValidLossCI` it must equal. The two
+# slots share the candidate / CI-bound / confidence / thin / sample-size fields but
+# RELABEL the comparison arm: the direction arm's ``surrogate_mean`` /
+# ``n_surrogate`` are stamped ``control_mean`` / ``n_control`` (input-contiguous
+# control) and the baseline arm's are stamped ``baseline_mean`` / ``n_baseline``
+# (no-freeze full-CE). Mirrors :data:`_CI_STAT_BINDINGS` (the TOP-LEVEL main-verdict
+# statistics) for the NESTED sub-verdict statistics; ``point_improvement`` /
+# ``is_material`` / ``passes`` are excluded HERE exactly as they are THERE
+# (``point_improvement`` is margin-invariant and so IS bound; the margin-dependent
+# booleans are not stamped on a sub-verdict and stay out of scope).
+_SUBVERDICT_CI_BINDINGS: dict[str, tuple[tuple[str, str], ...]] = {
+    "direction": (
+        ("candidate_mean", "candidate_mean"),
+        ("control_mean", "surrogate_mean"),
+        ("point_improvement", "point_improvement"),
+        ("lower", "lower"),
+        ("upper", "upper"),
+        ("confidence", "confidence"),
+        ("is_thin_evidence", "is_thin_evidence"),
+        ("n_candidate", "n_candidate"),
+        ("n_control", "n_surrogate"),
+    ),
+    "baseline": (
+        ("candidate_mean", "candidate_mean"),
+        ("baseline_mean", "surrogate_mean"),
+        ("point_improvement", "point_improvement"),
+        ("lower", "lower"),
+        ("upper", "upper"),
+        ("confidence", "confidence"),
+        ("is_thin_evidence", "is_thin_evidence"),
+        ("n_candidate", "n_candidate"),
+        ("n_baseline", "n_surrogate"),
+    ),
+}
+
+
+def _subverdict_ci_stats_stale(
+    data: dict[str, Any], *, slot: str, losses_key: str
+) -> list[str]:
+    """Stored derived §4 sub-verdict statistics that disagree with the sub-CI
+    re-derived from the deposit's per-arm losses (GOAL §7).
+
+    The NESTED sibling of :func:`_ci_stats_stale` (``6ed0f69``, which binds only the
+    TOP-LEVEL main-verdict statistics) and the float counterpart of
+    :func:`_subverdict_stale` / ``371e934`` (which binds only the sub-verdict
+    significance LABEL, never its floats). The deposit stamps each sub-verdict's
+    QUANTITATIVE backing — candidate / comparison-arm means, point improvement,
+    bootstrap CI bounds, confidence, sample sizes, thin-evidence flag — straight
+    from the sub-CI the producer computed the sub-verdict from
+    (:func:`scripts.run_freeze_validloss_ci_9b._direction_ci_to_json` /
+    :func:`_baseline_ci_to_json`); :func:`_subverdict_ci` reproduces that sub-CI
+    GPU-free from the stored ``candidate_losses`` plus the arm's losses
+    (``control_losses`` / ``baseline_losses``) with the producer's seed, so each
+    stamped statistic is re-derivable bit-for-bit.
+
+    The gap this closes: ``faithful`` binds only the MAIN verdict label,
+    ``_ci_stats_stale`` reaches only the top-level ``data[key]`` floats (never the
+    nested ``baseline.*`` / ``direction.*`` sub-dict), ``_subverdict_stale`` re-
+    derives only the sub-verdict significance LABEL, and ``evidence_hash`` / the
+    ledger bindings cover only raw evidence. So a hand-edited deposit that repaints
+    the cited sub-verdict MAGNITUDE — e.g. the §4 condition-(a) ``baseline.point_
+    improvement`` from the honest 0.18 to 0.95 and ``baseline.upper`` to 0.99 —
+    keeps the baseline verdict LABEL honest (it matches the verdict re-derived from
+    the untouched losses), ``faithful=True``, ``ci_stats_stale=[]`` (top-level
+    floats untouched), every evidence / ledger / label gate green, yet the cited
+    condition-(a) win is a lie and the deposit stays citable. ONLY this guard names
+    the repainted statistic. (Proof of need: that exact edit on the committed
+    citable TIES full deposit passes every prior gate silently — reproduced by the
+    ``TestSubVerdictCiStatsBinding`` reachability test.)
+
+    Returns the names of the disagreeing statistics (bare keys, since the slot is
+    encoded in the calling field ``direction_ci_stats_stale`` /
+    ``baseline_ci_stats_stale``); empty when every stamped statistic matches, the
+    slot is absent (the arm did not run), the sub-CI cannot be re-derived, or the
+    deposit stamps none of these statistics (the artifact-when-present-else-skip
+    discipline, same as :func:`_ci_stats_stale` / :func:`_subverdict_stale`).
+    """
+    sub = data.get(slot)
+    if not isinstance(sub, dict):
+        return []
+    ci = _subverdict_ci(data, losses_key=losses_key)
+    if ci is None:
+        return []
+    stale: list[str] = []
+    for stored_key, ci_attr in _SUBVERDICT_CI_BINDINGS[slot]:
+        if stored_key not in sub:
+            continue
+        if sub[stored_key] != getattr(ci, ci_attr):
+            stale.append(stored_key)
+    return stale
 
 
 # The verdict-critical per-arm loss vectors a deposit stamps, keyed by the ledger
@@ -1326,6 +1436,46 @@ def format_replay(path: str | Path, data: dict[str, Any], ci: SurrogateValidLoss
                 "deposit from a fresh producer run (or correct the stored label) "
                 "so it matches the losses."
             )
+    # §4 sub-verdict-statistics staleness guard (the NESTED sibling of
+    # CI_STATS_STALE above and the float counterpart of the sub-verdict label
+    # guards above): the deposit stamps each sub-verdict's QUANTITATIVE backing —
+    # candidate / comparison-arm means, point improvement, bootstrap CI bounds,
+    # confidence, sample sizes, thin-evidence flag — straight from the sub-CI the
+    # producer computed it from. ``_subverdict_stale`` re-derives only the
+    # significance LABEL, ``_ci_stats_stale`` reaches only the TOP-LEVEL floats,
+    # and ``faithful`` / ``evidence_hash`` cover only the main verdict / raw
+    # evidence, so a hand-edited deposit that repaints the cited sub-verdict
+    # magnitude (e.g. ``baseline.point_improvement`` 0.18 → 0.95) while keeping the
+    # baseline verdict label, main verdict, top-level stats, and evidence all
+    # honest passes every prior gate silently. The replay re-derives each
+    # margin-invariant sub-statistic from the SAME per-arm losses + seed and
+    # surfaces a disagreement loud — the stored-sub-statistic-trusted-over-artifact
+    # path this guard closes, the nested sibling of :func:`_ci_stats_stale`
+    # (``6ed0f69``) and the float counterpart of :func:`_subverdict_stale`
+    # (``371e934``). Skips statistics the sub-verdict does not stamp; fires only
+    # when the arm ran (the slot is present and non-null).
+    for slot, losses_key, note in (
+        ("direction", "control_losses", "DIRECTION_CI_STATS_STALE"),
+        ("baseline", "baseline_losses", "BASELINE_CI_STATS_STALE"),
+    ):
+        sub_stats_stale = _subverdict_ci_stats_stale(
+            data, slot=slot, losses_key=losses_key
+        )
+        if sub_stats_stale:
+            stats_clause = ", ".join(sub_stats_stale)
+            lines.append(
+                f"  note: {note} — the recording's stored {slot} sub-verdict "
+                f"statistics ({stats_clause}) disagree with the values re-derived "
+                f"from its stored {losses_key} (the same candidate-vs-arm two-sample "
+                "bootstrap the producer computed the sub-CI with, under the "
+                "deposit's base_seed). The sub-verdict LABEL, the main verdict, and "
+                "the raw losses may all still be honest (so the sub-verdict label "
+                "gate, `faithful`, `ci_stats_stale`, and `evidence_hash` stay clean) "
+                "— only the cited quantitative backing (means, CI bounds, point "
+                "improvement) was repainted. The replay trusts the artifact-derived "
+                "numbers over the stored ones. Re-stamp the deposit from a fresh "
+                "producer run so the sub-statistics match the losses (GOAL §7)."
+            )
     # §4 verdict-statistics staleness guard (sibling of CITATION_LABEL_STALE and
     # the sub-verdict guards above): the deposit stamps the main verdict's
     # QUANTITATIVE backing — candidate / surrogate means, point improvement,
@@ -1658,6 +1808,27 @@ def replay_to_json(path: str | Path, data: dict[str, Any], ci: SurrogateValidLos
             data, losses_key="baseline_losses"
         ),
         "baseline_verdict_stale": _subverdict_stale(
+            data, slot="baseline", losses_key="baseline_losses"
+        ),
+        # §4 sub-verdict-statistics staleness (the NESTED sibling of
+        # ``ci_stats_stale`` above and the float counterpart of the sub-verdict
+        # label gates above): the deposit stamps each sub-verdict's QUANTITATIVE
+        # backing (means, CI bounds, point improvement, confidence, sample sizes,
+        # thin-evidence flag) straight from the producer's sub-CI; the replay
+        # re-derives each margin-invariant sub-statistic from the SAME per-arm
+        # losses + seed and flags a deposit whose stored sub-numbers no longer
+        # match the losses (mirrors the prose DIRECTION_CI_STATS_STALE /
+        # BASELINE_CI_STATS_STALE notes; same helper — the two cannot drift). Empty
+        # when every stamped sub-statistic matches, the arm did not run (the slot is
+        # null), or the deposit stamps none (the artifact-when-present discipline).
+        # ``_subverdict_stale`` binds only the sub-verdict significance LABEL;
+        # ``_ci_stats_stale`` binds only the TOP-LEVEL floats. This is the one
+        # cross-check that reaches the cited sub-verdict NUMBERS the sub-verdict
+        # label and the top-level stats both skip.
+        "direction_ci_stats_stale": _subverdict_ci_stats_stale(
+            data, slot="direction", losses_key="control_losses"
+        ),
+        "baseline_ci_stats_stale": _subverdict_ci_stats_stale(
             data, slot="baseline", losses_key="baseline_losses"
         ),
         # Committed-ledger binding (the deposit-vs-ledger sibling of the

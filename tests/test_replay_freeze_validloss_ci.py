@@ -1689,6 +1689,227 @@ class TestSubVerdictLabelStaleness:
                 )
 
 
+class TestSubVerdictCiStatsBinding:
+    """The deposit-vs-its-own-sub-verdict-statistics binding: the producer stamps
+    each §4 sub-verdict's QUANTITATIVE backing — the candidate / comparison-arm
+    means, point improvement, bootstrap CI bounds, confidence, sample sizes,
+    thin-evidence flag — straight from the sub-CI it computed the sub-verdict from
+    (:func:`scripts.run_freeze_validloss_ci_9b._baseline_ci_to_json` /
+    :func:`_direction_ci_to_json`). The replay now re-derives each margin-invariant
+    sub-statistic from the SAME stored per-arm losses + seed and flags a deposit
+    whose stored sub-numbers no longer match the losses it cites — the
+    stored-derived-sub-statistic-trusted-over-artifact path this guard closes, the
+    NESTED sibling of :class:`TestCiStatsBinding` / ``6ed0f69`` (which binds only
+    the TOP-LEVEL main-verdict statistics) and :class:`TestSubVerdictLabelStaleness`
+    / ``371e934`` (which binds only the sub-verdict LABEL, not its floats).
+
+    The gap this closes: ``_subverdict_stale`` re-derives only the sub-verdict
+    SIGNIFICANCE LABEL (``SURPASSES`` / ``TIES``) and ``_ci_stats_stale`` reaches
+    only the top-level ``data[key]`` floats (never the nested ``baseline.*`` /
+    ``direction.*`` sub-dict), while ``evidence_hash`` deliberately excludes the
+    derived statistics and ``faithful`` covers only the main verdict. So a
+    hand-edited deposit that repaints the CITED baseline magnitude — say the §4
+    condition-(a) ``baseline.point_improvement`` from the honest 0.18 to 0.95 and
+    ``baseline.upper`` to 0.99 — keeps ``baseline.verdict`` honest (matches the
+    re-derived label), ``faithful=True`` (main verdict untouched),
+    ``ci_stats_stale=[]`` (top-level floats untouched), every evidence / ledger /
+    label gate green, yet the cited condition-(a) win is a 5x lie and the deposit
+    stays ``citable_as_full_section4_verdict=True``. Proof of need (verified
+    below): exactly that edit on the committed citable TIES full deposit passes
+    every prior gate silently; only this guard names ``point_improvement`` in
+    ``baseline_ci_stats_stale``.
+    """
+
+    def test_committed_deposits_sub_verdict_stats_match_losses(self):
+        # BYTE-IDENTICAL invariant: for every committed 9B deposit, each sub-verdict
+        # slot that ran (``baseline`` / ``direction`` is a dict) re-derives to an
+        # EMPTY stale list — the producer stamps each nested float from the sub-CI
+        # the deterministic bootstrap produced, so the replay reproduces them
+        # bit-for-bit from the same per-arm losses + seed. A slot that did not run
+        # (``None``) reports ``[]`` with no note (the artifact-when-present-else-skip
+        # discipline, never a false-positive). A future deposit whose stamped
+        # sub-numbers drifted from its losses (a botched harvest, a hand-edit) trips
+        # this and the silent repaint is prevented. Reverting the re-derivation to
+        # trust the stored floats makes every lie read as matching, so this holds —
+        # the MUTATION resistance is the hand-edited tests below.
+        seen = False
+        for fixture in _9b_deposit_fixtures():
+            data = load_samples(fixture)
+            ci = replay_samples(data)
+            out = replay_to_json(fixture, data, ci)
+            prose = format_replay(fixture, data, ci)
+            for slot, lk in (
+                ("direction", "control_losses"),
+                ("baseline", "baseline_losses"),
+            ):
+                if not isinstance(data.get(slot), dict):
+                    assert out[f"{slot}_ci_stats_stale"] == []
+                    assert f"{slot.upper()}_CI_STATS_STALE" not in prose
+                    continue
+                seen = True
+                assert out[f"{slot}_ci_stats_stale"] == [], (
+                    f"{fixture.name}: committed {slot} sub-statistics diverge from "
+                    f"the re-derived sub-ci on {out[slot + '_ci_stats_stale']!r}."
+                )
+                assert f"{slot.upper()}_CI_STATS_STALE" not in prose
+        assert seen, "expected at least one sub-verdict-stamping committed deposit"
+
+    def test_recording_without_sub_verdict_stats_skips_cleanly(self):
+        # SKIP / false-positive discipline: a recording that carries sample lists
+        # and a main verdict but stamps NO ``baseline`` / ``direction`` sub-dict
+        # (a legacy / minimal recording, or one whose arms did not run) must report
+        # CLEAN — the cross-check skips, it must not false-positive on a deposit
+        # that simply has no sub-statistics to bind.
+        path = "synthetic-no-subverdict.json"
+        data = {
+            "candidate_losses": [1.0, 1.0, 1.0],
+            "surrogate_losses": [2.0, 2.0, 2.0],
+            "base_seed": 0,
+        }
+        ci = replay_samples(data)
+        out = replay_to_json(path, data, ci)
+        assert out["baseline_ci_stats_stale"] == []
+        assert out["direction_ci_stats_stale"] == []
+        prose = format_replay(path, data, ci)
+        assert "BASELINE_CI_STATS_STALE" not in prose
+        assert "DIRECTION_CI_STATS_STALE" not in prose
+
+    def test_hand_edited_baseline_point_improvement_is_flagged(self):
+        # PRIMARY mutation proof (the corrupt-but-green path). The homogeneous full
+        # deposit records a real baseline arm (§4 condition (a), candidate vs
+        # full-backprop): editing ``baseline.point_improvement`` to an exaggerated
+        # positive value — repainting the cited condition-(a) win the §4 result
+        # reports — keeps the baseline verdict LABEL faithful (losses untouched, so
+        # the re-derived label still matches) and the evidence hash clean (derived
+        # statistics are not evidence), yet the stored nested number no longer
+        # matches the losses. ONLY this guard names ``point_improvement`` in
+        # ``baseline_ci_stats_stale`` and emits the BASELINE_CI_STATS_STALE note.
+        data = load_samples(
+            [p for p in _9b_deposit_fixtures() if p.name.endswith("_full.json")][0]
+        )
+        assert isinstance(data.get("baseline"), dict)  # the arm ran
+        # The lie: claim a 5x larger condition-(a) win than the losses support.
+        data["baseline"]["point_improvement"] = 0.95
+        ci = replay_samples(data)
+        out = replay_to_json("<lie-baseline-stat>", data, ci)
+        # The LABEL gate stays clean: the losses are untouched, so the re-derived
+        # baseline verdict still matches the stored (honest) label.
+        assert out["baseline_verdict_stale"] is False
+        # The FLOAT gate fires and names exactly the repainted statistic.
+        assert "point_improvement" in out["baseline_ci_stats_stale"], (
+            f"got {out['baseline_ci_stats_stale']!r}, expected to name "
+            f"'point_improvement'"
+        )
+        assert "BASELINE_CI_STATS_STALE" in format_replay("<lie-baseline-stat>", data, ci)
+
+    def test_hand_edited_baseline_ci_bounds_are_flagged(self):
+        # Mutation proof (baseline CI-bounds axis): repainting the bootstrap CI
+        # bounds the §4 result cites beside the condition-(a) verdict is caught
+        # symmetrically — not just the point estimate.
+        data = load_samples(
+            [p for p in _9b_deposit_fixtures() if p.name.endswith("_full.json")][0]
+        )
+        data["baseline"]["lower"] = 0.90
+        data["baseline"]["upper"] = 0.99
+        out = replay_to_json("<lie-baseline-bounds>", data, replay_samples(data))
+        assert set(out["baseline_ci_stats_stale"]) >= {"lower", "upper"}, (
+            f"got {out['baseline_ci_stats_stale']!r}, expected to name lower+upper"
+        )
+
+    def test_hand_edited_direction_floats_are_flagged(self):
+        # Mutation proof (direction axis, symmetric): the direction-isolation
+        # sub-verdict (§4 condition (b), candidate vs input-contiguous control)
+        # stamps the SAME float shape (relabeled ``control_mean`` / ``n_control``),
+        # so repainting ``direction.point_improvement`` is caught on that slot too —
+        # proving the cross-check covers BOTH sub-verdicts, not just baseline.
+        data = load_samples(
+            [p for p in _9b_deposit_fixtures() if "direction" in p.name][0]
+        )
+        assert isinstance(data.get("direction"), dict)  # the arm ran
+        data["direction"]["point_improvement"] = 0.77
+        out = replay_to_json("<lie-direction-stat>", data, replay_samples(data))
+        assert "point_improvement" in out["direction_ci_stats_stale"], (
+            f"got {out['direction_ci_stats_stale']!r}"
+        )
+        assert "DIRECTION_CI_STATS_STALE" in format_replay(
+            "<lie-direction-stat>", data, replay_samples(data)
+        )
+
+    def test_sub_verdict_stats_independent_of_label_gate(self):
+        # DISTINCTION proof: the float gate catches what the LABEL gate cannot. A
+        # deposit whose ``baseline.verdict`` LABEL is honest (matches the verdict
+        # re-derived from ``baseline_losses``) but whose ``baseline.point_improvement``
+        # FLOAT lies has ``baseline_verdict_stale == False`` AND a non-empty
+        # ``baseline_ci_stats_stale``. This pins that the two gates bind DISTINCT
+        # fields (label STRING vs derived FLOATS) — the same independence argument
+        # ``6ed0f69`` made for the top-level stats vs ``faithful``.
+        data = load_samples(
+            [p for p in _9b_deposit_fixtures() if p.name.endswith("_full.json")][0]
+        )
+        true = surrogate_valid_loss_ci(
+            data["candidate_losses"], data["baseline_losses"],
+            seed=int(data["base_seed"]),
+        )
+        data["baseline"]["point_improvement"] = true.point_improvement + 0.5  # lie float
+        data["baseline"]["verdict"] = true.significance_verdict  # honest label
+        out = replay_to_json("<honest-label-lie-float>", data, replay_samples(data))
+        assert out["baseline_verdict_stale"] is False  # label is honest
+        assert out["baseline_ci_stats_stale"] != []  # float is not
+
+    def test_reachability_corrupt_baseline_float_passes_all_other_gates(self):
+        # REACHABILITY proof (the proof of need, machine-asserted): a deposit whose
+        # ``baseline.point_improvement`` / ``baseline.upper`` / ``baseline.lower``
+        # / ``baseline.baseline_mean`` are repainted to exaggerate the condition-(a)
+        # win — while the baseline LABEL, main verdict, top-level stats, evidence
+        # hash, and ledger all stay honest — passes EVERY prior gate silently and
+        # remains ``citable_as_full_section4_verdict=True``. ONLY
+        # ``baseline_ci_stats_stale`` is non-empty. This is the corrupt-but-green §4
+        # deposit the guard exists to refuse.
+        data = load_samples(
+            [p for p in _9b_deposit_fixtures() if p.name.endswith("_full.json")][0]
+        )
+        data["baseline"]["point_improvement"] = 0.95
+        data["baseline"]["upper"] = 0.99
+        data["baseline"]["lower"] = 0.90
+        data["baseline"]["baseline_mean"] = 2.50
+        out = replay_to_json("<corrupt-but-green>", data, replay_samples(data))
+        # Every prior gate stays green (the corruption the guard closes):
+        assert out["faithful"] is True
+        assert out["citable_as_full_section4_verdict"] is True
+        assert out["baseline_verdict_stale"] is False
+        assert out["ci_stats_stale"] == []
+        assert out["evidence_hash_stale"] is False
+        # ... and the NEW gate is the only thing that fires:
+        assert out["baseline_ci_stats_stale"] != []
+
+    def test_prose_note_presence_matches_machine_stale_flag(self):
+        # DRIFT invariant (§6.2: prose and JSON execute the same contract): the
+        # machine stale list and the human prose note cannot drift — for every
+        # committed deposit AND for a hand-edited lie on each slot, the note's
+        # presence equals the truthiness of the JSON stale list.
+        cases = [("committed", load_samples(p)) for p in _9b_deposit_fixtures()]
+        full = load_samples(
+            [p for p in _9b_deposit_fixtures() if p.name.endswith("_full.json")][0]
+        )
+        full["baseline"]["point_improvement"] = 0.95
+        cases.append(("lie-baseline", full))
+        direction = load_samples(
+            [p for p in _9b_deposit_fixtures() if "direction" in p.name][0]
+        )
+        direction["direction"]["point_improvement"] = 0.77
+        cases.append(("lie-direction", direction))
+        for name, data in cases:
+            ci = replay_samples(data)
+            out = replay_to_json(f"<{name}>", data, ci)
+            prose = format_replay(f"<{name}>", data, ci)
+            for slot in ("direction", "baseline"):
+                flag = bool(out[f"{slot}_ci_stats_stale"])
+                note = f"{slot.upper()}_CI_STATS_STALE" in prose
+                assert flag is note, (
+                    f"{name}: {slot} stale truthy ({flag}) != prose note ({note})"
+                )
+
+
 class TestLedgerBinding:
     """The deposit-vs-ledger binding: the replay re-derives the §4 verdict from a
     deposit's per-arm losses, but the committed ledger (``ledger_witness_path``)
