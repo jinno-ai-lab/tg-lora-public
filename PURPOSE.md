@@ -1193,3 +1193,32 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
    > **注**: proxy の順序感度については、更なる正控御調整（避ける(a)）の代わりに**分散分解診断**
    > （`make freeze-order-sensitivity`）で決着させた——正控御を発火させるのではなく apparatus の
    > 解像度を直接測り ratio=0.000 を得た。この問いは**閉じた**（target-scale のみ残る）。
+
+> **【2026-07-24 追記・9B §4 verdict landing を GPU-free replay で確証 + operator 決定（ship-vs-DATA-axis）表面化（TASK-0194）】**
+> 直前 feedback（TASK-0193 = recover.py abort→rerun 堅牢化 が VALUABLE）は「9B run を robust path で起動して
+> §4 TIES を報告せよ（唯一の repeatedly-named high-leverage・guard/judge/advisor polish を超えて deferred され続けた）」
+> と指示。しかし検証の結果、**両 citable full §4 verdict は既に TIES で landed** しており、feedback の「deferred」
+> 前提は事実と異なることを **GPU-free replay の実行可能証拠**で確証した:
+> - `scripts.replay_freeze_validloss_ci`（stdlib-only・GPU/torch 不要）で両 committed deposit を再判定 →
+>   - **homogeneous**（`tests/fixtures/freeze_validloss_ci_9b_full.json`）: `replayed_verdict=TIES`・`faithful=true`・
+>     candidate **1.6947** vs surrogate 1.6960・CI[95%]=**[−0.00009, +0.0027]**・`citable_as_full_section4_verdict=True`・seq1024・proxy=false・synthetic=false。
+>   - **heterogeneous**（`tests/fixtures/freeze_validloss_ci_9b_full_heterogeneous.json`）: `replayed_verdict=TIES`・`faithful=true`・
+>     candidate **1.7180** vs surrogate 1.7190・CI[95%]=**[−0.00100, +0.00299]**・`citable_as_full_section4_verdict=True`・seq1024・heterogeneous。
+>   - **両者とも全 13 honesty-axis（`*_stale`）= false（clean）**・`--expected TIES` で exit 0。= verdict は prose ではなく
+>     誰でも GPU なしで再検証可能な committed artifact（feedback の「9B は deferred」を否定）。
+> - abort→rerun 起動導線は堅牢 + operator-invocable: TASK-0189/0193 で `recover.py --rerun` が resume 対象を probe して fresh-start 起動
+>   （初回 checkpoint 前 OOM-kill を完走させる・43 test/4 mutation-proven）・`make recover ARGS="--remediate <run_dir> <cfg> --rerun"` で標準 IF から呼び出し可能。
+>
+> **再起動しない理由（誠実）**: (a) 既知 citable TIES の再現=新情報ゼロ・(b) **GPU 競合で OOM 確実**（実測 8129/12288 MiB 使用 →
+> free 4GB のみ・seq1024 full-budget は 12GB VRAM-floor 必要）・(c) repo の学習「do NOT re-fire/re-harvest」（[[dead-cwd-background-run-trap]]）。
+> ゆえに feedback 自身の fallback（item #4「run が進まない場合の最高価値 = operator 決定の表面化 + unblock step」）に着地。
+>
+> **operator 決定（binding constraint・表面化）**: 相対 §4 verdict arc は **COMPLETE**（両 leg citable TIES = TG-LoRA 外挿は
+> full-backprop と統計的に同等品質 in full-budget seq1024・GOAL §0 品質保持×コスト削減〔bw 14–35% 減〕を支持）。残る真の open は
+> **private `src.data` absolute-loss 比較（DATA 軸・分類 C・外部依存）**のみ = code-doable でなく（品質 filter 移植が必要）・§4 verdict の
+> citability を block しない。決定は **(1) SHIP〔推奨〕** citable TIES 相対 verdict を §4 結果として採用（DATA 軸絶対比較は optional で private へ deferred）・
+> **(2) ACCEPT-NULL** TIES を誠実な null として受理・**(3) PIVOT** private `src.data` 品質 filter を移植して絶対比較を確立（unblock step:
+> `src/data/filter_dataset.py` 移植 → 同一 corpus で再測 → `form_freeze_validloss_deposit`+`freeze-replay`・再測中の OOM-before-checkpoint は
+> 堅牢化済み `make recover ... --rerun` で完走）。eval/cache 硬化延長停止（収益逓減）・derived-float guard 延長停止（EXHAUSTED）・spine/judge/advisor
+> 不製造（禁止）を遵守。`[[ai-hub-feedback-infra-vs-this-repo]]` `[[gpu-usable-proxy-runs]]` `[[dead-cwd-background-run-trap]]` `[[tg-lora-purpose-and-progressive-freeze]]`。
+> 詳細は [TASK-0194](specs/tg-lora/tasks/TASK-0194.md)。
