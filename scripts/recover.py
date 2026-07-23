@@ -433,31 +433,89 @@ def generate_recovery_config(
     )
 
 
+def _default_resume_probe(state_path: Path) -> str:
+    """Probe whether ``training_state.pt`` is safe to resume from.
+
+    Returns one of ``"missing"``, ``"unusable"`` (exists but torn / unreadable),
+    or ``"intact"``. A corrective re-run that passes a missing-or-unusable path
+    to ``--resume`` crashes on launch — ``train_tg_lora.main`` hands the path
+    straight to :func:`load_training_state`, which raises ``FileNotFoundError``
+    (absent) or :class:`CheckpointIntegrityError` (torn) *uncaught* — so the
+    caller must fresh-start instead of launching a doomed resume.
+
+    Existence is the always-on, torch-free primary gate; the common
+    OOM-killed-before-first-checkpoint case leaves no ``training_state.pt`` at
+    all. The torn check needs torch; without it we trust existence and report
+    ``"intact"`` so a missing-torch false negative — not the existence gate —
+    is the only thing that could mask a torn file.
+    """
+    state_path = Path(state_path)
+    if not state_path.exists():
+        return "missing"
+    try:
+        from src.utils.checkpoint import CheckpointIntegrityError, load_training_state
+    except Exception:
+        return "intact"  # no torch / no integrity tooling → trust the existence gate
+    try:
+        load_training_state(state_path)
+        return "intact"
+    except CheckpointIntegrityError:
+        return "unusable"
+    except Exception:
+        # Any other load failure (partial / foreign blob, schema drift) would
+        # also crash the launched resume; treat it as unusable rather than risk
+        # a doomed launch.
+        return "unusable"
+
+
+def _resume_decision(run_dir: str, *, probe=None) -> tuple[bool, str]:
+    """Decide whether the corrective re-run can safely resume or must fresh-start.
+
+    Returns ``(resume, reason)``. See :func:`_default_resume_probe` for why a
+    re-run must NOT pass ``--resume`` against a missing/torn target. ``probe``
+    is injectable so the intact / torn branches are unit-testable without
+    constructing a full loadable ``TrainingState`` or GPU.
+    """
+    probe_fn = probe or _default_resume_probe
+    state_path = Path(run_dir) / "training_state.pt"
+    verdict = probe_fn(state_path)
+    if verdict == "intact":
+        return True, f"resume from intact {state_path.name}"
+    return False, f"{state_path.name} {verdict} — launching fresh start"
+
+
 def _build_rerun_command(
-    recovery_config: str, run_dir: str, python: str | None = None
+    recovery_config: str,
+    run_dir: str,
+    *,
+    resume: bool,
+    python: str | None = None,
 ) -> list[str]:
     """Build the corrective re-run command for an interrupted 9B arm.
 
-    Resumes from the killed run's ``training_state.pt`` using the
-    reduced-footprint ``recovery_config`` produced by
+    ``resume=True`` resumes from the killed run's intact ``training_state.pt``
+    using the reduced-footprint ``recovery_config`` produced by
     :func:`generate_recovery_config` (halved ``max_seq_len``, enabled
     ``gradient_checkpointing``, and — for CUDA faults — halved ``batch_size``
-    with doubled ``grad_accumulation``). The whole point of a recovery config
-    that trims the memory footprint is to re-fire the run that OOM-killed /
-    was SIGKILL'd by the OOM-killer; this closes the gap where remediation
-    stopped at *printing* a ``Resume with: ...`` hint and left the operator to
-    copy, paste and adjust it by hand.
+    with doubled ``grad_accumulation``). ``resume=False`` (the killed arm left
+    no / a torn ``training_state.pt`` — the OOM-killed-before-first-checkpoint
+    case) launches a fresh start with that same reduced-footprint config so the
+    re-run completes instead of crashing on a missing resume target. The whole
+    point of a recovery config that trims the memory footprint is to re-fire the
+    run that OOM-killed / was SIGKILL'd by the OOM-killer; this closes the gap
+    where remediation stopped at *printing* a ``Resume with: ...`` hint and left
+    the operator to copy, paste and adjust it by hand.
     """
-    state_path = str(Path(run_dir) / "training_state.pt")
-    return [
+    cmd = [
         python or sys.executable,
         "-m",
         "src.training.train_tg_lora",
         "--config",
         recovery_config,
-        "--resume",
-        state_path,
     ]
+    if resume:
+        cmd += ["--resume", str(Path(run_dir) / "training_state.pt")]
+    return cmd
 
 
 def _default_rerun_launcher(cmd: list[str]) -> int:
@@ -479,6 +537,7 @@ def apply_remediation(
     *,
     rerun: bool = False,
     launcher=None,
+    resume_probe=None,
 ) -> list[RecoveryResult]:
     """Full automated remediation: analyze → sanitize → generate recovery config.
 
@@ -537,10 +596,16 @@ def apply_remediation(
         # 'automatic launch'). Opt-in via ``rerun`` so plain remediation still
         # just diagnoses + emits the recovery config. The launch reuses the
         # reduced-footprint recovery config so the OOM/SIGKILL that killed the
-        # original arm is not re-triggered on retry.
+        # original arm is not re-triggered on retry. The re-run resumes only
+        # when the killed arm left an INTACT ``training_state.pt``; otherwise
+        # (no checkpoint — the OOM-before-first-save case — or a torn one) it
+        # fresh-starts with the trimmed config instead of passing ``--resume``
+        # a path that would crash ``train_tg_lora`` on launch.
         if rerun:
-            cmd = _build_rerun_command(recovery_config_path, run_dir)
+            resume, resume_reason = _resume_decision(run_dir, probe=resume_probe)
+            cmd = _build_rerun_command(recovery_config_path, run_dir, resume=resume)
             launch = launcher or _default_rerun_launcher
+            mode = "resume" if resume else "fresh start"
             try:
                 rc = launch(cmd)
                 status = "ok" if rc == 0 else "warn"
@@ -548,11 +613,14 @@ def apply_remediation(
                     RecoveryResult(
                         "remediate",
                         status,
-                        f"Corrective re-run launched (exit {rc})",
+                        f"Corrective re-run launched ({mode}; exit {rc})",
                         {
                             "rerun_command": cmd,
                             "returncode": rc,
                             "fault_type": fault_type,
+                            "resume": resume,
+                            "mode": mode,
+                            "resume_reason": resume_reason,
                         },
                     )
                 )
@@ -562,7 +630,11 @@ def apply_remediation(
                         "remediate",
                         "error",
                         f"Failed to launch corrective re-run: {e}",
-                        {"rerun_command": cmd, "fault_type": fault_type},
+                        {
+                            "rerun_command": cmd,
+                            "fault_type": fault_type,
+                            "resume": resume,
+                        },
                     )
                 )
 
@@ -646,9 +718,7 @@ def main():
         )
     elif args.remediate:
         all_results.extend(
-            apply_remediation(
-                args.remediate[0], args.remediate[1], rerun=args.rerun
-            )
+            apply_remediation(args.remediate[0], args.remediate[1], rerun=args.rerun)
         )
     else:
         parser.print_help()

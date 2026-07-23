@@ -11,6 +11,8 @@ from scripts.recover import (
     RecoveryResult,
     _build_rerun_command,
     _default_rerun_launcher,
+    _default_resume_probe,
+    _resume_decision,
     analyze_fault,
     apply_remediation,
     generate_recovery_config,
@@ -488,9 +490,7 @@ class TestCorrectiveRerun:
 
     def _setup_oom_run(self, tmp_path) -> Path:
         # Step 472 mirrors the feedback's "9B arm killed at step 472→1500" fault.
-        (tmp_path / "train.log").write_text(
-            "Step 472: torch.cuda.OutOfMemoryError\n"
-        )
+        (tmp_path / "train.log").write_text("Step 472: torch.cuda.OutOfMemoryError\n")
         import yaml
 
         config = {
@@ -545,13 +545,23 @@ class TestCorrectiveRerun:
         return cfg_path
 
     def test_build_rerun_command_resumes_with_recovery_config(self):
-        cmd = _build_rerun_command("/x/recovery.yaml", "/run/dir", python="PY")
+        cmd = _build_rerun_command(
+            "/x/recovery.yaml", "/run/dir", resume=True, python="PY"
+        )
         assert cmd[0] == "PY"
         assert cmd[cmd.index("-m") + 1] == "src.training.train_tg_lora"
         assert cmd[cmd.index("--config") + 1] == "/x/recovery.yaml"
-        assert cmd[cmd.index("--resume") + 1] == str(
-            Path("/run/dir/training_state.pt")
+        assert cmd[cmd.index("--resume") + 1] == str(Path("/run/dir/training_state.pt"))
+
+    def test_build_rerun_command_fresh_start_omits_resume(self):
+        # The common OOM-killed-before-first-checkpoint case has no
+        # training_state.pt; the corrective re-run must NOT pass --resume to a
+        # path that does not exist (train_tg_lora.main would crash on launch).
+        cmd = _build_rerun_command(
+            "/x/recovery.yaml", "/run/dir", resume=False, python="PY"
         )
+        assert "--resume" not in cmd
+        assert cmd[cmd.index("--config") + 1] == "/x/recovery.yaml"
 
     def test_rerun_off_by_default_does_not_launch(self, tmp_path):
         cfg_path = self._setup_oom_run(tmp_path)
@@ -564,7 +574,7 @@ class TestCorrectiveRerun:
         assert not any("Corrective re-run" in r.message for r in results)
         assert (tmp_path / "recovery_config.yaml").exists()
 
-    def test_rerun_launches_with_reduced_footprint_config(self, tmp_path):
+    def test_rerun_resumes_with_reduced_footprint_when_state_intact(self, tmp_path):
         cfg_path = self._setup_oom_run(tmp_path)
         captured: dict = {}
 
@@ -573,17 +583,18 @@ class TestCorrectiveRerun:
             return 0
 
         results = apply_remediation(
-            str(tmp_path), str(cfg_path), rerun=True, launcher=recorder
+            str(tmp_path),
+            str(cfg_path),
+            rerun=True,
+            launcher=recorder,
+            # intact training_state.pt → the corrective re-run resumes
+            resume_probe=lambda p: "intact",
         )
         # launcher invoked with the reduced-footprint recovery config + resume path
         assert "cmd" in captured
         cmd = captured["cmd"]
-        assert cmd[cmd.index("--config") + 1] == str(
-            tmp_path / "recovery_config.yaml"
-        )
-        assert cmd[cmd.index("--resume") + 1] == str(
-            tmp_path / "training_state.pt"
-        )
+        assert cmd[cmd.index("--config") + 1] == str(tmp_path / "recovery_config.yaml")
+        assert cmd[cmd.index("--resume") + 1] == str(tmp_path / "training_state.pt")
         # the rerun actually used a reduced footprint (seq_len halved, gc on)
         import yaml
 
@@ -595,7 +606,58 @@ class TestCorrectiveRerun:
         rerun_results = [r for r in results if "Corrective re-run" in r.message]
         assert len(rerun_results) == 1
         assert rerun_results[0].status == "ok"
+        assert "resume" in rerun_results[0].message
+        assert rerun_results[0].details["resume"] is True
         assert rerun_results[0].details["rerun_command"] == cmd
+
+    def test_rerun_fresh_starts_when_no_training_state(self, tmp_path):
+        # The OOM-killed-before-first-checkpoint case: no training_state.pt was
+        # ever written, so --resume <path> would point at a non-existent file and
+        # the launched re-run would crash (FileNotFoundError, uncaught in main).
+        # The corrective re-run must fresh-start with the reduced-footprint
+        # recovery config instead — completing the killed arm, not re-failing it.
+        cfg_path = self._setup_oom_run(tmp_path)
+        assert not (tmp_path / "training_state.pt").exists()  # precondition
+        captured: dict = {}
+
+        def recorder(cmd):
+            captured["cmd"] = cmd
+            return 0
+
+        results = apply_remediation(
+            str(tmp_path), str(cfg_path), rerun=True, launcher=recorder
+        )
+        cmd = captured["cmd"]
+        assert "--resume" not in cmd
+        assert cmd[cmd.index("--config") + 1] == str(tmp_path / "recovery_config.yaml")
+        rerun_results = [r for r in results if "Corrective re-run" in r.message]
+        assert len(rerun_results) == 1
+        assert "fresh start" in rerun_results[0].message
+        assert rerun_results[0].details["resume"] is False
+
+    def test_rerun_fresh_starts_when_training_state_unusable(self, tmp_path):
+        # A torn / unreadable training_state.pt would raise CheckpointIntegrityError
+        # (or another load error) uncaught in the launched resume → crash. The
+        # corrective re-run must fresh-start rather than launch a doomed resume.
+        cfg_path = self._setup_oom_run(tmp_path)
+        captured: dict = {}
+
+        def recorder(cmd):
+            captured["cmd"] = cmd
+            return 0
+
+        results = apply_remediation(
+            str(tmp_path),
+            str(cfg_path),
+            rerun=True,
+            launcher=recorder,
+            resume_probe=lambda p: "unusable",
+        )
+        cmd = captured["cmd"]
+        assert "--resume" not in cmd
+        rerun_results = [r for r in results if "Corrective re-run" in r.message]
+        assert rerun_results[0].details["resume"] is False
+        assert "fresh start" in rerun_results[0].message
 
     def test_rerun_warns_on_nonzero_exit(self, tmp_path):
         cfg_path = self._setup_oom_run(tmp_path)
@@ -631,7 +693,63 @@ class TestCorrectiveRerun:
 
         rc = _default_rerun_launcher([sys.executable, "-c", "raise SystemExit(0)"])
         assert rc == 0
-        rc_fail = _default_rerun_launcher(
-            [sys.executable, "-c", "raise SystemExit(3)"]
-        )
+        rc_fail = _default_rerun_launcher([sys.executable, "-c", "raise SystemExit(3)"])
         assert rc_fail == 3
+
+
+# ---------------------------------------------------------------------------
+# resume-target decision (don't launch a --resume that is guaranteed to crash)
+# ---------------------------------------------------------------------------
+
+
+class TestResumeDecision:
+    """The corrective re-run must not pass ``--resume <path>`` to a missing or
+    torn ``training_state.pt``: ``train_tg_lora.main`` hands the path straight to
+    ``load_training_state``, which raises ``FileNotFoundError`` (absent) or
+    ``CheckpointIntegrityError`` (torn) *uncaught*, so the auto-launched re-run
+    would crash on launch instead of completing the killed 9B arm."""
+
+    def test_decision_resume_when_probe_intact(self, tmp_path):
+        resume, reason = _resume_decision(str(tmp_path), probe=lambda p: "intact")
+        assert resume is True
+        assert "resume" in reason
+
+    def test_decision_fresh_when_probe_missing(self, tmp_path):
+        resume, reason = _resume_decision(str(tmp_path), probe=lambda p: "missing")
+        assert resume is False
+        assert "fresh start" in reason
+
+    def test_decision_fresh_when_probe_unusable(self, tmp_path):
+        resume, reason = _resume_decision(str(tmp_path), probe=lambda p: "unusable")
+        assert resume is False
+        assert "fresh start" in reason
+
+    def test_decision_targets_training_state_pt(self, tmp_path):
+        # The probe receives <run_dir>/training_state.pt, the exact path the
+        # resume command would pass to --resume.
+        seen: list = []
+        _resume_decision(str(tmp_path), probe=lambda p: seen.append(p) or "intact")
+        assert seen == [tmp_path / "training_state.pt"]
+
+    def test_decision_default_probe_used_when_none_injected(self, tmp_path):
+        # No training_state.pt → default probe reports "missing" → fresh start.
+        resume, _ = _resume_decision(str(tmp_path))
+        assert resume is False
+
+
+class TestDefaultResumeProbe:
+    def test_probe_missing_for_absent_file(self, tmp_path):
+        # No torch / no load needed: existence is the primary gate.
+        assert _default_resume_probe(tmp_path / "absent.pt") == "missing"
+
+    def test_probe_unusable_for_torn_file(self, tmp_path):
+        pytest.importorskip("torch")
+        import torch
+
+        # A truncated .pt (torch.save header written, payload truncated) fails
+        # to unpickle → CheckpointIntegrityError → "unusable".
+        torn = tmp_path / "training_state.pt"
+        torch.save({"a": torch.zeros(4)}, tmp_path / "full.pt")
+        full_bytes = (tmp_path / "full.pt").read_bytes()
+        torn.write_bytes(full_bytes[: len(full_bytes) // 2])
+        assert _default_resume_probe(torn) == "unusable"
