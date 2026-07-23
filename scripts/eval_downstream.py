@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 import time
 import gc
 from pathlib import Path
@@ -21,10 +22,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("downstream-eval")
 
 
+def _clean_whitespace(s: str) -> str:
+    """Collapse all whitespace so the metric is purely over meaningful characters."""
+    return "".join(s.split())
+
+
 def compute_char_f1(ref: str, gen: str) -> float:
     """Compute character-level F1 score as a language-agnostic similarity metric."""
-    ref_clean = "".join(ref.split())
-    gen_clean = "".join(gen.split())
+    ref_clean = _clean_whitespace(ref)
+    gen_clean = _clean_whitespace(gen)
     if not ref_clean or not gen_clean:
         return 0.0
     matcher = SequenceMatcher(None, ref_clean, gen_clean)
@@ -34,6 +40,42 @@ def compute_char_f1(ref: str, gen: str) -> float:
     if precision + recall == 0:
         return 0.0
     return 2 * (precision * recall) / (precision + recall)
+
+
+def is_char_f1_degenerate_input(ref: str, gen: str) -> bool:
+    """Whether a char-F1 input is *degenerate* (undefined metric, not a genuine zero).
+
+    When either the reference or the generation is empty after whitespace-cleaning,
+    precision/recall/F1 are undefined. ``compute_char_f1`` returns ``0.0`` for these
+    (indistinguishable from a real total non-match), so callers must surface such items
+    instead of averaging the silent ``0.0`` into the headline mean. This is the
+    downstream char-F1 analogue of the G3 gate's silent-drop class (``d9ca7f5``).
+    """
+    return not _clean_whitespace(ref) or not _clean_whitespace(gen)
+
+
+def aggregate_char_f1(per_item: list[dict]) -> dict:
+    """Aggregate per-item char-F1 into an honest summary.
+
+    Degenerate items (``"degenerate": True``) have an *undefined* char-F1. Following
+    the G3 gate's compared-vs-dropped discipline (``d9ca7f5``), the headline
+    ``mean_char_f1`` runs over *comparable* items only; degenerate inputs are counted
+    and flagged ``incomplete`` so a collapsed generation or a broken reference cannot
+    hide inside a plausible-looking mean. ``per_item`` entries need a numeric
+    ``char_f1`` and an optional boolean ``degenerate``.
+    """
+    total = len(per_item)
+    comparable = [r["char_f1"] for r in per_item if not r.get("degenerate")]
+    comparable_count = len(comparable)
+    degenerate_inputs = total - comparable_count
+    mean = sum(comparable) / comparable_count if comparable_count else 0.0
+    return {
+        "total": total,
+        "comparable": comparable_count,
+        "degenerate_inputs": degenerate_inputs,
+        "incomplete": bool(degenerate_inputs),
+        "mean_char_f1": mean,
+    }
 
 
 def check_json_validity(gen: str, expected_keys: list) -> tuple[bool, bool]:
@@ -94,8 +136,7 @@ def evaluate_dataset(
     total = 0
     valid_json_count = 0
     key_compliance_count = 0
-    total_char_f1 = 0.0
-    
+
     try:
         for idx, rec in enumerate(tqdm(records, desc=f"Evaluating {task_type}")):
             prompt = rec.get("prompt", "")
@@ -119,14 +160,16 @@ def evaluate_dataset(
             ).strip()
             
             total += 1
-            
-            # Metric evaluation
+
+            # Metric evaluation. A degenerate input (empty reference/generation) has an
+            # undefined char-F1; flag it per-item so aggregate_char_f1 can surface it
+            # rather than letting its silent 0.0 contaminate the headline mean.
+            degenerate = is_char_f1_degenerate_input(expected, gen_text)
             char_f1 = compute_char_f1(expected, gen_text)
-            total_char_f1 += char_f1
-            
+
             is_json = False
             has_keys = False
-            
+
             expected_keys = []
             if task_type == "format_json":
                 try:
@@ -135,18 +178,19 @@ def evaluate_dataset(
                         expected_keys = list(exp_parsed.keys())
                 except json.JSONDecodeError:
                     pass
-                    
+
                 is_json, has_keys = check_json_validity(gen_text, expected_keys)
                 if is_json:
                     valid_json_count += 1
                 if has_keys:
                     key_compliance_count += 1
-            
+
             eval_results.append({
                 "prompt": prompt,
                 "expected": expected,
                 "generated": gen_text,
                 "char_f1": char_f1,
+                "degenerate": degenerate,
                 "is_json": is_json,
                 "has_keys": has_keys,
                 "expected_keys": expected_keys
@@ -161,16 +205,14 @@ def evaluate_dataset(
         if was_training:
             model.train()
             
-    summary = {
-        "total": total,
-        "mean_char_f1": total_char_f1 / total if total > 0 else 0.0,
-    }
-    
+    # Honest char-F1 aggregation: degenerate inputs (empty reference/generation) make
+    # the metric undefined, so surface them instead of averaging silent 0.0s into the
+    # headline mean (the G3 gate's compared-vs-dropped discipline, d9ca7f5).
+    summary = aggregate_char_f1(eval_results)
+
     if task_type == "format_json":
-        summary.update({
-            "json_validity_rate": valid_json_count / total if total > 0 else 0.0,
-            "key_compliance_rate": key_compliance_count / total if total > 0 else 0.0,
-        })
+        summary["json_validity_rate"] = valid_json_count / total if total > 0 else 0.0
+        summary["key_compliance_rate"] = key_compliance_count / total if total > 0 else 0.0
         
     return {
         "summary": summary,
@@ -281,7 +323,19 @@ def main():
         f.write(f"| **JSON Format Compliance** | Mean Char-F1 | {json_results['summary']['mean_char_f1']:.4f} |\n")
         f.write(f"| | JSON Validity Rate | {json_results['summary']['json_validity_rate']:.4%} |\n")
         f.write(f"| | Key Compliance Rate | {json_results['summary']['key_compliance_rate']:.4%} |\n\n")
-        
+
+        # Surface degenerate inputs (empty reference/generation): these were excluded
+        # from Mean Char-F1, so a plausible-looking mean cannot hide a collapse.
+        for label, res in (("Japanese Capability", jp_results), ("JSON Format Compliance", json_results)):
+            deg = res["summary"].get("degenerate_inputs", 0)
+            if deg:
+                tot = res["summary"].get("total", 0)
+                comp = res["summary"].get("comparable", 0)
+                f.write(
+                    f"> **[INCOMPLETE -- {label}]**: {deg}/{tot} items had degenerate inputs "
+                    f"(empty reference/generation); Mean Char-F1 is over the {comp} comparable item(s) only.\n\n"
+                )
+
         f.write("## 2. Detailed Task Results\n\n")
         f.write("### 2.1 Japanese Capability (Sample outputs)\n\n")
         for i, detail in enumerate(jp_results['details'][:5]):
@@ -306,6 +360,19 @@ def main():
     print(f"JSON Format Compliance - JSON Validity Rate: {json_results['summary']['json_validity_rate']:.4%}")
     print(f"JSON Format Compliance - Key Compliance Rate: {json_results['summary']['key_compliance_rate']:.4%}")
     print(f"======================================\n")
+
+    # Surface degenerate inputs loudly (stderr banner), mirroring the G3 gate's
+    # INCOMPLETE banner (d9ca7f5): a clean-looking mean must not hide a collapse.
+    total_degenerate = (
+        jp_results["summary"].get("degenerate_inputs", 0)
+        + json_results["summary"].get("degenerate_inputs", 0)
+    )
+    if total_degenerate:
+        print(
+            f"INCOMPLETE: {total_degenerate} downstream item(s) had degenerate inputs "
+            f"(empty reference/generation) and were excluded from Mean Char-F1. See report.",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":
