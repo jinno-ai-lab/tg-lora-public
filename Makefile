@@ -613,6 +613,12 @@ test-cli-help: ## Verify all Python CLI scripts respond to --help
 check-spine: ## Verify spec/doc spine-anchor integrity (no provenance drift)
 	$(PYTHON_VENV) scripts/check_spine_anchors.py
 
+check-commit-substantive: ## Commit-hygiene guard: fail if HEAD's diff is empty or
+                         ## normalization-only (whitespace/reflow-only, zero
+                         ## content delta) -- skip/squash before judging (TASK-0192).
+                         ## Use RANGE="A..B" for an arbitrary pair, STAGED=1 for the index.
+	$(PYTHON_VENV) scripts/check_substantive_diff.py $(if $(STAGED),--staged,--range $(or $(RANGE),HEAD^..HEAD))
+
 lint: ## Run linting
 	$(PYTHON_VENV) -m ruff check src/ tests/ scripts/
 	$(PYTHON_VENV) -m ruff format --check src/ tests/ scripts/
