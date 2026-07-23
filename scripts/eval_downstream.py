@@ -63,6 +63,12 @@ def aggregate_char_f1(per_item: list[dict]) -> dict:
     and flagged ``incomplete`` so a collapsed generation or a broken reference cannot
     hide inside a plausible-looking mean. ``per_item`` entries need a numeric
     ``char_f1`` and an optional boolean ``degenerate``.
+
+    An *empty* corpus (``total == 0``) is also ``incomplete``: with zero comparable
+    items the mean is ``0.0`` but carries no information, so it must not pose as a
+    clean score. This is the empty-corpus sibling of the degenerate surface
+    (TASK-0190 point 2: "comparable 0 件なら incomplete=True"); flagging both keeps the
+    rule "any zero-comparable summary is incomplete" consistent.
     """
     total = len(per_item)
     comparable = [r["char_f1"] for r in per_item if not r.get("degenerate")]
@@ -73,7 +79,7 @@ def aggregate_char_f1(per_item: list[dict]) -> dict:
         "total": total,
         "comparable": comparable_count,
         "degenerate_inputs": degenerate_inputs,
-        "incomplete": bool(degenerate_inputs),
+        "incomplete": bool(degenerate_inputs) or total == 0,
         "mean_char_f1": mean,
     }
 
@@ -324,13 +330,21 @@ def main():
         f.write(f"| | JSON Validity Rate | {json_results['summary']['json_validity_rate']:.4%} |\n")
         f.write(f"| | Key Compliance Rate | {json_results['summary']['key_compliance_rate']:.4%} |\n\n")
 
-        # Surface degenerate inputs (empty reference/generation): these were excluded
-        # from Mean Char-F1, so a plausible-looking mean cannot hide a collapse.
+        # Surface degenerate inputs (empty reference/generation) and empty corpora:
+        # both make the headline Mean Char-F1 non-representative, so a plausible-looking
+        # mean cannot hide a collapse — and an empty dataset cannot pose as a clean 0.0.
         for label, res in (("Japanese Capability", jp_results), ("JSON Format Compliance", json_results)):
-            deg = res["summary"].get("degenerate_inputs", 0)
+            summary = res["summary"]
+            if summary.get("total", 0) == 0:
+                f.write(
+                    f"> **[INCOMPLETE -- {label}]**: 0 items evaluated (empty corpus); "
+                    f"Mean Char-F1 is undefined.\n\n"
+                )
+                continue
+            deg = summary.get("degenerate_inputs", 0)
             if deg:
-                tot = res["summary"].get("total", 0)
-                comp = res["summary"].get("comparable", 0)
+                tot = summary.get("total", 0)
+                comp = summary.get("comparable", 0)
                 f.write(
                     f"> **[INCOMPLETE -- {label}]**: {deg}/{tot} items had degenerate inputs "
                     f"(empty reference/generation); Mean Char-F1 is over the {comp} comparable item(s) only.\n\n"
@@ -361,8 +375,9 @@ def main():
     print(f"JSON Format Compliance - Key Compliance Rate: {json_results['summary']['key_compliance_rate']:.4%}")
     print(f"======================================\n")
 
-    # Surface degenerate inputs loudly (stderr banner), mirroring the G3 gate's
-    # INCOMPLETE banner (d9ca7f5): a clean-looking mean must not hide a collapse.
+    # Surface degenerate inputs and empty corpora loudly (stderr banner), mirroring
+    # the G3 gate's INCOMPLETE banner (d9ca7f5): a clean-looking mean must not hide a
+    # collapse, and an empty dataset must not pose as a clean 0.0.
     total_degenerate = (
         jp_results["summary"].get("degenerate_inputs", 0)
         + json_results["summary"].get("degenerate_inputs", 0)
@@ -371,6 +386,17 @@ def main():
         print(
             f"INCOMPLETE: {total_degenerate} downstream item(s) had degenerate inputs "
             f"(empty reference/generation) and were excluded from Mean Char-F1. See report.",
+            file=sys.stderr,
+        )
+    empty_tasks = [
+        label
+        for label, res in (("Japanese Capability", jp_results), ("JSON Format Compliance", json_results))
+        if res["summary"].get("total", 0) == 0
+    ]
+    if empty_tasks:
+        print(
+            f"INCOMPLETE: 0 items evaluated (empty corpus) for {', '.join(empty_tasks)}; "
+            f"Mean Char-F1 is undefined. See report.",
             file=sys.stderr,
         )
 

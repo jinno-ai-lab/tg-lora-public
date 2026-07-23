@@ -86,11 +86,14 @@ def test_aggregate_char_f1_clean_corpus_no_degenerate():
 
 
 def test_aggregate_char_f1_empty_corpus():
+    # An empty corpus has zero comparable items, so by the same rule as a total
+    # degenerate collapse (TASK-0190 point 2: "comparable 0 件なら incomplete=True"),
+    # the summary is `incomplete` — the 0.0 mean must not masquerade as a clean score.
     summary = aggregate_char_f1([])
     assert summary["total"] == 0
     assert summary["comparable"] == 0
     assert summary["degenerate_inputs"] == 0
-    assert summary["incomplete"] is False
+    assert summary["incomplete"] is True
     assert summary["mean_char_f1"] == 0.0
 
 
