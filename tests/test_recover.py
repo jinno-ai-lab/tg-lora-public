@@ -9,6 +9,8 @@ from safetensors.torch import load_file, save_file
 
 from scripts.recover import (
     RecoveryResult,
+    _build_rerun_command,
+    _default_rerun_launcher,
     analyze_fault,
     apply_remediation,
     generate_recovery_config,
@@ -469,3 +471,167 @@ class TestApplyRemediation:
         with open(tmp_path / "recovery_config.yaml") as f:
             recovered = yaml.safe_load(f)
         assert recovered["tg_lora"]["alpha_initial"] == pytest.approx(0.15)
+
+
+# ---------------------------------------------------------------------------
+# corrective re-run (abort-detection → auto-launch; feedback main lever)
+# ---------------------------------------------------------------------------
+
+
+class TestCorrectiveRerun:
+    """Closing the gap where remediation stopped at *printing* the resume hint
+    and left the operator to hand-launch it. The corrective re-run must reuse
+    the reduced-footprint recovery config (so the OOM/SIGKILL that killed the
+    9B arm is not re-triggered) and resume from the killed arm's
+    training_state.pt — and it must stay opt-in so plain remediation never
+    spawns a training process."""
+
+    def _setup_oom_run(self, tmp_path) -> Path:
+        # Step 472 mirrors the feedback's "9B arm killed at step 472→1500" fault.
+        (tmp_path / "train.log").write_text(
+            "Step 472: torch.cuda.OutOfMemoryError\n"
+        )
+        import yaml
+
+        config = {
+            "data": {
+                "max_seq_len": 2048,
+                "train_path": "d",
+                "valid_quick_path": "d",
+                "valid_full_path": "d",
+            },
+            "training": {
+                "batch_size": 1,
+                "grad_accumulation": 8,
+                "learning_rate": 2e-4,
+                "max_cycles": 100,
+                "gradient_checkpointing": False,
+            },
+            "tg_lora": {
+                "alpha_initial": 0.3,
+                "relative_update_cap": 0.005,
+                "K_initial": 3,
+                "K_candidates": [2, 3, 5],
+                "N_initial": 5,
+                "N_candidates": [1, 3, 5],
+                "beta_initial": 0.8,
+                "beta_candidates": [0.5, 0.8],
+                "alpha_min": 0.03,
+                "alpha_max": 1.5,
+                "alpha_log_sigma": 0.15,
+                "lr_initial": 5e-4,
+                "lr_min": 1e-5,
+                "lr_max": 1e-3,
+                "active_layer_strategy": "last_25_percent",
+            },
+            "experiment": {"name": "test", "seed": 42},
+            "model": {"name_or_path": "test"},
+            "lora": {
+                "r": 16,
+                "alpha": 32,
+                "dropout": 0.05,
+                "target_modules": "all-linear",
+            },
+            "logging": {"run_dir": "runs/test"},
+            "eval": {
+                "quick_eval_examples": 32,
+                "full_eval_every_cycles": 10,
+                "rollback_tolerance": 0.005,
+            },
+        }
+        cfg_path = tmp_path / "config.yaml"
+        with open(cfg_path, "w") as f:
+            yaml.dump(config, f)
+        return cfg_path
+
+    def test_build_rerun_command_resumes_with_recovery_config(self):
+        cmd = _build_rerun_command("/x/recovery.yaml", "/run/dir", python="PY")
+        assert cmd[0] == "PY"
+        assert cmd[cmd.index("-m") + 1] == "src.training.train_tg_lora"
+        assert cmd[cmd.index("--config") + 1] == "/x/recovery.yaml"
+        assert cmd[cmd.index("--resume") + 1] == str(
+            Path("/run/dir/training_state.pt")
+        )
+
+    def test_rerun_off_by_default_does_not_launch(self, tmp_path):
+        cfg_path = self._setup_oom_run(tmp_path)
+        calls: list = []
+        results = apply_remediation(
+            str(tmp_path), str(cfg_path), launcher=lambda c: calls.append(c) or 0
+        )
+        # default rerun=False → launcher never invoked, no rerun result recorded
+        assert calls == []
+        assert not any("Corrective re-run" in r.message for r in results)
+        assert (tmp_path / "recovery_config.yaml").exists()
+
+    def test_rerun_launches_with_reduced_footprint_config(self, tmp_path):
+        cfg_path = self._setup_oom_run(tmp_path)
+        captured: dict = {}
+
+        def recorder(cmd):
+            captured["cmd"] = cmd
+            return 0
+
+        results = apply_remediation(
+            str(tmp_path), str(cfg_path), rerun=True, launcher=recorder
+        )
+        # launcher invoked with the reduced-footprint recovery config + resume path
+        assert "cmd" in captured
+        cmd = captured["cmd"]
+        assert cmd[cmd.index("--config") + 1] == str(
+            tmp_path / "recovery_config.yaml"
+        )
+        assert cmd[cmd.index("--resume") + 1] == str(
+            tmp_path / "training_state.pt"
+        )
+        # the rerun actually used a reduced footprint (seq_len halved, gc on)
+        import yaml
+
+        with open(tmp_path / "recovery_config.yaml") as f:
+            recovered = yaml.safe_load(f)
+        assert recovered["data"]["max_seq_len"] == 1024
+        assert recovered["training"]["gradient_checkpointing"] is True
+        # exactly one 'Corrective re-run launched' ok result carrying the command
+        rerun_results = [r for r in results if "Corrective re-run" in r.message]
+        assert len(rerun_results) == 1
+        assert rerun_results[0].status == "ok"
+        assert rerun_results[0].details["rerun_command"] == cmd
+
+    def test_rerun_warns_on_nonzero_exit(self, tmp_path):
+        cfg_path = self._setup_oom_run(tmp_path)
+        results = apply_remediation(
+            str(tmp_path), str(cfg_path), rerun=True, launcher=lambda c: 137
+        )
+        rerun_results = [r for r in results if "Corrective re-run" in r.message]
+        assert len(rerun_results) == 1
+        assert rerun_results[0].status == "warn"
+        assert rerun_results[0].details["returncode"] == 137
+
+    def test_no_rerun_when_no_fault(self, tmp_path):
+        (tmp_path / "train.log").write_text("Step 1: loss=2.5\n")
+        import yaml
+
+        config = {"data": {"max_seq_len": 2048}, "training": {"batch_size": 1}}
+        cfg_path = tmp_path / "config.yaml"
+        with open(cfg_path, "w") as f:
+            yaml.dump(config, f)
+        calls: list = []
+        apply_remediation(
+            str(tmp_path),
+            str(cfg_path),
+            rerun=True,
+            launcher=lambda c: calls.append(c) or 0,
+        )
+        # clean log → no fault → no recovery config → no launch even with rerun
+        assert calls == []
+        assert not (tmp_path / "recovery_config.yaml").exists()
+
+    def test_default_launcher_runs_subprocess_and_returns_exit_code(self):
+        import sys
+
+        rc = _default_rerun_launcher([sys.executable, "-c", "raise SystemExit(0)"])
+        assert rc == 0
+        rc_fail = _default_rerun_launcher(
+            [sys.executable, "-c", "raise SystemExit(3)"]
+        )
+        assert rc_fail == 3

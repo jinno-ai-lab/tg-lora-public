@@ -5,6 +5,7 @@ Usage:
     python scripts/recover.py --sanitize <checkpoint_dir>        # clean NaN/Inf from weights
     python scripts/recover.py --fix-config <config.yaml>         # generate recovery config
     python scripts/recover.py --remediate <run_dir> <config.yaml>  # full automated recovery
+    python scripts/recover.py --remediate <run_dir> <config.yaml> --rerun  # ... + auto-launch the corrective re-run
 """
 
 import argparse
@@ -432,7 +433,53 @@ def generate_recovery_config(
     )
 
 
-def apply_remediation(run_dir: str, config_path: str) -> list[RecoveryResult]:
+def _build_rerun_command(
+    recovery_config: str, run_dir: str, python: str | None = None
+) -> list[str]:
+    """Build the corrective re-run command for an interrupted 9B arm.
+
+    Resumes from the killed run's ``training_state.pt`` using the
+    reduced-footprint ``recovery_config`` produced by
+    :func:`generate_recovery_config` (halved ``max_seq_len``, enabled
+    ``gradient_checkpointing``, and — for CUDA faults — halved ``batch_size``
+    with doubled ``grad_accumulation``). The whole point of a recovery config
+    that trims the memory footprint is to re-fire the run that OOM-killed /
+    was SIGKILL'd by the OOM-killer; this closes the gap where remediation
+    stopped at *printing* a ``Resume with: ...`` hint and left the operator to
+    copy, paste and adjust it by hand.
+    """
+    state_path = str(Path(run_dir) / "training_state.pt")
+    return [
+        python or sys.executable,
+        "-m",
+        "src.training.train_tg_lora",
+        "--config",
+        recovery_config,
+        "--resume",
+        state_path,
+    ]
+
+
+def _default_rerun_launcher(cmd: list[str]) -> int:
+    """Launch the corrective re-run as a child process and return its exit code.
+
+    Kept as a tiny, injectable seam (:func:`apply_remediation` accepts any
+    ``launcher`` callable) so the auto-relaunch path is unit-testable without
+    GPU / private ``src.data`` — the test injects a recorder instead of
+    spawning a real training process.
+    """
+    import subprocess
+
+    return subprocess.run(cmd).returncode
+
+
+def apply_remediation(
+    run_dir: str,
+    config_path: str,
+    *,
+    rerun: bool = False,
+    launcher=None,
+) -> list[RecoveryResult]:
     """Full automated remediation: analyze → sanitize → generate recovery config.
 
     Returns all recovery results for logging/display.
@@ -485,6 +532,39 @@ def apply_remediation(run_dir: str, config_path: str) -> list[RecoveryResult]:
                 {"recovery_config": recovery_config_path, "fault_type": fault_type},
             )
         )
+
+        # Connect abort-detection to corrective re-run (feedback: 'report' →
+        # 'automatic launch'). Opt-in via ``rerun`` so plain remediation still
+        # just diagnoses + emits the recovery config. The launch reuses the
+        # reduced-footprint recovery config so the OOM/SIGKILL that killed the
+        # original arm is not re-triggered on retry.
+        if rerun:
+            cmd = _build_rerun_command(recovery_config_path, run_dir)
+            launch = launcher or _default_rerun_launcher
+            try:
+                rc = launch(cmd)
+                status = "ok" if rc == 0 else "warn"
+                results.append(
+                    RecoveryResult(
+                        "remediate",
+                        status,
+                        f"Corrective re-run launched (exit {rc})",
+                        {
+                            "rerun_command": cmd,
+                            "returncode": rc,
+                            "fault_type": fault_type,
+                        },
+                    )
+                )
+            except Exception as e:
+                results.append(
+                    RecoveryResult(
+                        "remediate",
+                        "error",
+                        f"Failed to launch corrective re-run: {e}",
+                        {"rerun_command": cmd, "fault_type": fault_type},
+                    )
+                )
 
     return results
 
@@ -542,6 +622,13 @@ def main():
         metavar=("RUN_DIR", "CONFIG_PATH"),
         help="Full automated remediation: analyze + sanitize + fix-config",
     )
+    parser.add_argument(
+        "--rerun",
+        action="store_true",
+        help="With --remediate: auto-launch the corrective re-run (resume from "
+        "training_state.pt with the reduced-footprint recovery config) instead "
+        "of only printing the resume command. Default: off.",
+    )
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show details")
     args = parser.parse_args()
@@ -558,7 +645,11 @@ def main():
             generate_recovery_config(args.fix_config, fault, args.output)
         )
     elif args.remediate:
-        all_results.extend(apply_remediation(args.remediate[0], args.remediate[1]))
+        all_results.extend(
+            apply_remediation(
+                args.remediate[0], args.remediate[1], rerun=args.rerun
+            )
+        )
     else:
         parser.print_help()
         sys.exit(1)
