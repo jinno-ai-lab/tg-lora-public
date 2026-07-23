@@ -1084,6 +1084,24 @@ FREEZE_REPLAY_FLAGS ?= tests/fixtures/freeze_validloss_generalize_proxy.json --e
 freeze-replay: ## Re-judge recorded valid_loss samples through the §4 judge (no GPU); asserts the recording still replays to its verdict
 	$(PYTHON_VENV) -m scripts.replay_freeze_validloss_ci $(FREEZE_REPLAY_FLAGS)
 
+# The §4 OPERATOR DECISION — ship / accept-null / pivot — consolidated from BOTH
+# citable full-budget deposits (homogeneous + heterogeneous) plus the
+# executability invariant, in one GPU/src.data-free snapshot. Where freeze-replay
+# re-judges ONE deposit, this re-derives BOTH legs (citable + faithful-TIES =
+# verdict arc COMPLETE) AND states whether a 9B run is even executable in this
+# checkout (it is not: src.data is deliberately stripped from this public mirror,
+# so train_tg_lora's module-scope data import dies on launch regardless of GPU).
+# PIVOT (absolute-loss via src.data) is therefore a private-repo action, not a
+# public-mirror port — the executable decision here is SHIP (recommended) or
+# ACCEPT-NULL. The recurring "launch the 9B run" feedback is stale: this command
+# is the machine-checkable proof the arc already landed. Needs only numpy (NOT
+# torch/GPU). SECTION4_DECISION_FLAGS=--json for machine consumption.
+# Exit 0 = arc complete (decision actionable), 2 = incomplete.
+SECTION4_DECISION_FLAGS ?=
+
+section4-operator-decision: ## Emit the §4 ship/accept-null/pivot operator decision, machine-verified from both deposits (no GPU); exit 0 = arc complete
+	$(PYTHON_VENV) -m scripts.section4_operator_decision $(SECTION4_DECISION_FLAGS)
+
 # Turnkey for recipe TASK-0152 Tier-1 step 3: form a §4 verdict-gate deposit from
 # real upstream run_metrics.jsonl (candidate = output_first progressive-freeze vs
 # surrogate = full-backprop baseline, multi-seed) so best_valid_loss is read
