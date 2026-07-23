@@ -531,6 +531,28 @@ def _default_rerun_launcher(cmd: list[str]) -> int:
     return subprocess.run(cmd).returncode
 
 
+def _rerun_failed(results: list[RecoveryResult]) -> bool:
+    """True when a corrective re-run was launched but exited non-zero.
+
+    The ``--rerun`` path exists for automation (the feedback's "report →
+    automatic launch"). A launched re-run that exits non-zero — a re-OOM,
+    SIGKILL (rc 137), or, in this public mirror, the ``src.data``
+    ``ModuleNotFoundError`` at ``train_tg_lora``'s module-scope import — must
+    surface to :func:`main`'s *exit code*, not only a ``warn`` line, so a caller
+    that gates on the exit code cannot mistake a failed recovery for a
+    completed arm (and then harvest a partial / non-existent deposit as a
+    citable §4 verdict). The rerun result is the only one that carries a
+    ``returncode`` in ``details``; results without one (analyze / sanitize /
+    config) never count, and a non-rerun ``error`` is handled separately by
+    :func:`main`'s ``has_error`` check.
+    """
+    for r in results:
+        rc = r.details.get("returncode")
+        if rc is not None and rc != 0:
+            return True
+    return False
+
+
 def apply_remediation(
     run_dir: str,
     config_path: str,
@@ -609,11 +631,12 @@ def apply_remediation(
             try:
                 rc = launch(cmd)
                 status = "ok" if rc == 0 else "warn"
+                outcome = "completed" if rc == 0 else "FAILED"
                 results.append(
                     RecoveryResult(
                         "remediate",
                         status,
-                        f"Corrective re-run launched ({mode}; exit {rc})",
+                        f"Corrective re-run {outcome} ({mode}; exit {rc})",
                         {
                             "rerun_command": cmd,
                             "returncode": rc,
@@ -732,7 +755,13 @@ def main():
         print()
 
     has_error = any(r.status == "error" for r in all_results)
-    sys.exit(1 if has_error else 0)
+    # A corrective re-run that exited non-zero must surface to the exit code:
+    # ``--rerun`` is the automation path, and a caller gating on the exit code
+    # must not mistake a failed recovery for a completed arm. (Without this, a
+    # re-OOM / SIGKILL — or, in this public mirror, the ``src.data`` import
+    # failure — would leave ``recover.py`` exiting 0, i.e. reporting success.)
+    rerun_failed = _rerun_failed(all_results)
+    sys.exit(1 if (has_error or rerun_failed) else 0)
 
 
 if __name__ == "__main__":

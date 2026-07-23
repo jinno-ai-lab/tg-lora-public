@@ -12,6 +12,7 @@ from scripts.recover import (
     _build_rerun_command,
     _default_rerun_launcher,
     _default_resume_probe,
+    _rerun_failed,
     _resume_decision,
     analyze_fault,
     apply_remediation,
@@ -695,6 +696,77 @@ class TestCorrectiveRerun:
         assert rc == 0
         rc_fail = _default_rerun_launcher([sys.executable, "-c", "raise SystemExit(3)"])
         assert rc_fail == 3
+
+    def test_main_exits_nonzero_when_corrective_rerun_fails(
+        self, tmp_path, monkeypatch
+    ):
+        # End-to-end automation contract: --remediate --rerun whose launched
+        # re-run returns non-zero must make recover.py exit non-zero (the
+        # operator / CI gating on the exit code must not mistake a failed
+        # recovery for a completed arm). Mutating main() to drop the
+        # `_rerun_failed` term makes this exit 0 (RED).
+        import scripts.recover as recover
+
+        cfg_path = self._setup_oom_run(tmp_path)
+        monkeypatch.setattr(recover, "_default_rerun_launcher", lambda cmd: 137)
+        monkeypatch.setattr(
+            "sys.argv",
+            ["recover", "--remediate", str(tmp_path), str(cfg_path), "--rerun"],
+        )
+        with pytest.raises(SystemExit) as exc:
+            recover.main()
+        assert exc.value.code != 0
+
+    def test_main_exits_zero_when_corrective_rerun_succeeds(
+        self, tmp_path, monkeypatch
+    ):
+        # Control: the same path with a succeeding re-run (rc 0) exits 0 — the
+        # failure propagation must not produce false positives on success.
+        import scripts.recover as recover
+
+        cfg_path = self._setup_oom_run(tmp_path)
+        monkeypatch.setattr(recover, "_default_rerun_launcher", lambda cmd: 0)
+        monkeypatch.setattr(
+            "sys.argv",
+            ["recover", "--remediate", str(tmp_path), str(cfg_path), "--rerun"],
+        )
+        with pytest.raises(SystemExit) as exc:
+            recover.main()
+        assert exc.value.code == 0
+
+
+# ---------------------------------------------------------------------------
+# rerun-failure exit-code propagation (don't let a failed recovery look done)
+# ---------------------------------------------------------------------------
+
+
+class TestRerunFailureExitPropagation:
+    """A corrective re-run that exits non-zero — a re-OOM, SIGKILL (rc 137), or,
+    in this public mirror, the ``src.data`` ``ModuleNotFoundError`` at
+    ``train_tg_lora``'s module-scope import — must surface to ``recover.py``'s
+    *exit code*, not just a ``warn`` line. ``--rerun`` is the automation path; a
+    caller gating on the exit code must not mistake a failed recovery for a
+    completed arm (and then harvest a partial / non-existent deposit as a
+    citable §4 verdict)."""
+
+    def test_rerun_failed_detects_nonzero_returncode(self):
+        # rc 137 = SIGKILL, the OOM-killer's signature on a re-OOM'd arm.
+        r = RecoveryResult("remediate", "warn", "x", {"returncode": 137})
+        assert _rerun_failed([r]) is True
+
+    def test_rerun_failed_clean_when_returncode_zero(self):
+        r = RecoveryResult("remediate", "ok", "x", {"returncode": 0})
+        assert _rerun_failed([r]) is False
+
+    def test_rerun_failed_clean_when_no_rerun_result_present(self):
+        # analysis / sanitize / config results carry no returncode → never count.
+        r = RecoveryResult("remediate", "warn", "Fault detected: oom", {})
+        assert _rerun_failed([r]) is False
+
+    def test_rerun_failed_ignores_error_result_without_returncode(self):
+        # a non-rerun error is handled by main()'s has_error, not by this helper.
+        r = RecoveryResult("remediate", "error", "missing dir", {})
+        assert _rerun_failed([r]) is False
 
 
 # ---------------------------------------------------------------------------
