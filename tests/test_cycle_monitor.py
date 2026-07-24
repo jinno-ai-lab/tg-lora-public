@@ -1,4 +1,5 @@
 """Tests for src/tg_lora/cycle_monitor.py — training cycle health monitor."""
+
 from __future__ import annotations
 
 
@@ -84,6 +85,75 @@ class TestDivergenceDetection:
         assert not report.divergence.detected
 
 
+class TestGradNormDivergence:
+    """A non-finite ``grad_norm`` is a divergence precursor the monitor's
+    docstring promises to catch ("NaN gradients") and the ``nan_detection``
+    flag gates.
+
+    Gradient explosion that ``clip_grad_norm_`` bounded leaves the *forward*
+    loss finite (the clipped step stayed small) while the *pre-clip* grad norm
+    the producer records is ``inf``/``NaN``. ``detect_divergence`` previously
+    read ``grad_norm`` in ``update`` and threw it away, checking only the
+    losses — so such a cycle reported ``healthy``. The ``advise_training`` CLI
+    streams the real producer's ``grad_norm`` straight into the monitor and
+    gates its exit-code-2 / ``critical`` automation on this signal, so the gap
+    was operator-visible: a diverging run reported healthy (exit 0).
+    """
+
+    def test_nan_grad_norm_detected_with_finite_loss(self):
+        m = CycleMonitor(nan_detection=True)
+        m.update({"train_loss": 1.0, "grad_norm": 0.5})
+        report = m.update({"train_loss": 0.95, "grad_norm": float("nan")})
+        assert report.divergence.detected
+        assert report.divergence.metric == "grad_norm"
+        assert report.divergence.severity == "critical"
+        assert report.status == "divergent"
+
+    def test_inf_grad_norm_detected_with_finite_loss(self):
+        m = CycleMonitor(nan_detection=True)
+        m.update({"train_loss": 1.0, "grad_norm": 0.5})
+        report = m.update({"train_loss": 0.95, "grad_norm": float("inf")})
+        assert report.divergence.detected
+        assert report.divergence.metric == "grad_norm"
+        assert report.divergence.severity == "critical"
+
+    def test_finite_grad_norm_not_flagged(self):
+        m = CycleMonitor(nan_detection=True)
+        m.update({"train_loss": 1.0, "grad_norm": 0.5})
+        report = m.update({"train_loss": 0.95, "grad_norm": 1.2})
+        assert not report.divergence.detected
+
+    def test_nan_grad_norm_recommends_rollback(self):
+        m = CycleMonitor(nan_detection=True)
+        m.update({"train_loss": 1.0, "grad_norm": 0.5})
+        report = m.update({"train_loss": 0.95, "grad_norm": float("inf")})
+        assert "rollback: NaN/Inf detected" in report.recommendations
+        assert "reduce_lr" in " ".join(report.recommendations)
+
+    def test_nan_grad_norm_respects_nan_detection_disabled(self):
+        m = CycleMonitor(nan_detection=False)
+        m.update({"train_loss": 1.0, "grad_norm": 0.5})
+        report = m.update({"train_loss": 0.95, "grad_norm": float("nan")})
+        assert not report.divergence.detected
+
+    def test_nan_train_loss_precedence_over_grad_norm(self):
+        """When both train_loss and grad_norm are non-finite, the loss signal
+        (checked first) wins — documents the loop order, not a regression."""
+        m = CycleMonitor(nan_detection=True)
+        m.update({"train_loss": 1.0, "grad_norm": 0.5})
+        report = m.update({"train_loss": float("nan"), "grad_norm": float("nan")})
+        assert report.divergence.detected
+        assert report.divergence.metric == "train_loss"
+
+    def test_grad_norm_absent_does_not_crash_or_flag(self):
+        """A cycle with no grad_norm key (older/loss-only fixtures) must behave
+        exactly as before — no crash, no spurious flag."""
+        m = CycleMonitor(nan_detection=True)
+        m.update({"train_loss": 1.0})
+        report = m.update({"train_loss": 0.95})
+        assert not report.divergence.detected
+
+
 class TestStagnationDetection:
     def test_no_stagnation_within_patience(self):
         m = CycleMonitor(patience=3)
@@ -144,17 +214,17 @@ class TestStagnationCurrentLossSelection:
     @pytest.mark.parametrize(
         "valid_loss, train_loss",
         [
-            (0.0, 1.43),    # the falsy-swallow case (0.0 is a real value)
-            (0.5, 1.0),     # normal scale, truthy
-            (1e-12, 2.0),   # tiny-but-nonzero is truthy, still must round-trip
+            (0.0, 1.43),  # the falsy-swallow case (0.0 is a real value)
+            (0.5, 1.0),  # normal scale, truthy
+            (1e-12, 2.0),  # tiny-but-nonzero is truthy, still must round-trip
         ],
     )
     def test_current_value_matches_best_loss_rule(self, valid_loss, train_loss):
         """``current_value`` must equal the same selection ``update`` applies
         for best-tracking, magnitude- and falsy-invariant across inputs."""
         m = CycleMonitor(patience=2)
-        m.update({"train_loss": 10.0, "valid_loss": valid_loss})        # best
-        m.update({"train_loss": 9.0, "valid_loss": valid_loss + 0.1})   # csb = 1
+        m.update({"train_loss": 10.0, "valid_loss": valid_loss})  # best
+        m.update({"train_loss": 9.0, "valid_loss": valid_loss + 0.1})  # csb = 1
         report = m.update({"train_loss": train_loss, "valid_loss": valid_loss})
         assert report.stagnation.detected
         expected = valid_loss if valid_loss is not None else train_loss

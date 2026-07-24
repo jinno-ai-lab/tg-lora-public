@@ -4,6 +4,7 @@ Detects divergence (loss spikes, NaN gradients) and stagnation (no improvement
 over N cycles), and recommends interventions such as LR reduction, K increase,
 or rollback.
 """
+
 from __future__ import annotations
 
 import math
@@ -63,7 +64,8 @@ class CycleMonitor:
 
         train_loss = cycle_data.get("train_loss")
         valid_loss = cycle_data.get("valid_loss")
-        cycle_data.get("grad_norm")
+        # ``grad_norm`` rides along inside ``cycle_data``; ``detect_divergence``
+        # reads it straight from the appended history (no local needed here).
 
         loss = valid_loss if valid_loss is not None else train_loss
 
@@ -107,9 +109,22 @@ class CycleMonitor:
         valid_loss = current.get("valid_loss")
         prev_train = previous.get("train_loss")
 
-        # NaN detection
+        # NaN/Inf detection. ``grad_norm`` is included so a gradient explosion
+        # that ``clip_grad_norm_`` bounded — leaving the *forward* loss finite
+        # while the recorded *pre-clip* grad norm is non-finite — still trips
+        # the monitor as the docstring ("NaN gradients") and ``nan_detection``
+        # flag promise. Without it the ``advise_training`` CLI (which streams
+        # the real producer's ``grad_norm`` here) reports such a cycle healthy
+        # and exits 0 instead of the critical/exit-2 a diverging run deserves.
+        # The loss entries are checked first, so a non-finite loss wins the
+        # ``metric`` label when both signals are bad.
         if self.nan_detection:
-            for name, val in [("train_loss", train_loss), ("valid_loss", valid_loss)]:
+            grad_norm = current.get("grad_norm")
+            for name, val in [
+                ("train_loss", train_loss),
+                ("valid_loss", valid_loss),
+                ("grad_norm", grad_norm),
+            ]:
                 if val is not None and (math.isnan(val) or math.isinf(val)):
                     return DivergenceReport(
                         detected=True,
@@ -174,13 +189,17 @@ class CycleMonitor:
         if divergence.detected:
             if divergence.severity == "critical":
                 recommendations.append("rollback: NaN/Inf detected")
-                recommendations.append("reduce_lr: critical divergence requires LR reduction")
+                recommendations.append(
+                    "reduce_lr: critical divergence requires LR reduction"
+                )
             elif divergence.severity == "high":
                 recommendations.append("reduce_lr: loss spike detected")
                 recommendations.append("consider_rollback: if divergence persists")
 
         if stagnation.detected:
-            recommendations.append("increase_K: stagnation suggests more extrapolation steps needed")
+            recommendations.append(
+                "increase_K: stagnation suggests more extrapolation steps needed"
+            )
             if stagnation.cycles_without_improvement >= self.patience * 2:
                 recommendations.append("rollback: prolonged stagnation")
 
