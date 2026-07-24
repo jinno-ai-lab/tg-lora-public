@@ -85,10 +85,28 @@ def optimizer_step(
     model: torch.nn.Module,
     max_grad_norm: float = 1.0,
 ) -> None:
-    torch.nn.utils.clip_grad_norm_(
+    # ``clip_grad_norm_`` returns the *pre-clip* total gradient norm — the
+    # canary for a gradient explosion that left the *forward* loss finite (so
+    # ``forward_backward``'s loss-only check never raised). The return was
+    # previously discarded, so Inf/NaN gradients got silently clipped every
+    # step: NaN grads stay NaN under the clip coefficient (poisoning every
+    # parameter) and Inf grads stall to NaN, leaving the run stepping on
+    # corrupted weights and exiting 0. Raising here surfaces it as the
+    # ``NumericalInstabilityError`` the fault-recovery / instability-exit path
+    # keys on (``train_tg_lora`` catches it; ``recover.py`` / ``diagnose.py``
+    # classify it). Mirrors ``cycle_monitor``'s grad_norm divergence check
+    # (TASK-0200) at the step seam shared by train_tg_lora,
+    # train_baseline_qlora and collect_true_gradients.
+    total_norm = torch.nn.utils.clip_grad_norm_(
         [p for p in model.parameters() if p.requires_grad],
         max_grad_norm,
     )
+    if not torch.isfinite(total_norm):
+        raise NumericalInstabilityError(
+            f"Gradient norm is non-finite (pre-clip total_norm="
+            f"{float(total_norm):.4g}). Check learning rate, batch size, "
+            f"and data quality."
+        )
     optimizer.step()
     if scheduler is not None:
         scheduler.step()

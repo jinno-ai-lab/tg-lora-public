@@ -314,6 +314,82 @@ class TestOptimizerStep:
         optimizer_step(opt, None, model, max_grad_norm=1.0)
 
 
+# ── optimizer_step: non-finite gradient detection ────────────────────────────
+#
+# ``clip_grad_norm_`` returns the pre-clip total gradient norm every step. The
+# silent-success path it gates: a finite *forward* loss (so ``forward_backward``
+# raised nothing) whose *backward* produced Inf/NaN gradients. Before the fix
+# the returned norm was discarded, the clip swallowed the bad grads, the run
+# kept stepping on corrupted weights, and the process exited 0. The check must
+# surface it as NumericalInstabilityError — the signal the fault-recovery /
+# instability-exit path (train_tg_lora catch, recover.py / diagnose.py
+# classification) keys on. Mirrors TASK-0200's grad_norm divergence check at
+# the step seam.
+
+
+def _first_trainable_grad(model):
+    # Pick a param whose grad is *non-zero*: under standard LoRA init lora_B is
+    # zeroed, so lora_A receives an all-zero grad (the forward output is
+    # constant in lora_A while lora_B == 0) and optimizer.step() leaves it
+    # unchanged. lora_B carries the real (non-zero) gradient, so poisoning it
+    # both trips the non-finite check AND would move the weight if the step ran.
+    for p in model.parameters():
+        if p.requires_grad and p.grad is not None and p.grad.abs().sum().item() > 0:
+            return p
+    raise AssertionError("no trainable param with a non-zero grad to poison")
+
+
+class TestOptimizerStepNonFiniteGrad:
+    def _setup(self):
+        model = _tiny_gpt2()
+        opt = create_optimizer(model, lr=1e-3)
+        forward_backward(model, _dummy_batch())
+        return model, opt
+
+    def test_nan_grad_raises(self):
+        """A NaN gradient must raise, not be silently clipped."""
+        model, opt = self._setup()
+        _first_trainable_grad(model).grad.data[0] = float("nan")
+        with pytest.raises(NumericalInstabilityError, match="non-finite"):
+            optimizer_step(opt, None, model, max_grad_norm=1.0)
+
+    def test_inf_grad_raises(self):
+        """An Inf gradient must raise, not stall the model into silence."""
+        model, opt = self._setup()
+        _first_trainable_grad(model).grad.data[0] = float("inf")
+        with pytest.raises(NumericalInstabilityError, match="non-finite"):
+            optimizer_step(opt, None, model, max_grad_norm=1.0)
+
+    def test_finite_grad_does_not_raise_and_steps(self):
+        """Happy path: finite grads step normally — the check must not over-fire."""
+        model, opt = self._setup()
+        param = _first_trainable_grad(model)
+        before = param.detach().clone()
+        optimizer_step(opt, None, model, max_grad_norm=1.0)
+        assert not torch.equal(param.detach(), before), (
+            "optimizer.step() must still apply on finite gradients"
+        )
+
+    def test_non_finite_grad_prevents_step(self):
+        """The raise must precede optimizer.step(), so corrupted grads never apply."""
+        model, opt = self._setup()
+        param = _first_trainable_grad(model)
+        param.grad.data[0] = float("nan")
+        before = param.detach().clone()
+        with pytest.raises(NumericalInstabilityError):
+            optimizer_step(opt, None, model, max_grad_norm=1.0)
+        assert torch.equal(param.detach(), before), (
+            "Weights must be unchanged when a non-finite gradient aborts the step"
+        )
+
+    def test_neg_inf_grad_raises(self):
+        """-Inf gradient is equally non-finite and must raise."""
+        model, opt = self._setup()
+        _first_trainable_grad(model).grad.data[0] = float("-inf")
+        with pytest.raises(NumericalInstabilityError, match="non-finite"):
+            optimizer_step(opt, None, model, max_grad_norm=1.0)
+
+
 # ── NumericalInstabilityError ─────────────────────────────────────────────────
 
 
