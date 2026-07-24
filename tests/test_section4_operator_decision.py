@@ -23,11 +23,18 @@ from types import SimpleNamespace
 from src.tg_lora.freeze_surrogate_gate import SURPASSES, TIES
 
 from scripts.section4_operator_decision import (
+    EXIT_AWAITING_DECISION,
+    EXIT_LAND_INVALID,
     HETEROGENEOUS_DEPOSIT,
     HOMOGENEOUS_DEPOSIT,
+    LANDING_RECORD_REL,
     RECOVER_RERUN_ENTRYPOINT,
     REPO_ROOT,
+    VALID_LAND_BRANCHES,
     VERDICT_WORKER_MODULE,
+    _blocking_prompt,
+    _land_decision,
+    _load_landed_decision,
     _probe_verdict_worker,
     assess_section4_decision,
     main,
@@ -53,8 +60,14 @@ def _write_deposits(
     fixtures = root / "tests" / "fixtures"
     fixtures.mkdir(parents=True, exist_ok=True)
     for name, payload in (
-        (HOMOGENEOUS_DEPOSIT.split("/")[-1], homo if homo is not None else _real_deposit(HOMOGENEOUS_DEPOSIT)),
-        (HETEROGENEOUS_DEPOSIT.split("/")[-1], hetero if hetero is not None else _real_deposit(HETEROGENEOUS_DEPOSIT)),
+        (
+            HOMOGENEOUS_DEPOSIT.split("/")[-1],
+            homo if homo is not None else _real_deposit(HOMOGENEOUS_DEPOSIT),
+        ),
+        (
+            HETEROGENEOUS_DEPOSIT.split("/")[-1],
+            hetero if hetero is not None else _real_deposit(HETEROGENEOUS_DEPOSIT),
+        ),
     ):
         (fixtures / name).write_text(json.dumps(payload))
     return fixtures
@@ -137,9 +150,7 @@ class TestProbeClassification:
     transient factor (torch) cannot be misread as an architectural block."""
 
     def test_probe_executable_when_import_succeeds(self):
-        status, reason = _probe_verdict_worker(
-            runner=lambda cmd, **kw: _fake_proc(0)
-        )
+        status, reason = _probe_verdict_worker(runner=lambda cmd, **kw: _fake_proc(0))
         assert status == "executable"
         assert "public Dolly" in reason
 
@@ -315,16 +326,23 @@ class TestUnblockStepAndArchitecturalInvariant:
 
 class TestCLI:
     def test_json_snapshot(self, capsys):
+        # real repo: arc complete, no decision landed yet → BLOCKING (exit 3). The
+        # snapshot is still emitted, with arc_complete / recommendation intact and
+        # the awaiting-decision state surfaced for machine consumers.
         rc = main(["--json"])
         out = capsys.readouterr().out
         snap = json.loads(out)
-        assert rc == 0
+        assert rc == EXIT_AWAITING_DECISION
         assert snap["arc_complete"] is True
         assert snap["recommendation"] == "SHIP"
+        assert snap["awaiting_operator_decision"] is True
+        assert snap["landed_decision"] is None
 
     def test_exit_code_tracks_arc(self, tmp_path):
-        # arc complete (real repo) → exit 0; arc incomplete (empty root) → exit 2
-        assert main([]) == 0
+        # arc complete + UN-LANDED (real repo) → BLOCKING (exit 3); arc incomplete
+        # (empty root) → exit 2. Landing a decision flips 3 → 0
+        # (see TestLandedDecision).
+        assert main([]) == EXIT_AWAITING_DECISION
         assert main(["--repo-root", str(tmp_path)]) == 2
 
     def test_help_launches_as_module(self):
@@ -347,3 +365,152 @@ class TestCLI:
         for branch in ("ship", "accept_null", "pivot"):
             assert branch in out
         assert "RECOMMENDATION: SHIP" in out
+        # the SINGLE blocking operator prompt is emitted while un-landed
+        assert "ACTION REQUIRED" in out
+        assert "--land" in out
+
+
+class TestLandedDecision:
+    """The decision-landing surface (feedback's highest-leverage move for this
+    already-complete arc): BLOCK (exit 3) with ONE operator prompt until the
+    operator lands a call via ``--land``, then exit 0 with no further variants.
+
+    The tool does NOT make the call — landing ``accept_null`` does not mutate the
+    evidence-based SHIP recommendation; the operator's recorded call and the
+    tool's suggestion coexist. Mutation-proven: each guard's negation flips a
+    test RED.
+    """
+
+    def test_no_record_awaits_with_exit_3(self, tmp_path):
+        # arc complete, no landing record → BLOCKING. (mutation: if awaiting were
+        # `landed is not None` this would be False; if exit were 0 this fails.)
+        _write_deposits(tmp_path)
+        snap = assess_section4_decision(repo_root=str(tmp_path))
+        assert snap["arc_complete"] is True
+        assert snap["landed_decision"] is None
+        assert snap["awaiting_operator_decision"] is True
+        assert main(["--repo-root", str(tmp_path), "--json"]) == EXIT_AWAITING_DECISION
+
+    def test_land_writes_record_and_unblocks(self, tmp_path):
+        # --land accept_null writes a committed record → awaiting clears → exit 0.
+        # (mutation: drop the `if landed: return 0` in main → exit stays 3.)
+        _write_deposits(tmp_path)
+        rc, msg = _land_decision(
+            str(tmp_path), "accept_null", "TIES is the honest null"
+        )
+        assert rc == 0
+        assert "accept_null" in msg
+        record_path = tmp_path / LANDING_RECORD_REL
+        assert record_path.exists()
+        record = json.loads(record_path.read_text())
+        assert record["branch"] == "accept_null"
+        assert record["landed"] is True
+        snap = assess_section4_decision(repo_root=str(tmp_path))
+        assert snap["awaiting_operator_decision"] is False
+        assert snap["landed_decision"]["branch"] == "accept_null"
+        assert main(["--repo-root", str(tmp_path)]) == 0
+
+    def test_land_ship_or_accept_null_unblock(self, tmp_path):
+        for branch in ("ship", "accept_null"):
+            sub = tmp_path / branch
+            sub.mkdir()
+            _write_deposits(sub)
+            rc, _ = _land_decision(str(sub), branch, "operator call")
+            assert rc == 0, branch
+            assert main(["--repo-root", str(sub)]) == 0, branch
+
+    def test_land_rejects_invalid_branch(self, tmp_path):
+        # (mutation: drop the branch check → rc becomes 0 and a record is written.)
+        _write_deposits(tmp_path)
+        rc, msg = _land_decision(str(tmp_path), "bogus", "x")
+        assert rc == EXIT_LAND_INVALID
+        assert "ship, accept_null, pivot" in msg
+        assert not (tmp_path / LANDING_RECORD_REL).exists()
+
+    def test_land_requires_basis(self, tmp_path):
+        # (mutation: drop the basis check → rc becomes 0.)
+        _write_deposits(tmp_path)
+        assert _land_decision(str(tmp_path), "ship", None)[0] == EXIT_LAND_INVALID
+        assert _land_decision(str(tmp_path), "ship", "   ")[0] == EXIT_LAND_INVALID
+        assert not (tmp_path / LANDING_RECORD_REL).exists()
+
+    def test_land_refused_when_arc_incomplete(self, tmp_path):
+        # cannot land a call on an incomplete verdict. (mutation: drop the
+        # arc_complete gate → rc becomes 0 and a record is written on an empty arc.)
+        rc, msg = _land_decision(str(tmp_path), "ship", "x")
+        assert rc == EXIT_LAND_INVALID
+        assert "arc is incomplete" in msg
+        assert not (tmp_path / LANDING_RECORD_REL).exists()
+
+    def test_land_pivot_records_private_repo_only(self, tmp_path):
+        # src.data stripped here → pivot is a private-repo action; the record says
+        # so. (mutation: flip the `not executable_here` → pivot_private_repo_only
+        # becomes False.)
+        _write_deposits(tmp_path)
+        rc, _ = _land_decision(str(tmp_path), "pivot", "go private")
+        assert rc == 0
+        record = json.loads((tmp_path / LANDING_RECORD_REL).read_text())
+        assert record["branch"] == "pivot"
+        assert record["pivot_private_repo_only"] is True
+
+    def test_land_does_not_mutate_recommendation(self, tmp_path):
+        # THE "not unilateral" PIN: landing accept_null does NOT flip the tool's
+        # SHIP suggestion. The operator's call and the evidence-based
+        # recommendation coexist; the tool surfaces both, it does not decide.
+        # (mutation: if landing set recommendation=landed branch, this fails.)
+        _write_deposits(tmp_path)
+        _land_decision(str(tmp_path), "accept_null", "ties is the honest null")
+        snap = assess_section4_decision(repo_root=str(tmp_path))
+        assert snap["recommendation"] == "SHIP"
+        assert snap["landed_decision"]["branch"] == "accept_null"
+
+    def test_blocking_prompt_names_branches_and_land_command(self):
+        # the single prompt names all three branches + the exact land command +
+        # the exit-3 contract.
+        prompt = _blocking_prompt()
+        for branch in VALID_LAND_BRANCHES:
+            assert branch in prompt
+        assert "--land" in prompt
+        assert "exit 3" in prompt
+
+    def test_human_readable_blocks_when_awaiting(self, tmp_path, capsys):
+        _write_deposits(tmp_path)
+        rc = main(["--repo-root", str(tmp_path)])
+        out = capsys.readouterr().out
+        assert rc == EXIT_AWAITING_DECISION
+        assert "ACTION REQUIRED" in out
+        assert "--land" in out
+
+    def test_human_readable_shows_landed_when_landed(self, tmp_path, capsys):
+        _write_deposits(tmp_path)
+        _land_decision(str(tmp_path), "accept_null", "ties is the honest null")
+        rc = main(["--repo-root", str(tmp_path)])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "LANDED OPERATOR DECISION" in out
+        assert "accept_null" in out
+        # no blocking prompt once a call is landed
+        assert "ACTION REQUIRED" not in out
+
+    def test_malformed_record_does_not_fake_landed(self, tmp_path):
+        # a torn/malformed record cannot fake a landed call — treated as un-landed.
+        # (mutation: drop the try/except in _load_landed_decision → raises.)
+        _write_deposits(tmp_path)
+        (tmp_path / LANDING_RECORD_REL).write_text("{not valid json")
+        snap = assess_section4_decision(repo_root=str(tmp_path))
+        assert snap["landed_decision"] is None
+        assert snap["awaiting_operator_decision"] is True
+
+    def test_non_branch_record_does_not_fake_landed(self, tmp_path):
+        # a record naming a non-branch value cannot fake a landed call.
+        # (mutation: drop the branch-membership check → this record would load.)
+        _write_deposits(tmp_path)
+        (tmp_path / LANDING_RECORD_REL).write_text(
+            json.dumps({"branch": "definitely_ship", "landed": True})
+        )
+        snap = assess_section4_decision(repo_root=str(tmp_path))
+        assert snap["landed_decision"] is None
+        assert snap["awaiting_operator_decision"] is True
+
+    def test_load_landed_decision_returns_none_when_absent(self, tmp_path):
+        assert _load_landed_decision(str(tmp_path)) is None

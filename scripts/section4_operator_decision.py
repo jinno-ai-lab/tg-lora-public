@@ -47,9 +47,13 @@ adds no guard around the (already-locked) metric.
 
 Usage::
 
-    python scripts/section4_operator_decision.py            # human-readable snapshot
-    python scripts/section4_operator_decision.py --json     # machine-readable
+    python scripts/section4_operator_decision.py            # snapshot; blocks (exit 3) until a call is landed
+    python scripts/section4_operator_decision.py --json     # machine-readable snapshot
+    python scripts/section4_operator_decision.py --land accept_null --basis "<why>"  # land the call → exit 0
     python -m scripts.section4_operator_decision --json
+
+Exit contract: ``0`` = an operator decision is landed (done); ``3`` = the verdict
+arc is complete but no call is landed yet (BLOCKING); ``2`` = arc incomplete.
 """
 
 from __future__ import annotations
@@ -70,6 +74,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts.replay_freeze_validloss_ci import load_samples, replay_samples  # noqa: E402
 from src.tg_lora.freeze_surrogate_gate import TIES  # noqa: E402
+from src.utils.io import load_json, save_json  # noqa: E402
 
 # The two committed citable full-budget §4 deposits (reified verdict arc). Both
 # are seq1024, ``proxy_scale=false``, ``citable_as_full_section4_verdict=True``.
@@ -99,10 +104,44 @@ RECOVER_RERUN_ENTRYPOINT = "src/data/build_seed_dataset.py"
 # factor, not an architectural gate (the verdict worker imports cleanly here).
 SEQ1024_FULL_BUDGET_VRAM_FLOOR_MIB = 11_000
 
+# --- The decision-landing surface ------------------------------------------------
+#
+# The feedback's single highest-leverage move for this (already-complete) arc is
+# to convert the *documented* accept-null/ship/pivot decision into a *landed*
+# one — either a default flip gated behind an explicit operator-approved commit,
+# or a single blocking operator prompt — and then STOP surfacing variants until
+# the operator's call lands. This implements both at once:
+#
+#   * ``--land <branch> --basis "<why>"`` writes a committed record (the
+#     operator-approved commit/flag that lands the call); once landed, this
+#     surface exits 0 and emits no further variants.
+#   * until a record is landed, the surface BLOCKS (exit ``EXIT_AWAITING_DECISION``)
+#     with ONE operator prompt naming all three branches + the exact land command.
+#
+# It does NOT re-derive the verdict, add a guard around the (locked) metric, or
+# fabricate the efficacy/single-pass levers the feedback also names — those
+# (``single-pass`` escape hatch, ``τ=+0.522`` ranking-triage, ``recursive`` /
+# ``max_passes``) are absent from this public mirror (see TASK-0167..0177). The
+# accept-null/ship/pivot DECISION itself is real and documented; only its landing
+# was missing. This tool still does not make the call unilaterally — it blocks
+# until the operator records it.
 
-def _probe_verdict_worker(
-    python: str | None = None, *, runner=None
-) -> tuple[str, str]:
+# The committed operator-decision record (repo-root-relative). Absent ⇒ no call
+# has landed yet ⇒ the surface blocks. Present + valid ⇒ the call is landed.
+LANDING_RECORD_REL = "section4_landed_decision.json"
+
+# The three branches the operator may land. Mirror the ``branches`` dict below;
+# landing a fourth is rejected so the decision space cannot drift silently.
+VALID_LAND_BRANCHES = ("ship", "accept_null", "pivot")
+
+# Exit contract: 0 = a decision is LANDED (done); 2 = arc incomplete (existing);
+# 3 = arc complete but the operator call is un-landed (the blocking state); 4 =
+# a ``--land`` was rejected (invalid branch / missing basis / incomplete arc).
+EXIT_AWAITING_DECISION = 3
+EXIT_LAND_INVALID = 4
+
+
+def _probe_verdict_worker(python: str | None = None, *, runner=None) -> tuple[str, str]:
     """Honest ground-truth probe of the §4 verdict worker's importability.
 
     Returns ``(status, reason)`` where ``status`` is one of:
@@ -135,7 +174,10 @@ def _probe_verdict_worker(
     )
     rc = getattr(proc, "returncode", 1)
     if rc == 0:
-        return "executable", "verdict worker imports cleanly (public Dolly; no src.data dep)"
+        return (
+            "executable",
+            "verdict worker imports cleanly (public Dolly; no src.data dep)",
+        )
     err = (getattr(proc, "stderr", "") or "").strip()
     last = err.splitlines()[-1] if err else f"import failed (exit {rc}, no stderr)"
     if "No module named 'src" in err:
@@ -184,12 +226,96 @@ def _assess_leg(label: str, deposit_rel: str, repo_root: Path) -> dict[str, Any]
     return leg
 
 
+def _landing_record_path(repo_root: Path | str | None) -> Path:
+    """Resolve the operator-decision landing record under *repo_root*."""
+    root = Path(repo_root) if repo_root is not None else REPO_ROOT
+    return root / LANDING_RECORD_REL
+
+
+def _load_landed_decision(repo_root: Path | str | None) -> dict | None:
+    """Return the landed operator-decision record, or ``None`` if none is landed.
+
+    ``None`` (no record committed yet) is the BLOCKING state — the surface emits
+    its single operator prompt and exits ``EXIT_AWAITING_DECISION``. A record that
+    is absent, unreadable, or names a non-branch value is treated as un-landed
+    rather than silently mis-read (a malformed record cannot fake a landed call).
+    """
+    path = _landing_record_path(repo_root)
+    if not path.exists():
+        return None
+    try:
+        record = load_json(path)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("branch") not in VALID_LAND_BRANCHES:
+        return None
+    return record
+
+
+def _write_landed_decision(
+    repo_root: Path | str | None,
+    *,
+    branch: str,
+    basis: str,
+    pivot_private_repo_only: bool,
+) -> dict[str, Any]:
+    """Atomically land (commit-ready) the operator's §4 decision record.
+
+    Routed through :func:`src.utils.io.save_json` (the atomic JSON publish point)
+    so a kill mid-write cannot leave a half-record that fakes a landed call. The
+    record is the operator-approved commit/flag that converts the *documented*
+    decision into a *landed* one.
+    """
+    from datetime import datetime, timezone
+
+    record = {
+        "branch": branch,
+        "basis": basis,
+        "landed": True,
+        "pivot_private_repo_only": bool(pivot_private_repo_only),
+        "deposits": [HOMOGENEOUS_DEPOSIT, HETEROGENEOUS_DEPOSIT],
+        "landed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_json(record, _landing_record_path(repo_root))
+    return record
+
+
+def _blocking_prompt() -> str:
+    """The SINGLE operator prompt emitted while the §4 call is un-landed.
+
+    One prompt — not a stream of variants. Names all three branches and the exact
+    ``--land`` command, and states it stops once the operator lands one. This is
+    the conversion of the documented accept-null/ship/pivot decision into a
+    blocking operator prompt (the feedback's highest-leverage move for this arc).
+    """
+    lines = [
+        "=== ACTION REQUIRED: land your §4 operator decision ===",
+        "",
+        "The §4 verdict arc is COMPLETE (both legs citable faithful TIES) — the",
+        "relative verdict is done and will not change on re-run. What remains is",
+        "YOUR call on a TIES (null) result, which this tool does not make for you:",
+        "",
+        "  ship        — adopt the citable relative-verdict TIES as the §4 result",
+        "  accept_null — record the TIES as the honest null (freeze-order gain is null)",
+        "  pivot       — absolute-loss comparability (private-repo src.data action)",
+        "",
+        "Land exactly one (writes a committed record; this prompt then stops):",
+        "",
+        "  python scripts/section4_operator_decision.py \\",
+        '      --land <ship|accept_null|pivot> --basis "<why>"',
+        "",
+        "Until you land one, this surface blocks (exit 3) and emits no further variants.",
+    ]
+    return "\n".join(lines)
+
+
 def assess_section4_decision(
     *,
     repo_root: Path | str | None = None,
     src_data_present: bool | None = None,
     verdict_worker_status: str | None = None,
     worker_probe=None,
+    landed: dict | None = None,
 ) -> dict[str, Any]:
     """Build the machine-verifiable §4 operator-decision snapshot.
 
@@ -211,6 +337,13 @@ def assess_section4_decision(
     worker_probe:
         Injectable probe callable (returns ``(status, reason)``) so the unit
         tests mock the verdict-worker import instead of spawning an interpreter.
+    landed:
+        Override for the operator-decision landing record
+        (:func:`_load_landed_decision`). ``None`` (default) reads it from disk
+        under *repo_root*; pass a ``dict`` to inject a landed record (tests) or
+        ``{}``-falsy via :func:`_load_landed_decision`. A landed record flips the
+        surface from the blocking (awaiting) state to done — see
+        :data:`EXIT_AWAITING_DECISION`.
     """
     root = Path(repo_root) if repo_root is not None else REPO_ROOT
 
@@ -301,9 +434,11 @@ def assess_section4_decision(
             "the §4 verdict arc is incomplete but the verdict worker is executable "
             "in this checkout (public Dolly; no src.data block) — fire "
             "`make freeze-validloss-ci-9b-full[-heterogeneous]` to produce the "
-            "missing deposit" + (
+            "missing deposit"
+            + (
                 " (a transient factor such as GPU/torch is currently unavailable)"
-                if verdict_worker_status == "transient_block" else ""
+                if verdict_worker_status == "transient_block"
+                else ""
             )
         )
     else:
@@ -341,8 +476,17 @@ def assess_section4_decision(
         )
     )
 
+    # The operator-decision landing record. ``None`` (default) reads it from disk;
+    # a landed record converts the surface from blocking (awaiting) to done. The
+    # tool does not make the call — it reports whether the operator has landed one.
+    if landed is None:
+        landed = _load_landed_decision(root)
+
     return {
         "arc_complete": arc_complete,
+        "landed_decision": landed,
+        # blocking state: the verdict arc is DONE but no operator call is recorded.
+        "awaiting_operator_decision": bool(arc_complete and landed is None),
         "legs": legs,
         "run_executable_here": run_executable_here,
         "verdict_worker_status": verdict_worker_status,
@@ -357,6 +501,56 @@ def assess_section4_decision(
     }
 
 
+def _land_decision(
+    repo_root: Path | str | None, branch: str | None, basis: str | None
+) -> tuple[int, str]:
+    """Land (write the committed record for) the operator's §4 decision.
+
+    Returns ``(exit_code, message)``. Validates the branch is one of the three,
+    that a non-empty ``--basis`` records the operator's reasoning, and that the
+    verdict arc is complete (you cannot land a call on an incomplete verdict).
+    The arc check is deposit-derived (GPU-free); the worker probe is overridden
+    so ``--land`` never depends on a torch interpreter being present. On success
+    the record is written atomically (:func:`_write_landed_decision`) and the
+    surface stops blocking.
+    """
+    root = Path(repo_root) if repo_root is not None else REPO_ROOT
+    if branch not in VALID_LAND_BRANCHES:
+        return EXIT_LAND_INVALID, (
+            f"invalid --land branch {branch!r}; choose one of "
+            f"{', '.join(VALID_LAND_BRANCHES)}."
+        )
+    if not (basis and basis.strip()):
+        return (
+            EXIT_LAND_INVALID,
+            "--land requires a non-empty --basis explaining the call.",
+        )
+    # arc_complete is deposit-derived (GPU-free replay); override the worker probe
+    # so --land is torch-free — the probe never gates whether a call may land.
+    snap = assess_section4_decision(repo_root=root, verdict_worker_status="executable")
+    if not snap["arc_complete"]:
+        return EXIT_LAND_INVALID, (
+            "cannot land a §4 decision: the verdict arc is incomplete (one or "
+            "both deposits are missing / non-citable / not faithful-TIES)."
+        )
+    pivot_private_repo_only = branch == "pivot" and not snap["branches"]["pivot"].get(
+        "executable_here", False
+    )
+    _write_landed_decision(
+        root,
+        branch=branch,
+        basis=basis.strip(),
+        pivot_private_repo_only=pivot_private_repo_only,
+    )
+    return 0, (
+        f"LANDED §4 operator decision: {branch}.\n"
+        f"  basis: {basis.strip()}\n"
+        f"  record: {_landing_record_path(root)}\n"
+        "  This call is landed and binding; `section4_operator_decision` now exits "
+        "0 and emits no further variants."
+    )
+
+
 def format_decision(snapshot: dict[str, Any]) -> str:
     """Human-readable rendering of the §4 operator-decision snapshot."""
     lines: list[str] = []
@@ -368,7 +562,9 @@ def format_decision(snapshot: dict[str, Any]) -> str:
             lines.append(f"  [{leg['label']}] MISSING ({leg['deposit']})")
             continue
         verdict = leg["rederived_verdict"]
-        citable = "citable" if leg["citable_as_full_section4_verdict"] else "NON-citable"
+        citable = (
+            "citable" if leg["citable_as_full_section4_verdict"] else "NON-citable"
+        )
         faithful = "faithful" if leg["faithful"] else "STALE-vs-rederived"
         lines.append(
             f"  [{leg['label']}] {verdict} · {citable} · {faithful} · "
@@ -393,8 +589,10 @@ def format_decision(snapshot: dict[str, Any]) -> str:
     lines.append("")
     lines.append("Decision branches (executable_here):")
     for name, branch in snapshot["branches"].items():
-        tag = "yes" if branch["executable_here"] else (
-            "no — private-repo only" if branch.get("private_repo_only") else "no"
+        tag = (
+            "yes"
+            if branch["executable_here"]
+            else ("no — private-repo only" if branch.get("private_repo_only") else "no")
         )
         lines.append(f"  {name}: {tag} — {branch['summary']}")
     lines.append("")
@@ -405,6 +603,22 @@ def format_decision(snapshot: dict[str, Any]) -> str:
     for sentence in snapshot["unblock_step"].split(". "):
         if sentence.strip():
             lines.append(f"  {sentence.strip()}.")
+    lines.append("")
+    landed = snapshot.get("landed_decision")
+    if landed:
+        lines.append("LANDED OPERATOR DECISION (binding — recorded by the operator):")
+        lines.append(f"  branch: {landed['branch']}")
+        if landed.get("basis"):
+            lines.append(f"  basis: {landed['basis']}")
+        if landed.get("pivot_private_repo_only"):
+            lines.append("  note: pivot recorded as a private-repo-only action")
+        lines.append(
+            "  This call is landed; this surface exits 0 and emits no further variants."
+        )
+    elif snapshot.get("awaiting_operator_decision"):
+        # The single blocking operator prompt — emitted only while the call is
+        # un-landed, never as a stream of variants.
+        lines.append(_blocking_prompt())
     return "\n".join(lines)
 
 
@@ -426,19 +640,43 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Repository root holding tests/fixtures/ (default: this script's repo).",
     )
+    parser.add_argument(
+        "--land",
+        metavar="BRANCH",
+        default=None,
+        help=(
+            "Land (commit-ready) your §4 operator decision: one of "
+            "ship/accept_null/pivot. Requires --basis. Writes a committed record "
+            "so the decision surface stops blocking (exit 3 → 0)."
+        ),
+    )
+    parser.add_argument(
+        "--basis",
+        default=None,
+        help="Reason recorded alongside --land (required with --land).",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.land is not None:
+        rc, message = _land_decision(args.repo_root, args.land, args.basis)
+        print(message)
+        return rc
     snapshot = assess_section4_decision(repo_root=args.repo_root)
     if args.json:
         print(json.dumps(snapshot, indent=2, default=str))
     else:
         print(format_decision(snapshot))
-    # exit 0 when the arc is complete (the decision is actionable); 2 otherwise —
-    # mirrors replay_freeze_validloss_ci's --expected exit contract.
-    return 0 if snapshot["arc_complete"] else 2
+    # exit contract: 0 = an operator decision is LANDED (done); 3 = the verdict
+    # arc is complete but no call is landed yet (BLOCKING — emit the single
+    # operator prompt, no further variants, until the operator lands one);
+    # 2 = arc incomplete. Extends replay's --expected contract with the
+    # awaiting-decision state.
+    if snapshot["landed_decision"] is not None:
+        return 0
+    return EXIT_AWAITING_DECISION if snapshot["arc_complete"] else 2
 
 
 if __name__ == "__main__":

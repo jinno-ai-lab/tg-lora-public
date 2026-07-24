@@ -1095,11 +1095,13 @@ freeze-replay: ## Re-judge recorded valid_loss samples through the §4 judge (no
 # public-mirror port — the executable decision here is SHIP (recommended) or
 # ACCEPT-NULL. The recurring "launch the 9B run" feedback is stale: this command
 # is the machine-checkable proof the arc already landed. Needs only numpy (NOT
-# torch/GPU). SECTION4_DECISION_FLAGS=--json for machine consumption.
-# Exit 0 = arc complete (decision actionable), 2 = incomplete.
+# torch/GPU). SECTION4_DECISION_FLAGS=--json for machine consumption;
+# SECTION4_DECISION_FLAGS="--land accept_null --basis <why>" LANDS the call.
+# Exit contract: 0 = a decision is LANDED; 3 = arc complete but awaiting the
+# operator's call (BLOCKING); 2 = arc incomplete.
 SECTION4_DECISION_FLAGS ?=
 
-section4-operator-decision: ## Emit the §4 ship/accept-null/pivot operator decision, machine-verified from both deposits (no GPU); exit 0 = arc complete
+section4-operator-decision: ## Emit the §4 operator decision; exit 0 = landed, 3 = arc complete but awaiting operator call (blocking), 2 = incomplete
 	$(PYTHON_VENV) -m scripts.section4_operator_decision $(SECTION4_DECISION_FLAGS)
 
 # Turnkey for recipe TASK-0152 Tier-1 step 3: form a §4 verdict-gate deposit from
