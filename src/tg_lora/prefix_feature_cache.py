@@ -140,7 +140,24 @@ def build_prefix_feature_cache_metadata(
     lora_dropout: float,
     lora_target_modules: str,
     trainable_lora_scope: str,
+    train_on_prompt: bool,
 ) -> dict[str, Any]:
+    """Cache-identity metadata for a prefix-feature cache shard.
+
+    ``train_on_prompt`` is REQUIRED (not defaulted) precisely because it changes
+    the cached content, not just its interpretation: the dataset's ``labels``
+    are produced by the loader (``train_on_prompt=False`` masks the prompt with
+    ``labels=-100``; ``True`` keeps them), and :func:`build_prefix_feature_dataset`
+    copies those labels verbatim into the cached ``PrefixFeatureExample`` (it
+    does NOT re-derive them on load). Because the field is applied at load time
+    from ``cfg.training.train_on_prompt`` — NOT baked into the dataset file —
+    two runs over the same ``dataset_path`` that differ ONLY in
+    ``train_on_prompt`` would otherwise share this fingerprint, hit one cache
+    path, and silently replay the other run's (wrongly-)masked labels: the
+    operator toggling ``train_on_prompt`` trains on stale labels with no signal.
+    Omitting it here is a TypeError at every call site on purpose, so a future
+    producer path cannot silently default it.
+    """
     data_file = Path(dataset_path)
     resolved_path = str(data_file.resolve()) if data_file.exists() else dataset_path
     size_bytes = data_file.stat().st_size if data_file.exists() else None
@@ -159,6 +176,7 @@ def build_prefix_feature_cache_metadata(
         "lora_dropout": lora_dropout,
         "lora_target_modules": lora_target_modules,
         "trainable_lora_scope": trainable_lora_scope,
+        "train_on_prompt": bool(train_on_prompt),
     }
 
 

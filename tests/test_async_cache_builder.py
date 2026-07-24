@@ -132,6 +132,7 @@ def test_async_build_disk_hit_skips_build(tmp_path: Path):
         split_layer_idx=2, lora_r=4, lora_alpha=8,
         lora_dropout=0.0, lora_target_modules="all-linear",
         trainable_lora_scope="last_25_percent",
+        train_on_prompt=False,
     )
     cache_path = get_prefix_feature_cache_path(cache_dir, metadata)
 
@@ -263,6 +264,7 @@ def test_async_force_rebuild_ignores_disk_cache(tmp_path: Path):
         split_layer_idx=2, lora_r=4, lora_alpha=8,
         lora_dropout=0.0, lora_target_modules="all-linear",
         trainable_lora_scope="last_25_percent",
+        train_on_prompt=False,
     )
     cache_path = get_prefix_feature_cache_path(cache_dir, metadata)
     fake_dataset = PrefixFeatureDataset([

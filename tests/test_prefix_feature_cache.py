@@ -113,6 +113,7 @@ def _default_metadata(**overrides):
         "lora_dropout": 0.0,
         "lora_target_modules": "all-linear",
         "trainable_lora_scope": "last_25_percent",
+        "train_on_prompt": False,
     }
     base.update(overrides)
     return build_prefix_feature_cache_metadata(**base)
@@ -195,6 +196,7 @@ def test_prefix_feature_dataset_round_trips_through_disk_cache(tmp_path: Path):
         lora_dropout=0.0,
         lora_target_modules="all-linear",
         trainable_lora_scope="last_25_percent",
+        train_on_prompt=False,
     )
     cache_path = get_prefix_feature_cache_path(tmp_path, metadata)
 
@@ -423,6 +425,26 @@ class TestCachePathSha256:
         p1 = get_prefix_feature_cache_path("/tmp/cache", m1)
         p2 = get_prefix_feature_cache_path("/tmp/cache", m2)
         assert p1 != p2
+
+    def test_different_train_on_prompt_gives_different_path(self):
+        """TC-132-04: different train_on_prompt → different path.
+
+        ``train_on_prompt`` is applied at load time (NOT baked into the dataset
+        file): ``False`` masks the prompt with ``labels=-100``; ``True`` keeps
+        them. ``build_prefix_feature_dataset`` copies those labels verbatim into
+        the cache, so two runs over the SAME ``dataset_path`` that differ only in
+        ``train_on_prompt`` must NOT share a cache path — otherwise the second
+        run silently replays the first run's (wrongly-)masked labels.
+        """
+        m_false = _default_metadata(train_on_prompt=False)
+        m_true = _default_metadata(train_on_prompt=True)
+        p_false = get_prefix_feature_cache_path("/tmp/cache", m_false)
+        p_true = get_prefix_feature_cache_path("/tmp/cache", m_true)
+        assert p_false != p_true
+        # And the field is actually stamped into the identity dict, so a future
+        # refactor cannot drop it while leaving the parameter in place.
+        assert m_false["train_on_prompt"] is False
+        assert m_true["train_on_prompt"] is True
 
 
 # ---------------------------------------------------------------------------

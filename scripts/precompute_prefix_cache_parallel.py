@@ -209,6 +209,10 @@ def _build_worker_configs(
             lora_dropout=cfg.lora.dropout,
             lora_target_modules=cfg.lora.target_modules,
             trainable_lora_scope=cfg.training.trainable_lora_scope,
+            # getattr (not .get): cfg.training is a Pydantic TrainingConfig in
+            # tests and an OmegaConf node at runtime — both support attribute
+            # access, neither uniformly supports dict-style .get().
+            train_on_prompt=bool(getattr(cfg.training, "train_on_prompt", False)),
         )
         final_cache_path = get_prefix_feature_cache_path(cache_dir, metadata)
         total_examples = _count_records(dataset_path)

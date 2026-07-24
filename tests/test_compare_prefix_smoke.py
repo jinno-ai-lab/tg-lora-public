@@ -46,6 +46,7 @@ def _default_metadata(**overrides):
         "lora_dropout": 0.0,
         "lora_target_modules": "all-linear",
         "trainable_lora_scope": "last_25_percent",
+        "train_on_prompt": False,
     }
     base.update(overrides)
     return build_prefix_feature_cache_metadata(**base)

@@ -212,6 +212,7 @@ class AsyncCacheBuilder:
                 lora_dropout=float(self._cfg.lora.dropout),
                 lora_target_modules=str(self._cfg.lora.target_modules),
                 trainable_lora_scope=self._trainable_lora_scope,
+                train_on_prompt=bool(self._cfg.training.get("train_on_prompt", False)),
             )
             cache_path = get_prefix_feature_cache_path(self._cache_dir, metadata)
             lazy_disk = (

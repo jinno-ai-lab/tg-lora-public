@@ -32,6 +32,7 @@ def _default_metadata():
         lora_dropout=0.0,
         lora_target_modules="all-linear",
         trainable_lora_scope="last_25_percent",
+        train_on_prompt=False,
     )
 
 

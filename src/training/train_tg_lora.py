@@ -1123,6 +1123,7 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
             lora_dropout=cfg.lora.dropout,
             lora_target_modules=cfg.lora.target_modules,
             trainable_lora_scope=trainable_lora_scope,
+            train_on_prompt=bool(cfg.training.get("train_on_prompt", False)),
         )
         cache_path = get_prefix_feature_cache_path(prefix_feature_cache_dir, metadata)
         prefix_feature_cache_summary[f"prefix_feature_cache_{label}_path"] = str(
