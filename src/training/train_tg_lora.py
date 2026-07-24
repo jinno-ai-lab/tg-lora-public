@@ -2723,13 +2723,20 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                             f"Cycle {cycle} full eval: loss={full_loss:.4f} "
                             f"ppl={full_result.perplexity:.2f}"
                         )
-                        cycle_state.record_full_eval(full_loss)
+                        was_new_best = cycle_state.record_full_eval(full_loss)
                         metrics.record_full_eval_loss(
                             cycle=cycle,
                             full_loss=full_loss,
                             total_backward_passes=cycle_state.full_backward_passes,
                         )
-                        if full_loss < best_full_eval_loss:
+                        # Save best_model only on a min_delta-significant new
+                        # best (``was_new_best``) that ALSO strictly lowers
+                        # ``best_full_eval_loss``. The conjunct preserves the
+                        # monotonic-best invariant: resuming a checkpoint whose
+                        # ``best_full_eval_loss`` and ``cycle_state.best_loss``
+                        # diverged must never overwrite a better saved model
+                        # (TASK-0202; see ``record_full_eval``).
+                        if was_new_best and full_loss < best_full_eval_loss:
                             best_full_eval_loss = full_loss
                             best_full_eval_perplexity = full_result.perplexity
                             save_checkpoint(model, tokenizer, run_dir / "best_model")
@@ -2860,13 +2867,15 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                             full_loss,
                             full_result.perplexity,
                         )
-                        cycle_state.record_full_eval(full_loss)
+                        was_new_best = cycle_state.record_full_eval(full_loss)
                         metrics.record_full_eval_loss(
                             cycle=cycle,
                             full_loss=full_loss,
                             total_backward_passes=cycle_state.full_backward_passes,
                         )
-                        if full_loss < best_full_eval_loss:
+                        # min_delta new-best (was_new_best) AND monotonic-best
+                        # guard — never raise best_full_eval_loss (TASK-0202).
+                        if was_new_best and full_loss < best_full_eval_loss:
                             best_full_eval_loss = full_loss
                             best_full_eval_perplexity = full_result.perplexity
                             save_checkpoint(
@@ -3028,13 +3037,20 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                             f"Cycle {cycle} full eval: loss={full_loss:.4f} "
                             f"ppl={full_result.perplexity:.2f}"
                         )
-                        cycle_state.record_full_eval(full_loss)
+                        was_new_best = cycle_state.record_full_eval(full_loss)
                         metrics.record_full_eval_loss(
                             cycle=cycle,
                             full_loss=full_loss,
                             total_backward_passes=cycle_state.full_backward_passes,
                         )
-                        if full_loss < best_full_eval_loss:
+                        # Save best_model only on a min_delta-significant new
+                        # best (``was_new_best``) that ALSO strictly lowers
+                        # ``best_full_eval_loss``. The conjunct preserves the
+                        # monotonic-best invariant: resuming a checkpoint whose
+                        # ``best_full_eval_loss`` and ``cycle_state.best_loss``
+                        # diverged must never overwrite a better saved model
+                        # (TASK-0202; see ``record_full_eval``).
+                        if was_new_best and full_loss < best_full_eval_loss:
                             best_full_eval_loss = full_loss
                             best_full_eval_perplexity = full_result.perplexity
                             save_checkpoint(model, tokenizer, run_dir / "best_model")
@@ -4359,7 +4375,16 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                     cycle_state.cycle,
                     early_stopping_min_delta,
                 )
-                if full_loss < best_full_eval_loss:
+                # Save best_model only on a min_delta-significant new best.
+                # ``is_new_best`` (``_evaluate_full_eval_outcome``) is the same
+                # min_delta-gated predicate ``cycle_state.record_full_eval``
+                # applied above; the ``full_loss < best_full_eval_loss`` conjunct
+                # preserves the monotonic-best invariant (the saved best never
+                # gets worse), which a pure new-best gate could violate when
+                # resuming a checkpoint whose ``best_full_eval_loss`` and
+                # ``cycle_state.best_loss`` diverged. Default ``min_delta=0.0``
+                # is byte-identical to the prior raw comparison (TASK-0202).
+                if is_new_best and full_loss < best_full_eval_loss:
                     best_full_eval_loss = full_loss
                     best_full_eval_perplexity = full_result.perplexity
                     save_checkpoint(model, tokenizer, run_dir / "best_model")
@@ -4604,13 +4629,16 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
         full_result = eval_loss_detailed(model, valid_full_loader, input_device)
         full_loss = full_result.avg_loss
         logger.info(f"Final full validation loss: {full_loss:.4f} (ppl: {full_result.perplexity:.2f})")
-        cycle_state.record_full_eval(full_loss)
+        was_new_best = cycle_state.record_full_eval(full_loss)
         metrics.record_full_eval_loss(
             cycle=cycle_state.cycle,
             full_loss=full_loss,
             total_backward_passes=cycle_state.full_backward_passes,
         )
-        if full_loss < best_full_eval_loss:
+        # min_delta new-best (was_new_best) AND monotonic-best guard — never
+        # raise best_full_eval_loss, even on resume from a divergent checkpoint
+        # (TASK-0202).
+        if was_new_best and full_loss < best_full_eval_loss:
             best_full_eval_loss = full_loss
             best_full_eval_perplexity = full_result.perplexity
             save_checkpoint(model, tokenizer, run_dir / "best_model")

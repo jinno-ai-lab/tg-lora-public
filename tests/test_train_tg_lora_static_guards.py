@@ -38,6 +38,7 @@ Skips when ``ruff`` is not on PATH.
 
 from __future__ import annotations
 
+import ast
 import shutil
 import subprocess
 from pathlib import Path
@@ -236,3 +237,95 @@ def test_rollback_tolerance_gates_use_relative_metric() -> None:
         "the alpha line-search accept must not use absolute "
         "'loss_before + rollback_tolerance' — rollback_tolerance is a relative fraction"
     )
+
+
+def test_best_model_save_gated_by_min_delta_new_best() -> None:
+    """Every ``best_model`` checkpoint save must be gated by the min_delta
+    new-best signal, not a raw ``full_loss < best_full_eval_loss`` comparison.
+
+    ``cycle_state.record_full_eval`` (and ``_evaluate_full_eval_outcome``'s
+    ``is_new_best``) lower ``best_loss`` only when an improvement strictly
+    exceeds ``early_stopping_min_delta`` (§5.3, Keras-style; both production
+    configs set ``0.01``). The five full-eval ``save_checkpoint(...
+    "best_model")`` sites previously gated on a raw ``full_loss <
+    best_full_eval_loss`` comparison, so a sub-``min_delta`` wobble lowered
+    ``best_full_eval_loss`` and overwrote the saved ``best_model`` (and logged
+    a spurious "New best model") while ``cycle_state.record_full_eval`` —
+    called on the same line — left the run's official ``best_loss`` unchanged:
+    the saved best model and the reported best loss silently diverged. They
+    now gate on ``was_new_best``/``is_new_best`` (TASK-0202).
+
+    This guard pins the *wiring* (the entry point is src.data-blocked, so
+    verified by AST rather than by running it): every ``best_model``
+    ``save_checkpoint`` must sit in the TRUE body of an ``if`` whose test is
+    the new-best name. A future edit that inlines the raw comparison back
+    reopens the divergence and fails here.
+    """
+    assert TARGET.is_file(), f"training entry point not found at {TARGET}"
+    tree = ast.parse(TARGET.read_text(encoding="utf-8"))
+
+    parents: dict[int, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+
+    def _is_best_model_path(arg: ast.AST) -> bool:
+        # ``run_dir / "best_model"`` (BinOp Div, possibly chained) or a bare
+        # "best_model" string constant.
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return "best_model" in arg.value
+        if isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.Div):
+            return _is_best_model_path(arg.right)
+        return False
+
+    saves = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "save_checkpoint"
+        and any(_is_best_model_path(a) for a in node.args)
+    ]
+    assert saves, "expected at least one save_checkpoint(... 'best_model' ...) site to pin"
+
+    for save in saves:
+        # Climb to the nearest enclosing ast.If — that is the save gate.
+        cur: ast.AST | None = save
+        gate: ast.If | None = None
+        gate_child: ast.AST | None = None
+        while cur is not None:
+            parent = parents.get(id(cur))
+            if isinstance(parent, ast.If):
+                gate = parent
+                gate_child = cur
+                break
+            cur = parent
+        assert gate is not None, "best_model save_checkpoint must sit inside an if-block"
+        assert gate_child in gate.body, (
+            "best_model save_checkpoint must be in the if's TRUE body, not an else branch"
+        )
+        # The gate must (a) reference the min_delta new-best name — either
+        # directly or as one conjunct of an And — AND (b) include a comparison
+        # (the monotonic-best guard ``... and full_loss < best_full_eval_loss``).
+        # (a) pins the §5.3 min_delta policy (a bare raw ``<`` ignores it); (b)
+        # pins the monotonic-best invariant so resuming a checkpoint whose
+        # ``best_full_eval_loss`` and ``cycle_state.best_loss`` diverged can never
+        # overwrite a better saved model. Dropping either conjunct is the
+        # TASK-0202 regression.
+        gate_names = {
+            node.id for node in ast.walk(gate.test) if isinstance(node, ast.Name)
+        }
+        assert gate_names & {"is_new_best", "was_new_best"}, (
+            "best_model save_checkpoint must be gated by `is_new_best`/`was_new_best` "
+            "(the min_delta new-best signal), not a bare raw `full_loss < "
+            "best_full_eval_loss` comparison that ignores min_delta (TASK-0202). "
+            f"Found gate names: {sorted(gate_names)}"
+        )
+        assert any(
+            isinstance(node, ast.Compare) for node in ast.walk(gate.test)
+        ), (
+            "best_model save_checkpoint gate must include a comparison (the "
+            "monotonic-best guard `... and full_loss < best_full_eval_loss`) so "
+            "best_full_eval_loss never increases, even on resume from a divergent "
+            "checkpoint (TASK-0202)"
+        )

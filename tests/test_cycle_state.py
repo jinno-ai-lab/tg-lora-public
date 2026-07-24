@@ -406,6 +406,72 @@ class TestRecordFullEvalMinDelta:
 
 
 # ---------------------------------------------------------------------------
+# record_full_eval return value — the min_delta new-best signal the producer
+# gates ``best_model`` checkpoint saves on (TASK-0202). Must be True exactly
+# when ``best_loss`` was just lowered past ``min_delta``, so a sub-min_delta
+# wobble does not overwrite the saved best model / diverge from the run's
+# official ``cycle_state.best_loss``.
+# ---------------------------------------------------------------------------
+
+
+class TestRecordFullEvalReturnValue:
+    """``record_full_eval`` returns whether the eval recorded a new best."""
+
+    def test_default_strict_decrease_returns_true(self):
+        cs = CycleState(best_loss=2.0)
+        assert cs.record_full_eval(1.9999) is True
+        assert cs.best_loss == pytest.approx(1.9999)
+
+    def test_default_equal_loss_returns_false(self):
+        cs = CycleState(best_loss=2.0)
+        assert cs.record_full_eval(2.0) is False
+        assert cs.best_loss == pytest.approx(2.0)
+        assert cs.stale_cycles == 1
+
+    def test_default_regression_returns_false(self):
+        cs = CycleState(best_loss=2.0, stale_cycles=0)
+        assert cs.record_full_eval(2.5) is False
+        assert cs.best_loss == pytest.approx(2.0)
+        assert cs.stale_cycles == 1
+
+    def test_subthreshold_improvement_returns_false(self):
+        # improvement 0.005 < min_delta 0.01 -> NOT a new best.
+        cs = CycleState(best_loss=2.0)
+        cs.min_delta = 0.01
+        assert cs.record_full_eval(1.995) is False
+        assert cs.best_loss == pytest.approx(2.0)
+        assert cs.stale_cycles == 1
+
+    def test_above_threshold_improvement_returns_true(self):
+        # improvement 0.05 > min_delta 0.01 -> genuine new best.
+        cs = CycleState(best_loss=2.0, stale_cycles=3)
+        cs.min_delta = 0.01
+        assert cs.record_full_eval(1.95) is True
+        assert cs.best_loss == pytest.approx(1.95)
+        assert cs.stale_cycles == 0
+
+    def test_first_eval_returns_true(self):
+        # best_loss starts at +inf -> first real loss always a new best.
+        cs = CycleState()
+        cs.min_delta = 0.01
+        assert cs.record_full_eval(5.0) is True
+
+    def test_non_finite_loss_returns_false(self):
+        # NaN/Inf must never count as a new best (best_loss - nan = nan,
+        # nan > min_delta is False; best_loss - inf = -inf, False) — so a
+        # non-finite eval never overwrites best_model.
+        cs = CycleState(best_loss=2.0)
+        cs.min_delta = 0.01
+        assert cs.record_full_eval(float("nan")) is False
+        assert cs.best_loss == pytest.approx(2.0)
+        assert cs.stale_cycles == 1
+        cs2 = CycleState(best_loss=2.0)
+        cs2.min_delta = 0.01
+        assert cs2.record_full_eval(float("inf")) is False
+        assert cs2.best_loss == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------------------------
 # Parameter validation
 # ---------------------------------------------------------------------------
 

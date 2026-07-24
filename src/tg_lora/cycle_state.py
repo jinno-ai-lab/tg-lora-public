@@ -237,7 +237,7 @@ class CycleState:
             return False
         return self.stale_cycles >= patience and self.cycle >= min_cycles
 
-    def record_full_eval(self, full_loss: float) -> None:
+    def record_full_eval(self, full_loss: float) -> bool:
         """Update best_loss / stale_cycles from a full-validation-set eval.
 
         Separate from ``record_cycle`` so the training loop can use quick-eval
@@ -248,13 +248,23 @@ class CycleState:
         strictly exceeds ``min_delta`` (§5.3 improvement-margin insurance).
         With the default ``min_delta=0.0`` this reduces to ``full_loss <
         best_loss`` — bit-identical to the pre-§5.3 contract.
+
+        Returns whether this eval recorded a new best (the same min_delta-gated
+        predicate the producer must gate ``best_model`` checkpoint saves on).
+        ``_evaluate_full_eval_outcome`` computes the identical ``is_new_best``
+        from the same ``prev_best`` / ``min_delta``; surfacing it here lets the
+        full-eval save sites that don't call that helper (the cached / final /
+        linearity-budget branches) gate on the run's official best-loss policy
+        instead of a raw ``full_loss < best_full_eval_loss`` comparison that
+        would diverge from ``cycle_state.best_loss`` (TASK-0202).
         """
         if self.best_loss - full_loss > self.min_delta:
             self.best_loss = full_loss
             self.best_step = self.full_backward_passes
             self.stale_cycles = 0
-        else:
-            self.stale_cycles += 1
+            return True
+        self.stale_cycles += 1
+        return False
 
     def summary(self) -> dict:
         return {
