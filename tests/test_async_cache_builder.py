@@ -133,6 +133,11 @@ def test_async_build_disk_hit_skips_build(tmp_path: Path):
         lora_dropout=0.0, lora_target_modules="all-linear",
         trainable_lora_scope="last_25_percent",
         train_on_prompt=False,
+        # Match _make_cfg()'s model precision (float32 / load_in_4bit=False) so
+        # the pre-written cache path equals the path the builder computes from
+        # cfg — otherwise the disk-hit test rebuilds instead of replaying.
+        dtype="float32", load_in_4bit=False,
+        bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype="float32",
     )
     cache_path = get_prefix_feature_cache_path(cache_dir, metadata)
 
@@ -265,6 +270,11 @@ def test_async_force_rebuild_ignores_disk_cache(tmp_path: Path):
         lora_dropout=0.0, lora_target_modules="all-linear",
         trainable_lora_scope="last_25_percent",
         train_on_prompt=False,
+        # Match _make_cfg()'s model precision (float32 / load_in_4bit=False) so
+        # the pre-written cache path equals the path the builder computes from
+        # cfg — otherwise the disk-hit test rebuilds instead of replaying.
+        dtype="float32", load_in_4bit=False,
+        bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype="float32",
     )
     cache_path = get_prefix_feature_cache_path(cache_dir, metadata)
     fake_dataset = PrefixFeatureDataset([

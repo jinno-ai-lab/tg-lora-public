@@ -213,6 +213,16 @@ def _build_worker_configs(
             # tests and an OmegaConf node at runtime — both support attribute
             # access, neither uniformly supports dict-style .get().
             train_on_prompt=bool(getattr(cfg.training, "train_on_prompt", False)),
+            # Plain attribute access (like model_name/max_seq_len above): the
+            # model-precision fields all carry Pydantic defaults, so they exist
+            # on both the Pydantic ModelConfig in tests and the OmegaConf node
+            # at runtime. They change the cached ACTIVATIONS (base-model forward
+            # captured at split_layer_idx), so they MUST be in the fingerprint —
+            # see build_prefix_feature_cache_metadata.
+            dtype=str(cfg.model.dtype),
+            load_in_4bit=bool(cfg.model.load_in_4bit),
+            bnb_4bit_quant_type=str(cfg.model.bnb_4bit_quant_type),
+            bnb_4bit_compute_dtype=str(cfg.model.bnb_4bit_compute_dtype),
         )
         final_cache_path = get_prefix_feature_cache_path(cache_dir, metadata)
         total_examples = _count_records(dataset_path)

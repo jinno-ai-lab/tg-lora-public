@@ -47,6 +47,10 @@ def _default_metadata(**overrides):
         "lora_target_modules": "all-linear",
         "trainable_lora_scope": "last_25_percent",
         "train_on_prompt": False,
+        "dtype": "bfloat16",
+        "load_in_4bit": True,
+        "bnb_4bit_quant_type": "nf4",
+        "bnb_4bit_compute_dtype": "bfloat16",
     }
     base.update(overrides)
     return build_prefix_feature_cache_metadata(**base)

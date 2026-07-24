@@ -213,6 +213,10 @@ class AsyncCacheBuilder:
                 lora_target_modules=str(self._cfg.lora.target_modules),
                 trainable_lora_scope=self._trainable_lora_scope,
                 train_on_prompt=bool(self._cfg.training.get("train_on_prompt", False)),
+                dtype=str(self._cfg.model.dtype),
+                load_in_4bit=bool(self._cfg.model.load_in_4bit),
+                bnb_4bit_quant_type=str(self._cfg.model.bnb_4bit_quant_type),
+                bnb_4bit_compute_dtype=str(self._cfg.model.bnb_4bit_compute_dtype),
             )
             cache_path = get_prefix_feature_cache_path(self._cache_dir, metadata)
             lazy_disk = (

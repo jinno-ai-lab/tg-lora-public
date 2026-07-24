@@ -141,6 +141,10 @@ def build_prefix_feature_cache_metadata(
     lora_target_modules: str,
     trainable_lora_scope: str,
     train_on_prompt: bool,
+    dtype: str,
+    load_in_4bit: bool,
+    bnb_4bit_quant_type: str,
+    bnb_4bit_compute_dtype: str,
 ) -> dict[str, Any]:
     """Cache-identity metadata for a prefix-feature cache shard.
 
@@ -157,6 +161,25 @@ def build_prefix_feature_cache_metadata(
     operator toggling ``train_on_prompt`` trains on stale labels with no signal.
     Omitting it here is a TypeError at every call site on purpose, so a future
     producer path cannot silently default it.
+
+    ``dtype`` / ``load_in_4bit`` / ``bnb_4bit_quant_type`` /
+    ``bnb_4bit_compute_dtype`` are REQUIRED for the same reason, on the
+    ACTIVATION side of the cache. ``build_prefix_feature_dataset`` captures the
+    base model's forward pass at ``split_layer_idx`` (a forward hook), so every
+    cached ``hidden_states`` tensor is computed by ``load_base_model(cfg)`` —
+    whose precision is set at load time by these four fields
+    (``build_bnb_config`` builds the ``BitsAndBytesConfig`` from
+    ``load_in_4bit``/``bnb_4bit_quant_type``/``bnb_4bit_compute_dtype``; absent
+    4-bit the weights are cast to ``dtype``). They are NOT baked into the
+    dataset file and are only proxied by ``model_name`` here, so two runs over
+    the same ``dataset_path``/``model_name`` that differ ONLY in quantization
+    (4-bit nf4 vs fp16, nf4 vs fp4, bf16 vs fp16 compute) would otherwise share
+    one cache path and silently replay the other run's wrong-precision
+    activations — the LoRA suffix then trains against a shifted objective with
+    no signal. The four fields together fully determine the forward precision
+    (some are no-ops depending on ``load_in_4bit``); all four are stamped so the
+    enumeration of precision-changing config stays complete. Omitting any is a
+    TypeError at every call site on purpose.
     """
     data_file = Path(dataset_path)
     resolved_path = str(data_file.resolve()) if data_file.exists() else dataset_path
@@ -177,6 +200,10 @@ def build_prefix_feature_cache_metadata(
         "lora_target_modules": lora_target_modules,
         "trainable_lora_scope": trainable_lora_scope,
         "train_on_prompt": bool(train_on_prompt),
+        "dtype": str(dtype),
+        "load_in_4bit": bool(load_in_4bit),
+        "bnb_4bit_quant_type": str(bnb_4bit_quant_type),
+        "bnb_4bit_compute_dtype": str(bnb_4bit_compute_dtype),
     }
 
 

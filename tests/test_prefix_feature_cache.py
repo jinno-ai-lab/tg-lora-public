@@ -114,6 +114,10 @@ def _default_metadata(**overrides):
         "lora_target_modules": "all-linear",
         "trainable_lora_scope": "last_25_percent",
         "train_on_prompt": False,
+        "dtype": "bfloat16",
+        "load_in_4bit": True,
+        "bnb_4bit_quant_type": "nf4",
+        "bnb_4bit_compute_dtype": "bfloat16",
     }
     base.update(overrides)
     return build_prefix_feature_cache_metadata(**base)
@@ -197,6 +201,10 @@ def test_prefix_feature_dataset_round_trips_through_disk_cache(tmp_path: Path):
         lora_target_modules="all-linear",
         trainable_lora_scope="last_25_percent",
         train_on_prompt=False,
+        dtype="bfloat16",
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype="bfloat16",
     )
     cache_path = get_prefix_feature_cache_path(tmp_path, metadata)
 
@@ -445,6 +453,77 @@ class TestCachePathSha256:
         # refactor cannot drop it while leaving the parameter in place.
         assert m_false["train_on_prompt"] is False
         assert m_true["train_on_prompt"] is True
+
+    def test_different_load_in_4bit_gives_different_path(self):
+        """TC-132-05: different load_in_4bit → different path.
+
+        The cached ``hidden_states`` are the base model's forward pass captured
+        at ``split_layer_idx`` (a forward hook in
+        ``build_prefix_feature_dataset``), so they depend on the model's
+        load-time precision — which ``load_in_4bit`` toggles
+        (``build_bnb_config`` builds a ``BitsAndBytesConfig`` only when it is
+        True). ``model_name`` alone does not distinguish a 4-bit run from a
+        full-precision run, so two runs over the SAME ``dataset_path`` /
+        ``model_name`` that differ only in ``load_in_4bit`` must NOT share a
+        cache path — otherwise the second run silently replays the first run's
+        wrong-precision activations (the ACTIVATION-side twin of the
+        ``train_on_prompt`` LABEL-side collision in TC-132-04).
+        """
+        m_quant = _default_metadata(load_in_4bit=True)
+        m_full = _default_metadata(load_in_4bit=False)
+        p_quant = get_prefix_feature_cache_path("/tmp/cache", m_quant)
+        p_full = get_prefix_feature_cache_path("/tmp/cache", m_full)
+        assert p_quant != p_full
+        assert m_quant["load_in_4bit"] is True
+        assert m_full["load_in_4bit"] is False
+
+    def test_different_bnb_4bit_quant_type_gives_different_path(self):
+        """TC-132-06: different bnb_4bit_quant_type → different path.
+
+        With ``load_in_4bit=True`` the dequantization type (nf4 vs fp4) changes
+        the rounded weights and therefore the forward activations; it must not
+        collide across runs differing only in ``bnb_4bit_quant_type``.
+        """
+        m_nf4 = _default_metadata(load_in_4bit=True, bnb_4bit_quant_type="nf4")
+        m_fp4 = _default_metadata(load_in_4bit=True, bnb_4bit_quant_type="fp4")
+        assert get_prefix_feature_cache_path("/tmp/cache", m_nf4) != \
+            get_prefix_feature_cache_path("/tmp/cache", m_fp4)
+
+    def test_different_dtype_gives_different_path(self):
+        """TC-132-07: different dtype → different path.
+
+        With ``load_in_4bit=False`` the weights are cast to ``dtype`` (bf16 vs
+        fp16), changing the forward activations; it must not collide across runs
+        differing only in ``dtype``.
+        """
+        m_bf16 = _default_metadata(load_in_4bit=False, dtype="bfloat16")
+        m_fp16 = _default_metadata(load_in_4bit=False, dtype="float16")
+        assert get_prefix_feature_cache_path("/tmp/cache", m_bf16) != \
+            get_prefix_feature_cache_path("/tmp/cache", m_fp16)
+
+    def test_required_precision_fields_have_no_default(self):
+        """TC-132-08: the four precision fields are REQUIRED (no silent default).
+
+        Mirrors TC-132-04's structural ban: a future producer path that omits a
+        precision field must TypeError at the call site rather than silently
+        defaulting to a value that masks a precision-driven collision.
+        """
+        import pytest
+
+        with pytest.raises(TypeError):
+            build_prefix_feature_cache_metadata(  # type: ignore[call-arg]
+                dataset_path="data/train.jsonl",
+                model_name="dummy-model",
+                seed=42,
+                max_seq_len=8,
+                split_layer_idx=2,
+                lora_r=16,
+                lora_alpha=32,
+                lora_dropout=0.0,
+                lora_target_modules="all-linear",
+                trainable_lora_scope="last_25_percent",
+                train_on_prompt=False,
+            )
 
 
 # ---------------------------------------------------------------------------
