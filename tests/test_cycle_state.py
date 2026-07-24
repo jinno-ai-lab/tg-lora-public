@@ -89,6 +89,99 @@ class TestRecordCycle:
 
 
 # ---------------------------------------------------------------------------
+# record_cycle §5.3 min_delta — the quick-eval path writes the SAME
+# ``best_loss`` / ``stale_cycles`` fields ``record_full_eval`` writes, and
+# ``stale_cycles`` is the early-stopping signal §5.3 governs (field doc +
+# ``record_full_eval`` docstring). The producer calls ``record_cycle`` on every
+# non-full-eval cycle with ``valid_loss=loss_pilot`` (the quick-eval subset
+# loss), so without the min_delta gate a sub-min_delta quick-eval wobble resets
+# the counter and defeats early stopping exactly when the §5.3 insurance is
+# meant to fire. The gate mirrors ``record_full_eval``; default ``min_delta=0.0``
+# keeps the historical ``valid_loss < best_loss`` contract bit-identical
+# (TASK-0203, same family as the best_model save-site gate in TASK-0202).
+# ---------------------------------------------------------------------------
+
+
+class TestRecordCycleMinDelta:
+    """§5.3 improvement-margin behavior of CycleState.record_cycle (quick-eval)."""
+
+    def test_default_min_delta_any_strict_decrease_is_improvement(self):
+        # min_delta defaults to 0.0: a tiny strict decrease still wins
+        # (byte-identical to the pre-gate ``valid_loss < best_loss``).
+        cs = CycleState(best_loss=2.0, stale_cycles=2)
+        cs.record_cycle(K=1, N=1, grad_accum=1, train_loss=0.5, valid_loss=1.9999)
+        assert cs.stale_cycles == 0
+        assert cs.best_loss == pytest.approx(1.9999)
+        assert cs.best_step == cs.full_backward_passes
+
+    def test_subthreshold_quick_eval_does_not_reset_stale(self):
+        # improvement 0.005 < min_delta 0.01 -> NOT a new best, stale increments.
+        cs = CycleState(best_loss=2.0, stale_cycles=0)
+        cs.min_delta = 0.01
+        cs.record_cycle(K=1, N=1, grad_accum=1, train_loss=0.5, valid_loss=1.995)
+        assert cs.stale_cycles == 1
+        assert cs.best_loss == pytest.approx(2.0)
+        assert cs.best_step == 0  # unchanged: no new best recorded
+
+    def test_subthreshold_keeps_accumulating_stale(self):
+        # Two consecutive sub-threshold quick-eval moves: stale climbs 0 -> 1 -> 2.
+        cs = CycleState(best_loss=2.0)
+        cs.min_delta = 0.01
+        cs.record_cycle(K=1, N=1, grad_accum=1, train_loss=0.5, valid_loss=1.998)
+        cs.record_cycle(K=1, N=1, grad_accum=1, train_loss=0.5, valid_loss=1.996)
+        assert cs.stale_cycles == 2
+        assert cs.best_loss == pytest.approx(2.0)
+
+    def test_above_threshold_quick_eval_resets_stale(self):
+        # improvement 0.05 > min_delta 0.01 -> genuine new best, stale resets.
+        cs = CycleState(best_loss=2.0, stale_cycles=3)
+        cs.min_delta = 0.01
+        cs.record_cycle(K=1, N=1, grad_accum=1, train_loss=0.5, valid_loss=1.95)
+        assert cs.stale_cycles == 0
+        assert cs.best_loss == pytest.approx(1.95)
+
+    def test_equal_loss_is_not_improvement_under_min_delta(self):
+        cs = CycleState(best_loss=2.0)
+        cs.min_delta = 0.01
+        cs.record_cycle(K=1, N=1, grad_accum=1, train_loss=0.5, valid_loss=2.0)
+        assert cs.stale_cycles == 1
+        assert cs.best_loss == pytest.approx(2.0)
+
+    def test_improvement_exactly_at_min_delta_is_not_new_best(self):
+        # improvement exactly == min_delta -> strictly-greater gate is False, so
+        # this is NOT a new best (stale increments, best unchanged). Pins the
+        # strict ``>`` boundary against a ``>=`` regression. Uses 0.5 (exactly
+        # representable) so 2.0 - 1.5 == 0.5 with no float error.
+        cs = CycleState(best_loss=2.0, stale_cycles=0)
+        cs.min_delta = 0.5
+        cs.record_cycle(K=1, N=1, grad_accum=1, train_loss=0.5, valid_loss=1.5)
+        assert cs.stale_cycles == 1
+        assert cs.best_loss == pytest.approx(2.0)
+        assert cs.best_step == 0
+
+    def test_first_cycle_always_new_best_regardless_of_min_delta(self):
+        # best_loss starts at +inf, so the first real quick-eval loss always wins.
+        cs = CycleState()
+        cs.min_delta = 0.01
+        cs.record_cycle(K=1, N=1, grad_accum=1, train_loss=0.5, valid_loss=5.0)
+        assert cs.stale_cycles == 0
+        assert cs.best_loss == pytest.approx(5.0)
+
+    def test_non_finite_valid_loss_not_new_best(self):
+        # NaN/+Inf quick-eval must never count as a new best (best_loss - nan =
+        # nan, nan > min_delta is False; best_loss - inf = -inf, False) — a
+        # non-finite quick-eval never lowers best_loss / resets stale. Scope
+        # matches record_full_eval's non-finite test (CE loss >= 0, so +inf/NaN
+        # are the realistic divergences).
+        cs = CycleState(best_loss=2.0, stale_cycles=0)
+        cs.min_delta = 0.01
+        for bad in (float("nan"), float("inf")):
+            cs.record_cycle(K=1, N=1, grad_accum=1, train_loss=0.5, valid_loss=bad)
+            assert cs.best_loss == pytest.approx(2.0)
+            assert cs.stale_cycles >= 1
+
+
+# ---------------------------------------------------------------------------
 # reduction_rate
 # ---------------------------------------------------------------------------
 

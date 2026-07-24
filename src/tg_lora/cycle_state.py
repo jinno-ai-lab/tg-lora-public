@@ -136,7 +136,24 @@ class CycleState:
 
         if valid_loss is not None:
             self.last_valid_loss = valid_loss
-            if valid_loss < self.best_loss:
+            # §5.3 improvement-margin: a quick-eval ``valid_loss`` only counts
+            # as a new best (resetting ``stale_cycles`` and lowering
+            # ``best_loss``) when it beats the current best by strictly more
+            # than ``min_delta`` — the same gate ``record_full_eval`` applies
+            # to the full-eval path. ``stale_cycles`` is the early-stopping
+            # signal §5.3 governs (field doc + ``record_full_eval`` docstring),
+            # and the producer calls ``record_cycle`` every non-full-eval cycle
+            # with ``valid_loss=loss_pilot`` (the quick-eval subset loss), so a
+            # raw ``valid_loss < best_loss`` lets a sub-min_delta quick-eval
+            # wobble reset the counter and defeats early stopping exactly when
+            # the insurance is meant to fire. Default ``min_delta=0.0`` keeps
+            # the historical ``valid_loss < best_loss`` bit-identical
+            # (TASK-0203; same family as the best_model save-site gate,
+            # TASK-0202). Non-finite NaN/+Inf quick-eval stays excluded:
+            # ``best_loss - nan = nan`` and ``best_loss - inf = -inf`` are both
+            # ``> min_delta`` → False, so a diverging quick-eval never lowers
+            # ``best_loss``.
+            if self.best_loss - valid_loss > self.min_delta:
                 self.best_loss = valid_loss
                 self.best_step = self.full_backward_passes
                 self.stale_cycles = 0
