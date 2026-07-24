@@ -154,6 +154,57 @@ class TestGradNormDivergence:
         assert not report.divergence.detected
 
 
+class TestValidLossSpikeDetection:
+    """The module docstring promises to detect "loss spikes" and ``update``
+    treats ``valid_loss`` (when present) as the authoritative loss for
+    best-tracking — but ``detect_divergence`` hard-coded the spike check to
+    ``train_loss`` only. A spike in the §5.1/§5.2 honest *validation* signal
+    while the training loss stays steady is a textbook generalization
+    collapse; it went undetected and the run reported healthy + ``no_action``.
+    """
+
+    def test_valid_loss_spike_detected_with_steady_train(self):
+        m = CycleMonitor(spike_threshold=2.0)
+        m.update({"train_loss": 1.0, "valid_loss": 0.5})
+        # train steady (1.0 -> 1.0), valid 3x (generalization collapse)
+        report = m.update({"train_loss": 1.0, "valid_loss": 1.5})
+        assert report.divergence.detected
+        assert report.divergence.metric == "valid_loss"
+        assert report.divergence.severity == "high"
+        assert report.status == "divergent"
+
+    def test_train_spike_wins_label_when_both_spike(self):
+        m = CycleMonitor(spike_threshold=2.0)
+        m.update({"train_loss": 1.0, "valid_loss": 0.5})
+        # both spike: train 1.0 -> 3.0, valid 0.5 -> 1.5
+        report = m.update({"train_loss": 3.0, "valid_loss": 1.5})
+        assert report.divergence.detected
+        assert report.divergence.metric == "train_loss"
+
+    def test_valid_spike_near_zero_prev_not_flagged(self):
+        """Mirrors the train_loss ``prev > 1e-6`` near-zero guard: a negligible
+        previous valid loss must not amplify a tiny absolute rise into a spike."""
+        m = CycleMonitor(spike_threshold=2.0)
+        m.update({"train_loss": 1.0, "valid_loss": 1e-9})
+        report = m.update({"train_loss": 1.0, "valid_loss": 1.0})
+        assert not report.divergence.detected
+
+    def test_steady_valid_loss_not_flagged(self):
+        m = CycleMonitor(spike_threshold=2.0)
+        m.update({"train_loss": 1.0, "valid_loss": 0.9})
+        report = m.update({"train_loss": 1.0, "valid_loss": 0.95})
+        assert not report.divergence.detected
+
+    def test_valid_absent_falls_back_to_train_only(self):
+        """A loss-only history (no valid_loss key) must stay bit-identical to the
+        train-only spike behavior — the valid check is skipped, not a crash."""
+        m = CycleMonitor(spike_threshold=2.0)
+        m.update({"train_loss": 1.0})
+        report = m.update({"train_loss": 2.5})
+        assert report.divergence.detected
+        assert report.divergence.metric == "train_loss"
+
+
 class TestStagnationDetection:
     def test_no_stagnation_within_patience(self):
         m = CycleMonitor(patience=3)

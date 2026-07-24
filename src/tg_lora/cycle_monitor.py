@@ -134,18 +134,31 @@ class CycleMonitor:
                         threshold=None,
                     )
 
-        # Loss spike detection — skip when losses are near zero to avoid
-        # false positives from ratio amplification of negligible absolute changes
-        if train_loss is not None and prev_train is not None and prev_train > 1e-6:
-            ratio = train_loss / prev_train
-            if ratio >= self.spike_threshold:
-                return DivergenceReport(
-                    detected=True,
-                    metric="train_loss",
-                    severity="high",
-                    current_value=train_loss,
-                    threshold=prev_train * self.spike_threshold,
-                )
+        # Loss spike detection. The module docstring promises to detect "loss
+        # spikes" and ``update`` treats ``valid_loss`` (when present) as the
+        # authoritative loss for best-tracking, but this check previously
+        # hard-coded ``train_loss`` only — so a spike in the §5.1/§5.2 honest
+        # *validation* signal while the training loss stayed steady (a textbook
+        # generalization collapse) went undetected and the run reported healthy
+        # + ``no_action`` instead of ``reduce_lr``. Check both signals;
+        # ``train_loss`` first so a bad forward loss keeps the ``metric`` label
+        # when both spike (mirrors the NaN/Inf order above). Each signal is
+        # skipped when its previous value is near zero to avoid ratio
+        # amplification of negligible absolute changes.
+        prev_valid = previous.get("valid_loss")
+        for name, cur, prev in (
+            ("train_loss", train_loss, prev_train),
+            ("valid_loss", valid_loss, prev_valid),
+        ):
+            if cur is not None and prev is not None and prev > 1e-6:
+                if cur / prev >= self.spike_threshold:
+                    return DivergenceReport(
+                        detected=True,
+                        metric=name,
+                        severity="high",
+                        current_value=cur,
+                        threshold=prev * self.spike_threshold,
+                    )
 
         return DivergenceReport()
 
