@@ -17,6 +17,7 @@ from src.tg_lora.prefix_feature_cache import (
     get_prefix_feature_cache_path, load_prefix_feature_dataset,
     merge_prefix_feature_cache_shards, resolve_prefix_feature_cache_seed,
     save_prefix_feature_dataset)
+from src.training.config_schema import DataConfig, ModelConfig
 from src.training.loss import compute_loss
 
 
@@ -524,6 +525,106 @@ class TestCachePathSha256:
                 trainable_lora_scope="last_25_percent",
                 train_on_prompt=False,
             )
+
+
+# ---------------------------------------------------------------------------
+# TASK-0210: cache-fingerprint completeness guard (schema → fingerprint)
+# ---------------------------------------------------------------------------
+
+
+class TestCacheFingerprintCompleteness:
+    """The prefix-feature cache stores base-model ``hidden_states`` captured at
+    ``split_layer_idx`` over a dataset loaded by
+    ``load_dataset(path, tokenizer, max_seq_len, train_on_prompt)`` (private
+    ``src.data``). Every config field that can change the CACHED BYTES must be
+    stamped into the fingerprint, else two runs differing only in that field
+    silently share one cache path and replay wrong content — the
+    silent-collision class closed incrementally by TASK-0206 (LABEL side,
+    ``train_on_prompt``) and TASK-0207 (ACTIVATION side, the four model-precision
+    fields).
+
+    This guard does NOT re-test pairwise collisions (the TC-132-* tests do). It
+    enumerates the config SCHEMA — the in-repo contract, since the loader itself
+    is private/absent from this mirror — and fails if any ``DataConfig`` /
+    ``ModelConfig`` field is neither fingerprinted nor explicitly allow-listed as
+    non-cache-affecting. So a future sub-sampling / tokenization / precision
+    field added to the schema is FORCED through the fingerprint decision instead
+    of slipping through as a silent-collision regression. Audit a
+    content-addressed cache by enumerating the config fields that change the
+    cached bytes, not just the cache struct's own fields.
+    """
+
+    def test_every_data_and_model_config_field_is_fingerprinted_or_allowlisted(self):
+        metadata = _default_metadata()
+        fingerprinted = set(metadata.keys())
+
+        # Each schema field maps to the fingerprint key it flows through. The
+        # claimed key MUST exist in `metadata`, so a rename in the fingerprint
+        # struct cannot silently strand a field (asserted below as `stale_keys`).
+        field_to_fingerprint_key = {
+            # --- DataConfig: input-file identity + tokenization ---
+            # Per-shard: the producer calls build_prefix_feature_cache_metadata
+            # once per split with that split's path, which is resolved and
+            # stamped together with size + mtime — so all three path fields flow
+            # through the same dataset_path mechanism.
+            "train_path": "dataset_path",
+            "valid_quick_path": "dataset_path",
+            "valid_full_path": "dataset_path",
+            "max_seq_len": "max_seq_len",
+            # --- ModelConfig: weights + tokenizer + activation precision ---
+            "name_or_path": "model_name",
+            "dtype": "dtype",
+            "load_in_4bit": "load_in_4bit",
+            "bnb_4bit_quant_type": "bnb_4bit_quant_type",
+            "bnb_4bit_compute_dtype": "bnb_4bit_compute_dtype",
+        }
+        # Fields that do NOT change the cached bytes — each carries a reason.
+        non_cache_affecting = {
+            # Only gold-eval generation reads gold_test_path; the cache is built
+            # over train/valid_quick/valid_full, so this file never enters the
+            # base-model forward that populates the cache.
+            "gold_test_path": "eval-generation-only; not one of the cache-built splits",
+            # Device placement changes WHERE the forward runs, not the tensor
+            # values it produces (deterministic given weights + precision).
+            "device_map": "runtime placement; does not change cached tensor values",
+            "device": "runtime placement; does not change cached tensor values",
+        }
+
+        schema_fields = set(DataConfig.model_fields) | set(ModelConfig.model_fields)
+        covered = set(field_to_fingerprint_key) | set(non_cache_affecting)
+
+        # (1) Every schema field must be accounted for exactly once. Adding a
+        # schema field without an entry here fails on purpose — the author must
+        # either flow it into the fingerprint or allow-list it WITH a reason.
+        unaccounted = schema_fields - covered
+        assert not unaccounted, (
+            f"Cache-fingerprint completeness gap: schema field(s) {sorted(unaccounted)} "
+            f"are neither fingerprinted nor allow-listed. A config field that can "
+            f"change the cached bytes MUST flow into build_prefix_feature_cache_metadata "
+            f"or be added to non_cache_affecting here WITH a reason "
+            f"(see TASK-0206/0207/0210)."
+        )
+
+        # (2) The fingerprint-key mapping must be current: every claimed key
+        # must actually exist in the metadata, so a fingerprint rename cannot
+        # silently strand a field.
+        stale_keys = {
+            field: key
+            for field, key in field_to_fingerprint_key.items()
+            if key not in fingerprinted
+        }
+        assert not stale_keys, (
+            f"Cache-fingerprint mapping is stale: {stale_keys} claim fingerprint "
+            f"keys absent from build_prefix_feature_cache_metadata output "
+            f"(keys present: {sorted(fingerprinted)})."
+        )
+
+        # (3) No schema field may claim coverage twice.
+        overlap = set(field_to_fingerprint_key) & set(non_cache_affecting)
+        assert not overlap, (
+            f"Schema field(s) {sorted(overlap)} are both fingerprinted and "
+            f"allow-listed — pick one."
+        )
 
 
 # ---------------------------------------------------------------------------
