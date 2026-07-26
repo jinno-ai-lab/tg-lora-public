@@ -7,9 +7,16 @@
 # arm (GOAL §4-247 / P1 品質保持: does freezing preserve quality vs full backprop?)
 # — the axis the homogeneous full leg already answers (SURPASSES) but the
 # heterogeneous deposit so far carries as ``n_baseline=0``/``baseline=null``
-# (UNANSWERED). ``--n-baseline`` is NOT in the per-arm ledger fingerprint, so
-# adding it and re-firing against the surviving 9-arm ledger skips
-# candidate/surrogate/control and executes ONLY the 3 new baseline arms.
+# (UNANSWERED). RESUME NOTE (verified 2026-07-27 on the live fire): ``--n-baseline``
+# is NOT in the per-arm ledger fingerprint, so a re-fire against a *current* 9-arm
+# ledger would skip the 9 and run only the 3 baselines. BUT the surviving 7/18
+# ledger's header predates the fingerprint-evolution commits — it records 15 keys
+# vs the worker's 21 (missing learning_rate/lora_r/lora_alpha/lora_dropout/
+# lora_target_modules/max_dataset_rows) — so ``load_ledger`` treats it as stale
+# (returns ``{}``) and the worker re-runs ALL 12 arms (~4h); the first arm banks
+# by truncating the stale file + writing a fresh header (``mode="w"`` on a stale
+# header). That §7-honest re-run is the cost of closing this cell; the fresh ledger
+# this run writes WILL support resume-skip on any later re-fire.
 #
 # This is the committed, version-controlled analogue of the ad-hoc
 # ``/home/jinno/tg-lora-public-full-run/fire.sh`` that robustly fired the
