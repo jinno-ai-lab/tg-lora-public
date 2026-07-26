@@ -36,6 +36,7 @@ from scripts.section4_operator_decision import (
     _land_decision,
     _load_landed_decision,
     _probe_verdict_worker,
+    _quality_preservation_clause,
     assess_section4_decision,
     format_decision,
     main,
@@ -345,6 +346,37 @@ class TestQualityPreservationAxis:
         # full-backprop axis (surfaced in ``quality_preservation``).
         rationale = assess_section4_decision()["rationale"]
         assert "only open axis" not in rationale
+
+    def test_ship_rationale_derives_quality_clause_from_surfaced_evidence(self):
+        # P0 科学誠実性: the SHIP rationale's per-leg P1 品質保持 clause must be
+        # DERIVED from the surfaced ``quality_preservation`` evidence, not
+        # hardcoded — otherwise the recommendation could contradict the very
+        # evidence it cites. Against the CURRENT harvested deposits this is
+        # byte-identical to the prior hardcoded text (homogeneous answered,
+        # heterogeneous not yet fired), proving no regression.
+        snap = assess_section4_decision()
+        clause = _quality_preservation_clause(snap["quality_preservation"])
+        assert "homogeneous SURPASSES" in clause
+        assert "heterogeneous unanswered" in clause
+        # the rationale embeds exactly this derived clause (no stale copy)
+        assert clause in snap["rationale"]
+
+    def test_quality_clause_tracks_answered_heterogeneous_not_hardcoded(self):
+        # Forward-compat / mutation guard: when the in-flight full-budget
+        # heterogeneous baseline arm lands + is harvested (n_baseline>0 +
+        # baseline.verdict), ``quality_preservation`` flips heterogeneous to
+        # answered. A HARDCODED "heterogeneous unanswered" rationale would then
+        # directly contradict that surfaced block (P0 科学誠実性 break). The
+        # derived clause must track the answered verdict instead.
+        qp = {
+            "homogeneous": {"answered": True, "verdict": SURPASSES},
+            "heterogeneous": {"answered": True, "verdict": TIES},
+        }
+        clause = _quality_preservation_clause(qp)
+        assert "heterogeneous TIES" in clause
+        assert "heterogeneous unanswered" not in clause
+        # mutation: a hardcoded "heterogeneous unanswered" survives this and
+        # fails the line above — proving the clause reads the answered state.
 
 
 class TestUnblockStepAndArchitecturalInvariant:

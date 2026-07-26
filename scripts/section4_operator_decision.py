@@ -240,6 +240,34 @@ def _assess_leg(label: str, deposit_rel: str, repo_root: Path) -> dict[str, Any]
     return leg
 
 
+def _quality_preservation_clause(quality_preservation: dict) -> str:
+    """Render the SHIP rationale's per-leg P1 品質保持 clause FROM the surfaced
+    evidence, so the recommendation can never contradict the measured evidence
+    it cites (P0 科学誠実性).
+
+    A hardcoded ``"heterogeneous unanswered"`` would survive the harvest of the
+    in-flight full-budget heterogeneous baseline arm and then directly
+    contradict the ``quality_preservation`` block — which renders adaptively —
+    so the recommendation and its cited evidence would disagree. Deriving the
+    clause here makes the rationale track whichever state the deposits actually
+    carry: an answered leg renders ``"{label} {verdict}"``; an unanswered leg
+    renders the wired-but-unfired clause. Iteration order follows
+    ``quality_preservation`` insertion order (homogeneous then heterogeneous),
+    matching the ``legs`` construction order.
+    """
+    parts = []
+    for label, qp in quality_preservation.items():
+        if qp.get("answered"):
+            parts.append(f"{label} {qp['verdict']}")
+        else:
+            parts.append(
+                f"{label} unanswered — the baseline arm is now wired into the "
+                "canonical full-budget target, so only a GPU window stands "
+                "between UNANSWERED and the reading"
+            )
+    return "; ".join(parts)
+
+
 def _landing_record_path(repo_root: Path | str | None) -> Path:
     """Resolve the operator-decision landing record under *repo_root*."""
     root = Path(repo_root) if repo_root is not None else REPO_ROOT
@@ -461,10 +489,9 @@ def assess_section4_decision(
             "deposits); adopt the TIES as the §4 result. Re-firing reproduces TIES "
             "and adds no information. Two absolute-loss senses remain: quality vs "
             "full backprop (GOAL §4-247 / P1 品質保持) is answered per-leg in "
-            "`quality_preservation` (homogeneous SURPASSES; heterogeneous "
-            "unanswered — the baseline arm is now wired into the canonical "
-            "full-budget target, so only a GPU window stands between UNANSWERED "
-            "and the reading); absolute-loss vs the private-repo PRODUCTION "
+            "`quality_preservation` ("
+            + _quality_preservation_clause(quality_preservation)
+            + "); absolute-loss vs the private-repo PRODUCTION "
             "baseline is Cat-C and private-repo-only (PIVOT)."
         )
     elif run_executable_here:
