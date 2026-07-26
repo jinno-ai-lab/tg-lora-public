@@ -1032,14 +1032,24 @@ freeze-validloss-ci-9b-full-bg: ## Self-retrying background launcher for the ful
 # ledger path (so the heterogeneous full verdict never clobbers the homogeneous
 # full deposit/ledger). The arm shape mirrors the landed heterogeneous-
 # generalization target (candidate + surrogate + input-side control = the
-# direction-isolation A/B), bumped from 96 to 1500 steps; --total-steps 1500
-# reaches the config max_steps so reduced_budget=False, and --train-examples 600
-# keeps a 1500-step run at ~2.5 epochs = generalization regime (the 4th honesty
-# axis a naive 1500/48 run would violate by memorizing). Verdict reading mirrors
-# the homogeneous full leg: SURPASSES (order survives full budget) / TIES (order
-# effect evaporates, as it did homogeneously) / UNDERSHOOTS (freeze cost quality).
-# Needs a torch+bnb+GPU interpreter: PYTHON_VENV=/path/to/torch-python make freeze-validloss-ci-9b-full-heterogeneous
-FREEZE_9B_FULL_HETEROGENEOUS_FLAGS ?= --seq-len 1024 --total-steps 1500 --warmup-steps 150 --depth 3 --spacing 450 --n-candidate 3 --n-surrogate 3 --n-control 3 --train-examples 600 --valid-examples 64 --max-dataset-rows 2000 --ledger runs/freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl
+# direction-isolation A/B) AND adds the full-backprop baseline arm (candidate vs
+# no-freeze) so the heterogeneous leg answers the SAME GOAL §4-247 P1 品質保持
+# axis ("does freezing preserve quality vs full backprop?") the homogeneous full
+# leg already answers (SURPASSES) — without ``--n-baseline`` the heterogeneous
+# deposit carries ``n_baseline=0``/``baseline=null`` and the decision surface
+# reports P1 品質保持 as UNANSWERED for this leg while homogeneous is answered.
+# Bumped from 96 to 1500 steps; --total-steps 1500 reaches the config max_steps
+# so reduced_budget=False, and --train-examples 600 keeps a 1500-step run at
+# ~2.5 epochs = generalization regime (the 4th honesty axis a naive 1500/48 run
+# would violate by memorizing). Verdict reading mirrors the homogeneous full leg:
+# SURPASSES (order survives full budget) / TIES (order effect evaporates, as it
+# did homogeneously) / UNDERSHOOTS (freeze cost quality); the baseline arm adds
+# the independent P1 品質保持 reading (candidate vs full-backprop).
+# Resumable: ``--n-baseline`` is NOT in the per-arm ledger fingerprint, so adding
+# it and re-firing against the existing 9-arm ledger skips candidate/surrogate/
+# control and executes ONLY the 3 new baseline arms (free-GPU-window → banked
+# progress). Needs a torch+bnb+GPU interpreter: PYTHON_VENV=/path/to/torch-python make freeze-validloss-ci-9b-full-heterogeneous
+FREEZE_9B_FULL_HETEROGENEOUS_FLAGS ?= --seq-len 1024 --total-steps 1500 --warmup-steps 150 --depth 3 --spacing 450 --n-candidate 3 --n-surrogate 3 --n-control 3 --n-baseline 3 --train-examples 600 --valid-examples 64 --max-dataset-rows 2000 --ledger runs/freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl
 
 freeze-validloss-ci-9b-full-heterogeneous: ## GOAL §4 real-9B FULL-BUDGET A/B on a HETEROGENEOUS per-layer-rank stack (1500 steps; generalization; ~hours GPU)
 	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_FULL_HETEROGENEOUS_FLAGS) --architecture heterogeneous --json --output tests/fixtures/freeze_validloss_ci_9b_full_heterogeneous.json

@@ -3,7 +3,13 @@
 # remaining open research leg (homogeneous full LANDED→TIES ``4b88ca8``;
 # heterogeneous REDUCED-budget LANDED→SURPASSES ``db542fe``/``d00a362``; whether
 # the heterogeneous SURPASSES survives the full 1500-step budget on an asymmetric
-# per-layer-rank adapter is unmeasured).
+# per-layer-rank adapter is unmeasured). It ALSO fires the full-backprop baseline
+# arm (GOAL §4-247 / P1 品質保持: does freezing preserve quality vs full backprop?)
+# — the axis the homogeneous full leg already answers (SURPASSES) but the
+# heterogeneous deposit so far carries as ``n_baseline=0``/``baseline=null``
+# (UNANSWERED). ``--n-baseline`` is NOT in the per-arm ledger fingerprint, so
+# adding it and re-firing against the surviving 9-arm ledger skips
+# candidate/surrogate/control and executes ONLY the 3 new baseline arms.
 #
 # This is the committed, version-controlled analogue of the ad-hoc
 # ``/home/jinno/tg-lora-public-full-run/fire.sh`` that robustly fired the
@@ -17,8 +23,9 @@
 #
 # Arm shape mirrors the Makefile ``FREEZE_9B_FULL_HETEROGENEOUS_FLAGS``: candidate
 # (output-first suffix {29,30,31}) + surrogate (random order) + input-side
-# control (input-first contiguous {24,25,26}) = the direction-isolation A/B,
-# bumped 96 → 1500 steps; ``--total-steps 1500`` reaches the config max_steps so
+# control (input-first contiguous {24,25,26}) = the direction-isolation A/B, PLUS
+# the full-backprop baseline (no freeze) = the P1 品質保持 axis, bumped 96 → 1500
+# steps; ``--total-steps 1500`` reaches the config max_steps so
 # ``reduced_budget=False``, and ``--train-examples 600`` keeps a 1500-step run at
 # ~2.5 epochs = generalization regime (the 4th honesty axis a naive 1500/48 run
 # would violate by memorizing). Distinct deposit + ledger so the heterogeneous
@@ -33,7 +40,8 @@
 #   nohup bash scripts/fire_freeze_ci_9b_full_heterogeneous.sh \
 #     > /home/jinno/tg-lora-public-full-run/full_heterogeneous_bg.log 2>&1 &
 #
-# Harvest (next session, when the ledger has 9 lines + the deposit is written).
+# Harvest (next session, when the ledger has 12 arms — 3 candidate + 3 surrogate
+# + 3 control + 3 baseline — + the deposit is written).
 # This verdict is the 2nd citable full-budget result, so it earns the SAME
 # independent-reproducibility provenance the homogeneous full got at ``7489023``:
 # a committed LEDGER WITNESS. The worker stamps ``run_log_*`` but NEVER
@@ -81,7 +89,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True     # 12 GiB-card headro
 exec "$PY" -m scripts.launch_freeze_ci_9b_full $LAUNCH_FLAGS -- \
     --architecture heterogeneous \
     --seq-len 1024 --total-steps 1500 --warmup-steps 150 --depth 3 --spacing 450 \
-    --n-candidate 3 --n-surrogate 3 --n-control 3 \
+    --n-candidate 3 --n-surrogate 3 --n-control 3 --n-baseline 3 \
     --train-examples 600 --valid-examples 64 --max-dataset-rows 2000 \
     --config "$STABLE/repo/configs/9b_baseline_suffix_only_last25.yaml" \
     --ledger "$STABLE/runs/freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl" \

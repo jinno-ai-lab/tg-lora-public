@@ -378,8 +378,11 @@ def assess_section4_decision(
     # surpass full-backprop quality?" — surfaced from each deposit's already-fired
     # baseline arm. Distinct from the candidate-vs-surrogate relative verdict AND
     # from PIVOT (vs the private-repo PRODUCTION baseline, Cat-C). Homogeneous is
-    # answered (SURPASSES); heterogeneous has no baseline arm (unanswered, but
-    # code-doable on public Dolly — the verdict worker supports ``n_baseline``).
+    # answered (SURPASSES); heterogeneous's deposit still has no baseline arm
+    # (n_baseline=0 ⇒ unanswered), but the arm is now wired into the canonical
+    # full-budget target (``FREEZE_9B_FULL_HETEROGENEOUS_FLAGS`` carries
+    # ``--n-baseline 3``), so the only thing between UNANSWERED and the reading is
+    # a GPU window firing ``make freeze-validloss-ci-9b-full-heterogeneous``.
     quality_preservation = {
         leg["label"]: {
             "answered": bool(leg.get("baseline_present", False)),
@@ -459,8 +462,10 @@ def assess_section4_decision(
             "and adds no information. Two absolute-loss senses remain: quality vs "
             "full backprop (GOAL §4-247 / P1 品質保持) is answered per-leg in "
             "`quality_preservation` (homogeneous SURPASSES; heterogeneous "
-            "unanswered — code-doable on public Dolly); absolute-loss vs the "
-            "private-repo PRODUCTION baseline is Cat-C and private-repo-only (PIVOT)."
+            "unanswered — the baseline arm is now wired into the canonical "
+            "full-budget target, so only a GPU window stands between UNANSWERED "
+            "and the reading); absolute-loss vs the private-repo PRODUCTION "
+            "baseline is Cat-C and private-repo-only (PIVOT)."
         )
     elif run_executable_here:
         recommendation = "FIRE_OR_EXTEND"
@@ -619,8 +624,9 @@ def format_decision(snapshot: dict[str, Any]) -> str:
         else:
             lines.append(
                 f"  [{label}] UNANSWERED · no full-backprop baseline arm fired "
-                f"(n_baseline=0) — code-doable on public Dolly (verdict worker "
-                f"supports n_baseline)"
+                f"(n_baseline=0) — wired into the canonical full-budget target "
+                f"(make freeze-validloss-ci-9b-full-heterogeneous includes "
+                f"--n-baseline 3); fires on public Dolly, no src.data block"
             )
     lines.append("")
     lines.append(

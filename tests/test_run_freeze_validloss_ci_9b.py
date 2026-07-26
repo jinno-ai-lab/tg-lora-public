@@ -3181,6 +3181,11 @@ class TestFullBudgetHeterogeneousLaunchPath:
         )
         assert "--total-steps 1500" in flag_def
         assert "freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl" in flag_def
+        # The P1 品質保持 axis is wired for BOTH full-budget legs (homogeneous
+        # FREEZE_9B_FULL_FLAGS already carries --n-baseline 3); without it here the
+        # Makefile target would land a deposit with n_baseline=0/baseline=null and
+        # silently drop the §4-247 quality-vs-full-backprop reading for this leg.
+        assert "--n-baseline 3" in flag_def
 
         direct = recipe("freeze-validloss-ci-9b-full-heterogeneous:")
         bg = recipe("freeze-validloss-ci-9b-full-heterogeneous-bg:")
@@ -3215,10 +3220,14 @@ class TestFullBudgetHeterogeneousLaunchPath:
         # GPU, banks arms in --ledger, bounded) — not the worker directly.
         assert "launch_freeze_ci_9b_full" in text
         assert "--architecture heterogeneous" in text
-        # Direction-isolation A/B (candidate/surrogate/CONTROL), NOT the
-        # homogeneous leg's full-backprop baseline arm.
+        # Direction-isolation A/B (candidate/surrogate/CONTROL) AND the
+        # full-backprop baseline arm — the heterogeneous leg answers the SAME
+        # GOAL §4-247 P1 品質保持 axis (does freezing preserve quality vs full
+        # backprop?) the homogeneous leg answers (SURPASSES); without ``--n-baseline``
+        # the heterogeneous deposit carries ``n_baseline=0``/``baseline=null`` and
+        # the decision surface reports P1 品質保持 as UNANSWERED for this leg.
         assert "--n-control 3" in text
-        assert "--n-baseline" not in text
+        assert "--n-baseline 3" in text
         # Full budget + generalization regime (the two honesty axes that clear
         # ``reduced_budget`` and the regime gate conjunct).
         assert "--total-steps 1500" in text
