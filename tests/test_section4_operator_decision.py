@@ -37,6 +37,7 @@ from scripts.section4_operator_decision import (
     _load_landed_decision,
     _probe_verdict_worker,
     assess_section4_decision,
+    format_decision,
     main,
 )
 
@@ -271,6 +272,79 @@ class TestArcIncompleteMutations:
         snap = assess_section4_decision(repo_root=str(tmp_path))
         assert snap["arc_complete"] is False
         assert all(not leg["present"] for leg in snap["legs"])
+
+
+class TestQualityPreservationAxis:
+    """GOAL §4-247 / constitution P1 品質保持 — "does Progressive Freezing
+    preserve (or surpass) full-backprop quality?"
+
+    The committed homogeneous deposit already fired a full-backprop baseline
+    arm (``n_baseline=3``) whose verdict is ``SURPASSES`` (candidate 1.6947 <
+    baseline 1.8794): freezing does NOT cost quality — it beats full backprop.
+    That is a MEASURED, public-Dolly, already-fired result DISTINCT from the
+    PIVOT axis (absolute-loss vs the private-repo PRODUCTION baseline, Cat-C).
+    Surfacing it — rather than burying it under a blanket "absolute-loss
+    remains the only open axis" — is constitution P0 科学誠実性: the inverse of
+    "don't conclude while unmeasured" is "don't leave MEASURED evidence
+    unreported" (this repo's surface-don't-swallow kernel).
+    """
+
+    def test_homogeneous_baseline_verdict_is_surfaced_per_leg(self):
+        snap = assess_section4_decision()
+        homo = next(leg for leg in snap["legs"] if leg["label"] == "homogeneous")
+        assert homo["baseline_present"] is True
+        assert homo["baseline_verdict"] == SURPASSES
+        assert homo["n_baseline"] == 3
+        # candidate (progressive freeze) BEATS the full-backprop baseline ⇒ P1 met
+        assert homo["baseline_candidate_mean"] < homo["baseline_baseline_mean"]
+
+    def test_heterogeneous_baseline_arm_was_never_fired(self):
+        snap = assess_section4_decision()
+        hetero = next(leg for leg in snap["legs"] if leg["label"] == "heterogeneous")
+        assert hetero["baseline_present"] is False
+        assert hetero["n_baseline"] == 0
+        assert hetero["baseline_verdict"] is None
+
+    def test_quality_preservation_summary_is_keyed_per_leg(self):
+        snap = assess_section4_decision()
+        qp = snap["quality_preservation"]
+        assert set(qp) == {"homogeneous", "heterogeneous"}
+        assert qp["homogeneous"]["answered"] is True
+        assert qp["homogeneous"]["verdict"] == SURPASSES
+        assert qp["homogeneous"]["candidate_mean"] < qp["homogeneous"]["baseline_mean"]
+        assert qp["heterogeneous"]["answered"] is False
+        assert qp["heterogeneous"]["verdict"] is None
+
+    def test_format_decision_renders_the_quality_preservation_axis(self):
+        out = format_decision(assess_section4_decision())
+        assert "GOAL §4-247" in out
+        assert "P1 品質保持" in out
+        assert "SURPASSES" in out  # the homogeneous full-backprop verdict
+        assert "UNANSWERED" in out  # the heterogeneous gap
+
+    def test_extraction_reads_the_deposit_field_not_a_hardcoded_default(self, tmp_path):
+        # Mutation guard: strip the baseline arm from a real homogeneous deposit
+        # ⇒ the surface must report it UNANSWERED (proving it reads the actual
+        # ``baseline`` field, not a hardcoded "homogeneous always SURPASSES").
+        homo = _real_deposit(HOMOGENEOUS_DEPOSIT)
+        homo["n_baseline"] = 0
+        homo["baseline"] = None
+        _write_deposits(tmp_path, homo=homo)
+        snap = assess_section4_decision(
+            repo_root=str(tmp_path), verdict_worker_status="executable"
+        )
+        homo_leg = next(leg for leg in snap["legs"] if leg["label"] == "homogeneous")
+        assert homo_leg["baseline_present"] is False
+        assert homo_leg["baseline_verdict"] is None
+        assert snap["quality_preservation"]["homogeneous"]["answered"] is False
+
+    def test_ship_rationale_disambiguates_the_two_absolute_loss_senses(self):
+        # The old rationale claimed absolute-loss "remains the ONLY open axis",
+        # burying the already-answered full-backprop comparison. The fix separates
+        # PIVOT (private-repo production baseline, Cat-C) from the GOAL §4-247
+        # full-backprop axis (surfaced in ``quality_preservation``).
+        rationale = assess_section4_decision()["rationale"]
+        assert "only open axis" not in rationale
 
 
 class TestUnblockStepAndArchitecturalInvariant:

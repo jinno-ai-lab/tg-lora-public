@@ -204,6 +204,14 @@ def _assess_leg(label: str, deposit_rel: str, repo_root: Path) -> dict[str, Any]
     ci = replay_samples(data)
     recorded = data.get("verdict")
     rederived = ci.significance_verdict
+    # GOAL §4-247 / constitution P1 品質保持: "does Progressive Freezing preserve
+    # (or surpass) full-backprop quality?" — read from the deposit's already-fired
+    # ``baseline`` arm (public Dolly; no src.data). This is a SEPARATE axis from
+    # the candidate-vs-surrogate relative verdict above AND from the PIVOT axis
+    # (absolute-loss vs the private-repo PRODUCTION baseline, Cat-C). Burying it
+    # would violate P0 科学誠実性 — measured evidence must be surfaced, not swallowed.
+    n_baseline = data.get("n_baseline") or 0
+    baseline_arm = data.get("baseline")
     leg.update(
         {
             "recorded_verdict": recorded,
@@ -221,6 +229,12 @@ def _assess_leg(label: str, deposit_rel: str, repo_root: Path) -> dict[str, Any]
             "seq_len": data.get("seq_len"),
             "proxy_scale": data.get("proxy_scale"),
             "architecture": data.get("architecture"),
+            # GOAL §4-247 full-backprop baseline arm (None ⇒ never fired for this leg).
+            "baseline_present": bool(baseline_arm) and n_baseline > 0,
+            "n_baseline": n_baseline,
+            "baseline_verdict": (baseline_arm or {}).get("verdict"),
+            "baseline_candidate_mean": (baseline_arm or {}).get("candidate_mean"),
+            "baseline_baseline_mean": (baseline_arm or {}).get("baseline_mean"),
         }
     )
     return leg
@@ -360,6 +374,23 @@ def assess_section4_decision(
         for leg in legs
     )
 
+    # Constitution P1 品質保持 (GOAL §4-247): per-leg "does freezing preserve /
+    # surpass full-backprop quality?" — surfaced from each deposit's already-fired
+    # baseline arm. Distinct from the candidate-vs-surrogate relative verdict AND
+    # from PIVOT (vs the private-repo PRODUCTION baseline, Cat-C). Homogeneous is
+    # answered (SURPASSES); heterogeneous has no baseline arm (unanswered, but
+    # code-doable on public Dolly — the verdict worker supports ``n_baseline``).
+    quality_preservation = {
+        leg["label"]: {
+            "answered": bool(leg.get("baseline_present", False)),
+            "verdict": leg.get("baseline_verdict"),
+            "candidate_mean": leg.get("baseline_candidate_mean"),
+            "baseline_mean": leg.get("baseline_baseline_mean"),
+            "n_baseline": leg.get("n_baseline", 0),
+        }
+        for leg in legs
+    }
+
     # §4 VERDICT-run executability — keyed off the ACTUAL verdict worker
     # (public Dolly; no src.data), NOT the recover.py --rerun / train_tg_lora
     # path. A stripped src.* dep is the only architectural block; a missing
@@ -425,8 +456,11 @@ def assess_section4_decision(
             "both §4 legs are citable faithful TIES — the verdict arc is COMPLETE "
             "(the full-budget run already fired on public Dolly and produced these "
             "deposits); adopt the TIES as the §4 result. Re-firing reproduces TIES "
-            "and adds no information; absolute-loss (vs the private-repo baseline) "
-            "remains the only open axis and is a private-repo action."
+            "and adds no information. Two absolute-loss senses remain: quality vs "
+            "full backprop (GOAL §4-247 / P1 品質保持) is answered per-leg in "
+            "`quality_preservation` (homogeneous SURPASSES; heterogeneous "
+            "unanswered — code-doable on public Dolly); absolute-loss vs the "
+            "private-repo PRODUCTION baseline is Cat-C and private-repo-only (PIVOT)."
         )
     elif run_executable_here:
         recommendation = "FIRE_OR_EXTEND"
@@ -488,6 +522,7 @@ def assess_section4_decision(
         # blocking state: the verdict arc is DONE but no operator call is recorded.
         "awaiting_operator_decision": bool(arc_complete and landed is None),
         "legs": legs,
+        "quality_preservation": quality_preservation,
         "run_executable_here": run_executable_here,
         "verdict_worker_status": verdict_worker_status,
         "verdict_worker_reason": worker_reason,
@@ -572,6 +607,21 @@ def format_decision(snapshot: dict[str, Any]) -> str:
             f"· CI[{leg['ci_lower']:+.4f}, {leg['ci_upper']:+.4f}] · seq{leg['seq_len']}"
         )
     lines.append(f"  arc_complete = {snapshot['arc_complete']}")
+    lines.append("")
+    lines.append("Quality preservation vs full backprop (GOAL §4-247 · P1 品質保持):")
+    for label, qp in snapshot["quality_preservation"].items():
+        if qp["answered"]:
+            lines.append(
+                f"  [{label}] {qp['verdict']} · cand {qp['candidate_mean']:.4f} "
+                f"vs full-backprop {qp['baseline_mean']:.4f} "
+                f"(n_baseline={qp['n_baseline']})"
+            )
+        else:
+            lines.append(
+                f"  [{label}] UNANSWERED · no full-backprop baseline arm fired "
+                f"(n_baseline=0) — code-doable on public Dolly (verdict worker "
+                f"supports n_baseline)"
+            )
     lines.append("")
     lines.append(
         f"Verdict run executable in this mirror: {snapshot['run_executable_here']} "
