@@ -17,7 +17,9 @@ from src.tg_lora.prefix_feature_cache import (
     get_prefix_feature_cache_path, load_prefix_feature_dataset,
     merge_prefix_feature_cache_shards, resolve_prefix_feature_cache_seed,
     save_prefix_feature_dataset)
-from src.training.config_schema import DataConfig, ModelConfig
+from src.training.config_schema import (
+    DataConfig, ModelConfig, TrainingConfig,
+)
 from src.training.loss import compute_loss
 
 
@@ -122,6 +124,34 @@ def _default_metadata(**overrides):
     }
     base.update(overrides)
     return build_prefix_feature_cache_metadata(**base)
+
+
+def cross_section_byte_changing_fingerprint_inputs():
+    """Config fields OUTSIDE ``DataConfig``/``ModelConfig`` that change the
+    cached bytes and therefore MUST stay in the prefix-feature fingerprint.
+
+    ``TestCacheFingerprintCompleteness`` enumerates the ``DataConfig`` /
+    ``ModelConfig`` schemas directly (block 1–3), but
+    :func:`build_prefix_feature_cache_metadata` ALSO reads these
+    ``TrainingConfig`` fields: ``train_on_prompt`` is the LABEL-side field
+    TASK-0206 added (it masks the prompt in the cached ``labels``), and
+    ``trainable_lora_scope`` drives ``split_layer_idx`` (which layer's hidden
+    states are captured). Both are byte-changing, so mapping them here extends
+    the guard's structural "no silent drop" guarantee to the fields that live
+    outside the Data/Model schemas.
+
+    Note: ``ExperimentConfig.seed`` and ``LoRAConfig.{r, alpha, dropout,
+    target_modules}`` are ALSO stamped into the fingerprint, but they do NOT
+    change the cached bytes (``seed`` only because the cache-build dataloader
+    uses ``shuffle=False``; the LoRA suffix is not applied during the base-model
+    forward pass that populates the cache), so they are intentionally NOT in
+    this byte-changing set — a stale key there can only cause an unnecessary
+    rebuild or a harmless extra reuse, never a wrong-content replay.
+    """
+    return {
+        (TrainingConfig, "train_on_prompt"): "train_on_prompt",
+        (TrainingConfig, "trainable_lora_scope"): "trainable_lora_scope",
+    }
 
 
 def test_build_prefix_feature_dataset_matches_full_eval_loss():
@@ -552,6 +582,15 @@ class TestCacheFingerprintCompleteness:
     of slipping through as a silent-collision regression. Audit a
     content-addressed cache by enumerating the config fields that change the
     cached bytes, not just the cache struct's own fields.
+
+    Block (4) closes the one cross-section gap that schema enumeration alone
+    leaves: ``build_prefix_feature_cache_metadata`` also reads byte-changing
+    ``TrainingConfig`` fields (``train_on_prompt``, ``trainable_lora_scope``)
+    that live OUTSIDE ``DataConfig``/``ModelConfig``. They are correctly
+    fingerprinted today, but without this block a future edit that dropped them
+    from the fingerprint would pass the guard with no failure — the very
+    silent-collision regression (LABEL-side ``train_on_prompt``, TASK-0206) the
+    guard exists to prevent.
     """
 
     def test_every_data_and_model_config_field_is_fingerprinted_or_allowlisted(self):
@@ -624,6 +663,57 @@ class TestCacheFingerprintCompleteness:
         assert not overlap, (
             f"Schema field(s) {sorted(overlap)} are both fingerprinted and "
             f"allow-listed — pick one."
+        )
+
+        # (4) Cross-section byte-changing inputs. build_prefix_feature_cache_metadata
+        # also reads TrainingConfig fields that live OUTSIDE the DataConfig/ModelConfig
+        # schemas enumerated above; the byte-changing ones (train_on_prompt = LABEL
+        # masking; trainable_lora_scope drives split_layer_idx) must stay mapped to a
+        # live fingerprint key, else a future edit could silently drop them with no
+        # guard failing — the silent-collision regression this guard exists to prevent.
+        for (schema_cls, field_name), fp_key in (
+            cross_section_byte_changing_fingerprint_inputs().items()
+        ):
+            assert field_name in schema_cls.model_fields, (
+                f"Cross-section fingerprint input {schema_cls.__name__}.{field_name} "
+                f"no longer exists in the schema — update the guard mapping "
+                f"(see TASK-0206/0210)."
+            )
+            assert fp_key in fingerprinted, (
+                f"Byte-changing field {schema_cls.__name__}.{field_name} is mapped to "
+                f"fingerprint key {fp_key!r}, which is absent from "
+                f"build_prefix_feature_cache_metadata output (keys present: "
+                f"{sorted(fingerprinted)}). A byte-changing config field MUST stay in "
+                f"the fingerprint, or two runs differing only in it silently replay "
+                f"wrong cached content (the TASK-0206/0207 silent-collision class)."
+            )
+
+    def test_guard_detects_dropped_train_on_prompt_fingerprint(self):
+        """Mutation proof for guard block (4): if the byte-changing LABEL field
+        ``train_on_prompt`` were removed from
+        :func:`build_prefix_feature_cache_metadata`'s output, the cross-section
+        completeness check MUST flag it — else two runs differing only in
+        ``train_on_prompt`` silently replay each other's wrongly-masked labels
+        with no signal (the TASK-0206 silent-collision class)."""
+        metadata = _default_metadata()
+        # Sanity: the field is present in the real fingerprint today.
+        assert "train_on_prompt" in metadata
+
+        # Simulate a producer regression that drops the key from the fingerprint.
+        fingerprinted_after_drop = {k for k in metadata if k != "train_on_prompt"}
+
+        # Mirror guard block (4): every cross-section byte-changing input must
+        # map to a key still present in the fingerprint.
+        flagged = [
+            f"{schema_cls.__name__}.{field_name}"
+            for (schema_cls, field_name), fp_key in (
+                cross_section_byte_changing_fingerprint_inputs().items()
+            )
+            if fp_key not in fingerprinted_after_drop
+        ]
+        assert "TrainingConfig.train_on_prompt" in flagged, (
+            "completeness guard must detect train_on_prompt dropped from the "
+            f"fingerprint; flagged={flagged!r}"
         )
 
 
