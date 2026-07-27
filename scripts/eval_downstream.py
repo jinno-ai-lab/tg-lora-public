@@ -1,7 +1,6 @@
 import argparse
 import json
 import logging
-import os
 import sys
 import time
 import gc
@@ -9,7 +8,6 @@ from pathlib import Path
 from difflib import SequenceMatcher
 
 import torch
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.model.load_model import load_base_model, load_tokenizer, apply_lora
@@ -368,12 +366,12 @@ def main():
             f.write("---\n\n")
             
     logger.info(f"Evaluation complete. Reports saved to {args.output_dir}")
-    print(f"\n=== DOWNSTREAM EVALUATION SUMMARY ===")
+    print("\n=== DOWNSTREAM EVALUATION SUMMARY ===")
     print(f"Japanese Capability - Mean Char-F1: {jp_results['summary']['mean_char_f1']:.4f}")
     print(f"JSON Format Compliance - Mean Char-F1: {json_results['summary']['mean_char_f1']:.4f}")
     print(f"JSON Format Compliance - JSON Validity Rate: {json_results['summary']['json_validity_rate']:.4%}")
     print(f"JSON Format Compliance - Key Compliance Rate: {json_results['summary']['key_compliance_rate']:.4%}")
-    print(f"======================================\n")
+    print("======================================\n")
 
     # Surface degenerate inputs and empty corpora loudly (stderr banner), mirroring
     # the G3 gate's INCOMPLETE banner (d9ca7f5): a clean-looking mean must not hide a
