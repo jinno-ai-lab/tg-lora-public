@@ -284,6 +284,208 @@ def test_fingerprint_completeness_every_lora_config_field_covered():
     )
 
 
+# --- ledger fingerprint: cross-section (Training/Data) completeness ----------
+
+def _cfg_section_reads(source: str, section: str) -> set[str]:
+    """The field names ``source`` reads off ``cfg.<section>``.
+
+    An AST walk (so comments and docstrings never count) catching all three
+    OmegaConf access forms used in this codebase: ``cfg.training.X``,
+    ``cfg.training.get("X", ...)`` and the defensive
+    ``cfg.get("training", {}).get("X", ...)`` chain (the inner
+    ``cfg.get("training", {})`` call canonicalizes to ``cfg.training`` before
+    the outer ``.get`` is matched).
+    """
+    import ast
+
+    def chain(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            base = chain(node.value)
+            return f"{base}.{node.attr}" if base else None
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            # cfg.get("training", {}) → canonical "cfg.training"
+            base = chain(node.func.value)
+            return f"{base}.{node.args[0].value}" if base else None
+        return None
+
+    reads: set[str] = set()
+    prefix = f"cfg.{section}"
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Attribute) and chain(node.value) == prefix:
+            reads.add(node.attr)  # cfg.training.X
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and chain(node.func.value) == prefix
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            reads.add(node.args[0].value)  # cfg.training.get("X", ...)
+    reads.discard("get")  # the ``.get`` attribute itself is not a field read
+    return reads
+
+
+def test_cfg_section_read_scanner_catches_all_access_forms():
+    """Mutation-proof the detection mechanism the two completeness guards below
+    depend on: attribute access, ``.get`` access and the defensive
+    ``cfg.get(section, {}).get`` chain are ALL caught, while comments, string
+    literals and other sections are NOT."""
+    src = (
+        "cfg.training.learning_rate\n"
+        'cfg.training.get("max_steps", 0)\n'
+        'cfg.get("training", {}).get("gradient_checkpointing", True)\n'
+        "cfg.model.dtype\n"
+        "# cfg.training.in_a_comment\n"
+        'doc = "cfg.training.in_a_string"\n'
+    )
+    assert _cfg_section_reads(src, "training") == {
+        "learning_rate", "max_steps", "gradient_checkpointing",
+    }
+    assert _cfg_section_reads(src, "data") == set()
+
+
+def test_fingerprint_completeness_every_consumed_training_field_covered():
+    """Schema-consumption completeness guard for ``TrainingConfig`` — the
+    resume-ledger analogue of ``TestCacheFingerprintCompleteness`` block 4
+    (the cache lane's cross-section ``train_on_prompt`` /
+    ``trainable_lora_scope`` pin). The ``ModelConfig`` / ``LoRAConfig`` guards
+    above enumerate whole SCHEMA SECTIONS; ``TrainingConfig`` cannot be
+    enumerated wholesale because the §4 launcher reads only a few of its ~40
+    fields (the rest drive the ``train_tg_lora`` production loop, never an §4
+    arm). So this guard pins the exact CONSUMED surface instead: every
+    ``cfg.training.*`` read on the §4 arm path — in the launcher itself and in
+    the shared ``src/model/load_model.py`` loaders it calls — must be either a
+    fingerprint key or carry a justified byte-invariance allow-list entry.
+
+    That closes the SAME corrupt-but-green failure mode (GOAL §7) the schema
+    guards close, for the section they don't cover: if a future change wires a
+    new ``cfg.training`` knob (e.g. ``weight_decay`` / ``batch_size``) into the
+    arm path WITHOUT fingerprinting it, a re-run under the new value would hit
+    a matching fingerprint and silently replay arms trained under the old one —
+    this guard fails loud and demands a fingerprint key or a justification.
+    """
+    from pathlib import Path
+
+    import scripts.run_freeze_validloss_ci_9b as launcher
+    import src.model.load_model as load_model
+    from src.training.config_schema import TrainingConfig
+
+    consumed = _cfg_section_reads(
+        Path(launcher.__file__).read_text(encoding="utf-8"), "training"
+    )
+    consumed |= _cfg_section_reads(
+        Path(load_model.__file__).read_text(encoding="utf-8"), "training"
+    )
+
+    # TrainingConfig field consumed on the §4 arm path → its ledger fingerprint
+    # key. trainable_lora_scope → scope_label (and the derived active_scope);
+    # learning_rate → the lr of every arm's AdamW (arm_valid_loss_9b).
+    fingerprinted = {
+        "trainable_lora_scope": "scope_label",
+        "learning_rate": "learning_rate",
+    }
+    # Consumed but provably byte-invariant — each entry is a justification that
+    # the field CANNOT change any arm's trained bytes / valid_loss.
+    non_result_affecting = {
+        # Feeds ONLY _is_reduced_budget(...) — the honest full-vs-reduced label
+        # in the deposit footer. It clamps neither the trained step count (the
+        # CLI total_steps does, and IS fingerprinted) nor any arm bytes.
+        "max_steps",
+        # Memory-only activation recomputation in load_base_model / apply_lora;
+        # forward/backward numerics are identical with or without it.
+        "gradient_checkpointing",
+    }
+
+    unaccounted = consumed - set(fingerprinted) - non_result_affecting
+    assert not unaccounted, (
+        f"Ledger-fingerprint completeness gap: TrainingConfig field(s) "
+        f"{sorted(unaccounted)} are read on the §4 arm path "
+        f"(scripts/run_freeze_validloss_ci_9b.py or src/model/load_model.py) "
+        f"but are neither fingerprinted nor allow-listed — a re-run under a "
+        f"different value would silently replay stale arms (corrupt-but-green "
+        f"§4, GOAL §7). Add a _config_fingerprint key if the field changes arm "
+        f"bytes, or justify it in non_result_affecting if it cannot."
+    )
+    stale = (set(fingerprinted) | non_result_affecting) - consumed
+    assert not stale, (
+        f"Ledger-fingerprint guard drift: field(s) {sorted(stale)} are "
+        f"accounted for here but no longer read on the §4 arm path — update "
+        f"this guard to match the source it pins."
+    )
+    sample = _fp()
+    for field, key in fingerprinted.items():
+        assert key in sample, (
+            f"TrainingConfig.{field} is consumed on the §4 arm path but its "
+            f"fingerprint key {key!r} is absent from _config_fingerprint — a "
+            f"value change would silently replay stale arms (corrupt-but-green "
+            f"§4, GOAL §7)."
+        )
+    phantom = (set(fingerprinted) | non_result_affecting) - set(
+        TrainingConfig.model_fields
+    )
+    assert not phantom, (
+        f"Ledger-fingerprint guard drift: {sorted(phantom)} are not "
+        f"TrainingConfig fields — the accounting lists must track the schema."
+    )
+
+
+def test_launcher_reads_no_data_config_field_and_data_surface_fingerprinted():
+    """``DataConfig`` isolation guard — the prompt/data-contract surface the
+    feedback loop asks to keep honest: the §4 arm path builds its inputs
+    ENTIRELY from fingerprinted CLI args (``dataset`` / ``max_dataset_rows`` /
+    ``base_seed`` / ``seq_len`` / ``train_examples`` / ``valid_examples`` →
+    ``_load_dolly_records`` + ``build_real_batches``). The ``cfg.data`` section
+    (the ``train_tg_lora`` dataset PATHS / ``max_seq_len``) must NEVER feed an
+    arm: if a future change starts reading ``cfg.data.X`` into the §4 path, two
+    runs differing only in that value would share a fingerprint and silently
+    replay arms trained on different inputs — corrupt-but-green (GOAL §7), the
+    truncation-changes-the-label class the cache lane pins via TC-132-09
+    (``max_seq_len`` cache miss + rebuild). This guard fails loud at the first
+    such read and demands fingerprinting or a justification; the second half
+    pins that every CLI data-surface key is actually present in the fingerprint
+    (drop detection, the direction the per-field change tests don't all cover).
+    """
+    from pathlib import Path
+
+    import scripts.run_freeze_validloss_ci_9b as launcher
+    import src.model.load_model as load_model
+
+    data_reads = _cfg_section_reads(
+        Path(launcher.__file__).read_text(encoding="utf-8"), "data"
+    )
+    data_reads |= _cfg_section_reads(
+        Path(load_model.__file__).read_text(encoding="utf-8"), "data"
+    )
+    assert not data_reads, (
+        f"The §4 arm path now reads DataConfig field(s) {sorted(data_reads)} "
+        f"off cfg.data — every input-changing read MUST appear in "
+        f"_config_fingerprint (like seq_len / max_dataset_rows) or a "
+        f"same-input-different-config re-run silently replays stale arms "
+        f"(corrupt-but-green §4, GOAL §7)."
+    )
+    sample = _fp()
+    for key in (
+        "dataset", "max_dataset_rows", "base_seed",
+        "seq_len", "train_examples", "valid_examples",
+    ):
+        assert key in sample, (
+            f"Data-surface key {key!r} is absent from _config_fingerprint — "
+            f"runs differing only in {key} would share a fingerprint and "
+            f"silently replay arms trained on different inputs."
+        )
+
+
 def test_fingerprint_carries_ledger_version():
     """A future schema bump reads as stale via the embedded version."""
     assert _fp()["ledger_version"] == LEDGER_VERSION
