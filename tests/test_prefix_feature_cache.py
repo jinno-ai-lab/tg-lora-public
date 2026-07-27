@@ -15,8 +15,8 @@ from src.tg_lora.prefix_feature_cache import (
     build_prefix_feature_cache_metadata, build_prefix_feature_dataset,
     collate_prefix_feature_batch, compute_prefix_feature_shard_ranges,
     get_prefix_feature_cache_path, load_prefix_feature_dataset,
-    merge_prefix_feature_cache_shards, resolve_prefix_feature_cache_seed,
-    save_prefix_feature_dataset)
+    merge_prefix_feature_cache_shards, prefix_feature_cache_metadata_from_config,
+    resolve_prefix_feature_cache_seed, save_prefix_feature_dataset)
 from src.training.config_schema import (
     DataConfig, ModelConfig, TrainingConfig,
 )
@@ -752,6 +752,188 @@ class TestCacheFingerprintCompleteness:
             "completeness guard must detect train_on_prompt dropped from the "
             f"fingerprint; flagged={flagged!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Single config→fingerprint mapping shared by all cache producers
+# ---------------------------------------------------------------------------
+
+
+def _baseline_cfg_training_fields(**overrides):
+    """Training-section values shared by the Pydantic and OmegaConf fixtures.
+
+    Non-default values are chosen deliberately so a mapping regression that
+    hardcodes a default (the TASK-0206 ``train_on_prompt`` class) cannot pass.
+    """
+    fields = {
+        "batch_size": 2,
+        "grad_accumulation": 1,
+        "learning_rate": 1e-4,
+        "max_steps": 10,
+        "train_on_prompt": True,
+        "trainable_lora_scope": "last_25_percent",
+        "prefix_feature_cache_share_across_seeds": False,
+    }
+    fields.update(overrides)
+    return fields
+
+
+def _pydantic_cfg(**training_overrides):
+    """The validated-config model (config_schema / producer ``_load_cfg``)."""
+    from src.training.config_schema import (
+        BaselineConfig, DataConfig, ExperimentConfig, LoggingConfig,
+        LoRAConfig, ModelConfig, TrainingConfig,
+    )
+
+    return BaselineConfig(
+        experiment=ExperimentConfig(name="fp-consistency", seed=7),
+        model=ModelConfig(
+            name_or_path="dummy-model",
+            dtype="float16",
+            load_in_4bit=True,
+            bnb_4bit_quant_type="fp4",
+            bnb_4bit_compute_dtype="float16",
+        ),
+        lora=LoRAConfig(r=8, alpha=16, dropout=0.05, target_modules="all-linear"),
+        data=DataConfig(
+            train_path="data/train.jsonl",
+            valid_quick_path="data/valid_quick.jsonl",
+            valid_full_path="data/valid_full.jsonl",
+            max_seq_len=64,
+        ),
+        training=TrainingConfig(**_baseline_cfg_training_fields(**training_overrides)),
+        logging=LoggingConfig(run_dir="runs/test"),
+    )
+
+
+def _omegaconf_cfg(**training_overrides):
+    """The Hydra runtime config model (unvalidated DictConfig).
+
+    Built from the SAME values as ``_pydantic_cfg`` (via ``model_dump``) so
+    the parity test compares container-type semantics, not fixture drift.
+    """
+    from omegaconf import OmegaConf
+
+    return OmegaConf.create(_pydantic_cfg(**training_overrides).model_dump())
+
+
+class TestMetadataFromConfig:
+    """``prefix_feature_cache_metadata_from_config`` is the single config→
+    fingerprint mapping every cache producer must route through. These tests
+    pin that a change to ANY label-affecting / precision-affecting config
+    field flows from the config object into the fingerprint consistently —
+    regardless of which config model (Pydantic vs OmegaConf) carries it.
+    """
+
+    def test_every_cfg_field_flows_into_the_fingerprint(self):
+        metadata = prefix_feature_cache_metadata_from_config(
+            _pydantic_cfg(), dataset_path="data/train.jsonl", split_layer_idx=3
+        )
+        expected = build_prefix_feature_cache_metadata(
+            dataset_path="data/train.jsonl",
+            model_name="dummy-model",
+            seed=7,
+            max_seq_len=64,
+            split_layer_idx=3,
+            lora_r=8,
+            lora_alpha=16,
+            lora_dropout=0.05,
+            lora_target_modules="all-linear",
+            trainable_lora_scope="last_25_percent",
+            train_on_prompt=True,
+            dtype="float16",
+            load_in_4bit=True,
+            bnb_4bit_quant_type="fp4",
+            bnb_4bit_compute_dtype="float16",
+        )
+        assert metadata == expected
+
+    def test_pydantic_and_omegaconf_config_models_agree_byte_for_byte(self):
+        """The two config models this repo runs on must mint IDENTICAL
+        fingerprints for the same intended config — else the validated-config
+        producer and the Hydra-runtime producer mint divergent cache paths
+        (silent redundant rebuilds) or agree on a path while disagreeing on
+        its meaning (the TASK-0206/0207 collision class)."""
+        m_pydantic = prefix_feature_cache_metadata_from_config(
+            _pydantic_cfg(), dataset_path="data/train.jsonl", split_layer_idx=3
+        )
+        m_omegaconf = prefix_feature_cache_metadata_from_config(
+            _omegaconf_cfg(), dataset_path="data/train.jsonl", split_layer_idx=3
+        )
+        assert m_pydantic == m_omegaconf
+        assert get_prefix_feature_cache_path("/tmp/cache", m_pydantic) == (
+            get_prefix_feature_cache_path("/tmp/cache", m_omegaconf)
+        )
+
+    def test_label_affecting_train_on_prompt_flows_from_cfg_to_cache_path(self):
+        m_on = prefix_feature_cache_metadata_from_config(
+            _pydantic_cfg(train_on_prompt=True),
+            dataset_path="data/train.jsonl",
+            split_layer_idx=3,
+        )
+        m_off = prefix_feature_cache_metadata_from_config(
+            _pydantic_cfg(train_on_prompt=False),
+            dataset_path="data/train.jsonl",
+            split_layer_idx=3,
+        )
+        assert m_on["train_on_prompt"] is True
+        assert m_off["train_on_prompt"] is False
+        assert get_prefix_feature_cache_path("/tmp/cache", m_on) != (
+            get_prefix_feature_cache_path("/tmp/cache", m_off)
+        )
+
+    def test_share_across_seeds_config_collapses_seed_in_fingerprint(self):
+        m_shared = prefix_feature_cache_metadata_from_config(
+            _pydantic_cfg(prefix_feature_cache_share_across_seeds=True),
+            dataset_path="data/train.jsonl",
+            split_layer_idx=3,
+        )
+        m_per_seed = prefix_feature_cache_metadata_from_config(
+            _pydantic_cfg(prefix_feature_cache_share_across_seeds=False),
+            dataset_path="data/train.jsonl",
+            split_layer_idx=3,
+        )
+        assert m_shared["seed"] == 0
+        assert m_per_seed["seed"] == 7
+
+    def test_missing_or_null_training_fields_fall_back_to_pydantic_defaults(self):
+        """An OmegaConf YAML that omits (or explicitly nulls) an optional
+        training field must yield the SAME fingerprint as a validated config
+        carrying the Pydantic default — not crash, and not ``str(None)``-style
+        drift. This pins the getattr-with-default normalization; the legacy
+        precompute producer read ``prefix_feature_cache_share_across_seeds``
+        with no default at all."""
+        from omegaconf import OmegaConf
+
+        sparse = _omegaconf_cfg()
+        sparse_cfg = OmegaConf.merge(
+            sparse,
+            OmegaConf.create(
+                {
+                    "training": {
+                        "train_on_prompt": None,
+                        "trainable_lora_scope": None,
+                        "prefix_feature_cache_share_across_seeds": None,
+                    }
+                }
+            ),
+        )
+        del sparse_cfg.training["train_on_prompt"]  # also cover full omission
+        m_sparse = prefix_feature_cache_metadata_from_config(
+            sparse_cfg, dataset_path="data/train.jsonl", split_layer_idx=3
+        )
+        m_defaults = prefix_feature_cache_metadata_from_config(
+            _pydantic_cfg(
+                train_on_prompt=False,
+                trainable_lora_scope="all",
+                prefix_feature_cache_share_across_seeds=False,
+            ),
+            dataset_path="data/train.jsonl",
+            split_layer_idx=3,
+        )
+        assert m_sparse["train_on_prompt"] is False
+        assert m_sparse["trainable_lora_scope"] == "all"
+        assert m_sparse == m_defaults
 
 
 # ---------------------------------------------------------------------------

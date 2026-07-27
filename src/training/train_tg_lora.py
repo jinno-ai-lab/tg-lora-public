@@ -53,12 +53,11 @@ from src.tg_lora.lora_state import (
 )
 from src.tg_lora.prefix_feature_cache import (
     PrefixFeatureDatasetBase,
-    build_prefix_feature_cache_metadata,
     build_prefix_feature_dataset,
     collate_prefix_feature_batch,
     get_prefix_feature_cache_path,
     load_prefix_feature_dataset,
-    resolve_prefix_feature_cache_seed,
+    prefix_feature_cache_metadata_from_config,
     save_prefix_feature_dataset,
 )
 from src.tg_lora.prefix_runtime_offload import offload_prefix_runtime_to_cpu
@@ -1109,25 +1108,13 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 "prefix cache split layer must be set before dataset caching"
             )
 
-        metadata = build_prefix_feature_cache_metadata(
+        # Single config→fingerprint mapping shared with async_cache_builder /
+        # precompute_prefix_cache_parallel — cross-producer cache-path agreement
+        # is structural, not three inlined copies that can diverge.
+        metadata = prefix_feature_cache_metadata_from_config(
+            cfg,
             dataset_path=dataset_path,
-            model_name=cfg.model.name_or_path,
-            seed=resolve_prefix_feature_cache_seed(
-                cfg.experiment.seed,
-                share_across_seeds=prefix_feature_cache_share_across_seeds,
-            ),
-            max_seq_len=cfg.data.max_seq_len,
             split_layer_idx=prefix_cache_split_layer,
-            lora_r=cfg.lora.r,
-            lora_alpha=cfg.lora.alpha,
-            lora_dropout=cfg.lora.dropout,
-            lora_target_modules=cfg.lora.target_modules,
-            trainable_lora_scope=trainable_lora_scope,
-            train_on_prompt=bool(cfg.training.get("train_on_prompt", False)),
-            dtype=str(cfg.model.dtype),
-            load_in_4bit=bool(cfg.model.load_in_4bit),
-            bnb_4bit_quant_type=str(cfg.model.bnb_4bit_quant_type),
-            bnb_4bit_compute_dtype=str(cfg.model.bnb_4bit_compute_dtype),
         )
         cache_path = get_prefix_feature_cache_path(prefix_feature_cache_dir, metadata)
         prefix_feature_cache_summary[f"prefix_feature_cache_{label}_path"] = str(

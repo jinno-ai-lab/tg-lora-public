@@ -211,6 +211,73 @@ def resolve_prefix_feature_cache_seed(seed: int, *, share_across_seeds: bool) ->
     return 0 if share_across_seeds else seed
 
 
+def _cfg_field(node: Any, name: str, default: Any) -> Any:
+    """Read one config field from EITHER config model this repo runs on.
+
+    ``cfg.training`` is a Pydantic ``TrainingConfig`` in tests (and in every
+    producer path that validates via ``config_schema``) and an OmegaConf
+    ``DictConfig`` at the Hydra runtime. Attribute access works on both;
+    dict-style ``.get()`` only on the latter. ``getattr(node, name, default)``
+    catches both missing-attribute errors uniformly (OmegaConf's
+    ``ConfigAttributeError`` subclasses ``AttributeError``). An explicit null
+    in an OmegaConf YAML resolves to ``None`` where the Pydantic default would
+    have applied, so ``None`` is normalized back to ``default`` — otherwise
+    ``str(None) == "None"`` / ``bool(None) is False`` would let the two config
+    models disagree on the fingerprint for the SAME intended config.
+    """
+    value = getattr(node, name, default)
+    return default if value is None else value
+
+
+def prefix_feature_cache_metadata_from_config(
+    cfg: Any,
+    *,
+    dataset_path: str,
+    split_layer_idx: int,
+) -> dict[str, Any]:
+    """The single config→fingerprint mapping shared by ALL cache producers.
+
+    The cache producers (``train_tg_lora``, ``async_cache_builder``,
+    ``scripts/precompute_prefix_cache_parallel``) historically each inlined
+    this mapping with divergent idioms — ``cfg.training.get(...)`` vs
+    ``getattr(cfg.training, ...)`` vs a pre-resolved local, and one producer
+    read ``prefix_feature_cache_share_across_seeds`` with NO default. The
+    fingerprint is the cache's content-addressed identity: producers that read
+    the same cfg differently either mint divergent cache paths for identical
+    content (silent redundant rebuilds) or — the TASK-0206/0207 collision
+    class — agree on a path while disagreeing on what the bytes mean. Routing
+    every producer through this one function makes cross-producer agreement
+    structural instead of coincidental, and any future label-affecting or
+    precision-affecting config field is added in exactly one place.
+
+    ``dataset_path`` and ``split_layer_idx`` stay parameters: the former is
+    per-split (train / valid_quick / valid_full), the latter is computed from
+    the model's layer structure rather than carried on ``cfg``.
+    """
+    return build_prefix_feature_cache_metadata(
+        dataset_path=dataset_path,
+        model_name=str(cfg.model.name_or_path),
+        seed=resolve_prefix_feature_cache_seed(
+            int(cfg.experiment.seed),
+            share_across_seeds=bool(
+                _cfg_field(cfg.training, "prefix_feature_cache_share_across_seeds", False)
+            ),
+        ),
+        max_seq_len=int(cfg.data.max_seq_len),
+        split_layer_idx=int(split_layer_idx),
+        lora_r=int(cfg.lora.r),
+        lora_alpha=int(cfg.lora.alpha),
+        lora_dropout=float(cfg.lora.dropout),
+        lora_target_modules=str(cfg.lora.target_modules),
+        trainable_lora_scope=str(_cfg_field(cfg.training, "trainable_lora_scope", "all")),
+        train_on_prompt=bool(_cfg_field(cfg.training, "train_on_prompt", False)),
+        dtype=str(cfg.model.dtype),
+        load_in_4bit=bool(cfg.model.load_in_4bit),
+        bnb_4bit_quant_type=str(cfg.model.bnb_4bit_quant_type),
+        bnb_4bit_compute_dtype=str(cfg.model.bnb_4bit_compute_dtype),
+    )
+
+
 def get_prefix_feature_cache_path(
     cache_dir: str | Path,
     metadata: dict[str, Any],
