@@ -28,10 +28,9 @@ from src.data.build_seed_dataset import load_dataset
 from src.model.load_model import (apply_lora, get_input_device,
                                   load_base_model, load_tokenizer)
 from src.tg_lora.prefix_feature_cache import (
-    build_prefix_feature_cache_metadata, build_prefix_feature_dataset,
-    compute_prefix_feature_shard_ranges, get_prefix_feature_cache_path,
-    merge_prefix_feature_cache_shards, resolve_prefix_feature_cache_seed,
-    save_prefix_feature_dataset)
+    build_prefix_feature_dataset, compute_prefix_feature_shard_ranges,
+    get_prefix_feature_cache_path, merge_prefix_feature_cache_shards,
+    prefix_feature_cache_metadata_from_config, save_prefix_feature_dataset)
 from src.training.config_schema import TGLoRAConfig, load_and_validate_config
 from src.utils.io import save_json
 
@@ -195,34 +194,17 @@ def _build_worker_configs(
 
     for label in labels:
         dataset_path = _dataset_path(cfg, label)
-        metadata = build_prefix_feature_cache_metadata(
+        # Single cfg→fingerprint mapping shared with train_tg_lora /
+        # async_cache_builder — the label-affecting fields (train_on_prompt,
+        # trainable_lora_scope, max_seq_len) and precision-affecting model
+        # fields (dtype/4bit knobs — they change the cached ACTIVATIONS) are
+        # read in exactly one place, so this producer's cache paths are
+        # byte-identical to the other producers' for the same config, whether
+        # cfg is the Pydantic TGLoRAConfig (tests) or an OmegaConf node (CLI).
+        metadata = prefix_feature_cache_metadata_from_config(
+            cfg,
             dataset_path=dataset_path,
-            model_name=cfg.model.name_or_path,
-            seed=resolve_prefix_feature_cache_seed(
-                cfg.experiment.seed,
-                share_across_seeds=cfg.training.prefix_feature_cache_share_across_seeds,
-            ),
-            max_seq_len=cfg.data.max_seq_len,
             split_layer_idx=split_layer_idx,
-            lora_r=cfg.lora.r,
-            lora_alpha=cfg.lora.alpha,
-            lora_dropout=cfg.lora.dropout,
-            lora_target_modules=cfg.lora.target_modules,
-            trainable_lora_scope=cfg.training.trainable_lora_scope,
-            # getattr (not .get): cfg.training is a Pydantic TrainingConfig in
-            # tests and an OmegaConf node at runtime — both support attribute
-            # access, neither uniformly supports dict-style .get().
-            train_on_prompt=bool(getattr(cfg.training, "train_on_prompt", False)),
-            # Plain attribute access (like model_name/max_seq_len above): the
-            # model-precision fields all carry Pydantic defaults, so they exist
-            # on both the Pydantic ModelConfig in tests and the OmegaConf node
-            # at runtime. They change the cached ACTIVATIONS (base-model forward
-            # captured at split_layer_idx), so they MUST be in the fingerprint —
-            # see build_prefix_feature_cache_metadata.
-            dtype=str(cfg.model.dtype),
-            load_in_4bit=bool(cfg.model.load_in_4bit),
-            bnb_4bit_quant_type=str(cfg.model.bnb_4bit_quant_type),
-            bnb_4bit_compute_dtype=str(cfg.model.bnb_4bit_compute_dtype),
         )
         final_cache_path = get_prefix_feature_cache_path(cache_dir, metadata)
         total_examples = _count_records(dataset_path)

@@ -44,6 +44,7 @@ def _make_cfg(tmp_path: Path, split_layer: int = 2) -> OmegaConf:
                 "batch_size": 2,
                 "prefix_feature_cache_valid_quick": True,
                 "prefix_feature_cache_valid_full": True,
+                "trainable_lora_scope": "last_25_percent",
             },
             "experiment": {"seed": 42},
             "lora": {
@@ -84,7 +85,6 @@ class TestSmokeFullLifecycle:
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
             model_factory=_model_factory,
         )
@@ -132,7 +132,6 @@ class TestSmokeFullLifecycle:
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
             model_factory=_model_factory,
         )
@@ -167,7 +166,6 @@ class TestSmokePollAndSwap:
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
             model_factory=_model_factory,
         )
@@ -221,7 +219,6 @@ class TestSmokePollAndSwap:
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
             model_factory=_model_factory,
         )
@@ -258,7 +255,6 @@ class TestSmokeDiskPersistence:
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
             model_factory=_model_factory,
         )
@@ -279,7 +275,6 @@ class TestSmokeDiskPersistence:
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
             model_factory=_model_factory,
         )
@@ -306,7 +301,6 @@ class TestSmokeDiskPersistence:
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
             model_factory=_model_factory,
         )
@@ -321,7 +315,6 @@ class TestSmokeDiskPersistence:
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=True,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
             model_factory=_model_factory,
         )
@@ -352,7 +345,6 @@ class TestSmokeErrorHandling:
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
             model_factory=failing_factory,
         )
@@ -393,7 +385,6 @@ class TestSmokeErrorHandling:
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
             model_factory=factory_with_bad_split,
         )
@@ -436,7 +427,6 @@ class TestSmokeHiddenStateValues:
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
             model_factory=deterministic_factory,
         )
@@ -452,7 +442,6 @@ class TestSmokeHiddenStateValues:
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=True,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
             model_factory=deterministic_factory,
         )
@@ -479,7 +468,6 @@ class TestSmokeHiddenStateValues:
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
             model_factory=_model_factory,
         )

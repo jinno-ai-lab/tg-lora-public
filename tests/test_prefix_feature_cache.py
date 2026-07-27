@@ -1161,3 +1161,122 @@ class TestTC224:
         )
         assert config.training.prefix_feature_cache_mode == "one_shot"
         assert config.training.prefix_feature_cache_experimental is True
+
+class TestCrossProducerFingerprintIdentity:
+    """T-002: ALL three cache producers must mint byte-identical metadata.
+
+    train_tg_lora (T-001), AsyncCacheBuilder and
+    scripts/precompute_prefix_cache_parallel (T-002) each route through the
+    single ``prefix_feature_cache_metadata_from_config`` mapping. These tests
+    make cross-producer cache-path agreement a TESTED invariant instead of a
+    coincidence of three formerly-inlined idioms (``.get()`` vs ``getattr()``
+    vs a pre-resolved constructor arg): if any producer re-inlines a divergent
+    read of a label/precision-affecting field, these equality assertions go
+    RED. Feedback bullet 2 asked for test-suite evidence that label-affecting
+    metadata consistently reflects config/prompt-contract changes across ALL
+    config models and producers — this is that evidence.
+    """
+
+    def test_all_three_producers_mint_byte_identical_metadata(self, tmp_path, monkeypatch):
+        from omegaconf import OmegaConf
+
+        from scripts.precompute_prefix_cache_parallel import _build_worker_configs
+        from src.tg_lora.prefix_feature_cache import get_prefix_feature_cache_path
+        from src.training.async_cache_builder import AsyncCacheBuilder
+
+        # _pydantic_cfg() reads data/train.jsonl relative to CWD; chdir so the
+        # real _count_records can open it.
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "data").mkdir()
+        dataset_path = tmp_path / "data" / "train.jsonl"
+        dataset_path.write_text('{"text": "a"}\n{"text": "b"}\n')
+
+        # OmegaConf twin of _pydantic_cfg() (same values, the Hydra-runtime
+        # config model AsyncCacheBuilder runs on), with the non-default
+        # label-affecting fields the shared fixture deliberately sets.
+        omega_cfg = OmegaConf.create({
+            "model": {"name_or_path": "dummy-model", "dtype": "float16",
+                      "load_in_4bit": True, "bnb_4bit_quant_type": "fp4",
+                      "bnb_4bit_compute_dtype": "float16"},
+            "data": {"train_path": str(dataset_path),
+                     "valid_quick_path": str(tmp_path / "data" / "vq.jsonl"),
+                     "valid_full_path": str(tmp_path / "data" / "vf.jsonl"),
+                     "max_seq_len": 64},
+            "training": {"batch_size": 2,
+                         "train_on_prompt": True,
+                         "trainable_lora_scope": "last_25_percent",
+                         "prefix_feature_cache_share_across_seeds": False},
+            "experiment": {"name": "xprod-identity", "seed": 7},
+            "lora": {"r": 8, "alpha": 16, "dropout": 0.05,
+                     "target_modules": "all-linear"},
+        })
+        split_layer_idx = 3
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+
+        # Reference: the single shared mapping itself.
+        ref = prefix_feature_cache_metadata_from_config(
+            omega_cfg, dataset_path=str(dataset_path), split_layer_idx=split_layer_idx
+        )
+        # Non-vacuity: the label-affecting non-defaults actually reach the
+        # fingerprint, so the producer equalities below cannot pass by both
+        # sides collapsing to defaults.
+        assert ref["train_on_prompt"] is True
+        assert ref["trainable_lora_scope"] == "last_25_percent"
+
+        # Producer A (background validator caching): AsyncCacheBuilder.
+        builder = AsyncCacheBuilder(
+            cfg=omega_cfg,
+            raw_datasets={"train": object()},
+            cache_loader_kwargs={},
+            split_layer=split_layer_idx,
+            cache_dir=cache_dir,
+            force_rebuild=False,
+            background_device="cpu",
+        )
+        assert builder._metadata_for(str(dataset_path)) == ref
+
+        # Producer B (offline parallel precompute, Pydantic-validated cfg):
+        # _build_worker_configs must plan the SAME cache path.
+        pyd_cfg = _pydantic_cfg()
+        _, plan = _build_worker_configs(
+            pyd_cfg, tmp_path / "cfg.yaml", ["train"], ["cpu"],
+            split_layer_idx=split_layer_idx, cache_dir=cache_dir,
+            shard_root=tmp_path / "shards", force_rebuild=False,
+        )
+        assert plan["train"]["metadata"] == ref
+        assert plan["train"]["cache_path"] == str(
+            get_prefix_feature_cache_path(cache_dir, ref)
+        )
+
+    def test_scope_change_in_cfg_changes_builder_fingerprint_without_ctor_arg(self, tmp_path):
+        """The builder's fingerprint follows cfg.training.trainable_lora_scope —
+        there is no longer a constructor argument that could disagree with cfg
+        (the divergence surface T-002 removed)."""
+        from src.tg_lora.prefix_feature_cache import get_prefix_feature_cache_path
+        from src.training.async_cache_builder import AsyncCacheBuilder
+
+        def _builder_for(scope: str) -> dict:
+            cfg = _omegaconf_cfg(trainable_lora_scope=scope)
+            cache_dir = tmp_path / "cache"
+            cache_dir.mkdir(exist_ok=True)
+            builder = AsyncCacheBuilder(
+                cfg=cfg,
+                raw_datasets={"train": object()},
+                cache_loader_kwargs={},
+                split_layer=3,
+                cache_dir=cache_dir,
+                force_rebuild=False,
+                background_device="cpu",
+            )
+            return builder._metadata_for("data/train.jsonl")
+
+        m_last25 = _builder_for("last_25_percent")
+        m_all = _builder_for("all")
+        assert m_last25["trainable_lora_scope"] == "last_25_percent"
+        assert m_all["trainable_lora_scope"] == "all"
+        # Different scope ⇒ different content-addressed cache path.
+        cache_dir = tmp_path / "cache"
+        assert get_prefix_feature_cache_path(cache_dir, m_last25) != (
+            get_prefix_feature_cache_path(cache_dir, m_all)
+        )

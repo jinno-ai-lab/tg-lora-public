@@ -65,7 +65,8 @@ def _make_cfg(tmp_path, split_layer=2):
                  "valid_full_path": str(tmp_path / "vf.jsonl"),
                  "max_seq_len": 8},
         "training": {"batch_size": 2, "prefix_feature_cache_valid_quick": True,
-                     "prefix_feature_cache_valid_full": True},
+                     "prefix_feature_cache_valid_full": True,
+                     "trainable_lora_scope": "last_25_percent"},
         "experiment": {"seed": 42},
         "lora": {"r": 4, "alpha": 8, "dropout": 0.0, "target_modules": "all-linear"},
     })
@@ -95,7 +96,6 @@ def test_async_build_produces_cached_dataset(tmp_path: Path):
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
         )
         builder.start()
@@ -117,8 +117,8 @@ def test_async_build_produces_cached_dataset(tmp_path: Path):
 
 def test_async_build_disk_hit_skips_build(tmp_path: Path):
     from src.tg_lora.prefix_feature_cache import (
-        PrefixFeatureExample, build_prefix_feature_cache_metadata,
-        get_prefix_feature_cache_path, save_prefix_feature_dataset,
+        PrefixFeatureExample, get_prefix_feature_cache_path,
+        prefix_feature_cache_metadata_from_config, save_prefix_feature_dataset,
     )
 
     cfg = _make_cfg(tmp_path)
@@ -126,18 +126,11 @@ def test_async_build_disk_hit_skips_build(tmp_path: Path):
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
 
-    metadata = build_prefix_feature_cache_metadata(
-        dataset_path=str(tmp_path / "vq.jsonl"),
-        model_name="dummy", seed=42, max_seq_len=8,
-        split_layer_idx=2, lora_r=4, lora_alpha=8,
-        lora_dropout=0.0, lora_target_modules="all-linear",
-        trainable_lora_scope="last_25_percent",
-        train_on_prompt=False,
-        # Match _make_cfg()'s model precision (float32 / load_in_4bit=False) so
-        # the pre-written cache path equals the path the builder computes from
-        # cfg — otherwise the disk-hit test rebuilds instead of replaying.
-        dtype="float32", load_in_4bit=False,
-        bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype="float32",
+    # Derive the pre-written cache path from the SAME single cfg→fingerprint
+    # mapping the builder uses — the disk-hit invariant is that a cache minted
+    # by any producer at this path replays here without a rebuild.
+    metadata = prefix_feature_cache_metadata_from_config(
+        cfg, dataset_path=str(tmp_path / "vq.jsonl"), split_layer_idx=2
     )
     cache_path = get_prefix_feature_cache_path(cache_dir, metadata)
 
@@ -162,7 +155,6 @@ def test_async_build_disk_hit_skips_build(tmp_path: Path):
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
         )
         builder.start()
@@ -189,7 +181,6 @@ def test_async_build_error_sets_failed(tmp_path: Path):
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
         )
         builder.start()
@@ -213,7 +204,6 @@ def test_async_poll_is_nonblocking(tmp_path: Path):
         split_layer=2,
         cache_dir=cache_dir,
         force_rebuild=False,
-        trainable_lora_scope="last_25_percent",
         background_device="cpu",
     )
     builder.start()
@@ -243,7 +233,6 @@ def test_async_get_result_nonexistent_label_returns_none(tmp_path: Path):
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
         )
         builder.start()
@@ -254,8 +243,8 @@ def test_async_get_result_nonexistent_label_returns_none(tmp_path: Path):
 
 def test_async_force_rebuild_ignores_disk_cache(tmp_path: Path):
     from src.tg_lora.prefix_feature_cache import (
-        PrefixFeatureExample, build_prefix_feature_cache_metadata,
-        get_prefix_feature_cache_path, save_prefix_feature_dataset,
+        PrefixFeatureExample, get_prefix_feature_cache_path,
+        prefix_feature_cache_metadata_from_config, save_prefix_feature_dataset,
     )
 
     cfg = _make_cfg(tmp_path)
@@ -263,18 +252,11 @@ def test_async_force_rebuild_ignores_disk_cache(tmp_path: Path):
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
 
-    metadata = build_prefix_feature_cache_metadata(
-        dataset_path=str(tmp_path / "vq.jsonl"),
-        model_name="dummy", seed=42, max_seq_len=8,
-        split_layer_idx=2, lora_r=4, lora_alpha=8,
-        lora_dropout=0.0, lora_target_modules="all-linear",
-        trainable_lora_scope="last_25_percent",
-        train_on_prompt=False,
-        # Match _make_cfg()'s model precision (float32 / load_in_4bit=False) so
-        # the pre-written cache path equals the path the builder computes from
-        # cfg — otherwise the disk-hit test rebuilds instead of replaying.
-        dtype="float32", load_in_4bit=False,
-        bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype="float32",
+    # Same single cfg→fingerprint mapping the builder uses — the force-rebuild
+    # invariant is that a cache already present at this path gets rebuilt, not
+    # replayed.
+    metadata = prefix_feature_cache_metadata_from_config(
+        cfg, dataset_path=str(tmp_path / "vq.jsonl"), split_layer_idx=2
     )
     cache_path = get_prefix_feature_cache_path(cache_dir, metadata)
     fake_dataset = PrefixFeatureDataset([
@@ -298,7 +280,6 @@ def test_async_force_rebuild_ignores_disk_cache(tmp_path: Path):
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=True,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
         )
         builder.start()
@@ -341,7 +322,6 @@ def test_async_partial_failure_continues_other_datasets(tmp_path: Path):
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=True,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
         )
         builder.start()
@@ -365,7 +345,6 @@ class TestAsyncCacheBuilderValidation:
                 split_layer=2,
                 cache_dir=tmp_path / "cache",
                 force_rebuild=False,
-                trainable_lora_scope="last_25_percent",
                 background_device="invalid",
             )
 
@@ -379,7 +358,6 @@ class TestAsyncCacheBuilderValidation:
                 split_layer=-1,
                 cache_dir=tmp_path / "cache",
                 force_rebuild=False,
-                trainable_lora_scope="last_25_percent",
                 background_device="cpu",
             )
 
@@ -392,7 +370,6 @@ class TestAsyncCacheBuilderValidation:
                 split_layer=2,
                 cache_dir=tmp_path / "cache",
                 force_rebuild=False,
-                trainable_lora_scope="last_25_percent",
                 background_device="cpu",
             )
 
@@ -406,7 +383,6 @@ class TestAsyncCacheBuilderValidation:
                 split_layer=2,
                 cache_dir=tmp_path / "cache",
                 force_rebuild=False,
-                trainable_lora_scope="last_25_percent",
                 background_device="cpu",
             )
 
@@ -420,20 +396,10 @@ class TestAsyncCacheBuilderValidation:
                 split_layer=2,
                 cache_dir="not_a_path",
                 force_rebuild=False,
-                trainable_lora_scope="last_25_percent",
                 background_device="cpu",
             )
 
-    def test_rejects_empty_trainable_lora_scope(self, tmp_path):
-        cfg = _make_cfg(tmp_path)
-        with pytest.raises(ValueError, match="trainable_lora_scope must be a non-empty string"):
-            AsyncCacheBuilder(
-                cfg=cfg,
-                raw_datasets={"train": _TokenDataset()},
-                cache_loader_kwargs={},
-                split_layer=2,
-                cache_dir=tmp_path / "cache",
-                force_rebuild=False,
-                trainable_lora_scope="",
-                background_device="cpu",
-            )
+    # test_rejects_empty_trainable_lora_scope was removed with the constructor
+    # argument: the builder now reads trainable_lora_scope from cfg through
+    # prefix_feature_cache_metadata_from_config, and invalid scopes are rejected
+    # upstream by the TrainableLoraScope literal in config_schema.

@@ -337,7 +337,7 @@ class TestBuildWorkerConfigs:
 
     @pytest.fixture()
     def _patch_deps(self):
-        with patch("scripts.precompute_prefix_cache_parallel.build_prefix_feature_cache_metadata") as mock_meta, \
+        with patch("scripts.precompute_prefix_cache_parallel.prefix_feature_cache_metadata_from_config") as mock_meta, \
              patch("scripts.precompute_prefix_cache_parallel.get_prefix_feature_cache_path") as mock_path, \
              patch("scripts.precompute_prefix_cache_parallel._count_records") as mock_count:
             mock_meta.return_value = _mock_metadata()

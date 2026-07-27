@@ -1223,7 +1223,9 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
                 split_layer=prefix_cache_split_layer,
                 cache_dir=prefix_feature_cache_dir,
                 force_rebuild=prefix_feature_cache_force_rebuild,
-                trainable_lora_scope=trainable_lora_scope,
+                # trainable_lora_scope is NOT passed here by design: the builder
+                # reads it from cfg via prefix_feature_cache_metadata_from_config,
+                # the single cfg→fingerprint mapping shared by all cache producers.
                 background_device=background_device,
             )
             async_builder.start()

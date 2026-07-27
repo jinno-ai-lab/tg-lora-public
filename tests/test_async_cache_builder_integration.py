@@ -41,6 +41,7 @@ def _make_cfg(tmp_path, split_layer=2, max_seq_len=8):
             "batch_size": 2,
             "prefix_feature_cache_valid_quick": True,
             "prefix_feature_cache_valid_full": True,
+            "trainable_lora_scope": "last_25_percent",
         },
         "experiment": {"seed": 42},
         "lora": {
@@ -80,7 +81,6 @@ def test_full_lifecycle_build_wait_load_on_cpu(tmp_path: Path):
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
         )
         builder.start()
@@ -136,7 +136,6 @@ def test_poll_and_swap_pattern_simulates_training(tmp_path: Path):
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
         )
 
@@ -199,7 +198,6 @@ def test_build_failure_continues_with_raw_dataset(tmp_path: Path):
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
         )
         builder.start()
@@ -239,7 +237,6 @@ def test_disk_cache_reuse_skips_rebuild(tmp_path: Path):
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
         )
         builder1.start()
@@ -265,7 +262,6 @@ def test_disk_cache_reuse_skips_rebuild(tmp_path: Path):
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
         )
         builder2.start()
@@ -320,7 +316,6 @@ def test_max_seq_len_change_triggers_cache_miss_and_rebuild(tmp_path: Path):
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
         )
         builder1.start()
@@ -348,7 +343,6 @@ def test_max_seq_len_change_triggers_cache_miss_and_rebuild(tmp_path: Path):
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
         )
         builder2.start()
@@ -401,7 +395,6 @@ def test_concurrent_poll_and_get_result_are_threadsafe(tmp_path: Path):
             split_layer=2,
             cache_dir=cache_dir,
             force_rebuild=False,
-            trainable_lora_scope="last_25_percent",
             background_device="cpu",
         )
         builder.start()

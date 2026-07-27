@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
@@ -24,10 +24,9 @@ from torch.utils.data import Dataset
 
 from src.model.load_model import apply_lora, get_input_device, load_base_model
 from src.tg_lora.prefix_feature_cache import (
-    PrefixFeatureDatasetBase, build_prefix_feature_cache_metadata,
-    build_prefix_feature_dataset, get_prefix_feature_cache_path,
-    load_prefix_feature_dataset, resolve_prefix_feature_cache_seed,
-    save_prefix_feature_dataset)
+    PrefixFeatureDatasetBase, build_prefix_feature_dataset,
+    get_prefix_feature_cache_path, load_prefix_feature_dataset,
+    prefix_feature_cache_metadata_from_config, save_prefix_feature_dataset)
 
 # Type alias for the model factory callable accepted by AsyncCacheBuilder.
 # When provided, the builder skips load_base_model/apply_lora and uses the
@@ -58,7 +57,6 @@ class AsyncCacheBuilder:
         split_layer: int,
         cache_dir: Path,
         force_rebuild: bool,
-        trainable_lora_scope: str,
         background_device: str,
         model_factory: ModelFactory | None = None,
     ) -> None:
@@ -68,8 +66,6 @@ class AsyncCacheBuilder:
             raise ValueError("raw_datasets must be a non-empty dict")
         if not isinstance(cache_dir, Path):
             raise TypeError("cache_dir must be a Path")
-        if not isinstance(trainable_lora_scope, str) or not trainable_lora_scope:
-            raise ValueError("trainable_lora_scope must be a non-empty string")
         _valid_devices = {"cpu", "cuda", "cuda:0", "cuda:1", "cuda:2", "cuda:3", "mps"}
         if background_device not in _valid_devices and not background_device.startswith("cuda:"):
             raise ValueError(
@@ -84,7 +80,6 @@ class AsyncCacheBuilder:
         self._split_layer = split_layer
         self._cache_dir = cache_dir
         self._force_rebuild = force_rebuild
-        self._trainable_lora_scope = trainable_lora_scope
         self._background_device = background_device
         self._model_factory = model_factory
 
@@ -185,6 +180,23 @@ class AsyncCacheBuilder:
         key = f"prefix_feature_cache_{label}"
         return bool(self._cfg.training.get(key, True))
 
+    def _metadata_for(self, dataset_path: str) -> dict[str, Any]:
+        """Cache identity for ``dataset_path`` via the single shared cfg→fingerprint mapping.
+
+        Reads ``trainable_lora_scope`` — and every other label/precision-affecting
+        field — from ``self._cfg`` rather than a pre-resolved constructor argument,
+        so this producer cannot mint a cache path that diverges from
+        ``train_tg_lora`` or ``scripts/precompute_prefix_cache_parallel.py`` for
+        the same config. Happy-path fingerprint bytes are identical to the old
+        inline idiom (train_tg_lora always passed the cfg-resolved scope), so
+        existing on-disk caches stay valid.
+        """
+        return prefix_feature_cache_metadata_from_config(
+            self._cfg,
+            dataset_path=dataset_path,
+            split_layer_idx=self._split_layer,
+        )
+
     def _build_one(
         self,
         model: nn.Module,
@@ -194,30 +206,7 @@ class AsyncCacheBuilder:
         dataset_path: str,
     ) -> AsyncCacheBuildResult:
         try:
-            metadata = build_prefix_feature_cache_metadata(
-                dataset_path=dataset_path,
-                model_name=str(self._cfg.model.name_or_path),
-                seed=resolve_prefix_feature_cache_seed(
-                    int(self._cfg.experiment.seed),
-                    share_across_seeds=bool(
-                        self._cfg.training.get(
-                            "prefix_feature_cache_share_across_seeds", False
-                        )
-                    ),
-                ),
-                max_seq_len=int(self._cfg.data.max_seq_len),
-                split_layer_idx=self._split_layer,
-                lora_r=int(self._cfg.lora.r),
-                lora_alpha=int(self._cfg.lora.alpha),
-                lora_dropout=float(self._cfg.lora.dropout),
-                lora_target_modules=str(self._cfg.lora.target_modules),
-                trainable_lora_scope=self._trainable_lora_scope,
-                train_on_prompt=bool(self._cfg.training.get("train_on_prompt", False)),
-                dtype=str(self._cfg.model.dtype),
-                load_in_4bit=bool(self._cfg.model.load_in_4bit),
-                bnb_4bit_quant_type=str(self._cfg.model.bnb_4bit_quant_type),
-                bnb_4bit_compute_dtype=str(self._cfg.model.bnb_4bit_compute_dtype),
-            )
+            metadata = self._metadata_for(dataset_path)
             cache_path = get_prefix_feature_cache_path(self._cache_dir, metadata)
             lazy_disk = (
                 str(self._cfg.training.get("prefix_feature_cache_mode", "reuse"))
