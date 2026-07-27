@@ -532,6 +532,43 @@ class TestCachePathSha256:
         assert get_prefix_feature_cache_path("/tmp/cache", m_bf16) != \
             get_prefix_feature_cache_path("/tmp/cache", m_fp16)
 
+    def test_different_max_seq_len_gives_different_path(self):
+        """TC-132-09: different max_seq_len → different path.
+
+        ``max_seq_len`` is the truncation bound applied at load time by
+        ``load_dataset(path, tokenizer, max_seq_len, train_on_prompt)`` —
+        ``truncation=True, max_length=max_seq_len`` in the HF tokenizer call.
+        It therefore changes:
+
+          - the input tokens (truncated) → ``hidden_states`` (forward pass
+            over the truncated sequence)
+          - the cached ``labels`` mask (the loader applies the prompt mask
+            AFTER truncation, so the mask position is a function of the
+            post-truncation sequence length)
+          - the cached tensor byte shape itself when truncation fires
+
+        Two runs over the SAME ``dataset_path`` that differ ONLY in
+        ``max_seq_len`` must NOT share a cache path, else the second run
+        silently replays the first run's truncation-bound content. This is
+        the label-affecting / activation-affecting collision — feedback §3
+        asked for an integration-test verification of "cache miss +
+        re-inference on config diff"; that answer lives in
+        ``tests/test_async_cache_builder_integration.py::test_max_seq_len_change_triggers_cache_miss_and_rebuild``,
+        this unit test pins the SHA-256 divergence + key-stamping so the
+        integration test cannot silently lose its mutation-proof
+        precondition.
+        """
+        m8 = _default_metadata(max_seq_len=8)
+        m16 = _default_metadata(max_seq_len=16)
+        p8 = get_prefix_feature_cache_path("/tmp/cache", m8)
+        p16 = get_prefix_feature_cache_path("/tmp/cache", m16)
+        assert p8 != p16
+        # And the field is actually stamped into the identity dict, so a
+        # future refactor cannot drop it while leaving the parameter in
+        # place (mirrors TC-132-04 / TC-132-05 structural ban).
+        assert m8["max_seq_len"] == 8
+        assert m16["max_seq_len"] == 16
+
     def test_required_precision_fields_have_no_default(self):
         """TC-132-08: the four precision fields are REQUIRED (no silent default).
 

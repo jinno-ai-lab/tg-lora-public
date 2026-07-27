@@ -20,7 +20,7 @@ from src.training.async_cache_builder import AsyncCacheBuilder
 from .conftest import TokenDataset, TinyModel
 
 
-def _make_cfg(tmp_path, split_layer=2):
+def _make_cfg(tmp_path, split_layer=2, max_seq_len=8):
     return OmegaConf.create({
         "model": {
             "name_or_path": "dummy",
@@ -35,7 +35,7 @@ def _make_cfg(tmp_path, split_layer=2):
             "train_path": str(tmp_path / "train.jsonl"),
             "valid_quick_path": str(tmp_path / "vq.jsonl"),
             "valid_full_path": str(tmp_path / "vf.jsonl"),
-            "max_seq_len": 8,
+            "max_seq_len": max_seq_len,
         },
         "training": {
             "batch_size": 2,
@@ -277,6 +277,107 @@ def test_disk_cache_reuse_skips_rebuild(tmp_path: Path):
     assert result2.source == "disk"
     assert result2.dataset is not None
     assert len(result2.dataset) == len(result1.dataset)
+
+
+def test_max_seq_len_change_triggers_cache_miss_and_rebuild(tmp_path: Path):
+    """TC-132-09 integration: ``cfg.data.max_seq_len`` change → cache miss + rebuild.
+
+    The fingerprint-level proof that ``max_seq_len`` produces a different
+    SHA-256 cache path lives in
+    ``tests/test_prefix_feature_cache.py::TestCachePathSha256.test_different_max_seq_len_gives_different_path``.
+    This test exercises the same property at the AsyncCacheBuilder scale,
+    which is the *integration* answer to feedback §3's "実サーバーまたは
+    統合テストで同一入力の設定差による cache miss と再推論を確認":
+
+      - Run 1 (max_seq_len=8):   writes cache_8   to disk (source='built').
+      - Run 2 (max_seq_len=16):  must NOT reuse cache_8, must rebuild.
+
+    A ``source='disk'`` result on Run 2 would mean the second run silently
+    replayed Run 1's truncation-bound content — the same silent-collision
+    class closed for ``train_on_prompt`` (TC-132-04) and the model-precision
+    fields (TC-132-05/06/07). ``max_seq_len`` has the same shape because
+    the HF tokenizer's ``truncation=True, max_length=max_seq_len`` shrinks
+    the input token sequence, which (a) changes the cached ``hidden_states``
+    (forward pass over the truncated tokens) and (b) shifts where the
+    loader's ``labels=-100`` prompt mask lands in the cached ``labels``
+    tensor. Both are byte-changing.
+    """
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    raw_vq = TokenDataset(n=4)
+
+    # Run 1: build with max_seq_len=8.
+    cfg1 = _make_cfg(tmp_path, max_seq_len=8)
+    with (
+        patch("src.training.async_cache_builder.load_base_model", return_value=_model()),
+        patch("src.training.async_cache_builder.apply_lora", side_effect=lambda m, c: m),
+        patch("src.training.async_cache_builder.get_input_device", return_value=torch.device("cpu")),
+    ):
+        builder1 = AsyncCacheBuilder(
+            cfg=cfg1,
+            raw_datasets={"valid_quick": raw_vq},
+            cache_loader_kwargs={},
+            split_layer=2,
+            cache_dir=cache_dir,
+            force_rebuild=False,
+            trainable_lora_scope="last_25_percent",
+            background_device="cpu",
+        )
+        builder1.start()
+        builder1.join(timeout=60)
+
+    assert builder1.poll()
+    assert not builder1.failed
+    result1 = builder1.get_result("valid_quick")
+    assert result1 is not None
+    assert result1.source == "built"
+    cache_path_8 = result1.cache_path
+    assert cache_path_8.exists()
+
+    # Run 2: same setup, only cfg.data.max_seq_len differs (8 → 16).
+    cfg2 = _make_cfg(tmp_path, max_seq_len=16)
+    with (
+        patch("src.training.async_cache_builder.load_base_model", return_value=_model()),
+        patch("src.training.async_cache_builder.apply_lora", side_effect=lambda m, c: m),
+        patch("src.training.async_cache_builder.get_input_device", return_value=torch.device("cpu")),
+    ):
+        builder2 = AsyncCacheBuilder(
+            cfg=cfg2,
+            raw_datasets={"valid_quick": raw_vq},
+            cache_loader_kwargs={},
+            split_layer=2,
+            cache_dir=cache_dir,
+            force_rebuild=False,
+            trainable_lora_scope="last_25_percent",
+            background_device="cpu",
+        )
+        builder2.start()
+        builder2.join(timeout=60)
+
+    assert builder2.poll()
+    assert not builder2.failed
+    result2 = builder2.get_result("valid_quick")
+    assert result2 is not None
+
+    # (a) Cache-miss: paths diverge because max_seq_len is in the fingerprint.
+    # If a future refactor dropped max_seq_len from
+    # build_prefix_feature_cache_metadata, this assertion would fail — that
+    # is the mutation proof (silent-collision class, same shape as TC-132-04).
+    assert result2.cache_path != cache_path_8, (
+        "max_seq_len change must produce a different cache path; got "
+        f"identical paths {result2.cache_path!r}. This means max_seq_len "
+        "is no longer in the fingerprint — the silent-replay regression "
+        "TC-132-09 exists to prevent."
+    )
+
+    # (b) Re-inference: source='built' (NOT 'disk'). A 'disk' source here
+    # would mean Run 2 silently reused Run 1's truncation-bound content.
+    assert result2.source == "built", (
+        f"Expected rebuild (source='built') for max_seq_len change; got "
+        f"source={result2.source!r}. A 'disk' source means the second run "
+        "silently replayed the first run's cached tokens, hidden_states, "
+        "and label mask."
+    )
 
 
 def test_concurrent_poll_and_get_result_are_threadsafe(tmp_path: Path):
