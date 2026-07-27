@@ -127,6 +127,16 @@ def test_fingerprint_changes_with_total_steps():
     assert _fp(total_steps=96) != _fp(total_steps=1500)
 
 
+def test_fingerprint_changes_with_seq_len():
+    """``seq_len`` is the tokenization/truncation boundary: batches built at one
+    sequence length are not interchangeable with batches built at another (rows
+    truncated or padded to a different length train differently), so a ledger
+    banked at one ``seq_len`` must NOT replay under another — the same
+    truncation-changes-the-input class the cache side pins for ``max_seq_len``
+    (TC-132-09)."""
+    assert _fp(seq_len=1024) != _fp(seq_len=2048)
+
+
 def test_fingerprint_changes_with_active_scope():
     """Scopes that share a layer count must not collide (the indices pin it)."""
     assert _fp(active_scope=[10, 11, 12]) != _fp(active_scope=[10, 11, 12, 13])
@@ -229,6 +239,47 @@ def test_fingerprint_completeness_every_model_config_field_covered():
     assert not unaccounted, (
         f"Ledger-fingerprint completeness gap: ModelConfig field(s) "
         f"{sorted(unaccounted)} affect arm numerics but are neither "
+        f"fingerprinted nor allow-listed — add to _config_fingerprint."
+    )
+
+
+def test_fingerprint_completeness_every_lora_config_field_covered():
+    """Schema-enumeration completeness guard for ``LoRAConfig`` — the symmetric
+    companion of the ``ModelConfig`` guard above. ``apply_lora`` realizes ALL
+    four ``LoRAConfig`` fields (``r`` / ``alpha`` / ``dropout`` /
+    ``target_modules``) into every arm's adapter, so each changes every arm's
+    training (``r`` load-bearingly: under HETEROGENEOUS it sets the whole
+    per-layer geometric schedule — the §4 experimental variable) and MUST
+    appear in the ledger fingerprint. The per-field
+    ``test_fingerprint_changes_with_lora_*`` tests pin DROPS of the current
+    four; this guard additionally pins OMISSIONS — a future ``LoRAConfig``
+    field (e.g. ``use_rslora`` / ``bias``) added to the schema without
+    fingerprinting would otherwise slip through and let a re-run silently
+    replay arms wired under the old adapter config — corrupt-but-green
+    (GOAL §7), the same failure mode TASK-0218 closed for ``ModelConfig``.
+    """
+    from src.training.config_schema import LoRAConfig
+
+    # LoRAConfig field → its key in the fingerprint dict (r → "lora_r" etc.).
+    field_to_fp_key = {
+        "r": "lora_r",
+        "alpha": "lora_alpha",
+        "dropout": "lora_dropout",
+        "target_modules": "lora_target_modules",
+    }
+
+    sample = _fp()
+    for field, key in field_to_fp_key.items():
+        assert key in sample, (
+            f"LoRAConfig.{field} is realized by apply_lora into every arm but "
+            f"its fingerprint key {key!r} is absent from _config_fingerprint — "
+            f"an adapter-config change would silently replay stale arms "
+            f"(corrupt-but-green §4)."
+        )
+    unaccounted = set(LoRAConfig.model_fields) - set(field_to_fp_key)
+    assert not unaccounted, (
+        f"Ledger-fingerprint completeness gap: LoRAConfig field(s) "
+        f"{sorted(unaccounted)} are realized by apply_lora but are neither "
         f"fingerprinted nor allow-listed — add to _config_fingerprint."
     )
 
