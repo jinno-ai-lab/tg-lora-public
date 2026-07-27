@@ -1280,3 +1280,87 @@ class TestCrossProducerFingerprintIdentity:
         assert get_prefix_feature_cache_path(cache_dir, m_last25) != (
             get_prefix_feature_cache_path(cache_dir, m_all)
         )
+
+
+def _fixed_seq_examples(n: int, seq_len: int, hidden: int = 4) -> PrefixFeatureDataset:
+    """Deterministic examples at an exact per-row sequence length."""
+    examples = []
+    for i in range(n):
+        examples.append(
+            PrefixFeatureExample(
+                hidden_states=torch.arange(
+                    seq_len * hidden, dtype=torch.float32
+                ).reshape(seq_len, hidden)
+                + i,
+                attention_mask=torch.ones(seq_len, dtype=torch.long),
+                labels=torch.arange(seq_len, dtype=torch.long),
+                split_layer_idx=2,
+            )
+        )
+    return PrefixFeatureDataset(examples)
+
+
+class TestBytesFingerprintConsistency:
+    """The REVERSE direction of the cache-fingerprint collision lane.
+
+    ``TestCacheFingerprintCompleteness`` / ``TestCachePathSha256`` pin that
+    every byte-changing config field is IN the fingerprint. This class pins
+    the converse: bytes filed under a fingerprint must not CONTRADICT it.
+    A producer that persists rows longer than the fingerprint's own
+    ``max_seq_len`` (its dataset loader skipped the truncation the config
+    declares) plants a cache that a later, correctly-truncated run — same
+    config, same fingerprint, same cache path — silently replays as though
+    it were truncated: the TASK-0206/0207 silent-replay class arriving
+    THROUGH the producer instead of through the fingerprint. Feedback
+    bullet 3's label-affecting rationale ("truncation changes the cached
+    labels") is only load-bearing if the persistence boundary enforces it,
+    which is what these tests pin at BOTH write seams (save + shard merge).
+    """
+
+    def test_save_rejects_bytes_longer_than_fingerprint_bound(self, tmp_path: Path):
+        dataset = _fixed_seq_examples(2, seq_len=8)
+        metadata = _default_metadata(max_seq_len=4)  # bound says 4, bytes say 8
+        cache_path = get_prefix_feature_cache_path(tmp_path, metadata)
+        with pytest.raises(ValueError, match="max_seq_len"):
+            save_prefix_feature_dataset(dataset, cache_path, metadata=metadata)
+        assert not cache_path.exists(), "a refused write must plant nothing"
+
+    def test_merge_rejects_shard_bytes_longer_than_merged_bound(self, tmp_path: Path):
+        # Shards saved under bound-less metadata (the guard skips non-canonical
+        # metadata), then merged under a canonical fingerprint whose bound the
+        # shard bytes exceed: the merged artifact must be refused too, or the
+        # precompute producer could plant the same contradiction.
+        shard = tmp_path / "shard.pt"
+        save_prefix_feature_dataset(
+            _fixed_seq_examples(2, seq_len=8), shard, metadata={"id": "s1"}
+        )
+        target = tmp_path / "merged.pt"
+        with pytest.raises(ValueError, match="max_seq_len"):
+            merge_prefix_feature_cache_shards(
+                [shard], target, metadata=_default_metadata(max_seq_len=4)
+            )
+        assert not target.exists(), "a refused merge must plant nothing"
+
+    def test_save_accepts_bytes_at_or_below_bound(self, tmp_path: Path):
+        # seq == bound (truncated rows) and seq < bound (rows shorter than the
+        # bound are NOT padded up to it) are both legitimate. Pins the guard's
+        # comparison direction: seq > bound fails, seq <= bound passes.
+        for seq_len in (4, 3):
+            cache_path = tmp_path / f"cache_{seq_len}.pt"
+            save_prefix_feature_dataset(
+                _fixed_seq_examples(2, seq_len=seq_len),
+                cache_path,
+                metadata=_default_metadata(max_seq_len=4),
+            )
+            assert cache_path.exists()
+
+    def test_save_skips_check_for_metadata_without_bound(self, tmp_path: Path):
+        # Non-canonical metadata (unit-test fixtures only — canonical producers
+        # always mint max_seq_len: it is a REQUIRED kwarg of
+        # build_prefix_feature_cache_metadata) carry no bound to contradict,
+        # so the guard is a no-op rather than a KeyError.
+        cache_path = tmp_path / "cache.pt"
+        save_prefix_feature_dataset(
+            _fixed_seq_examples(2, seq_len=16), cache_path, metadata={"id": "s1"}
+        )
+        assert cache_path.exists()

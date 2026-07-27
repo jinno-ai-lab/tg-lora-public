@@ -10,10 +10,11 @@ from unittest.mock import patch
 
 import torch
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from src.tg_lora.prefix_feature_cache import (
     collate_prefix_feature_batch,
+    load_prefix_feature_dataset,
 )
 from src.training.async_cache_builder import AsyncCacheBuilder
 
@@ -435,3 +436,129 @@ def test_concurrent_poll_and_get_result_are_threadsafe(tmp_path: Path):
     assert not errors, f"Thread-safety errors: {errors}"
     assert builder.poll()
     assert not builder.failed
+
+
+class _TruncatableDataset(Dataset):
+    """Shared raw token rows exposed at a truncation bound.
+
+    Models what the production loader applies from ``cfg.data.max_seq_len``:
+    the SAME underlying input rows, truncated to the bound. Two instances
+    built from one ``raw`` at different bounds are the feedback-bullet-3
+    fixture — same input, config difference only.
+    """
+
+    def __init__(self, raw: torch.Tensor, bound: int):
+        self.input_ids = raw[:, :bound].contiguous()
+        self.attention_mask = torch.ones_like(self.input_ids)
+        self.labels = self.input_ids.clone()
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, idx):
+        return {
+            "input_ids": self.input_ids[idx],
+            "attention_mask": self.attention_mask[idx],
+            "labels": self.labels[idx],
+        }
+
+
+def test_max_seq_len_change_re_infers_config_reflecting_cached_bytes(tmp_path: Path):
+    """Feedback bullet 3, empirically: same input + different truncation bound
+    → cache miss + re-inference whose PERSISTED bytes reflect the bound.
+
+    TC-132-09 (test_max_seq_len_change_triggers_cache_miss_and_rebuild) pins
+    path divergence + source='built'. This test pins the next link: the
+    artifacts on disk actually differ — the cached labels of the bound-8 run
+    are exactly the bound-16 run's labels truncated to 8, so the truncation
+    bound demonstrably changes cached LABEL bytes, not just the fingerprint
+    path (the label-affecting rationale, verified at the integration scale).
+    """
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    raw = torch.arange(4 * 16, dtype=torch.long).reshape(4, 16) % 32
+
+    def _run(bound: int):
+        cfg = _make_cfg(tmp_path, max_seq_len=bound)
+        with (
+            patch("src.training.async_cache_builder.load_base_model", return_value=_model()),
+            patch("src.training.async_cache_builder.apply_lora", side_effect=lambda m, c: m),
+            patch("src.training.async_cache_builder.get_input_device", return_value=torch.device("cpu")),
+        ):
+            builder = AsyncCacheBuilder(
+                cfg=cfg,
+                raw_datasets={"valid_quick": _TruncatableDataset(raw, bound)},
+                cache_loader_kwargs={},
+                split_layer=2,
+                cache_dir=cache_dir,
+                force_rebuild=False,
+                background_device="cpu",
+            )
+            builder.start()
+            builder.join(timeout=60)
+        assert builder.poll()
+        assert not builder.failed
+        result = builder.get_result("valid_quick")
+        assert result is not None
+        assert result.source == "built"
+        return result
+
+    result_8 = _run(8)
+    result_16 = _run(16)
+
+    # Cache miss: the fingerprint path diverges (max_seq_len is in it).
+    assert result_16.cache_path != result_8.cache_path
+
+    # Re-inference proof at the PERSISTED-artifact level: reload BOTH caches
+    # from disk and compare bytes, not the in-memory build results.
+    cached_8 = load_prefix_feature_dataset(result_8.cache_path)
+    cached_16 = load_prefix_feature_dataset(result_16.cache_path)
+    ex_8, ex_16 = cached_8[0], cached_16[0]
+    assert ex_8["hidden_states"].shape[0] == 8
+    assert ex_16["hidden_states"].shape[0] == 16
+    assert ex_8["attention_mask"].shape[0] == 8
+    assert ex_16["attention_mask"].shape[0] == 16
+    assert ex_8["labels"].shape[0] == 8
+    assert ex_16["labels"].shape[0] == 16
+    # Same raw input rows: the bound-8 labels ARE the bound-16 labels
+    # truncated — the config difference demonstrably changes cached bytes.
+    assert torch.equal(ex_8["labels"], ex_16["labels"][:8])
+
+
+def test_builder_fails_loud_when_dataset_exceeds_fingerprint_bound(tmp_path: Path):
+    """A producer feeding rows LONGER than cfg.data.max_seq_len (its loader
+    skipped the truncation the config declares) must not plant a cache filed
+    under the shorter bound: a later correctly-truncated run would mint the
+    SAME fingerprint, hit this cache path, and silently replay untruncated
+    bytes. The persistence boundary refuses the write and the builder
+    surfaces the per-split failure as source='error'.
+    """
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    raw = torch.arange(4 * 16, dtype=torch.long).reshape(4, 16) % 32
+
+    cfg = _make_cfg(tmp_path, max_seq_len=8)  # fingerprint declares bound 8 ...
+    with (
+        patch("src.training.async_cache_builder.load_base_model", return_value=_model()),
+        patch("src.training.async_cache_builder.apply_lora", side_effect=lambda m, c: m),
+        patch("src.training.async_cache_builder.get_input_device", return_value=torch.device("cpu")),
+    ):
+        builder = AsyncCacheBuilder(
+            cfg=cfg,
+            raw_datasets={"valid_quick": _TruncatableDataset(raw, 16)},  # ... rows are 16
+            cache_loader_kwargs={},
+            split_layer=2,
+            cache_dir=cache_dir,
+            force_rebuild=False,
+            background_device="cpu",
+        )
+        builder.start()
+        builder.join(timeout=60)
+
+    assert builder.poll()  # the loop completes; the failure is per-split:
+    result = builder.get_result("valid_quick")
+    assert result is not None
+    assert result.source == "error"
+    assert isinstance(result.error, ValueError)
+    assert "max_seq_len" in str(result.error)
+    assert list(cache_dir.iterdir()) == [], "a refused write must plant nothing"

@@ -345,6 +345,52 @@ def _extract_prefix_feature_storage(
     raise TypeError(f"Unsupported prefix feature dataset type: {type(dataset)!r}")
 
 
+def _assert_cached_bytes_match_fingerprint(
+    *,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+    metadata: dict[str, Any],
+) -> None:
+    """Fail loud if persisted bytes contradict the fingerprint they are filed under.
+
+    The fingerprint's ``max_seq_len`` is the truncation bound the dataset
+    loader applies from ``cfg.data.max_seq_len``; every cached tensor's
+    sequence dimension must be at or below it. A producer that persists rows
+    LONGER than its own fingerprint's bound (its loader skipped the
+    truncation the config declares) files a lie: a later run with the
+    correctly-truncated dataset mints the SAME fingerprint, hits this cache
+    path, and silently replays untruncated bytes — the TASK-0206/0207
+    silent-replay class arriving THROUGH the producer instead of through the
+    fingerprint. The field-enumeration guards
+    (``TestCacheFingerprintCompleteness``) prove the bound is IN the
+    fingerprint; this guard proves the fingerprint is IN the bytes.
+
+    Metadata without ``max_seq_len`` (non-canonical unit-test fixtures only —
+    canonical producers always mint it: it is a required kwarg of
+    :func:`build_prefix_feature_cache_metadata`) carries no bound to
+    contradict, so the check is a no-op there, not a KeyError.
+    """
+    bound = metadata.get("max_seq_len")
+    if bound is None:
+        return
+    bound = int(bound)
+    for name, tensor in (
+        ("hidden_states", hidden_states),
+        ("attention_mask", attention_mask),
+        ("labels", labels),
+    ):
+        seq_len = tensor.shape[1]
+        if seq_len > bound:
+            raise ValueError(
+                f"cached {name} sequence length {seq_len} exceeds the "
+                f"fingerprint's max_seq_len={bound}: the dataset was not "
+                "truncated to the config this cache would be filed under — "
+                "persisting it would plant a cache a correctly-truncated run "
+                "silently replays"
+            )
+
+
 def save_prefix_feature_dataset(
     dataset: PrefixFeatureDatasetBase,
     cache_path: str | Path,
@@ -356,6 +402,12 @@ def save_prefix_feature_dataset(
 
     hidden_states, attention_mask, labels, split_layer_idx, position_ids = (
         _extract_prefix_feature_storage(dataset)
+    )
+    _assert_cached_bytes_match_fingerprint(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        labels=labels,
+        metadata=metadata,
     )
 
     blob = {
@@ -408,14 +460,24 @@ def merge_prefix_feature_cache_shards(
         if has_position_ids:
             position_ids.append(blob["position_ids"])
 
+    merged_hidden = torch.cat(hidden_states, dim=0)
+    merged_attention_mask = torch.cat(attention_mask, dim=0)
+    merged_labels = torch.cat(labels, dim=0)
+    _assert_cached_bytes_match_fingerprint(
+        hidden_states=merged_hidden,
+        attention_mask=merged_attention_mask,
+        labels=merged_labels,
+        metadata=metadata,
+    )
+
     path = Path(cache_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     merged_blob = {
         "format_version": _PREFIX_FEATURE_CACHE_FORMAT_VERSION,
         "metadata": metadata,
-        "hidden_states": torch.cat(hidden_states, dim=0),
-        "attention_mask": torch.cat(attention_mask, dim=0),
-        "labels": torch.cat(labels, dim=0),
+        "hidden_states": merged_hidden,
+        "attention_mask": merged_attention_mask,
+        "labels": merged_labels,
         "split_layer_idx": split_layer_idx,
         "position_ids": torch.cat(position_ids, dim=0) if has_position_ids else None,
     }
