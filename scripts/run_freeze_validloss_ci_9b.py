@@ -1026,6 +1026,10 @@ def _config_fingerprint(
     lora_alpha: float,
     lora_dropout: float,
     lora_target_modules,
+    dtype: str,
+    load_in_4bit: bool,
+    bnb_4bit_quant_type: str,
+    bnb_4bit_compute_dtype: str,
 ) -> dict:
     """The run-config identity that defines an arm's result.
 
@@ -1072,6 +1076,23 @@ def _config_fingerprint(
     faster re-download) would hit a matching fingerprint and silently replay arms
     trained on the larger pool's data subset — corrupt-but-green (GOAL §7), the
     same class as the ``lora_r`` (4ad9a73) and ``learning_rate`` (d6af3cd) gaps.
+
+    The model-quantization knobs (``dtype`` / ``load_in_4bit`` /
+    ``bnb_4bit_quant_type`` / ``bnb_4bit_compute_dtype`` — the four
+    :func:`load_base_model` realizes via ``BitsAndBytesConfig`` / ``torch_dtype``)
+    are included because they change the trained model's forward/backward
+    NUMERICS, and so the ``valid_loss`` read off EVERY arm. ``model``
+    (``name_or_path``) alone is insufficient: two runs over the same base weights
+    but one in ``nf4`` / 4-bit and the other in ``fp4`` (or 4-bit vs full
+    ``bfloat16``, or a different ``compute_dtype``) are genuinely different §4
+    experiments. Without these fields an operator resuming an interrupted run
+    after switching the quantization regime (a standard memory/precision trade)
+    would hit a matching fingerprint and silently replay arms trained under the
+    OTHER numerics — corrupt-but-green (GOAL §7), the same class as the
+    ``lora_r`` / ``learning_rate`` / ``max_dataset_rows`` gaps. This closes the
+    one asymmetry the prefix-feature cache already guards (its
+    ``test_different_load_in_4bit_*`` / ``_dtype`` / ``_bnb_4bit_quant_type``
+    pins) but the resume ledger did not.
     """
     return {
         "ledger_version": LEDGER_VERSION,
@@ -1095,6 +1116,10 @@ def _config_fingerprint(
         "lora_alpha": float(lora_alpha),
         "lora_dropout": float(lora_dropout),
         "lora_target_modules": _normalize_target_modules(lora_target_modules),
+        "dtype": str(dtype),
+        "load_in_4bit": bool(load_in_4bit),
+        "bnb_4bit_quant_type": str(bnb_4bit_quant_type),
+        "bnb_4bit_compute_dtype": str(bnb_4bit_compute_dtype),
     }
 
 
@@ -1315,6 +1340,7 @@ def _ledger_seal_ready(
     train_examples, valid_examples, model, scope_label, dataset,
     max_dataset_rows, use_local_loss, learning_rate, base_seed,
     architecture, lora_r, lora_alpha, lora_dropout, lora_target_modules,
+    dtype, load_in_4bit, bnb_4bit_quant_type, bnb_4bit_compute_dtype,
     n_candidate, n_surrogate, n_control, n_baseline,
 ) -> dict | None:
     """Is the ledger a complete, config-matched bank of THIS run's arms?
@@ -1354,6 +1380,9 @@ def _ledger_seal_ready(
         architecture=architecture, learning_rate=learning_rate,
         lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
         lora_target_modules=lora_target_modules,
+        dtype=dtype, load_in_4bit=load_in_4bit,
+        bnb_4bit_quant_type=bnb_4bit_quant_type,
+        bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,
     )
     for key, val in requested.items():
         if key == "active_scope":
@@ -1588,7 +1617,12 @@ def run_ci_9b(
         use_local_loss=use_local_loss, base_seed=base_seed, architecture=architecture,
         learning_rate=float(cfg.training.learning_rate), lora_r=int(cfg.lora.r),
         lora_alpha=float(cfg.lora.alpha), lora_dropout=float(cfg.lora.dropout),
-        lora_target_modules=cfg.lora.target_modules, n_candidate=n_candidate,
+        lora_target_modules=cfg.lora.target_modules,
+        dtype=cfg.model.get("dtype", "bfloat16"),
+        load_in_4bit=cfg.model.get("load_in_4bit", True),
+        bnb_4bit_quant_type=cfg.model.get("bnb_4bit_quant_type", "nf4"),
+        bnb_4bit_compute_dtype=cfg.model.get("bnb_4bit_compute_dtype", "bfloat16"),
+        n_candidate=n_candidate,
         n_surrogate=n_surrogate, n_control=n_control, n_baseline=n_baseline,
     ) if ledger_path is not None else None
     if seal is not None:
@@ -1690,6 +1724,10 @@ def run_ci_9b(
         lora_alpha=float(cfg.lora.alpha),
         lora_dropout=float(cfg.lora.dropout),
         lora_target_modules=cfg.lora.target_modules,
+        dtype=cfg.model.get("dtype", "bfloat16"),
+        load_in_4bit=cfg.model.get("load_in_4bit", True),
+        bnb_4bit_quant_type=cfg.model.get("bnb_4bit_quant_type", "nf4"),
+        bnb_4bit_compute_dtype=cfg.model.get("bnb_4bit_compute_dtype", "bfloat16"),
     )
     if ledger_path is not None:
         logger.info(
@@ -2762,7 +2800,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 architecture=args.architecture,
                 learning_rate=float(cfg.training.learning_rate), lora_r=int(cfg.lora.r),
                 lora_alpha=float(cfg.lora.alpha), lora_dropout=float(cfg.lora.dropout),
-                lora_target_modules=cfg.lora.target_modules, n_candidate=args.n_candidate,
+                lora_target_modules=cfg.lora.target_modules,
+                dtype=cfg.model.get("dtype", "bfloat16"),
+                load_in_4bit=cfg.model.get("load_in_4bit", True),
+                bnb_4bit_quant_type=cfg.model.get("bnb_4bit_quant_type", "nf4"),
+                bnb_4bit_compute_dtype=cfg.model.get("bnb_4bit_compute_dtype", "bfloat16"),
+                n_candidate=args.n_candidate,
                 n_surrogate=args.n_surrogate, n_control=args.n_control,
                 n_baseline=args.n_baseline,
             )

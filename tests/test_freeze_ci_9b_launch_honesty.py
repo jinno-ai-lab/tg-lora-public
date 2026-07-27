@@ -1193,7 +1193,10 @@ class TestLedgerSealReadyGate:
             scope_label="last_25_percent", dataset="dolly", max_dataset_rows=12,
             use_local_loss=True, learning_rate=1e-4, base_seed=7,
             architecture=HETEROGENEOUS, lora_r=16, lora_alpha=32, lora_dropout=0.0,
-            lora_target_modules="all-linear", n_candidate=2, n_surrogate=2,
+            lora_target_modules="all-linear",
+            dtype="bfloat16", load_in_4bit=True,
+            bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype="bfloat16",
+            n_candidate=2, n_surrogate=2,
             n_control=0, n_baseline=0,
         )
         kw.update(overrides)

@@ -55,6 +55,8 @@ def _fp(**overrides):
         use_local_loss=True, base_seed=0, learning_rate=2.0e-4,
         lora_r=16, lora_alpha=32.0, lora_dropout=0.0,
         lora_target_modules="all-linear",
+        dtype="bfloat16", load_in_4bit=True,
+        bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype="bfloat16",
     )
     kw.update(overrides)
     return _config_fingerprint(**kw)
@@ -155,6 +157,80 @@ def test_fingerprint_changes_with_max_dataset_rows():
     as the ``lora_r`` (4ad9a73) and ``learning_rate`` (d6af3cd) gaps.
     """
     assert _fp(max_dataset_rows=1000) != _fp(max_dataset_rows=4000)
+
+
+def test_fingerprint_changes_with_model_dtype():
+    """``load_base_model`` resolves ``cfg.model.dtype`` to the base
+    ``torch_dtype`` — it changes the model's forward/backward numerics and so
+    every arm's ``valid_loss``. A run resumed after switching ``bfloat16`` →
+    ``float16`` must NOT replay arms trained under the other precision — else
+    corrupt-but-green (GOAL §7), the same class as the ``lora_r`` /
+    ``learning_rate`` / ``max_dataset_rows`` gaps.
+    """
+    assert _fp(dtype="bfloat16") != _fp(dtype="float16")
+
+
+def test_fingerprint_changes_with_load_in_4bit():
+    """``load_in_4bit`` gates ``BitsAndBytesConfig`` in :func:`load_base_model`
+    — 4-bit vs full precision is a different numerics regime for every arm."""
+    assert _fp(load_in_4bit=True) != _fp(load_in_4bit=False)
+
+
+def test_fingerprint_changes_with_bnb_4bit_quant_type():
+    """``bnb_4bit_quant_type`` (``nf4`` vs ``fp4``) selects the 4-bit storage
+    codebook inside ``BitsAndBytesConfig`` — it changes the dequantized
+    activations every arm trains on."""
+    assert _fp(bnb_4bit_quant_type="nf4") != _fp(bnb_4bit_quant_type="fp4")
+
+
+def test_fingerprint_changes_with_bnb_4bit_compute_dtype():
+    """``bnb_4bit_compute_dtype`` is the dequant matmul precision
+    (``BitsAndBytesConfig``) — it changes the arm numerics independently of the
+    base ``dtype``."""
+    assert _fp(bnb_4bit_compute_dtype="bfloat16") != _fp(
+        bnb_4bit_compute_dtype="float16"
+    )
+
+
+def test_fingerprint_completeness_every_model_config_field_covered():
+    """Schema-enumeration completeness guard — the resume-ledger analogue of
+    ``TestCacheFingerprintCompleteness`` block 1. Every ``ModelConfig`` field
+    that changes the trained model's numerics (and thus every arm's
+    ``valid_loss``) MUST appear in the ledger fingerprint, else a re-run at a
+    different quant/dtype silently replays wrong-numerics arms — corrupt-but-
+    green (GOAL §7). This catches BOTH a drop (a field removed from
+    ``_config_fingerprint`` → its key vanishes from the sample) AND an omission
+    (a new ``ModelConfig`` field added without fingerprinting →
+    ``unaccounted``), the two failure modes a hand-maintained field list admits.
+    """
+    from src.training.config_schema import ModelConfig
+
+    # ModelConfig field → its key in the fingerprint dict (name_or_path → "model").
+    field_to_fp_key = {
+        "name_or_path": "model",
+        "dtype": "dtype",
+        "load_in_4bit": "load_in_4bit",
+        "bnb_4bit_quant_type": "bnb_4bit_quant_type",
+        "bnb_4bit_compute_dtype": "bnb_4bit_compute_dtype",
+    }
+    # Placement-only fields: change WHERE the model runs, not its result numerics.
+    non_result_affecting = {"device_map", "device"}
+
+    sample = _fp()
+    for field, key in field_to_fp_key.items():
+        assert key in sample, (
+            f"ModelConfig.{field} changes arm numerics but its fingerprint key "
+            f"{key!r} is absent from _config_fingerprint — a model-quant change "
+            f"would silently replay stale arms (corrupt-but-green §4)."
+        )
+    unaccounted = (
+        set(ModelConfig.model_fields) - set(field_to_fp_key) - non_result_affecting
+    )
+    assert not unaccounted, (
+        f"Ledger-fingerprint completeness gap: ModelConfig field(s) "
+        f"{sorted(unaccounted)} affect arm numerics but are neither "
+        f"fingerprinted nor allow-listed — add to _config_fingerprint."
+    )
 
 
 def test_fingerprint_carries_ledger_version():
