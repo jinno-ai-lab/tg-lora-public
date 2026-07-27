@@ -988,7 +988,7 @@ freeze-validloss-ci-9b-baseline: ## GOAL §4 real-9B A/B + FULL-BACKPROP baselin
 # that retries on tempfail must therefore bypass make and run the module
 # directly (or sniff "Deferring — exit 75" in the output); the exit codes are
 # only honored when the interpreter is invoked without a make wrapper.
-FREEZE_9B_FULL_FLAGS ?= --seq-len 1024 --total-steps 1500 --warmup-steps 150 --depth 3 --spacing 450 --n-candidate 3 --n-surrogate 3 --n-baseline 3 --train-examples 600 --valid-examples 64 --max-dataset-rows 2000 --ledger runs/freeze_validloss_ci_9b_full_ledger.jsonl
+FREEZE_9B_FULL_FLAGS ?= --seq-len 1024 --total-steps 1500 --warmup-steps 150 --depth 3 --spacing 450 --n-candidate 3 --n-surrogate 3 --n-baseline 3 --train-examples 600 --valid-examples 64 --max-dataset-rows 2000 --ledger runs/freeze_validloss_ci_9b_full_ledger.jsonl --run-log tests/fixtures/freeze_validloss_ci_9b_full_runlog.json
 
 freeze-validloss-ci-9b-full: ## GOAL §4 real-9B FULL-BUDGET A/B verdict (1500 steps; generalization regime; ~hours GPU)
 	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_FULL_FLAGS) --json --output tests/fixtures/freeze_validloss_ci_9b_full.json
@@ -1049,7 +1049,7 @@ freeze-validloss-ci-9b-full-bg: ## Self-retrying background launcher for the ful
 # it and re-firing against the existing 9-arm ledger skips candidate/surrogate/
 # control and executes ONLY the 3 new baseline arms (free-GPU-window → banked
 # progress). Needs a torch+bnb+GPU interpreter: PYTHON_VENV=/path/to/torch-python make freeze-validloss-ci-9b-full-heterogeneous
-FREEZE_9B_FULL_HETEROGENEOUS_FLAGS ?= --seq-len 1024 --total-steps 1500 --warmup-steps 150 --depth 3 --spacing 450 --n-candidate 3 --n-surrogate 3 --n-control 3 --n-baseline 3 --train-examples 600 --valid-examples 64 --max-dataset-rows 2000 --ledger runs/freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl
+FREEZE_9B_FULL_HETEROGENEOUS_FLAGS ?= --seq-len 1024 --total-steps 1500 --warmup-steps 150 --depth 3 --spacing 450 --n-candidate 3 --n-surrogate 3 --n-control 3 --n-baseline 3 --train-examples 600 --valid-examples 64 --max-dataset-rows 2000 --ledger runs/freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl --run-log tests/fixtures/freeze_validloss_ci_9b_full_heterogeneous_runlog.json
 
 freeze-validloss-ci-9b-full-heterogeneous: ## GOAL §4 real-9B FULL-BUDGET A/B on a HETEROGENEOUS per-layer-rank stack (1500 steps; generalization; ~hours GPU)
 	$(PYTHON_VENV) -m scripts.run_freeze_validloss_ci_9b $(FREEZE_9B_FULL_HETEROGENEOUS_FLAGS) --architecture heterogeneous --json --output tests/fixtures/freeze_validloss_ci_9b_full_heterogeneous.json

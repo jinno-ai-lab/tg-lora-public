@@ -1429,6 +1429,39 @@ class TestFullRunGateLiveness:
                 f"Raise {token} to >= {MIN_SAMPLE_FOR_BOOTSTRAP}."
             )
 
+    def test_full_run_captures_run_log_for_independent_reproducibility(self):
+        # GOAL §7 / Constitution Rule #6: the deposit's content-hash
+        # (evidence_hash) proves the committed bytes are immutable/auditable but
+        # NOT that a GPU generated them — only a captured run log (per-arm loss
+        # curves, linked into the deposit via run_log_sha256) makes a citable
+        # §4 verdict independently reproducible. The reduced-budget
+        # heterogeneous-generalization target already ships --run-log; the
+        # FULL-budget citable targets must too, or hours of GPU land a deposit
+        # that is citable yet NOT independently reproducible (run_log_path=None —
+        # the exact state both committed full deposits are in today, harvested
+        # pre-capture). Pin the --run-log wiring in BOTH full-budget flag vars so
+        # a silent drop fails this guard in a GPU-free second, not after a
+        # multi-hour run.
+        repo_root = Path(__file__).resolve().parents[1]
+        text = (repo_root / "Makefile").read_text(encoding="utf-8")
+        for var in ("FREEZE_9B_FULL_FLAGS", "FREEZE_9B_FULL_HETEROGENEOUS_FLAGS"):
+            m = re.search(rf"^{var}\s*\?=\s*(.+)$", text, re.MULTILINE)
+            assert m, f"{var} missing from Makefile — guard cannot run"
+            flags = m.group(1)
+            rl = re.search(r"--run-log\s+(\S+)", flags)
+            assert rl, (
+                f"{var} lacks --run-log: a full-budget citable §4 verdict would "
+                f"land with run_log_path=None and NOT be independently "
+                f"reproducible (GOAL §7 / Constitution Rule #6). Add "
+                f"--run-log tests/fixtures/<deposit_stem>_runlog.json."
+            )
+            path = rl.group(1)
+            assert path.startswith("tests/fixtures/"), (
+                f"{var} --run-log {path} is not under tests/fixtures/: the run "
+                f"log must be committed alongside the deposit for auditability, "
+                f"not banked under a gitignored runs/ path."
+            )
+
 
 # ── deposit gate self-consistency (the "inert green" guard) ───────────────────
 #
