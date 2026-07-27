@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
-# Robust launcher for the FULL-BUDGET × HETEROGENEOUS 9B §4 verdict — the ONE
-# remaining open research leg (homogeneous full LANDED→TIES ``4b88ca8``;
-# heterogeneous REDUCED-budget LANDED→SURPASSES ``db542fe``/``d00a362``; whether
-# the heterogeneous SURPASSES survives the full 1500-step budget on an asymmetric
-# per-layer-rank adapter is unmeasured). It ALSO fires the full-backprop baseline
-# arm (GOAL §4-247 / P1 品質保持: does freezing preserve quality vs full backprop?)
-# — the axis the homogeneous full leg already answers (SURPASSES) but the
-# heterogeneous deposit so far carries as ``n_baseline=0``/``baseline=null``
-# (UNANSWERED). RESUME NOTE (verified 2026-07-27 on the live fire): ``--n-baseline``
-# is NOT in the per-arm ledger fingerprint, so a re-fire against a *current* 9-arm
-# ledger would skip the 9 and run only the 3 baselines. BUT the surviving 7/18
-# ledger's header predates the fingerprint-evolution commits — it records 15 keys
-# vs the worker's 21 (missing learning_rate/lora_r/lora_alpha/lora_dropout/
-# lora_target_modules/max_dataset_rows) — so ``load_ledger`` treats it as stale
-# (returns ``{}``) and the worker re-runs ALL 12 arms (~4h); the first arm banks
-# by truncating the stale file + writing a fresh header (``mode="w"`` on a stale
-# header). That §7-honest re-run is the cost of closing this cell; the fresh ledger
-# this run writes WILL support resume-skip on any later re-fire.
+# Robust launcher for the FULL-BUDGET × HETEROGENEOUS 9B §4 verdict. This leg is
+# now CLOSED: fired + harvested 2026-07-27 from the full-12 re-run into
+# ``tests/fixtures/freeze_validloss_ci_9b_full_heterogeneous.json``. The DIRECTION
+# verdict is TIES (homogeneous full LANDED→TIES ``4b88ca8``; heterogeneous
+# REDUCED-budget LANDED→SURPASSES ``db542fe``/``d00a362`` — and the heterogeneous
+# SURPASSES does NOT survive the full 1500-step budget on the asymmetric per-layer-
+# rank adapter). The full-backprop baseline arm (GOAL §4-247 / P1 品質保持: does
+# freezing preserve quality vs full backprop?) answers SURPASSES for the
+# heterogeneous leg too (candidate ≈1.718 vs full-backprop ≈1.886) — the SAME axis
+# the homogeneous full leg answers (SURPASSES). This script remains the canonical
+# robust re-launcher for any future re-fire.
+#
+# RESUME NOTE (historical — verified 2026-07-27 on the live fire that produced the
+# harvested deposit): ``--n-baseline`` is NOT in the per-arm ledger fingerprint, so
+# a re-fire against a *current* 9-arm ledger would skip the 9 and run only the 3
+# baselines. The 7/18 ledger's header predated the fingerprint-evolution commits —
+# it recorded 15 keys vs the worker's 21 (missing learning_rate/lora_r/lora_alpha/
+# lora_dropout/lora_target_modules/max_dataset_rows) — so ``load_ledger`` treated
+# it as stale (returned ``{}``) and the worker re-ran ALL 12 arms (~4h); the first
+# arm banked by truncating the stale file + writing a fresh header (``mode="w"`` on
+# a stale header). That §7-honest full-12 re-run is what closed this cell; the
+# fresh ledger it wrote supports resume-skip on any later re-fire.
 #
 # This is the committed, version-controlled analogue of the ad-hoc
 # ``/home/jinno/tg-lora-public-full-run/fire.sh`` that robustly fired the
@@ -79,8 +83,12 @@
 #   "
 #   # 3. pin the two frozen literals the test suite forces you to set on a real
 #   #    deposit: TestCommittedLedgerWitnessHeterogeneousFull._FROZEN_WITNESS_HASH
-#   #    and the _EXPECTED entry in TestDepositEvidenceHash (both currently skip).
-# Do NOT re-fire the homogeneous leg — it is harvested (``4b88ca8``).
+#   #    and the _EXPECTED entry in TestDepositEvidenceHash (both pinned after the
+#   #    2026-07-27 full-12 re-run harvest; the 2026-07-18 literals they replaced
+#   #    are in git history).
+# Do NOT re-fire either full leg — both are harvested: homogeneous (``4b88ca8``)
+# and heterogeneous (2026-07-27 full-12 re-run; direction TIES + baseline
+# SURPASSES, both committed).
 set -euo pipefail
 
 # Machine-specific paths — overridable via env for portability / re-targeting.

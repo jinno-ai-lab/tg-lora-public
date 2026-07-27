@@ -405,12 +405,13 @@ def assess_section4_decision(
     # Constitution P1 品質保持 (GOAL §4-247): per-leg "does freezing preserve /
     # surpass full-backprop quality?" — surfaced from each deposit's already-fired
     # baseline arm. Distinct from the candidate-vs-surrogate relative verdict AND
-    # from PIVOT (vs the private-repo PRODUCTION baseline, Cat-C). Homogeneous is
-    # answered (SURPASSES); heterogeneous's deposit still has no baseline arm
-    # (n_baseline=0 ⇒ unanswered), but the arm is now wired into the canonical
-    # full-budget target (``FREEZE_9B_FULL_HETEROGENEOUS_FLAGS`` carries
-    # ``--n-baseline 3``), so the only thing between UNANSWERED and the reading is
-    # a GPU window firing ``make freeze-validloss-ci-9b-full-heterogeneous``.
+    # from PIVOT (vs the private-repo PRODUCTION baseline, Cat-C). BOTH legs are
+    # now answered (SURPASSES): homogeneous (candidate 1.6947 vs full-backprop
+    # 1.8794, ``4b88ca8``) AND heterogeneous (candidate ≈1.718 vs full-backprop
+    # ≈1.886, harvested 2026-07-27 from the full-12 re-run). The clause is DERIVED
+    # from ``baseline_present`` below, so this reads adaptively — a leg whose
+    # deposit lacks the baseline arm (``n_baseline=0``) still renders UNANSWERED
+    # rather than a stale hardcoded verdict.
     quality_preservation = {
         leg["label"]: {
             "answered": bool(leg.get("baseline_present", False)),

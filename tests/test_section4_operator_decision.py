@@ -299,12 +299,17 @@ class TestQualityPreservationAxis:
         # candidate (progressive freeze) BEATS the full-backprop baseline ⇒ P1 met
         assert homo["baseline_candidate_mean"] < homo["baseline_baseline_mean"]
 
-    def test_heterogeneous_baseline_arm_was_never_fired(self):
+    def test_heterogeneous_baseline_verdict_is_surfaced_per_leg(self):
         snap = assess_section4_decision()
         hetero = next(leg for leg in snap["legs"] if leg["label"] == "heterogeneous")
-        assert hetero["baseline_present"] is False
-        assert hetero["n_baseline"] == 0
-        assert hetero["baseline_verdict"] is None
+        # The full-backprop baseline arm WAS fired for the heterogeneous leg too
+        # (harvested 2026-07-27 from the full-12 re-run). candidate (progressive
+        # freeze, output-first) BEATS the full-backprop baseline on the asymmetric
+        # per-layer-rank adapter ⇒ P1 品質保持 met for BOTH legs, not just homogeneous.
+        assert hetero["baseline_present"] is True
+        assert hetero["n_baseline"] == 3
+        assert hetero["baseline_verdict"] == SURPASSES
+        assert hetero["baseline_candidate_mean"] < hetero["baseline_baseline_mean"]
 
     def test_quality_preservation_summary_is_keyed_per_leg(self):
         snap = assess_section4_decision()
@@ -313,15 +318,20 @@ class TestQualityPreservationAxis:
         assert qp["homogeneous"]["answered"] is True
         assert qp["homogeneous"]["verdict"] == SURPASSES
         assert qp["homogeneous"]["candidate_mean"] < qp["homogeneous"]["baseline_mean"]
-        assert qp["heterogeneous"]["answered"] is False
-        assert qp["heterogeneous"]["verdict"] is None
+        assert qp["heterogeneous"]["answered"] is True
+        assert qp["heterogeneous"]["verdict"] == SURPASSES
+        assert (
+            qp["heterogeneous"]["candidate_mean"] < qp["heterogeneous"]["baseline_mean"]
+        )
 
     def test_format_decision_renders_the_quality_preservation_axis(self):
         out = format_decision(assess_section4_decision())
         assert "GOAL §4-247" in out
         assert "P1 品質保持" in out
-        assert "SURPASSES" in out  # the homogeneous full-backprop verdict
-        assert "UNANSWERED" in out  # the heterogeneous gap
+        # BOTH legs now answered (heterogeneous harvested 2026-07-27): the axis
+        # renders two full-backprop SURPASSES verdicts and NO UNANSWERED gap.
+        assert "SURPASSES" in out
+        assert "UNANSWERED" not in out
 
     def test_extraction_reads_the_deposit_field_not_a_hardcoded_default(self, tmp_path):
         # Mutation guard: strip the baseline arm from a real homogeneous deposit
@@ -351,13 +361,14 @@ class TestQualityPreservationAxis:
         # P0 科学誠実性: the SHIP rationale's per-leg P1 品質保持 clause must be
         # DERIVED from the surfaced ``quality_preservation`` evidence, not
         # hardcoded — otherwise the recommendation could contradict the very
-        # evidence it cites. Against the CURRENT harvested deposits this is
-        # byte-identical to the prior hardcoded text (homogeneous answered,
-        # heterogeneous not yet fired), proving no regression.
+        # evidence it cites. After the 2026-07-27 heterogeneous baseline harvest,
+        # BOTH legs are answered (SURPASSES); the derived clause tracks that
+        # (it auto-corrected from the pre-harvest "heterogeneous unanswered").
         snap = assess_section4_decision()
         clause = _quality_preservation_clause(snap["quality_preservation"])
         assert "homogeneous SURPASSES" in clause
-        assert "heterogeneous unanswered" in clause
+        assert "heterogeneous SURPASSES" in clause
+        assert "unanswered" not in clause
         # the rationale embeds exactly this derived clause (no stale copy)
         assert clause in snap["rationale"]
 

@@ -244,18 +244,22 @@ FIXTURE_9B_HETEROGENEOUS_RUNLOG = (
 # full 1500-step budget on an asymmetric per-layer-rank adapter is unmeasured).
 # Arm shape MIRRORS the reduced heterogeneous direction-isolation design —
 # candidate (output-first) + surrogate (random) + input-side control — bumped
-# 96→1500 steps at 600 train / 2.5 epoch = generalization regime, with NO
-# full-backprop baseline arm (``n_baseline == 0``). This is the SECOND citable
-# full-budget deposit (``citable_as_full_section4_verdict=True``; LANDED +
-# harvested 2026-07-18), so its arm SHAPE differs from the homogeneous full
-# (control, not baseline) — the shape-SPECIFIC guards below (structural-full-
-# budget, ledger-witness reconstruction) therefore have heterogeneous variants,
-# while the shape-INDEPENDENT guards (gate/regime/evidence-hash self-consistency)
-# cover it via ``_REAL_9B_DEPOSIT_FIXTURES``. Fired via
-# ``scripts/fire_freeze_ci_9b_full_heterogeneous.sh``; verdict TIES (the
-# reduced-budget heterogeneous SURPASSES does NOT survive the full 1500-step
-# budget), recorded honestly. Tests keep a skip-until-exists guard so an
-# accidentally-removed fixture fails loudly, not silently.
+# 96→1500 steps at 600 train / 2.5 epoch = generalization regime, AND carries the
+# full-backprop baseline arm (``--n-baseline 3``, wired ``5e7009b``) so the GOAL
+# §4-247 P1 品質保持 question is answered for the asymmetric adapter too. This is
+# the SECOND citable full-budget deposit (``citable_as_full_section4_verdict=
+# True``; LANDED 2026-07-18, RE-HARVESTED 2026-07-27 from the full-12 re-run
+# because the 2026-07-18 ledger was stale). Its arm SHAPE differs from the
+# homogeneous full (direction-isolation CONTROL in addition to BASELINE) — the
+# shape-SPECIFIC guards below (structural-full-budget, ledger-witness
+# reconstruction) therefore have heterogeneous variants, while the shape-
+# INDEPENDENT guards (gate/regime/evidence-hash self-consistency) cover it via
+# ``_REAL_9B_DEPOSIT_FIXTURES``. Fired via
+# ``scripts/fire_freeze_ci_9b_full_heterogeneous.sh``; DIRECTION verdict TIES
+# (the reduced-budget heterogeneous SURPASSES does NOT survive the full 1500-step
+# budget) while the baseline verdict is SURPASSES (P1 品質保持 met), both recorded
+# honestly. Tests keep a skip-until-exists guard so an accidentally-removed
+# fixture fails loudly, not silently.
 FIXTURE_9B_FULL_HETEROGENEOUS = (
     Path(__file__).resolve().parent
     / "fixtures"
@@ -269,10 +273,11 @@ FIXTURE_9B_FULL_HETEROGENEOUS = (
 # repo file, no gitignored ``runs/`` dependency) and stamps
 # ``ledger_witness_path`` / ``ledger_witness_sha256`` into the deposit (these
 # are HARVEST fields — the worker stamps ``run_log_*`` but NOT ``ledger_witness_*``;
-# see ``scripts/fire_freeze_ci_9b_full_heterogeneous.sh`` harvest notes). 10
-# JSONL lines (1 header + 9 arms: 3 candidate / 3 surrogate / 3 control), each
-# carrying the arm's exact ``valid_loss`` — so the deposit's three loss-vectors
-# reconstruct byte-for-byte from this witness. LANDED + harvested 2026-07-18
+# see ``scripts/fire_freeze_ci_9b_full_heterogeneous.sh`` harvest notes). 13
+# JSONL lines (1 header + 12 arms: 3 candidate / 3 surrogate / 3 control /
+# 3 baseline), each carrying the arm's exact ``valid_loss`` — so the deposit's
+# four loss-vectors reconstruct byte-for-byte from this witness. LANDED
+# 2026-07-18, RE-HARVESTED 2026-07-27 from the full-12 re-run
 # (see :class:`TestCommittedLedgerWitnessHeterogeneousFull`).
 FIXTURE_9B_FULL_HETEROGENEOUS_LEDGER = (
     Path(__file__).resolve().parent
@@ -1602,15 +1607,15 @@ class TestDepositGateSelfConsistency:
         assert data["n_baseline"] >= 3
 
     def test_heterogeneous_full_deposit_is_structurally_full_budget(self):
-        # The heterogeneous full verdict has a DIFFERENT arm shape from the
-        # homogeneous full: it re-runs the reduced-heterogeneous direction-
-        # isolation design (candidate output-first + random surrogate + input-side
-        # control) at the full 1500-step budget, with NO full-backprop baseline arm
-        # (``n_baseline == 0`` — the baseline is the homogeneous leg's condition-(a)
-        # question, already answered at ``4b88ca8``). So the homogeneous structural
-        # test's ``n_baseline >= 3`` assertion does NOT apply; this pins the
-        # heterogeneous arm shape instead, plus the SAME shared full-budget axes
-        # (not proxy / not reduced / total_steps reaches cfg_max_steps / non-thin).
+        # The heterogeneous full verdict re-runs the reduced-heterogeneous
+        # direction-isolation design (candidate output-first + random surrogate +
+        # input-side control) at the full 1500-step budget AND now carries the
+        # full-backprop baseline arm (``--n-baseline 3``, wired ``5e7009b``) so the
+        # GOAL §4-247 P1 品質保持 question is answered for the asymmetric per-layer-
+        # rank adapter too — not just the homogeneous leg (``4b88ca8``). So BOTH the
+        # direction-isolation control (``n_control >= 3``) AND the baseline
+        # (``n_baseline >= 3``) apply, plus the SAME shared full-budget axes (not
+        # proxy / not reduced / total_steps reaches cfg_max_steps / non-thin).
         # Independent of the empirical SURPASSES/TIES outcome the gate test handles.
         if not FIXTURE_9B_FULL_HETEROGENEOUS.exists():
             pytest.skip(
@@ -1624,8 +1629,8 @@ class TestDepositGateSelfConsistency:
         assert data["is_thin_evidence"] is False
         assert data["n_candidate"] >= 3
         assert data["n_surrogate"] >= 3
-        assert data["n_control"] >= 3
-        assert data["n_baseline"] == 0  # no baseline arm — direction-isolation design
+        assert data["n_control"] >= 3  # direction-isolation A/B arm
+        assert data["n_baseline"] >= 3  # full-backprop baseline arm (P1 品質保持)
 
 
 class TestRunLogArtifact:
@@ -1810,12 +1815,15 @@ class TestDepositEvidenceHash:
         FIXTURE_9B_FULL: "785d9cfae66fbf20fb0b9c3349dacbfd3ec5caf7cd9b046610d78f4e2bcf8577",
         FIXTURE_9B_HETEROGENEOUS: "c07b1de1e8f3692b4e99ee7a20fcef6ce3c3a6e955de4a672e62838d17288a49",
         # The 2nd citable full-budget verdict — heterogeneous (per-layer rank)
-        # arm shape, LANDED 2026-07-18. Distinct from the homogeneous full pin
-        # above (``architecture`` + ``lora_rank_pattern`` are EVIDENCE keys) and
-        # from the reduced-budget heterogeneous pin (different total_steps +
-        # losses): the SURPASSES the reduced leg earned does NOT survive the
-        # full 1500-step budget → verdict TIES, recorded honestly either way.
-        FIXTURE_9B_FULL_HETEROGENEOUS: "335a1ffb5a740dfa70f19d17c201cf77901eaef86cc916cb603e7417e01fa323",
+        # arm shape. Distinct from the homogeneous full pin above (``architecture``
+        # + ``lora_rank_pattern`` are EVIDENCE keys) and from the reduced-budget
+        # heterogeneous pin (different total_steps + losses). RE-HARVESTED
+        # 2026-07-27 from the full-12 re-run (the 2026-07-18 ledger was stale):
+        # direction verdict stays TIES (the reduced-budget SURPASSES does NOT
+        # survive the full 1500-step budget), AND the now-fired full-backprop
+        # baseline arm answers P1 品質保持 = SURPASSES (candidate ≈1.718 vs
+        # full-backprop ≈1.886) — both recorded honestly.
+        FIXTURE_9B_FULL_HETEROGENEOUS: "8298c4539f6c14d3a7b77e880cd9ccf23b65fede95845955e59007c1894d258a",
     }
 
     @pytest.mark.parametrize("path", _REAL_9B_DEPOSIT_FIXTURES)
@@ -2195,28 +2203,33 @@ class TestCommittedLedgerWitnessHeterogeneousFull:
     ``scripts/fire_freeze_ci_9b_full_heterogeneous.sh``). These tests then
     auto-verify the harvest: the witness is a committed repo file pointed at by a
     RELATIVE path, its stamp is self-consistent with its bytes, and it
-    reconstructs the deposit's three loss-vectors (candidate / surrogate /
-    CONTROL — the heterogeneous arm shape, not baseline) byte-for-byte.
+    reconstructs the deposit's FOUR loss-vectors (candidate / surrogate / CONTROL
+    / BASELINE) byte-for-byte — the direction-isolation A/B (control) AND the
+    full-backprop baseline arm (P1 品質保持, wired ``5e7009b``).
 
     Canonical hashing DELEGATES to ``TestCommittedLedgerWitness._ledger_witness_
     sha256`` so the two verdicts are held to a single canonicalization (a future
-    drift in one would fail the other). The run LANDED 2026-07-18 and the HARVEST
-    is DONE: ``_FROZEN_WITNESS_HASH`` (activates the coordinated-drift pin below)
+    drift in one would fail the other). The run LANDED 2026-07-18 and was
+    RE-HARVESTED 2026-07-27 from the full-12 re-run (the 2026-07-18 ledger was
+    stale): ``_FROZEN_WITNESS_HASH`` (activates the coordinated-drift pin below)
     and the frozen evidence-hash literal in :class:`TestDepositEvidenceHash` are
     both pinned to the committed bytes. Tests keep a skip-until-exists guard so
     an accidentally-removed witness/deposit fails loudly, not silently.
     """
 
     # Frozen witness hash over the canonical encoding of the committed ledger.
-    # Filled at HARVEST (the deliberate change the pin exists to force) when the
-    # heterogeneous-full ledger landed (2026-07-18): the verdict TIES (candidate
-    # 1.71804 vs surrogate 1.71903, CI straddles 0) on a clean one-shot run
-    # (``resumed_arm_count=0``), so the SURPASSES the reduced-budget heterogeneous
-    # leg earned does NOT survive the full 1500-step budget — recorded honestly,
-    # not papered over. A future deliberate re-deposit (real re-run) must update
-    # this literal; that update is itself the reviewable change this guard forces.
+    # Re-pinned at HARVEST (the deliberate change the pin exists to force) when the
+    # heterogeneous-full ledger was RE-HARVESTED 2026-07-27 from the full-12 re-run
+    # (the 2026-07-18 ledger was stale; ``resumed_arm_count=0`` clean one-shot run):
+    # the DIRECTION verdict TIES (candidate 1.71802 vs surrogate 1.71907, CI
+    # straddles 0) so the SURPASSES the reduced-budget heterogeneous leg earned
+    # does NOT survive the full 1500-step budget — AND the now-fired full-backprop
+    # baseline arm answers P1 品質保持 = SURPASSES (candidate ≈1.718 vs full-backprop
+    # ≈1.886) — both recorded honestly, not papered over. A future deliberate
+    # re-deposit (real re-run) must update this literal; that update is itself the
+    # reviewable change this guard forces.
     _FROZEN_WITNESS_HASH = (
-        "00084c2646eb5463cd0ff835a8a6579d31c331c07d81a89bc1f7dc3e1f4b0390"
+        "d8fea1279ef4f8651139c8c13c7abd1b4de3a1c76fed97d7045e94bfc94d4a96"
     )
 
     def test_witness_file_is_committed_and_deposit_points_at_it(self):
@@ -2266,10 +2279,12 @@ class TestCommittedLedgerWitnessHeterogeneousFull:
 
     def test_ledger_reconstructs_deposit_loss_vectors_exactly(self):
         # THE independent-reproducibility link for the heterogeneous arm shape:
-        # each ledger arm's ``valid_loss`` reconstructs the deposit's three loss
-        # vectors (candidate / surrogate / CONTROL) byte-for-byte. Mirrors the
-        # homogeneous reconstruction with the heterogeneous role map (control, not
-        # baseline — the heterogeneous full carries no full-backprop baseline arm).
+        # each ledger arm's ``valid_loss`` reconstructs the deposit's FOUR loss
+        # vectors (candidate / surrogate / CONTROL / BASELINE) byte-for-byte. The
+        # direction-isolation A/B (candidate / surrogate / control) AND the
+        # full-backprop baseline arm (P1 品質保持, wired ``5e7009b``) — so a skeptic
+        # reading only the committed ledger reproduces BOTH the direction verdict
+        # and the quality-vs-full-backprop reading.
         if not FIXTURE_9B_FULL_HETEROGENEOUS_LEDGER.exists():
             pytest.skip("heterogeneous-full ledger witness not landed yet")
         data = json.loads(FIXTURE_9B_FULL_HETEROGENEOUS.read_text())
@@ -2284,6 +2299,7 @@ class TestCommittedLedgerWitnessHeterogeneousFull:
             ("candidate", "candidate_losses"),
             ("surrogate", "surrogate_losses"),
             ("control", "control_losses"),
+            ("baseline", "baseline_losses"),
         ):
             losses = data[key]
             n_ledger = sum(1 for r, _ in by_role_index if r == role)
@@ -3257,8 +3273,9 @@ class TestFullBudgetHeterogeneousLaunchPath:
         # full-backprop baseline arm — the heterogeneous leg answers the SAME
         # GOAL §4-247 P1 品質保持 axis (does freezing preserve quality vs full
         # backprop?) the homogeneous leg answers (SURPASSES); without ``--n-baseline``
-        # the heterogeneous deposit carries ``n_baseline=0``/``baseline=null`` and
-        # the decision surface reports P1 品質保持 as UNANSWERED for this leg.
+        # the heterogeneous deposit would carry ``n_baseline=0``/``baseline=null``
+        # and the decision surface would report P1 品質保持 as UNANSWERED for this
+        # leg — the flag is what let the 2026-07-27 harvest read SURPASSES here.
         assert "--n-control 3" in text
         assert "--n-baseline 3" in text
         # Full budget + generalization regime (the two honesty axes that clear
