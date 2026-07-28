@@ -709,6 +709,17 @@ class TestSnapshotFixtureIntegrity:
         # The top-level flags that gate operator action must match. A drift
         # here means the surface contract changed (e.g., new branch, new
         # status, recommendation flipped) without the snapshot being refreshed.
+        #
+        # run_executable_here / recover_rerun_blocked_by_src_data are DERIVED
+        # from already-pinned inputs (verdict_worker_status / src_data_status),
+        # but pinning their derived VALUES too closes the catalog-completeness
+        # gap the feedback's "pin in CI" spirit names: a refactor that silently
+        # changes the derivation (e.g. adds a condition) would flip the derived
+        # predicate while leaving its input pinned, and so slip through unless
+        # the derived value is itself pinned. recover_rerun_blocked_by_src_data
+        # is load-bearing — it is the surface's whole point (docstring point 2:
+        # the executable verdict run is distinguished from the src.data-blocked
+        # recover path); a silent flip there is a scientific-honesty break.
         for key in (
             "arc_complete",
             "landed_decision",
@@ -716,6 +727,8 @@ class TestSnapshotFixtureIntegrity:
             "recommendation",
             "verdict_worker_status",
             "src_data_status",
+            "run_executable_here",
+            "recover_rerun_blocked_by_src_data",
         ):
             assert live_payload[key] == fixture_payload[key], (
                 f"top-level predicate {key!r} drifted: "
