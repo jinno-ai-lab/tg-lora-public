@@ -20,6 +20,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from src.tg_lora.freeze_surrogate_gate import SURPASSES, TIES
 
 from scripts.section4_operator_decision import (
@@ -631,3 +633,161 @@ class TestLandedDecision:
 
     def test_load_landed_decision_returns_none_when_absent(self, tmp_path):
         assert _load_landed_decision(str(tmp_path)) is None
+
+
+class TestSnapshotFixtureIntegrity:
+    """Pin the §4 operator-decision surface against the committed fixture.
+
+    The committed ``tests/fixtures/section4_decision_snapshot_2026-07-28.json``
+    captures a fixed audit artifact (TASK-0225). The §4 logic tests above cover
+    the decision combinator, but a refactor that silently changes the surface
+    output (new top-level predicate, leg label rename, additional branch, a
+    reverted P1 品質保持 axis) would slip through them — the predicate set
+    would compile fine and the existing tests would still pass. This class
+    runs the REAL script via subprocess and asserts the *predicate set*
+    matches the committed snapshot. Numerical means and CI bounds are
+    intentionally excluded — they would require fixture refresh on a re-fire
+    (Cat-C blocked in this mirror), and the predicate invariants are what the
+    surface contracts on (a refactor that preserves verdicts but renames a
+    leg is still a contract break even if numbers don't move).
+
+    This is the real analog of feedback's "pin in CI rather than just in
+    pytest discovery" for this checkout: the literal ``TestAuditCatalogCompleteness``
+    name is phantom in this repo (grep 0 hit), but the SPIRIT — refactor-safety
+    for a load-bearing surface — applies to the §4 decision surface. A
+    mutation that breaks any pinned predicate flips a test RED.
+    """
+
+    FIXTURE_REL = "tests/fixtures/section4_decision_snapshot_2026-07-28.json"
+
+    @pytest.fixture
+    def fixture_path(self) -> Path:
+        return REPO_ROOT / self.FIXTURE_REL
+
+    @pytest.fixture
+    def fixture_payload(self, fixture_path: Path) -> dict:
+        return json.loads(fixture_path.read_text())
+
+    @pytest.fixture
+    def live_payload(self) -> dict:
+        # Run the REAL script via subprocess — mirrors how an operator would
+        # invoke it (``-m`` + cwd=REPO_ROOT so relative deposit paths resolve).
+        proc = subprocess.run(
+            [sys.executable, "-m", "scripts.section4_operator_decision", "--json"],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+            timeout=60,
+        )
+        # On the real checkout the surface is AWAITING_DECISION (exit 3); a
+        # different exit code means the fixture is stale relative to the
+        # surface contract (e.g., the operator landed a call, or the arc
+        # regressed). Either way the snapshot integrity claim is broken.
+        assert proc.returncode == EXIT_AWAITING_DECISION, (
+            f"surface should be AWAITING_DECISION (exit 3) on the real checkout; "
+            f"got returncode={proc.returncode}, stderr={proc.stderr!r}"
+        )
+        return json.loads(proc.stdout)
+
+    def test_fixture_exists_and_is_loadable(self, fixture_path: Path):
+        # Guard the fixture itself — a delete / rename of the tracked audit
+        # artifact would silently lose the §4 closeout trail.
+        assert fixture_path.exists(), (
+            f"tracked audit artifact missing: {fixture_path}. "
+            f"Re-run TASK-0225 (drive surface + capture snapshot) to regenerate."
+        )
+        payload = json.loads(fixture_path.read_text())
+        # A committed snapshot of an UNCOMPLETE arc would be incoherent —
+        # a refactor that flips arc_complete without bumping the fixture
+        # name is suspicious.
+        assert payload["arc_complete"] is True
+        assert payload["landed_decision"] is None
+
+    def test_top_level_predicates_match_fixture(
+        self, fixture_payload: dict, live_payload: dict
+    ):
+        # The top-level flags that gate operator action must match. A drift
+        # here means the surface contract changed (e.g., new branch, new
+        # status, recommendation flipped) without the snapshot being refreshed.
+        for key in (
+            "arc_complete",
+            "landed_decision",
+            "awaiting_operator_decision",
+            "recommendation",
+            "verdict_worker_status",
+            "src_data_status",
+        ):
+            assert live_payload[key] == fixture_payload[key], (
+                f"top-level predicate {key!r} drifted: "
+                f"fixture={fixture_payload[key]!r}, live={live_payload[key]!r}"
+            )
+
+    def test_legs_set_and_predicates_match(
+        self, fixture_payload: dict, live_payload: dict
+    ):
+        # Same two legs (homogeneous + heterogeneous), same verdicts, same
+        # faithfulness / citability / baseline flags. A new leg, a renamed
+        # leg, a reverted verdict, or a dropped baseline all break here.
+        live_by_label = {leg["label"]: leg for leg in live_payload["legs"]}
+        fixture_by_label = {leg["label"]: leg for leg in fixture_payload["legs"]}
+        assert set(live_by_label) == set(fixture_by_label), (
+            f"leg labels drifted: fixture={set(fixture_by_label)}, "
+            f"live={set(live_by_label)}"
+        )
+        for label in ("homogeneous", "heterogeneous"):
+            live_leg = live_by_label[label]
+            fix_leg = fixture_by_label[label]
+            for key in (
+                "present",
+                "recorded_verdict",
+                "rederived_verdict",
+                "citable_as_full_section4_verdict",
+                "faithful",
+                "baseline_present",
+                "baseline_verdict",
+            ):
+                assert live_leg[key] == fix_leg[key], (
+                    f"leg={label}, predicate {key!r} drifted: "
+                    f"fixture={fix_leg[key]!r}, live={live_leg[key]!r}"
+                )
+
+    def test_quality_preservation_predicates_match(
+        self, fixture_payload: dict, live_payload: dict
+    ):
+        # The P1 品質保持 axis (TASK-0213/0215/0216) is the ONLY leg verdict
+        # driver and must match — a regression would silently undo the
+        # auto-derivation that closed the heterogeneous full-budget baseline.
+        assert set(live_payload["quality_preservation"]) == set(
+            fixture_payload["quality_preservation"]
+        )
+        for label in ("homogeneous", "heterogeneous"):
+            live_q = live_payload["quality_preservation"][label]
+            fix_q = fixture_payload["quality_preservation"][label]
+            for key in ("answered", "verdict", "n_baseline"):
+                assert live_q[key] == fix_q[key], (
+                    f"quality[{label}].{key!r} drifted: "
+                    f"fixture={fix_q[key]!r}, live={live_q[key]!r}"
+                )
+
+    def test_branch_executability_matches(
+        self, fixture_payload: dict, live_payload: dict
+    ):
+        # ship / accept_null / pivot branches — the ``executable_here`` flags
+        # are the gate on operator action. pivot is private_repo_only=True in
+        # this mirror (the only way it could flip to executable_here=True is
+        # if src.data were ported — which is the deliberate boundary
+        # ``src/data/*`` represents). The other two must remain locally
+        # executable so the operator's land command is actually runnable.
+        assert set(live_payload["branches"]) == set(fixture_payload["branches"]), (
+            f"branch keys drifted: fixture={set(fixture_payload['branches'])}, "
+            f"live={set(live_payload['branches'])}"
+        )
+        for branch in fixture_payload["branches"]:
+            assert (
+                live_payload["branches"][branch]["executable_here"]
+                == fixture_payload["branches"][branch]["executable_here"]
+            ), (
+                f"branch {branch!r}.executable_here drifted: "
+                f"fixture={fixture_payload['branches'][branch]['executable_here']!r}, "
+                f"live={live_payload['branches'][branch]['executable_here']!r}"
+            )
