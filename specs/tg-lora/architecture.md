@@ -740,6 +740,8 @@ make paper-memory SEEDS='42 43 44' TARGET_BP=240 MAX_SEQ_LEN=1024 \
 - [freeze-ci-operator-errors 自動分析記録](/home/jinno/tg-lora-public/specs/freeze-ci-operator-errors/interview-record.md)
 - [freeze-ci-operator-errors 要件定義書](/home/jinno/tg-lora-public/specs/freeze-ci-operator-errors/requirements.md)
 - [freeze-ci-operator-errors タスク概要](/home/jinno/tg-lora-public/specs/freeze-ci-operator-errors/tasks/overview.md)
+- [oper-decision-surface 自動分析記録](/home/jinno/tg-lora-public/specs/oper-decision-surface/interview-record.md)
+- [oper-decision-surface 要件定義書](/home/jinno/tg-lora-public/specs/oper-decision-surface/requirements.md)
 
 <!-- spine:children:end -->
 
@@ -941,5 +943,7 @@ make paper-memory SEEDS='42 43 44' TARGET_BP=240 MAX_SEQ_LEN=1024 \
 - [TASK-0219: feedback 4 bullet の要件整理（kairo-requirements）→ 実在対応物へ変換: ledger 指紋の **LoRAConfig 列挙ガード**＋**`seq_len` per-field pin** を追加（mutation-proven 双方向）、`label_affecting`/`context_size` は grep-proven PHANTOM（code 0 hit）・bullets 1/4 は durable closeout + operator-facing decision の surface](tasks/TASK-0219.md)
 - [TASK-0220: feedback 4 bullet の要件整理（kairo-requirements・第2ラウンド）→ TC-132-09 統合テストの mutation 証明を "by construction" 主張から**実執行の失敗再現ログ**へ昇格（3 層検知を実証）・phantom 再検証・operator decision を実行出力で surface](tasks/TASK-0220.md)
 - [TASK-0221: resume-ledger 指紋ガードの cross-section 拡張 — TrainingConfig 消費面列挙 + DataConfig 隔離を AST スキャンで構造化（feedback bullet 2/3 の実在対応物）](tasks/TASK-0221.md)
+- [TASK-0222: cache 指紋の producer 間一貫性 — async_cache_builder + precompute を単一 cfg→fingerprint mapping へ接続（T-002 完了・feedback bullet 2 への横断テスト実証）](tasks/TASK-0222.md)
+- [TASK-0223: feedback 4-bullet サイクルの永続 closeout 宣言 + operator-facing decision の新規 surface 実行ログ（bullet 1 遵守・bullet 4 応答）](tasks/TASK-0223.md)
 
 <!-- spine:references:end -->

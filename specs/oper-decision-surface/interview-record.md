@@ -1,5 +1,14 @@
 # oper-decision-surface 自動分析記録
 
+
+<!-- spine:anchor:begin -->
+> **Spine anchor**: [TG-LoRA アーキテクチャ設計](../tg-lora/architecture.md)
+>
+> - parent: `tg-lora/architecture.md`
+> - role: `detailed`
+> - status: `canonical_child`
+<!-- spine:anchor:end -->
+
 **作成日**: 2026-07-28
 **feature_id**: `oper-decision-surface`
 **work_scope**: `light`
@@ -167,3 +176,13 @@
 - **受け入れ基準**: [acceptance-criteria.md](acceptance-criteria.md)
 - **正本実装**: [`scripts/section4_operator_decision.py`](../../scripts/section4_operator_decision.py)
 - **直交 spec**: [`specs/freeze-ci-operator-errors/`](../../specs/freeze-ci-operator-errors/)
+
+
+<!-- spine:references:begin -->
+## Spine: external references
+
+- [oper-decision-surface 受け入れ基準](acceptance-criteria.md)
+- [oper-decision-surface 準備タスク（ユーザー作業）](prep.md)
+- [oper-decision-surface ユーザストーリー](user-stories.md)
+
+<!-- spine:references:end -->

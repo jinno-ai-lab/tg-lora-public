@@ -1,5 +1,14 @@
 # oper-decision-surface 要件定義書
 
+
+<!-- spine:anchor:begin -->
+> **Spine anchor**: [TG-LoRA アーキテクチャ設計](../tg-lora/architecture.md)
+>
+> - parent: `tg-lora/architecture.md`
+> - role: `detailed`
+> - status: `canonical_child`
+<!-- spine:anchor:end -->
+
 **作成日**: 2026-07-28
 **feature_id**: `oper-decision-surface`
 **work_scope**: `light` — 機能追加（artifact）は既に commit 済（TASK-0198 / 0217）+ 43 tests green。本 spec は**既存の operator-decision 表面を EARS 形式で形式化**し、フィードバックループが「operator `--land` 以外の次手」を提案する前に踏むべき停止点を 1 つの正本へ蒸留する目的。
