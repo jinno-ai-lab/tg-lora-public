@@ -750,6 +750,14 @@ class TestSnapshotFixtureIntegrity:
         for label in ("homogeneous", "heterogeneous"):
             live_leg = live_by_label[label]
             fix_leg = fixture_by_label[label]
+            # proxy_scale=False is the load-bearing FULL-BUDGET claim of the
+            # §4 arc — a silent flip to True would turn "citable full-budget
+            # TIES" into "proxy TIES" (a scientific-honesty break). It is read
+            # INDEPENDENTLY from the deposit (data.get("proxy_scale")), so none
+            # of the other pinned predicates would catch its drift. architecture
+            # likewise identifies each leg structurally (homogeneous=None /
+            # heterogeneous="heterogeneous"). Both are pinned as VALUES here,
+            # not just as catalog members (see test_leg_predicate_catalog_is_complete).
             for key in (
                 "present",
                 "recorded_verdict",
@@ -758,10 +766,86 @@ class TestSnapshotFixtureIntegrity:
                 "faithful",
                 "baseline_present",
                 "baseline_verdict",
+                "proxy_scale",
+                "architecture",
             ):
                 assert live_leg[key] == fix_leg[key], (
                     f"leg={label}, predicate {key!r} drifted: "
                     f"fixture={fix_leg[key]!r}, live={live_leg[key]!r}"
+                )
+
+    def test_leg_predicate_catalog_is_complete(
+        self, fixture_payload: dict, live_payload: dict
+    ):
+        """Leg-level catalog completeness — the nested analog of
+        test_top_level_predicate_catalog_is_complete (TASK-0229).
+
+        The sibling ``test_legs_set_and_predicates_match`` iterates a FIXED
+        pinned key list per leg, so it catches a *value* drift on a known leg
+        predicate and a KeyError if a pinned one is dropped — but NOT the
+        *addition* of a new per-leg predicate: a refactor that introduces a
+        fresh per-leg contract term (e.g. a new per-leg ``xxx_status`` gate)
+        would land unpinned and slip through CI green. This is the residual
+        "a refactor that silently adds a contract term blocks the PR, not slip
+        through" gap (feedback bullet 3) at the LEG level — the per-leg
+        verdicts are what drive the SHIP recommendation, so a leg predicate
+        is load-bearing. This closes it by asserting each leg's key set is
+        EXACTLY {pinned-leg-predicates} ∪ {allowlisted-non-load-bearing} for
+        BOTH the live output and the committed fixture, so any added/removed
+        leg key fails loudly and forces the author to consciously pin it
+        (load-bearing) or allowlist it (identifier / numerical / informational).
+        """
+        # Per-leg predicates byte-pinned by test_legs_set_and_predicates_match —
+        # the load-bearing verdict + structural flags (incl. proxy_scale = the
+        # full-budget claim, and architecture = the leg's identity).
+        PINNED_LEG = {
+            "present",
+            "recorded_verdict",
+            "rederived_verdict",
+            "citable_as_full_section4_verdict",
+            "faithful",
+            "baseline_present",
+            "baseline_verdict",
+            "proxy_scale",
+            "architecture",
+        }
+        # Non-load-bearing leg keys deliberately NOT byte-pinned: two
+        # identifiers (label / deposit path), the numerical verdict drivers
+        # (means / CI bounds — intentionally excluded: they would need fixture
+        # refresh on a re-fire, which is Cat-C blocked in this mirror), and two
+        # informational ints (seq_len / n_baseline — n_baseline is already
+        # value-pinned inside the quality_preservation sub-test). Each is
+        # ENUMERATED (not a wildcard) so a new leg key cannot hide.
+        ALLOWLISTED_LEG = {
+            "label",
+            "deposit",
+            "candidate_mean",
+            "surrogate_mean",
+            "ci_lower",
+            "ci_upper",
+            "seq_len",
+            "n_baseline",
+            "baseline_candidate_mean",
+            "baseline_baseline_mean",
+        }
+        catalog = PINNED_LEG | ALLOWLISTED_LEG
+        live_by_label = {leg["label"]: leg for leg in live_payload["legs"]}
+        fixture_by_label = {leg["label"]: leg for leg in fixture_payload["legs"]}
+        for label in ("homogeneous", "heterogeneous"):
+            for source, by_label in (
+                ("live", live_by_label),
+                ("fixture", fixture_by_label),
+            ):
+                leg_keys = set(by_label[label])
+                assert leg_keys == catalog, (
+                    f"§4 leg={label!r} ({source}) predicate catalog is "
+                    "INCOMPLETE vs the pin — a refactor added or removed a "
+                    "per-leg predicate. A NEW load-bearing leg predicate must "
+                    "be pinned (add to PINNED_LEG and the value-pin tuple in "
+                    "test_legs_set_and_predicates_match); a new non-load-bearing "
+                    "leg key must be consciously allowlisted. "
+                    f"missing_from_leg={catalog - leg_keys!r}, "
+                    f"unpinned_new_in_leg={leg_keys - catalog!r}"
                 )
 
     def test_quality_preservation_predicates_match(
