@@ -804,3 +804,70 @@ class TestSnapshotFixtureIntegrity:
                 f"fixture={fixture_payload['branches'][branch]['executable_here']!r}, "
                 f"live={live_payload['branches'][branch]['executable_here']!r}"
             )
+
+    def test_top_level_predicate_catalog_is_complete(
+        self, fixture_payload: dict, live_payload: dict
+    ):
+        """Catalog completeness — feedback bullet 3 ("catalog completeness is
+        now the load-bearing claim; a refactor that silently drops/ adds a
+        contract term should block the PR, not slip through").
+
+        The sibling ``test_top_level_predicates_match_fixture`` iterates a
+        FIXED 8-key list, so it catches a *value* drift on a known predicate
+        but NOT the *addition* of a new top-level predicate: a refactor that
+        introduces a fresh contract term (e.g. a new ``xxx_status`` gate on
+        operator action) would land unpinned and slip through CI green. This
+        closes that residual gap by asserting the snapshot's top-level key set
+        is EXACTLY {pinned} ∪ {allowlisted-non-load-bearing} — so any added or
+        removed key fails loudly and forces the author to consciously pin it
+        (load-bearing) or allowlist it (derived / prose / constant). This is
+        the literal "catalog completeness" claim the feedback names, applied
+        to the REAL §4 surface (``TestAuditCatalogCompleteness`` is phantom in
+        this checkout — grep 0 hit; see TASK-0226/0228/0229).
+        """
+        # Keys byte-pinned by test_top_level_predicates_match_fixture — the
+        # load-bearing operator-action gates (booleans / enums / the sole
+        # executable-here verdict).
+        PINNED_TOP_LEVEL = {
+            "arc_complete",
+            "landed_decision",
+            "awaiting_operator_decision",
+            "recommendation",
+            "verdict_worker_status",
+            "src_data_status",
+            "run_executable_here",
+            "recover_rerun_blocked_by_src_data",
+        }
+        # Keys pinned by their OWN dedicated sub-tests (leg / quality /
+        # branch predicate sets), not by the top-level loop.
+        PINNED_BY_SUBTEST = {"legs", "quality_preservation", "branches"}
+        # Non-load-bearing keys deliberately NOT byte-pinned: a derived reason
+        # string, an informational constant, and two prose fields (rationale /
+        # unblock_step) whose wording may evolve without a verdict/state
+        # change. Each is ENUMERATED (not a wildcard) so a new key cannot hide.
+        ALLOWLISTED_NON_LOAD_BEARING = {
+            "verdict_worker_reason",  # derived from verdict_worker_status
+            "seq1024_full_budget_vram_floor_mib",  # informational constant (11_000)
+            "rationale",  # prose, derived from state
+            "unblock_step",  # prose, derived from state
+        }
+        catalog = PINNED_TOP_LEVEL | PINNED_BY_SUBTEST | ALLOWLISTED_NON_LOAD_BEARING
+        live_keys = set(live_payload)
+        fixture_keys = set(fixture_payload)
+        # live == fixture key set is already implied by the sibling tests, but
+        # assert it explicitly so a catalog drift is attributed correctly.
+        assert live_keys == fixture_keys, (
+            "live and fixture top-level key sets disagree before the catalog "
+            "completeness check: "
+            f"only_live={live_keys - fixture_keys!r}, "
+            f"only_fixture={fixture_keys - live_keys!r}"
+        )
+        assert live_keys == catalog, (
+            "§4 snapshot top-level predicate catalog is INCOMPLETE vs the pin — "
+            "a refactor added or removed a top-level predicate. A NEW "
+            "load-bearing predicate must be pinned (add to PINNED_TOP_LEVEL or "
+            "a dedicated sub-test); a new non-load-bearing key must be "
+            "consciously allowlisted. "
+            f"missing_from_snapshot={catalog - live_keys!r}, "
+            f"unpinned_new_in_snapshot={live_keys - catalog!r}"
+        )
