@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 import shutil
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,12 @@ import torch.multiprocessing as mp
 from omegaconf import OmegaConf
 from torch.utils.data import Subset
 from transformers import AutoConfig
+
+# Allow running as a standalone CLI (``python scripts/precompute_prefix_cache_parallel.py``): a bare
+# script invocation puts ``scripts/`` — not the repo root — on sys.path, so make the repo root
+# importable so ``src.*`` resolves to THIS repo's own copy rather than a stale externally-installed
+# ``src`` leaked by an editable install of the private repo.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.data.build_seed_dataset import load_dataset
 from src.model.load_model import (apply_lora, get_input_device,
