@@ -73,6 +73,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.replay_freeze_validloss_ci import load_samples, replay_samples  # noqa: E402
+from src.tg_lora.freeze_evidence_hash import evidence_hash  # noqa: E402
 from src.tg_lora.freeze_surrogate_gate import TIES  # noqa: E402
 from src.utils.io import load_json, save_json  # noqa: E402
 
@@ -196,6 +197,7 @@ def _assess_leg(label: str, deposit_rel: str, repo_root: Path) -> dict[str, Any]
     if not path.exists():
         leg["citable_as_full_section4_verdict"] = False
         leg["faithful"] = False
+        leg["evidence_hash_stale"] = False
         leg["rederived_verdict"] = None
         leg["recorded_verdict"] = None
         return leg
@@ -212,6 +214,24 @@ def _assess_leg(label: str, deposit_rel: str, repo_root: Path) -> dict[str, Any]
     # would violate P0 科学誠実性 — measured evidence must be surfaced, not swallowed.
     n_baseline = data.get("n_baseline") or 0
     baseline_arm = data.get("baseline")
+    # Evidence-byte integrity (GOAL §7 citation honesty) — the sibling of
+    # ``faithful``. ``faithful`` proves the stored verdict label is the one the
+    # stored floats earn under the bootstrap; it CANNOT catch a coordinated
+    # repaint that edits the floats AND the verdict together (so rederived ==
+    # recorded still holds), nor any accidental evidence-byte drift. The
+    # ``evidence_hash`` stamp — frozen over the raw-measurement + run-config keys
+    # by the shared ``freeze_evidence_hash`` leaf (the single source the producer
+    # stamps and the replay cross-checks) — closes exactly that hole. Mirrors
+    # ``scripts.replay_freeze_validloss_ci._evidence_hash_stale``: a deposit
+    # carrying no stamp is NOT stale (artifact-when-present-else-skip discipline,
+    # same as the ledger gate) so a legacy/proxy recording never breaks the arc;
+    # one whose stamp diverges from the hash re-derived from its OWN evidence
+    # bytes IS stale.
+    stored_hash = data.get("evidence_hash")
+    if not isinstance(stored_hash, str) or not stored_hash:
+        evidence_hash_stale = False
+    else:
+        evidence_hash_stale = stored_hash != evidence_hash(data)
     leg.update(
         {
             "recorded_verdict": recorded,
@@ -222,6 +242,10 @@ def _assess_leg(label: str, deposit_rel: str, repo_root: Path) -> dict[str, Any]
             # faithful = the recorded verdict is the one the stored floats earn
             # under the deterministic bootstrap (the verdict is not painted on).
             "faithful": rederived == recorded,
+            # evidence-byte integrity: the stamped evidence_hash matches the
+            # bytes (see above). Co-equal leg predicate with ``faithful`` — both
+            # gate ``arc_complete`` below.
+            "evidence_hash_stale": evidence_hash_stale,
             "candidate_mean": data.get("candidate_mean"),
             "surrogate_mean": data.get("surrogate_mean"),
             "ci_lower": data.get("lower"),
@@ -333,7 +357,7 @@ def _blocking_prompt() -> str:
     lines = [
         "=== ACTION REQUIRED: land your §4 operator decision ===",
         "",
-        "The §4 verdict arc is COMPLETE (both legs citable faithful TIES) — the",
+        "The §4 verdict arc is COMPLETE (both legs citable faithful evidence-intact TIES) — the",
         "relative verdict is done and will not change on re-run. What remains is",
         "YOUR call on a TIES (null) result, which this tool does not make for you:",
         "",
@@ -398,6 +422,7 @@ def assess_section4_decision(
         leg["present"]
         and leg["citable_as_full_section4_verdict"]
         and leg["faithful"]
+        and not leg["evidence_hash_stale"]
         and leg["rederived_verdict"] == TIES
         for leg in legs
     )
@@ -485,7 +510,7 @@ def assess_section4_decision(
     if arc_complete:
         recommendation = "SHIP"
         rationale = (
-            "both §4 legs are citable faithful TIES — the verdict arc is COMPLETE "
+            "both §4 legs are citable faithful evidence-intact TIES — the verdict arc is COMPLETE "
             "(the full-budget run already fired on public Dolly and produced these "
             "deposits); adopt the TIES as the §4 result. Re-firing reproduces TIES "
             "and adds no information. Two absolute-loss senses remain: quality vs "
@@ -517,7 +542,7 @@ def assess_section4_decision(
         )
 
     unblock_step = (
-        "The §4 RELATIVE verdict arc is COMPLETE (both legs citable faithful TIES) "
+        "The §4 RELATIVE verdict arc is COMPLETE (both legs citable faithful evidence-intact TIES) "
         "and the verdict run already fired on public Dolly — no re-fire is needed "
         "(it reproduces TIES). The sole remaining axis is ABSOLUTE-LOSS "
         "comparability vs the private-repo baseline, which needs the private "

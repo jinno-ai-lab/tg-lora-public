@@ -11,6 +11,7 @@
       "rederived_verdict": "TIES",
       "citable_as_full_section4_verdict": true,
       "faithful": true,
+      "evidence_hash_stale": false,
       "candidate_mean": 1.6947166467580246,
       "surrogate_mean": 1.6960347842638537,
       "ci_lower": -9.042031403305728e-05,
@@ -32,6 +33,7 @@
       "rederived_verdict": "TIES",
       "citable_as_full_section4_verdict": true,
       "faithful": true,
+      "evidence_hash_stale": false,
       "candidate_mean": 1.718021787732141,
       "surrogate_mean": 1.7190724188209667,
       "ci_lower": -0.001093412545742467,
@@ -84,6 +86,6 @@
     }
   },
   "recommendation": "SHIP",
-  "rationale": "both \u00a74 legs are citable faithful TIES \u2014 the verdict arc is COMPLETE (the full-budget run already fired on public Dolly and produced these deposits); adopt the TIES as the \u00a74 result. Re-firing reproduces TIES and adds no information. Two absolute-loss senses remain: quality vs full backprop (GOAL \u00a74-247 / P1 \u54c1\u8cea\u4fdd\u6301) is answered per-leg in `quality_preservation` (homogeneous SURPASSES; heterogeneous SURPASSES); absolute-loss vs the private-repo PRODUCTION baseline is Cat-C and private-repo-only (PIVOT).",
-  "unblock_step": "The \u00a74 RELATIVE verdict arc is COMPLETE (both legs citable faithful TIES) and the verdict run already fired on public Dolly \u2014 no re-fire is needed (it reproduces TIES). The sole remaining axis is ABSOLUTE-LOSS comparability vs the private-repo baseline, which needs the private src.data quality filter: src.data is deliberately stripped from this public mirror (see the note in scripts/prepare_data.py and the interface-without-implementation in tests/test_filter_dataset.py + tests/test_dedup.py). Execute PIVOT in the private repo (/home/jinno/tg-lora): port/refresh src/data/filter_dataset.py quality filtering \u2192 re-fire the same corpus \u2192 form_freeze_validloss_deposit + freeze-replay \u2192 deposit here. Do NOT half-port src.data into this mirror (it breaks the deliberate boundary and cannot run without the full private pipeline + corpus). NOTE: the recover.py `--rerun` / train_tg_lora corrective-re-run path is a SEPARATE, src.data-blocked path \u2014 that block does not apply to the verdict worker."
+  "rationale": "both \u00a74 legs are citable faithful evidence-intact TIES \u2014 the verdict arc is COMPLETE (the full-budget run already fired on public Dolly and produced these deposits); adopt the TIES as the \u00a74 result. Re-firing reproduces TIES and adds no information. Two absolute-loss senses remain: quality vs full backprop (GOAL \u00a74-247 / P1 \u54c1\u8cea\u4fdd\u6301) is answered per-leg in `quality_preservation` (homogeneous SURPASSES; heterogeneous SURPASSES); absolute-loss vs the private-repo PRODUCTION baseline is Cat-C and private-repo-only (PIVOT).",
+  "unblock_step": "The \u00a74 RELATIVE verdict arc is COMPLETE (both legs citable faithful evidence-intact TIES) and the verdict run already fired on public Dolly \u2014 no re-fire is needed (it reproduces TIES). The sole remaining axis is ABSOLUTE-LOSS comparability vs the private-repo baseline, which needs the private src.data quality filter: src.data is deliberately stripped from this public mirror (see the note in scripts/prepare_data.py and the interface-without-implementation in tests/test_filter_dataset.py + tests/test_dedup.py). Execute PIVOT in the private repo (/home/jinno/tg-lora): port/refresh src/data/filter_dataset.py quality filtering \u2192 re-fire the same corpus \u2192 form_freeze_validloss_deposit + freeze-replay \u2192 deposit here. Do NOT half-port src.data into this mirror (it breaks the deliberate boundary and cannot run without the full private pipeline + corpus). NOTE: the recover.py `--rerun` / train_tg_lora corrective-re-run path is a SEPARATE, src.data-blocked path \u2014 that block does not apply to the verdict worker."
 }

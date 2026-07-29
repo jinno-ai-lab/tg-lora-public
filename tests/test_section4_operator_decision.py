@@ -24,6 +24,7 @@ import pytest
 
 from src.tg_lora.freeze_surrogate_gate import SURPASSES, TIES
 
+from scripts.replay_freeze_validloss_ci import replay_samples
 from scripts.section4_operator_decision import (
     EXIT_AWAITING_DECISION,
     EXIT_LAND_INVALID,
@@ -275,6 +276,101 @@ class TestArcIncompleteMutations:
         snap = assess_section4_decision(repo_root=str(tmp_path))
         assert snap["arc_complete"] is False
         assert all(not leg["present"] for leg in snap["legs"])
+
+
+class TestEvidenceHashIntegrityGatesArc:
+    """Evidence-byte integrity — the sibling of ``faithful`` that gates
+    ``arc_complete`` (and thus the SHIP recommendation).
+
+    ``faithful`` proves the stored verdict label is the one the stored floats
+    earn under the bootstrap. It CANNOT catch a *coordinated repaint*: edit the
+    evidence floats AND the verdict label together (so ``rederived == recorded``
+    still holds), or any accidental evidence-byte drift, and every DERIVED check
+    — ``faithful`` included — stays green. The ``evidence_hash`` stamp (frozen
+    over the raw-measurement + run-config keys by the shared
+    ``freeze_evidence_hash`` leaf — the single source the producer stamps and the
+    replay cross-checks via ``_evidence_hash_stale``) is the one check that
+    reaches the evidence BYTES. The §4 operator-decision surface is the
+    operator-facing chokepoint for the SHIP call, so it must verify that binding
+    too — not leave it to the replay gate alone — or it could recommend SHIP on
+    evidence whose committed bytes no longer match their integrity stamp. This
+    closes the scientific-honesty hole on the very surface feedback bullet 3
+    re-points the iteration at (the ship/accept-null/pivot decision's evidentiary
+    basis): not chunker (phantom), not re-measurement, not docs churn.
+    """
+
+    def test_committed_deposits_are_evidence_intact(self):
+        # Pinned (not fabricated): both committed §4 legs carry an evidence_hash
+        # matching the hash re-derived from their own bytes — the happy path is
+        # unchanged (SHIP stays SHIP; the gate merely adds a passing conjunct).
+        snap = assess_section4_decision()
+        assert snap["arc_complete"] is True
+        assert snap["recommendation"] == "SHIP"
+        for leg in snap["legs"]:
+            assert leg["evidence_hash_stale"] is False
+
+    def test_coordinated_repaint_breaks_arc_despite_faithful(self, tmp_path):
+        # THE hole-closure test. Drift an evidence byte (first candidate loss)
+        # AND re-stamp the verdict to what the drifted floats now earn, so
+        # `faithful` (rederived == recorded) still passes — the exact attack
+        # `faithful` is blind to. Only the evidence_hash stamp catches it.
+        homo = _real_deposit(HOMOGENEOUS_DEPOSIT)
+        homo["candidate_losses"][0] = homo["candidate_losses"][0] + 0.001
+        # coordinated repaint: re-stamp the verdict to match the drifted floats
+        homo["verdict"] = replay_samples(homo).significance_verdict
+        _write_deposits(tmp_path, homo=homo)
+        snap = assess_section4_decision(repo_root=str(tmp_path))
+        labels = {leg["label"]: leg for leg in snap["legs"]}
+        assert labels["homogeneous"]["faithful"] is True  # repaint defeated `faithful`
+        assert labels["homogeneous"]["evidence_hash_stale"] is True  # ...not the hash
+        # the new `not evidence_hash_stale` conjunct kills the arc → no SHIP on
+        # tampered evidence.
+        # mutation guard: drop that conjunct from arc_complete and arc_complete
+        # would be True (faithful + TIES) — this assertion flips the load-bearing
+        # RED back to a silent GREEN, so it pins the conjunct is present.
+        assert snap["arc_complete"] is False
+        assert snap["recommendation"] != "SHIP"
+
+    def test_byte_drift_without_repaint_also_flags_stale(self, tmp_path):
+        # Accidental drift in any evidence field (here the surrogate losses) — no
+        # verdict repaint — still surfaces evidence_hash_stale and breaks the arc.
+        homo = _real_deposit(HOMOGENEOUS_DEPOSIT)
+        homo["surrogate_losses"][0] = homo["surrogate_losses"][0] + 0.01
+        _write_deposits(tmp_path, homo=homo)
+        snap = assess_section4_decision(repo_root=str(tmp_path))
+        labels = {leg["label"]: leg for leg in snap["legs"]}
+        assert labels["homogeneous"]["evidence_hash_stale"] is True
+        assert snap["arc_complete"] is False
+
+    def test_no_stamp_is_not_stale_skip_discipline(self, tmp_path):
+        # Backward compat / artifact-when-present-else-skip: a deposit carrying
+        # NO evidence_hash (a legacy / proxy / synthetic recording) is NOT stale,
+        # mirroring replay's `_evidence_hash_stale` + the ledger gate — it must
+        # not break the arc when the deposit is otherwise complete.
+        homo = _real_deposit(HOMOGENEOUS_DEPOSIT)
+        hetero = _real_deposit(HETEROGENEOUS_DEPOSIT)
+        del homo["evidence_hash"]
+        del hetero["evidence_hash"]
+        _write_deposits(tmp_path, homo=homo, hetero=hetero)
+        snap = assess_section4_decision(repo_root=str(tmp_path))
+        for leg in snap["legs"]:
+            assert leg["evidence_hash_stale"] is False
+        assert snap["arc_complete"] is True  # no stamp → not stale → arc intact
+
+    def test_derived_label_drift_does_not_touch_the_hash(self, tmp_path):
+        # The hash freezes EVIDENCE bytes, never the derived verdict/gate/regime
+        # labels (hashing those would make the integrity check circular). Editing
+        # only a derived label flips `faithful` but leaves evidence_hash_stale
+        # False — proving the two predicates are independent, complementary axes.
+        homo = _real_deposit(HOMOGENEOUS_DEPOSIT)
+        homo["verdict"] = SURPASSES  # derived label only; bytes untouched
+        _write_deposits(tmp_path, homo=homo)
+        snap = assess_section4_decision(repo_root=str(tmp_path))
+        labels = {leg["label"]: leg for leg in snap["legs"]}
+        assert labels["homogeneous"]["faithful"] is False
+        assert labels["homogeneous"]["evidence_hash_stale"] is False
+        # arc still breaks — via faithful, the complementary axis
+        assert snap["arc_complete"] is False
 
 
 class TestQualityPreservationAxis:
@@ -764,6 +860,7 @@ class TestSnapshotFixtureIntegrity:
                 "rederived_verdict",
                 "citable_as_full_section4_verdict",
                 "faithful",
+                "evidence_hash_stale",
                 "baseline_present",
                 "baseline_verdict",
                 "proxy_scale",
@@ -804,6 +901,7 @@ class TestSnapshotFixtureIntegrity:
             "rederived_verdict",
             "citable_as_full_section4_verdict",
             "faithful",
+            "evidence_hash_stale",
             "baseline_present",
             "baseline_verdict",
             "proxy_scale",
