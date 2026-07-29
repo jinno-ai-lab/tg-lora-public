@@ -37,6 +37,12 @@ _PRIVATE_INREPO_MODULES = ("src.data",)
 # imports (e.g. ``src.utils.io``) then fail in the split namespace — the root
 # cause is the absent private pipeline, not the downstream module name.
 _PRIVATE_PIPELINE_ORIGIN = re.compile(r"\bsrc\.data\.\w+|src/data/\w+\.py")
+# A module-load failure is the only non-zero-exit shape the IMPORT_ONLY arm treats
+# as a bootstrap signal: ``ModuleNotFoundError`` / ``ImportError`` / ``SyntaxError``
+# raised while importing the script. Any other non-zero exit (the script's own
+# ``Usage:`` exit on a missing argument, an argparse error, a runtime exception in
+# ``main``) means the top-level imports already resolved — a pass, not a defect.
+_MODULE_LOAD_FAILURE = re.compile(r"ModuleNotFoundError|ImportError|SyntaxError")
 
 
 def _classify_cli_help_failure(stderr: str) -> str:
@@ -179,23 +185,47 @@ class TestCLIHelpSmoke:
         )
 
     def test_import_only(self, import_script_path):
-        """Non-argparse script can be imported without errors."""
+        """Non-argparse (raw ``sys.argv``) script: its top-level imports must
+        resolve when invoked the way users invoke it.
+
+        A bare ``python scripts/X.py`` puts the script's own directory — NOT the
+        repo root — on ``sys.path``, so an in-repo ``scripts.*`` / ``src.*``
+        import that resolves only via a repo-root bootstrap breaks at import
+        time. The previous check used ``importlib.util.spec_from_file_location``
+        under ``python -c``: that builds a spec WITHOUT executing the module, and
+        ``python -c`` additionally puts the CWD on ``sys.path`` — so a script
+        broken under real invocation passed here silently (it never reached the
+        classifier, which is why ``analyze_accel_sweep.py`` shipped broken).
+        Run the script as a real subprocess instead and route any module-load
+        failure through :func:`_classify_cli_help_failure`, so a genuine bootstrap
+        defect fails loud rather than silently passing.
+
+        A non-zero exit that is NOT a module-load failure (the script's own
+        ``Usage:`` exit with no argument) means the imports resolved → pass.
+        """
         r = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import importlib.util; "
-                    f"importlib.util.spec_from_file_location('m', '{import_script_path}')"
-                ),
-            ],
+            [sys.executable, import_script_path],
             capture_output=True,
             check=False,
             text=True,
-            timeout=10,
+            timeout=15,
             cwd=str(ROOT),
         )
-        assert r.returncode == 0, f"Import check failed for {import_script_path}: {r.stderr}"
+        if r.returncode == 0:
+            return
+        if not _MODULE_LOAD_FAILURE.search(r.stderr):
+            # Imports resolved; the script exited non-zero for its own reasons
+            # (missing argument, usage message, ...) — not a bootstrap defect.
+            return
+        cause = _classify_cli_help_failure(r.stderr)
+        if cause == "known_unavailable":
+            pytest.xfail(
+                f"{import_script_path} blocked by an unavailable dependency/"
+                f"private module — not a bootstrap regression"
+            )
+        pytest.fail(
+            f"{import_script_path} BOOTSTRAP DEFECT (classified={cause}):\n{r.stderr[:500]}"
+        )
 
 
 class TestClassifyCliHelpFailure:

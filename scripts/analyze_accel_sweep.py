@@ -18,6 +18,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# Allow running as a standalone CLI (``python scripts/analyze_accel_sweep.py``): a bare
+# script invocation puts ``scripts/`` — not the repo root — on sys.path, so the
+# in-repo ``scripts.*`` / ``src.*`` imports below fail with ``ModuleNotFoundError``
+# unless the repo root is made importable first. Mirrors benchmark_prefix_cache.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from scripts.compare_runs import find_best_run, gather_runs
 
 
