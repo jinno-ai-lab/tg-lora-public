@@ -58,7 +58,11 @@ ANY_OPENER_RE = re.compile(r">\s*\*\*【")
 
 # Frozen baseline: number of 追記 addendum openers in the 次の一手 section as of
 # the 2026-07-28 freeze (TASK-0227). Bump ONLY for a genuine new milestone.
-FROZEN_NEXT_STEPS_ADDENDUM_COUNT = 97
+#
+# 2026-07-29 bump 97→98: 追記(28) records the operator landing SHIP — the
+# decision the freeze (and feedback bullet 3) explicitly awaited. This is the
+# sanctioned escape valve (a state transition, not pending-state re-description).
+FROZEN_NEXT_STEPS_ADDENDUM_COUNT = 98
 
 
 def _next_steps_section() -> str:

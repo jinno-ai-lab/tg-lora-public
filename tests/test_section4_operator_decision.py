@@ -541,23 +541,24 @@ class TestUnblockStepAndArchitecturalInvariant:
 
 class TestCLI:
     def test_json_snapshot(self, capsys):
-        # real repo: arc complete, no decision landed yet → BLOCKING (exit 3). The
-        # snapshot is still emitted, with arc_complete / recommendation intact and
-        # the awaiting-decision state surfaced for machine consumers.
+        # real repo: arc complete + LANDED (ship) → exit 0. The snapshot is
+        # still emitted with arc_complete / recommendation intact and the
+        # landed decision surfaced for machine consumers.
         rc = main(["--json"])
         out = capsys.readouterr().out
         snap = json.loads(out)
-        assert rc == EXIT_AWAITING_DECISION
+        assert rc == 0
         assert snap["arc_complete"] is True
         assert snap["recommendation"] == "SHIP"
-        assert snap["awaiting_operator_decision"] is True
-        assert snap["landed_decision"] is None
+        assert snap["awaiting_operator_decision"] is False
+        assert snap["landed_decision"]["branch"] == "ship"
 
     def test_exit_code_tracks_arc(self, tmp_path):
-        # arc complete + UN-LANDED (real repo) → BLOCKING (exit 3); arc incomplete
-        # (empty root) → exit 2. Landing a decision flips 3 → 0
-        # (see TestLandedDecision).
-        assert main([]) == EXIT_AWAITING_DECISION
+        # arc complete + LANDED (real repo) → exit 0; arc incomplete (empty
+        # root) → exit 2. The un-landed exit-3 case is covered by
+        # TestLandedDecision (synthetic un-landed repo) and
+        # test_human_readable_mentions_all_three_branches (tmp_path).
+        assert main([]) == 0
         assert main(["--repo-root", str(tmp_path)]) == 2
 
     def test_help_launches_as_module(self):
@@ -574,8 +575,13 @@ class TestCLI:
         assert "ship" in proc.stdout
         assert "pivot" in proc.stdout
 
-    def test_human_readable_mentions_all_three_branches(self, capsys):
-        main([])
+    def test_human_readable_mentions_all_three_branches(self, tmp_path, capsys):
+        # the blocking (un-landed) human-readable output names all three
+        # branches, the SHIP recommendation, and the exact --land command.
+        # Tested against a synthetic un-landed repo so it holds regardless of
+        # the real checkout's (now LANDED) landing state.
+        _write_deposits(tmp_path)
+        main(["--repo-root", str(tmp_path)])
         out = capsys.readouterr().out
         for branch in ("ship", "accept_null", "pivot"):
             assert branch in out
@@ -775,12 +781,13 @@ class TestSnapshotFixtureIntegrity:
             cwd=str(REPO_ROOT),
             timeout=60,
         )
-        # On the real checkout the surface is AWAITING_DECISION (exit 3); a
-        # different exit code means the fixture is stale relative to the
-        # surface contract (e.g., the operator landed a call, or the arc
-        # regressed). Either way the snapshot integrity claim is broken.
-        assert proc.returncode == EXIT_AWAITING_DECISION, (
-            f"surface should be AWAITING_DECISION (exit 3) on the real checkout; "
+        # On the real checkout the §4 call is LANDED (exit 0 — the operator
+        # landed `ship`); a different exit code means the fixture is stale
+        # relative to the surface contract (e.g., the call was re-landed to
+        # another branch, the record was removed, or the arc regressed).
+        # Either way the snapshot integrity claim is broken.
+        assert proc.returncode == 0, (
+            f"surface should be LANDED (exit 0) on the real checkout; "
             f"got returncode={proc.returncode}, stderr={proc.stderr!r}"
         )
         return json.loads(proc.stdout)
@@ -795,9 +802,12 @@ class TestSnapshotFixtureIntegrity:
         payload = json.loads(fixture_path.read_text())
         # A committed snapshot of an UNCOMPLETE arc would be incoherent —
         # a refactor that flips arc_complete without bumping the fixture
-        # name is suspicious.
+        # name is suspicious. The real checkout's call is LANDED `ship`, so
+        # the snapshot must carry that landed decision (not the pre-landing
+        # None).
         assert payload["arc_complete"] is True
-        assert payload["landed_decision"] is None
+        assert payload["landed_decision"] is not None
+        assert payload["landed_decision"]["branch"] == "ship"
 
     def test_top_level_predicates_match_fixture(
         self, fixture_payload: dict, live_payload: dict
