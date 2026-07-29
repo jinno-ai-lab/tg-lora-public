@@ -62,18 +62,64 @@ def extract_json(text: str) -> tuple[dict | None, bool]:
     except json.JSONDecodeError:
         pass
 
-    # Lenient: extract first {...} block (strip markdown fences, prose)
-    fenced = re.sub(r"```(?:json)?\s*", "", stripped)
-    fence_cleaned = fenced.replace("```", "")
-    match = re.search(r"\{.*\}", fence_cleaned, re.DOTALL)
-    if match:
-        try:
-            obj = json.loads(match.group(0))
-            if isinstance(obj, dict):
-                return obj, False
-        except json.JSONDecodeError:
-            pass
+    # Lenient: extract first balanced {...} block (strip markdown fences, prose).
+    obj = _first_json_object(_strip_markdown_fences(stripped))
+    if obj is not None:
+        return obj, False
     return None, False
+
+
+def _strip_markdown_fences(text: str) -> str:
+    """Remove ``` / ```json fences so a fenced object parses as bare JSON."""
+    fenced = re.sub(r"```(?:json)?\s*", "", text)
+    return fenced.replace("```", "")
+
+
+def _first_json_object(text: str) -> dict | None:
+    """Return the first balanced ``{...}`` substring that parses to a dict.
+
+    Scans left-to-right tracking brace depth (ignoring braces inside JSON
+    string literals) and tries ``json.loads`` on each depth-0-to-0 span,
+    returning the first that yields a dict. This replaces a greedy
+    ``\\{.*\\}`` regex that spanned from the first ``{`` to the *last* ``}`` in
+    the text — so a perfect JSON object followed by explanatory prose that
+    contained a ``}`` (a common model output: JSON + a one-line note) was
+    over-captured, failed to parse, and scored ``valid=0`` on the headline
+    quality metric. Balanced scanning also tolerates braces inside string
+    values and nested objects.
+    """
+    depth = 0
+    start: int | None = None
+    in_str = False
+    escape = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0 and start is not None:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[start : i + 1])
+                    except json.JSONDecodeError:
+                        start = None
+                        continue
+                    if isinstance(obj, dict):
+                        return obj
+                    start = None
+    return None
 
 
 def _field_match(pred: Any, gold: Any) -> bool:
