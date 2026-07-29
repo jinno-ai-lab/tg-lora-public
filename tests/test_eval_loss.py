@@ -285,6 +285,66 @@ def test_eval_loss_detailed_skips_all_masked_batches():
     assert abs(mixed.avg_loss - valid.avg_loss) < 1e-6
 
 
+# ---- per-EXAMPLE weighting (vs the per-BATCH average) ----
+
+
+def test_eval_loss_weights_by_examples_not_batches(monkeypatch):
+    """eval_loss returns a per-EXAMPLE weighted average, not a per-BATCH average.
+
+    On EQUAL-sized batches the two coincide, so the existing exact-value test
+    (n=4 -> batches [2,2]) cannot tell them apart. Production eval loaders
+    routinely end in a PARTIAL last batch, where per-batch averaging would
+    over-weight that short batch and mis-state the headline metric. Here the
+    per-batch loss is forced to equal its batch size, so on the UNEQUAL loader
+    n=5 (batches [2,2,1]) the per-example and per-batch references are exact,
+    deterministic and provably distinct:
+      per-example = (2*2 + 2*2 + 1*1) / (2+2+1) = 9/5 = 1.8
+      per-batch   = (2 + 2 + 1) / 3            = 5/3 ~= 1.667
+    """
+    import src.eval.eval_loss as el
+
+    def _loss_equals_batch_size(model, batch):
+        return torch.tensor(float(el._infer_batch_size(batch)))
+
+    monkeypatch.setattr(el, "_compute_batch_loss", _loss_equals_batch_size)
+
+    # n=5, batch_size=2 -> batches of sizes [2, 2, 1] (partial last batch)
+    loader = DataLoader(_DictDataset(n=5), batch_size=2)
+    got = eval_loss(_TinyModel(), loader, device="cpu")
+
+    per_example = (2 * 2 + 2 * 2 + 1 * 1) / 5  # 1.8
+    per_batch = (2 + 2 + 1) / 3  # 1.6667
+
+    assert got == pytest.approx(per_example, abs=1e-9)
+    # Must NOT collapse to the per-batch average -> the test genuinely
+    # distinguishes the two weightings (guards against a refactor that drops
+    # the per-example `* batch_examples` / `/ total_examples`).
+    assert got != pytest.approx(per_batch, abs=1e-3)
+
+
+def test_eval_loss_detailed_weights_by_examples_not_batches(monkeypatch):
+    """eval_loss_detailed.avg_loss is the same per-EXAMPLE weighting."""
+    import src.eval.eval_loss as el
+
+    def _loss_equals_batch_size(model, batch):
+        return torch.tensor(float(el._infer_batch_size(batch)))
+
+    monkeypatch.setattr(el, "_compute_batch_loss", _loss_equals_batch_size)
+
+    loader = DataLoader(_DictDataset(n=5), batch_size=2)
+    result = eval_loss_detailed(_TinyModel(), loader, device="cpu")
+
+    per_example = (2 * 2 + 2 * 2 + 1 * 1) / 5  # 1.8
+    per_batch = (2 + 2 + 1) / 3  # 1.6667
+
+    assert result.avg_loss == pytest.approx(per_example, abs=1e-9)
+    assert result.avg_loss != pytest.approx(per_batch, abs=1e-3)
+    assert result.num_batches == 3
+    # min/max are taken over the per-batch losses [2.0, 2.0, 1.0]
+    assert result.min_loss == pytest.approx(1.0)
+    assert result.max_loss == pytest.approx(2.0)
+
+
 def test_eval_loss_result_repr():
     r = EvalLossResult(avg_loss=2.5, num_batches=10, min_loss=1.0, max_loss=4.0)
     s = repr(r)
