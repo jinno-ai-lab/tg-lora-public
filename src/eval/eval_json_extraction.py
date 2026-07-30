@@ -49,8 +49,16 @@ def extract_json(text: str) -> tuple[dict | None, bool]:
     the model produced clean JSON with no surrounding prose.
     """
     stripped = text.strip()
-    # Remove trailing assistant token if present
-    for tok in ("<|im_end|>", "</s>", "<|eot_id|>"):
+    # Remove a trailing EOS / stop token if present. This set mirrors the
+    # generation layer's stop-token superset (jsonex_generation._STOP_TOKENS /
+    # json_generation._END_TOKENS) so the *strict* contract holds regardless of
+    # which runner (or no runner) feeds the scorer: a clean JSON object plus one
+    # tokenizer EOS artifact is still a strict whole-text parse. ``<|endoftext|>``
+    # is the primary EOS of the experiment's Qwen base model — omitting it left
+    # the token as trailing "Extra data", demoting a clean generation to the
+    # lenient path and mis-scoring ``strict_valid`` (the headline "clean output"
+    # metric) to 0.
+    for tok in ("<|im_end|>", "<|endoftext|>", "</s>", "<|eot_id|>"):
         if stripped.endswith(tok):
             stripped = stripped[: -len(tok)].strip()
 

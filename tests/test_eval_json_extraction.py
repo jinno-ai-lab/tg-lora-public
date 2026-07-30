@@ -72,9 +72,20 @@ class TestExtractJson:
         assert was_strict is False
 
     def test_trailing_assistant_token_is_stripped(self):
-        for tok in ("<|im_end|>", "</s>", "<|eot_id|>"):
-            obj, _ = extract_json(_PERFECT_MEETING_JSON + tok)
-            assert obj == GOLD_MEETING, f"token {tok!r} broke strict parse"
+        # A lone trailing EOS / stop token is a tokenizer artifact, not
+        # surrounding prose: a clean JSON object + one EOS token must still
+        # score as a STRICT whole-text parse (strict_valid=1). The strip set
+        # here must mirror the generation layer's stop-token *superset*
+        # (``jsonex_generation._STOP_TOKENS``): the experiment's base model
+        # (``Qwen/Qwen3.5-9B``) emits ``<|endoftext|>`` as its primary EOS, and a
+        # scorer that recognizes ``<|im_end|>`` but not ``<|endoftext|>`` leaves
+        # the token as trailing "Extra data", demoting an otherwise-clean
+        # generation to the lenient path — a false-negative on the headline
+        # ``strict_valid`` metric.
+        for tok in ("<|im_end|>", "<|endoftext|>", "</s>", "<|eot_id|>"):
+            obj, was_strict = extract_json(_PERFECT_MEETING_JSON + tok)
+            assert obj == GOLD_MEETING, f"token {tok!r} broke the parse"
+            assert was_strict is True, f"token {tok!r} must not cost strict_valid"
 
     def test_no_json_returns_none(self):
         assert extract_json("会議の情報です。構造化出力なし。")[0] is None
