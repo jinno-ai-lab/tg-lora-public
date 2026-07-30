@@ -211,6 +211,48 @@ _PERFECT_KEYS = ("valid", "strict_valid", "type_correct", "field_f1",
                  "exact_match", "computed_accuracy", "combined")
 
 
+def _device_spy_tokenizer() -> tuple[_CharTokenizer, dict]:
+    """A ``_CharTokenizer`` whose batch encoding records the device fed to ``.to()``.
+
+    Used to mutation-proof the ``device=None`` auto-detect branches — both
+    wrappers read the device off ``model.parameters()`` when the caller omits
+    ``device``. The spy records the device handed to ``.to()``; if the
+    auto-detect line is removed, ``device`` stays ``None`` and the recorded
+    value diverges from the model's parameter device, failing the test.
+    """
+    seen: dict[str, object] = {}
+
+    class _SpyOutput(_TokenizedOutput):
+        def to(self, device):  # noqa: ANN001 - record + passthrough
+            seen["device"] = device
+            return self
+
+    class _SpyTokenizer(_CharTokenizer):
+        def __call__(self, *args, **kwargs):
+            base = super().__call__(*args, **kwargs)
+            return _SpyOutput(input_ids=base["input_ids"],
+                              attention_mask=base["attention_mask"])
+
+    return _SpyTokenizer(), seen
+
+
+def _echo_generate_model() -> _MockModel:
+    """A ``_MockModel`` whose ``generate`` echoes ``input_ids`` + one column.
+
+    Drives the generation → new-token slicing → decode path without a gold
+    lookup, so the device-auto-detect tests assert ONLY the device (not a
+    score) — isolating the branch under test.
+    """
+    model = _MockModel()
+
+    def _echo(**kwargs):
+        ids = kwargs["input_ids"]
+        return torch.cat([ids, ids[:, :1]], dim=1)
+
+    model.generate = _echo
+    return model
+
+
 # --------------------------------------------------------------------------- #
 # End-to-end: gold-emitting model scores perfectly through both wrappers.     #
 # --------------------------------------------------------------------------- #
@@ -337,3 +379,74 @@ class TestStateRestoration:
         model.train()
         generate_json_completions(model, tok, records, device="cpu")
         assert model.training is True
+
+
+# --------------------------------------------------------------------------- #
+# device=None auto-detect: read the device off model.parameters().            #
+# --------------------------------------------------------------------------- #
+
+
+class TestDeviceAutoDetect:
+    """``device=None`` must auto-detect from ``model.parameters()``.
+
+    Both wrappers accept an omitted ``device``; the auto-detect line feeds the
+    model's parameter device to the tokenized batch's ``.to()``. Mutation-proven
+    with a device-spy tokenizer: removing the auto-detect leaves ``device=None``
+    and the recorded device no longer matches the model's parameter device, so
+    these would catch a silent drop of the caller-omitted-device contract.
+    """
+
+    def test_batched_auto_detects_device_from_model_parameters(self):
+        records = _sample_records()[:2]
+        model = _echo_generate_model()
+        tok, seen = _device_spy_tokenizer()
+        expected = next(model.parameters()).device
+        generate_predictions(model, tok, records, batch_size=2, device=None)
+        assert seen.get("device") == expected, (
+            f"device=None should auto-detect to the model's parameter device "
+            f"{expected}, got {seen.get('device')!r}"
+        )
+
+    def test_per_record_auto_detects_device_from_model_parameters(self):
+        records = _sample_records()[:2]
+        model = _echo_generate_model()
+        tok, seen = _device_spy_tokenizer()
+        expected = next(model.parameters()).device
+        generate_json_completions(model, tok, records, device=None)
+        assert seen.get("device") == expected, (
+            f"device=None should auto-detect to the model's parameter device "
+            f"{expected}, got {seen.get('device')!r}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Remaining uncovered branches in the per-record wrapper.                     #
+# --------------------------------------------------------------------------- #
+
+
+class TestPromptFallbackAndMaxExamples:
+    def test_build_prompt_prefix_passthrough_without_assistant_marker(self):
+        # build_prompt_prefix returns the text unchanged when it carries NO
+        # assistant marker (the no-marker fallback) — e.g. a raw record the
+        # probe could receive before ChatML shaping. Mutation-proven: dropping
+        # the fallback returns None here instead of the input text.
+        assert build_prompt_prefix({}) == ""
+        assert build_prompt_prefix({"text": "raw text without the marker"}) == "raw text without the marker"
+        # And the marker path still reconstructs the assistant header (parity).
+        prefix = build_prompt_prefix(_sample_records()[0])
+        assert prefix.endswith("<|im_start|>assistant\n")
+
+    def test_per_record_max_examples_truncates_record_count(self):
+        # max_examples caps how many records are generated/scored; the surplus
+        # records are never processed. Mutation-proven: dropping the truncation
+        # returns all 4 predictions instead of 2.
+        records = _sample_records()  # 4 records
+        model, tok = _gold_emit_model(records)
+        preds, golds = generate_json_completions(
+            model, tok, records, max_examples=2, device="cpu"
+        )
+        assert len(preds) == 2
+        assert len(golds) == 2
+        scores = score_json_extraction(preds, golds)
+        for key in _PERFECT_KEYS:
+            assert scores[key] == 1.0, f"truncated gold-emitting run {key}={scores[key]}"

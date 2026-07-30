@@ -141,7 +141,7 @@ def format_score_summary(scores: dict[str, Any], *, ndigits: int = 3) -> str:
     return json.dumps(summary, ensure_ascii=False)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover -- CLI smoke, exercised by `python -m`, not pytest
     # Quick smoke: score the test set with whatever model is given via env, else
     # just validate the gold self-consistency path (no model needed).
     import os
