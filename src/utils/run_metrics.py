@@ -71,9 +71,20 @@ def _read_existing_provenance(
             first = rf.readline()
             if first:
                 try:
-                    run_id = orjson.loads(first).get("run_id")
+                    header = orjson.loads(first)
                 except (ValueError, OSError):
-                    run_id = None
+                    header = None
+                # A line that is valid JSON but NOT a dict (a bare array/scalar/
+                # string — a corrupt or hand-edited metrics file) parses fine yet
+                # has no ``.get``: that raises ``AttributeError``, which neither
+                # the inner ``(ValueError, OSError)`` nor the outer ``(OSError)``
+                # catches, escaping the function and crashing resume at
+                # construction — the opposite of this reader's "degrade
+                # gracefully ... instead of crashing" contract. Guard the dict
+                # access (same non-dict-after-json.loads shape guard as
+                # eval_format's scoring path, 1d6e7d4): any non-dict first line
+                # degrades to ``run_id=None``.
+                run_id = header.get("run_id") if isinstance(header, dict) else None
             rf.seek(0, 2)
             size = rf.tell()
             rf.seek(max(0, size - 4096))
@@ -83,6 +94,12 @@ def _read_existing_provenance(
                 try:
                     rec = orjson.loads(line)
                 except (ValueError, OSError):
+                    continue
+                # Same guard as the first-line read above: the last record may be
+                # valid JSON but a non-dict (array/scalar/string), whose ``.get``
+                # would raise an uncaught ``AttributeError`` and crash resume.
+                # Skip it and keep scanning upward for a real step/footer record.
+                if not isinstance(rec, dict):
                     continue
                 last_elapsed = rec.get("elapsed_seconds")
                 last_peak = rec.get("gpu_peak_mb")

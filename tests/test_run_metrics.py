@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from src.eval.eval_loss import EvalLossResult, eval_loss_detailed
-from src.utils.run_metrics import RunMetrics
+from src.utils.run_metrics import RunMetrics, _read_existing_provenance
 
 
 class FakeCfg:
@@ -814,4 +814,113 @@ class TestAppendModeResumeContinuity:
         # GLOBAL peak wins: the resumed 800 did NOT overwrite the carried 1500.
         # Without carry-forward the footer would report 800 (segment-local).
         assert footer["gpu_peak_mb"] == 1500.0
+
+    def test_append_resume_survives_non_dict_line(self, tmp_path):
+        """A ``run_metrics.jsonl`` whose first line is valid JSON but NOT a dict
+        (a corrupt / externally-edited header) must NOT crash resume.
+
+        ``_read_existing_provenance`` is the one call site at ``append=True``
+        construction; before the isinstance guard it raised an uncaught
+        ``AttributeError`` (``.get`` on a parsed list/int/str) that escaped the
+        ``(ValueError, OSError)`` handlers and took down the whole
+        ``RunMetrics`` construction — the opposite of the resume-continuity this
+        class pins. The reader now degrades ``run_id`` to ``None`` so the
+        appended segment falls back to a fresh run_id and keeps writing,
+        preserving the pre-resume file (no truncation).
+        """
+        (tmp_path / "run_metrics.jsonl").write_bytes(
+            b'[1, 2, 3]\n'  # corrupt, non-dict first line (valid JSON, a list)
+            b'{"type":"step","step":1,"elapsed_seconds":5.0,"gpu_peak_mb":100.0,"run_id":"old"}\n'
+        )
+        m2 = RunMetrics(tmp_path, mode="baseline", append=True)  # must not raise
+        # Non-dict header carried no readable run_id → fresh auto run_id.
+        assert m2.run_id.startswith("baseline_")
+        assert m2.run_id != "old"
+        m2.record_step(step=2, loss_train=2.5, total_backward_passes=2)
+        m2.close()
+
+        records = self._records(tmp_path)
+        # Pre-resume lines preserved (NOT truncated) + 1 appended segment record.
+        assert len(records) == 3
+        assert records[-1]["step"] == 2  # appended segment landed
+
+
+# --- non-dict JSON line in the provenance reader (sibling of 1d6e7d4) ---
+
+
+class TestReadExistingProvenanceNonDictLines:
+    """``_read_existing_provenance`` must degrade gracefully when a metrics line
+    is valid JSON but NOT a dict — a bare array/scalar/string from a corrupt or
+    hand-edited ``run_metrics.jsonl``.
+
+    This is the on-disk analog of the eval-format scoring defect fixed in
+    ``1d6e7d4`` (same shape: ``json.loads`` succeeds but yields a non-dict, then a
+    dict-only ``.get`` raises ``AttributeError``). The reader's whole purpose —
+    called once at ``append=True`` construction — is to carry forward ``run_id``
+    / wall-clock / gpu-peak "instead of crashing at construction," so a single
+    non-dict line must NOT take down resume. The bug: both ``.get`` sites sat
+    under ``except (ValueError, OSError)``, which does not catch
+    ``AttributeError``, so the exception escaped the function.
+    """
+
+    @staticmethod
+    def _write(tmp_path, raw: bytes):
+        path = tmp_path / "run_metrics.jsonl"
+        path.write_bytes(raw)
+        return path
+
+    def test_non_dict_first_line_degrades_run_id_not_crash(self, tmp_path):
+        # First line is a bare JSON ARRAY (valid JSON, not a dict); the trailing
+        # step record is well-formed. The reader must return run_id=None (the
+        # array carries no "run_id") AND still surface the valid last record's
+        # elapsed/peak — not crash with ``'list' object has no attribute 'get'``.
+        path = self._write(
+            tmp_path,
+            b'[1, 2, 3]\n'
+            b'{"type":"step","elapsed_seconds":5.0,"gpu_peak_mb":100.0}\n',
+        )
+        run_id, last_elapsed, last_peak = _read_existing_provenance(path)
+        assert run_id is None          # non-dict header → no readable run_id
+        assert last_elapsed == 5.0     # valid last record still read
+        assert last_peak == 100.0
+
+    def test_non_dict_last_line_degrades_tail_fields_not_crash(self, tmp_path):
+        # A well-formed header, but the LAST non-empty line is a bare JSON scalar
+        # (42). The reader must return the header's run_id and degrade the
+        # tail-only elapsed/peak to None — not crash with
+        # ``'int' object has no attribute 'get'``.
+        path = self._write(
+            tmp_path,
+            b'{"type":"run_header","run_id":"run-X"}\n42\n',
+        )
+        run_id, last_elapsed, last_peak = _read_existing_provenance(path)
+        assert run_id == "run-X"       # valid header still read
+        assert last_elapsed is None    # non-dict tail → no readable fields
+        assert last_peak is None
+
+    def test_non_dict_tail_recovers_to_prior_valid_record(self, tmp_path):
+        # When the very last line is a non-dict, the reader must skip it and keep
+        # scanning UPWARD for the most recent valid step/footer record — not give
+        # up (returning None tail fields while a valid record sits above) and not
+        # crash.
+        path = self._write(
+            tmp_path,
+            b'{"type":"run_header","run_id":"R"}\n'
+            b'{"type":"step","elapsed_seconds":7.0,"gpu_peak_mb":80.0}\n'
+            b'"orphan"\n',  # non-dict last line → skipped, prior step read instead
+        )
+        run_id, last_elapsed, last_peak = _read_existing_provenance(path)
+        assert run_id == "R"
+        assert last_elapsed == 7.0
+        assert last_peak == 80.0
+
+    def test_valid_dict_lines_still_read_correctly(self, tmp_path):
+        # Regression guard: the isinstance guards must not change behavior for
+        # the normal, all-dict metrics file every real run produces.
+        path = self._write(
+            tmp_path,
+            b'{"type":"run_header","run_id":"ok"}\n'
+            b'{"type":"step","elapsed_seconds":9.0,"gpu_peak_mb":250.0}\n',
+        )
+        assert _read_existing_provenance(path) == ("ok", 9.0, 250.0)
 
