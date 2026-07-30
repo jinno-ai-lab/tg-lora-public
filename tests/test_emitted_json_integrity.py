@@ -614,3 +614,207 @@ class TestJsonEmitterSurfaceIsGuarded:
             assert (ROOT / script).exists(), (
                 f"guarded-emitter map references missing script: {script}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Inventory (layer 4): record EVERY json/orjson serializer call site as a test
+# ---------------------------------------------------------------------------
+
+# The make-run feedback asked the standing audit claim — "every JSON emitter
+# uses json.dumps/orjson.dumps; zero hand-built" — to rest on a *recorded,
+# reproducible grep* rather than prose (comment-only corrections bounce in
+# review). Layer 3 forbids hand-built JSON *assembly*; this layer records the
+# OTHER half — the complete set of files that serialize JSON through the legit
+# serializers — so the claim's two halves are BOTH CI-enforced:
+#
+#   * zero hand-built     -> TestNoHandBuiltJsonStringAssembly (layer 3, BAN)
+#   * all-via-serializer  -> the inventory below          (layer 4, RECORDED)
+#
+# A brand-new JSON emitter is therefore impossible to add SILENTLY: it either
+# calls json/orjson (joining the inventory, which this test flags for review)
+# or it hand-builds (which layer 3 rejects). The 4-entry GUARDED_EMITTERS map
+# above tracks only the *round-trip-tested* CLIs; this inventory tracks the
+# full serializer-call surface (src/ + scripts/) so that map's "no silent
+# drift" promise finally covers every emitter, not four.
+_SERIALIZER_DUMPS = {
+    ("json", "dumps"),
+    ("json", "dump"),
+    ("orjson", "dumps"),
+    ("orjson", "dump"),
+}
+
+
+def _serializer_call_count(source: str) -> int:
+    """Number of ``json.dumps``/``json.dump``/``orjson.dumps``/``orjson.dump``
+    call expressions in ``source``.
+
+    AST-based (not text grep) so docstrings/comments that merely *mention*
+    ``json.dumps`` are not counted — only real call expressions. This is the
+    precision property :meth:`TestJsonDumpsCallSiteInventory.test_discovery_counts_only_real_calls_not_prose`
+    pins, so the inventory cannot drift on prose.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return 0
+    count = 0
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and (node.func.value.id, node.func.attr) in _SERIALIZER_DUMPS
+        ):
+            count += 1
+    return count
+
+
+def _serializer_call_files() -> dict[str, int]:
+    """``{relative_path: call_count}`` for every file under ``src/`` +
+    ``scripts/`` that makes a serializer dump call.
+
+    Sibling of :func:`_hand_built_json_sites`: same AST-walk shape, recording
+    the legitimate surface where layer 3 records the forbidden one. Returns
+    counts so the failure message shows per-file detail for easy updating,
+    while the snapshot itself is keyed on the (stable) file set.
+    """
+    found: dict[str, int] = {}
+    for sub in ("src", "scripts"):
+        for py in sorted((ROOT / sub).rglob("*.py")):
+            n = _serializer_call_count(py.read_text(encoding="utf-8"))
+            if n:
+                found[str(py.relative_to(ROOT))] = n
+    return found
+
+
+# Recorded baseline of the JSON-serialization surface across src/ + scripts/.
+# Update DELIBERATELY: a new entry means a new JSON emitter shipped — confirm it
+# is not hand-built (enforced by layer 3) and, if it is consumer-/judge-facing,
+# also add a strict round-trip guard to GUARDED_EMITTERS above. This constant is
+# the "recorded grep result" the audit claim rests on; the test below proves it
+# matches the live tree, so the claim is CI-enforced, not prose.
+JSON_DUMPS_EMITTER_FILES: tuple[str, ...] = (
+    'scripts/advise_training.py',
+    'scripts/analyze_accel_sweep.py',
+    'scripts/analyze_benchmark.py',
+    'scripts/analyze_extrapolation_predictability.py',
+    'scripts/analyze_prefix_cache_break_even.py',
+    'scripts/analyze_sensitivity.py',
+    'scripts/analyze_trajectory.py',
+    'scripts/analyze_trajectory_deltas.py',
+    'scripts/bench_extended_forward.py',
+    'scripts/benchmark_optimizer_lifecycle.py',
+    'scripts/benchmark_prefix_cache.py',
+    'scripts/benchmark_velocity_ops.py',
+    'scripts/compare_experiment_configs.py',
+    'scripts/compare_paper_memory_modes.py',
+    'scripts/compare_runs.py',
+    'scripts/consolidate_paper_results.py',
+    'scripts/diagnose.py',
+    'scripts/download_data.py',
+    'scripts/eval_downstream.py',
+    'scripts/evaluate_paper_gates.py',
+    'scripts/form_freeze_validloss_deposit.py',
+    'scripts/frontier_report.py',
+    'scripts/generate_json_extraction_data.py',
+    'scripts/git_utils.py',
+    'scripts/inspect_model.py',
+    'scripts/layer_mode_analysis.py',
+    'scripts/layer_quadrant_map.py',
+    'scripts/lookup_batch_plan.py',
+    'scripts/measure_extraction_fidelity_delta.py',
+    'scripts/measure_predictability.py',
+    'scripts/per_tensor_timeseries.py',
+    'scripts/per_tensor_timeseries_deep.py',
+    'scripts/precompute_prefix_cache_parallel.py',
+    'scripts/prepare_data.py',
+    'scripts/probe_9b_memory_frontier.py',
+    'scripts/recover.py',
+    'scripts/replay_freeze_order_sensitivity.py',
+    'scripts/replay_freeze_validloss_ci.py',
+    'scripts/run_all_seeds_eval.py',
+    'scripts/run_freeze_frontier.py',
+    'scripts/run_freeze_order_sensitivity.py',
+    'scripts/run_freeze_validloss_ci.py',
+    'scripts/run_freeze_validloss_ci_9b.py',
+    'scripts/run_paper_external_eval.py',
+    'scripts/run_phase2_m9_suite.py',
+    'scripts/section4_operator_decision.py',
+    'scripts/summarize_component2_landing.py',
+    'scripts/summarize_cosine_n_ablation.py',
+    'scripts/summarize_psa_sweep.py',
+    'src/eval/json_generation.py',
+    'src/tg_lora/freeze_evidence_hash.py',
+    'src/tg_lora/prefix_feature_cache.py',
+    'src/training/deterministic_batch_plan.py',
+    'src/training/train_tg_lora.py',
+    'src/utils/cli_errors.py',
+    'src/utils/io.py',
+    'src/utils/run_metrics.py',
+)
+
+
+class TestJsonDumpsCallSiteInventory:
+    """Layer 4 of the ``judge_invalid_json`` defense: a recorded, test-backed
+    inventory of EVERY ``json.dumps``/``orjson.dumps`` serializer call site in
+    ``src/`` + ``scripts/``.
+
+    Layers 1–3 prove the *guarded* emitters round-trip and forbid the
+    *forbidden* shapes (``print(<dict repr>)`` and hand-built string assembly).
+    This layer records the *legitimate* surface — the complete set of files that
+    serialize JSON through ``json``/``orjson`` — so the standing audit claim
+    ("every emitter uses json.dumps/orjson; zero hand-built") has its
+    "all-via-serializer" half CI-enforced as a recorded baseline, not asserted
+    in prose. With layer 3 banning hand-built assembly and this layer recording
+    every serializer call, a new JSON emitter cannot ship silently: it joins the
+    inventory (flagged here for review) or trips the hand-built ban. The
+    category is closed as a pair of structural facts, not a one-time audit."""
+
+    def test_inventory_matches_recorded_baseline(self):
+        discovered = _serializer_call_files()
+        discovered_files = sorted(discovered)
+        recorded = list(JSON_DUMPS_EMITTER_FILES)
+        assert discovered_files == recorded, (
+            "The json/orjson serializer-call surface changed — a JSON emitter "
+            "was added or removed without updating JSON_DUMPS_EMITTER_FILES. "
+            "This inventory is the recorded grep the audit claim rests on; "
+            "update the constant deliberately (see its comment).\n"
+            f"  added (NEW emitters — review; if consumer/judge-facing, add a "
+            f"round-trip guard to GUARDED_EMITTERS too): "
+            f"{sorted(set(discovered_files) - set(recorded))}\n"
+            f"  removed (update snapshot): "
+            f"{sorted(set(recorded) - set(discovered_files))}\n"
+            f"  live per-file call counts: {discovered}"
+        )
+
+    def test_inventory_is_nonempty(self):
+        """Non-vacuity: the inventory AND the discovery must be populated. An
+        empty snapshot would make the match-test pass trivially for the wrong
+        reason if discovery ever regressed to returning nothing."""
+        assert JSON_DUMPS_EMITTER_FILES, "inventory snapshot is empty"
+        live = _serializer_call_files()
+        assert live, (
+            "discovery returned zero serializer calls across src/+scripts/ "
+            "(AST regression — the match-test above would then pass vacuously)"
+        )
+
+    def test_discovery_counts_only_real_calls_not_prose(self):
+        """Non-vacuity / precision: a docstring or comment that merely MENTIONS
+        ``json.dumps`` must NOT be counted, and a real call expression must be.
+        Otherwise the inventory is a text grep that drifts on prose and the
+        match-test can be gamed by editing a comment."""
+        # Mentions only (docstring + comment) -> zero calls.
+        assert _serializer_call_count(
+            '"""serialize with json.dumps then json.dump"""\n'
+            '# remember: orjson.dumps(x)\n'
+        ) == 0
+        # Real call expressions -> counted, across all four spellings.
+        assert _serializer_call_count(
+            "import json, orjson\n"
+            "json.dumps({})\n"
+            "json.dump({}, None)\n"
+            "orjson.dumps({})\n"
+            "orjson.dump({}, None)\n"
+        ) == 4
+        # A similarly-named attribute that is NOT a serializer is ignored.
+        assert _serializer_call_count("x.json_dumps()\ny.dumps()\n") == 0
