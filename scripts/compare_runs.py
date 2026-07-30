@@ -36,6 +36,18 @@ def load_run(path: Path) -> tuple[dict, list[dict], dict | None]:
         if not line.strip():
             continue
         rec = orjson.loads(line)
+        # A line that is valid JSON but NOT a dict (a bare array / scalar /
+        # string from a corrupt or hand-edited run_metrics.jsonl) parses fine,
+        # yet ``rec.get("type")`` below assumes a dict and raised an uncaught
+        # ``AttributeError`` (e.g. ``'list' object has no attribute 'get'``)
+        # that aborted the whole two-run comparison report — one stray line
+        # taking down a ``make compare`` instead of being skipped. Same
+        # non-dict-after-json.loads crash class already hardened in the
+        # sibling readers: parse_jsonl (680bfa5) and _read_existing_provenance
+        # (a5506f7). Skip the non-dict line rather than crash; genuine
+        # invalid-JSON still raises from ``orjson.loads`` above.
+        if not isinstance(rec, dict):
+            continue
         t = rec.get("type", "step")
         if t == "run_header":
             header = rec

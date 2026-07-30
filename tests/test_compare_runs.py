@@ -188,6 +188,35 @@ def test_load_run_parses_header_records_footer(tmp_path):
     assert footer["best_valid_loss"] == 2.1
 
 
+def test_load_run_skips_non_dict_jsonl_lines(tmp_path):
+    """A valid-JSON-but-non-dict line (array/scalar from a corrupt or
+    hand-edited run_metrics.jsonl) must be skipped, not crash the report.
+
+    Same non-dict-after-json.loads crash class parse_jsonl (680bfa5) and
+    _read_existing_provenance (a5506f7) already guard against. Without the
+    ``isinstance(rec, dict)`` guard this raises ``AttributeError`` on the
+    first non-dict line (``rec.get("type")``) — mutation-proven below.
+    """
+    f = tmp_path / "metrics.jsonl"
+    # Interleave non-dict lines (array, bare scalar) among valid dict records.
+    f.write_bytes(
+        orjson.dumps({"type": "run_header", "model_name": "m", "seed": 1}) + b"\n"
+        + b"[1, 2, 3]\n"  # valid JSON, but a list -> rec.get would raise
+        + orjson.dumps({"type": "step", "step": 1, "loss_train": 3.0}) + b"\n"
+        + b"42\n"  # valid JSON, but an int -> rec.get would raise
+        + orjson.dumps({"type": "run_footer", "best_valid_loss": 2.1}) + b"\n"
+    )
+
+    header, records, footer = load_run(f)
+
+    # The two non-dict lines are skipped; the valid dict records survive.
+    assert header["model_name"] == "m"
+    assert len(records) == 1
+    assert records[0]["type"] == "step"
+    assert footer is not None
+    assert footer["best_valid_loss"] == 2.1
+
+
 def test_generate_report_contains_key_sections():
     """TC-036-02: Report includes loss curves, efficiency metrics, acceptance rate."""
     b_header, b_records, b_footer = (
