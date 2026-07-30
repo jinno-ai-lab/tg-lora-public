@@ -118,7 +118,10 @@ def _first_json_object(text: str) -> dict | None:
                         continue
                     if isinstance(obj, dict):
                         return obj
-                    start = None
+                    # Unreachable fallthrough: a balanced ``{...}`` span parsed
+                    # by ``json.loads`` is always a dict, so we never get here —
+                    # if a future change makes a non-dict possible, restore a
+                    # ``start = None`` reset here (and cover it).
     return None
 
 
@@ -216,7 +219,7 @@ def score_json_extraction(
     return out
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover -- CLI self-test, exercised by `python -m`, not pytest
     # Self-test: gold completions should score perfectly
     from pathlib import Path
 

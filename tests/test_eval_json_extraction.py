@@ -96,6 +96,38 @@ class TestExtractJson:
         assert obj is not None
         assert obj["name"] == "a}b"
 
+    def test_escaped_quote_inside_string_value_is_not_a_terminator(self):
+        # An *escaped* quote (``\"``) inside a JSON string value must not close
+        # the string for the balanced-brace scanner. The escape-tracking branch
+        # of ``_first_json_object`` (the ``\\`` set-escape / clear-escape pair)
+        # is only LOAD-BEARING when a brace follows the escaped quote: if the
+        # escaped ``"`` wrongly closed the string, that trailing ``}`` would be
+        # counted as the object terminator, prematurely ending the span and
+        # failing to parse. So the value below carries ``\"}`` (escaped quote
+        # immediately followed by a brace). Trailing prose forces the lenient
+        # scanner (the strict whole-text parse fails on the trailer).
+        text = (
+            r'{"type":"person","name":"a\"}b","role":"x",'
+            r'"department":"d","contact":"c"} (note)'
+        )
+        obj, was_strict = extract_json(text)
+        assert obj is not None, "escaped quote must not break extraction"
+        assert obj["name"] == 'a"}b'
+        assert was_strict is False  # trailing prose → lenient path
+
+    def test_invalid_first_balanced_span_recovers_to_next_object(self):
+        # The lenient scanner must not give up when the *first* brace-balanced
+        # span fails to parse — it must reset and try the next candidate. A
+        # model emitting a garbled fragment before the real object is the
+        # realistic trigger; a naive scanner that returns on the first balanced
+        # span would return None here (false-negative on the headline metric).
+        text = '{ not json } {"type":"person","name":"x","role":"r","department":"d","contact":"c"}'
+        obj, was_strict = extract_json(text)
+        assert obj is not None, "scanner must recover past an invalid first span"
+        assert obj["type"] == "person"
+        assert obj["name"] == "x"
+        assert was_strict is False
+
 
 class TestScoreSingle:
     def test_perfect_meeting_scores_all_ones(self):
@@ -131,6 +163,22 @@ class TestScoreSingle:
         )
         s = score_single(pred, GOLD_TX)
         assert s["computed_accuracy"] == 0.0
+        assert s["exact_match"] == 0.0
+
+    def test_non_numeric_string_for_computed_field_scores_zero_not_crash(self):
+        # A non-numeric placeholder ("N/A", "TBD") for a COMPUTED (numeric) gold
+        # field must score computed_accuracy=0 — not crash the scorer. This is
+        # the ``_field_match`` numeric-conversion error branch (``float(pred)``
+        # raises on an unparseable string): without the try/except, a single
+        # such prediction would take down the whole eval pass with an uncaught
+        # ValueError.
+        pred = (
+            '{"type":"transaction","item":"ノートPC","quantity":24,'
+            '"unit_price":18000,"total_cost":"N/A","counterparty":"株式会社A"}'
+        )
+        s = score_single(pred, GOLD_TX)
+        assert s["valid"] == 1.0           # still valid JSON
+        assert s["computed_accuracy"] == 0.0  # total_cost not a number → wrong
         assert s["exact_match"] == 0.0
 
     def test_person_has_no_computed_field(self):
