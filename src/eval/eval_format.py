@@ -59,7 +59,14 @@ def eval_format_compliance(
                 parsed = json.loads(completion)
                 results["valid_json"] += 1
 
-                if all(k in parsed for k in required_keys):
+                # Only a JSON OBJECT can carry the required keys. A completion
+                # that is valid JSON but a non-dict scalar (``42`` / ``true`` /
+                # ``null``) or an array parses fine and counts as valid_json, yet
+                # ``k in parsed`` raises an uncaught TypeError on a number/bool/
+                # None (and checks list-membership / substring on an array/string,
+                # wrongly scoring them) — which aborted the whole pass. Guard with
+                # isinstance, mirroring ``_infer_required_keys`` below.
+                if isinstance(parsed, dict) and all(k in parsed for k in required_keys):
                     results["has_required_keys"] += 1
             except json.JSONDecodeError:
                 pass

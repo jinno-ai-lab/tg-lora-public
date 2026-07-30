@@ -238,6 +238,39 @@ def test_eval_format_compliance_mixed_json():
     assert result["json_rate"] == 0.5
 
 
+def test_eval_format_compliance_bare_scalar_does_not_crash():
+    """Regression: a completion that is valid JSON but a NON-dict scalar
+    (``42`` / ``true`` / ``null``) must not abort the format-compliance pass.
+
+    The scoring loop checks ``all(k in parsed for k in required_keys)``; on a
+    number/bool/None that raises an uncaught ``TypeError`` (only
+    ``JSONDecodeError`` is caught), so a single model turn that emits a bare
+    scalar crashed the WHOLE eval the moment ``required_keys`` was non-empty.
+    A scalar is valid JSON (counts as ``valid_json``) but carries no keys, so
+    ``has_required_keys`` must stay 0 — mirroring the ``isinstance(parsed, dict)``
+    guard ``_infer_required_keys`` already applies.
+    """
+    for scalar in ("42", "true", "null"):
+        model = _TinyGenModel()
+        tokenizer = _make_tokenizer()
+        tokenizer.decode = MagicMock(return_value=scalar)
+
+        # Dict-bearing gold records ⇒ required_keys is non-empty, so the buggy
+        # ``k in parsed`` path is reached and crashes on the scalar decode.
+        records = [
+            {"prompt": "Q1?", "completion": '{"answer": "42", "confidence": 0.9}'},
+        ]
+
+        with patch("src.eval.eval_format.load_jsonl", return_value=records):
+            result = eval_format_compliance(model, tokenizer, "dummy.jsonl", device="cpu")
+
+        assert result["total"] == 1
+        assert result["valid_json"] == 1            # a bare scalar IS valid JSON
+        assert result["has_required_keys"] == 0     # ...but a scalar has no keys
+        assert result["json_rate"] == 1.0
+        assert result["key_compliance_rate"] == 0.0
+
+
 # ---- _infer_required_keys tests ----
 
 
