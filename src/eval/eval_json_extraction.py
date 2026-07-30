@@ -164,6 +164,23 @@ def score_single(prediction: str, gold: dict) -> dict[str, float]:
         if was_strict:
             result["strict_valid"] = 1.0
 
+    # A gold that parsed as valid JSON but is NOT a dict (an array / scalar /
+    # bool / null / bare string from a mis-generated or hand-edited dataset
+    # line) carries no type or fields to match. The prediction side is already
+    # hardened — ``extract_json`` returns ``dict | None`` via its
+    # ``isinstance(obj, dict)`` guard — but the gold side assumed a dict, so
+    # ``gold.get("type")`` / ``set(gold.keys())`` below raised an uncaught
+    # ``AttributeError`` (e.g. ``'list' object has no attribute 'get'``) that
+    # aborted the whole JSON-extraction pass. Mirror the prediction guard: a
+    # non-dict gold scores only the prediction's validity; type/field/exact
+    # stay 0 and ``computed_accuracy`` stays None (excluded from the aggregate
+    # mean, exactly like a person record). Same "json.loads succeeds but yields
+    # a non-dict, then a dict-only access raises" defect class as eval_format
+    # (1d6e7d4) and run_metrics (a5506f7).
+    if not isinstance(gold, dict):
+        result["combined"] = 0.3 * result["valid"]
+        return result
+
     gold_type = gold.get("type")
     if obj is not None and obj.get("type") == gold_type:
         result["type_correct"] = 1.0

@@ -190,6 +190,37 @@ class TestScoreSingle:
         assert s["computed_accuracy"] is None
         assert s["exact_match"] == 1.0
 
+    def test_non_dict_gold_does_not_crash_scorer(self):
+        # A gold completion that parsed as valid JSON but is NOT a dict — an
+        # array (``[1,2,3]``), scalar (``42``), bool, null, or bare string from
+        # a mis-generated or hand-edited dataset line — must not crash the
+        # scorer. The prediction side is already guarded (extract_json returns
+        # dict|None), but the gold side assumed a dict: ``gold.get("type")`` /
+        # ``set(gold.keys())`` raised an uncaught AttributeError that aborted
+        # the whole eval pass — the same "valid JSON, non-dict, dict-only
+        # access" defect class as eval_format (1d6e7d4) and run_metrics
+        # (a5506f7). A non-dict gold scores only the prediction's validity;
+        # type/field/exact stay 0 and computed_accuracy stays None.
+        pred = _PERFECT_MEETING_JSON
+        for bad_gold in ([1, 2, 3], 42, True, None, "just a string"):
+            s = score_single(pred, bad_gold)
+            assert s["valid"] == 1.0, f"gold={bad_gold!r}: prediction still parses"
+            assert s["strict_valid"] == 1.0
+            assert s["type_correct"] == 0.0   # a non-dict gold has no type
+            assert s["field_f1"] == 0.0
+            assert s["exact_match"] == 0.0
+            assert s["computed_accuracy"] is None  # excluded from the mean
+            assert s["combined"] == 0.3           # 0.3*valid + 0.2*0 + 0.5*0
+        # The aggregate path — the real entry point the wrappers
+        # (json_generation / jsonex_generation) call with golds read straight
+        # out of json.loads(record["completion"]) — must not crash either.
+        scores = score_json_extraction([pred, pred], [[1, 2, 3], 42])
+        assert scores["valid"] == 1.0
+        assert scores["type_correct"] == 0.0
+        assert scores["field_f1"] == 0.0
+        # Neither gold had a computed field, so comp_n stays 0 → 0.0, not a crash.
+        assert scores["computed_accuracy"] == 0.0
+
 
 class TestScoreJsonExtraction:
     def test_computed_accuracy_excludes_person_records(self):
