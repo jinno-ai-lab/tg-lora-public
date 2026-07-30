@@ -22,9 +22,24 @@ def parse_jsonl(path: str | Path) -> list[dict[str, Any]]:
         if not line:
             continue
         try:
-            records.append(orjson.loads(line))
+            rec = orjson.loads(line)
         except orjson.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON at line {i}: {e}") from e
+        # A line that is valid JSON but NOT a dict (a bare scalar / array /
+        # string from a corrupt or hand-edited metrics file) parses fine, yet
+        # every caller does ``rec.get("type")`` on the result — so a non-dict
+        # line raised an uncaught ``AttributeError`` (e.g. ``'int' object has no
+        # attribute 'get'``) that aborted the whole query pass, and
+        # ``list_runs``'s ``except (ValueError, JSONDecodeError)`` does NOT
+        # catch ``AttributeError``, so one corrupt line took down the
+        # run-selection sweep. Skip it, mirroring the same non-dict-after-
+        # json.loads guard the writer's own reader (``_read_existing_provenance``,
+        # a5506f7) already enforces on these files; this also makes the function
+        # honour its own "list of dicts" contract. Invalid-JSON lines still
+        # raise (above) so genuine corruption is still surfaced with a line no.
+        if not isinstance(rec, dict):
+            continue
+        records.append(rec)
     return records
 
 

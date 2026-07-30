@@ -426,3 +426,74 @@ def test_list_runs_skips_no_header(tmp_path):
     )
     runs = list_runs(tmp_path)
     assert runs == []
+
+
+# --- non-dict lines: valid JSON, wrong shape (crash-on-corrupt-file class) ---
+# A line that parses as valid JSON but is NOT a dict (a bare scalar / array /
+# string from a corrupt or hand-edited metrics file) is the SAME threat model
+# the writer's own reader was hardened against in a5506f7
+# (run_metrics._read_existing_provenance): "valid JSON but non-dict, then a
+# dict-only ``.get`` raises AttributeError". The query API reads those exact
+# files but parse_jsonl appended the non-dict as-is, so the next rec.get("type")
+# aborted the whole pass with an uncaught AttributeError (and list_runs's
+# ``except (ValueError, JSONDecodeError)`` does NOT catch AttributeError, so a
+# single corrupt line took down the run-selection sweep). These pin the fix:
+# parse_jsonl now skips non-dict lines and every caller degrades gracefully.
+
+
+def test_parse_jsonl_skips_non_dict_lines(tmp_path):
+    p = tmp_path / "nondict.jsonl"
+    p.write_text('{"type": "run_header"}\n42\n{"type": "run_footer"}\n')
+    # The bare ``42`` is dropped; only the dicts come through (contract: list of
+    # dicts). Invalid-JSON lines still raise (see test_parse_jsonl_corrupt_line).
+    assert parse_jsonl(p) == [{"type": "run_header"}, {"type": "run_footer"}]
+
+
+def test_parse_jsonl_skips_various_non_dict_shapes(tmp_path):
+    """Array, bool, null, and bare-string lines are all valid JSON, non-dict."""
+    p = tmp_path / "shapes.jsonl"
+    p.write_text(
+        '{"type": "run_header"}\n'
+        "[1, 2, 3]\n"
+        "true\n"
+        "null\n"
+        '"a bare string"\n'
+        '{"type": "run_footer"}\n'
+    )
+    assert [r["type"] for r in parse_jsonl(p)] == ["run_header", "run_footer"]
+
+
+def test_get_footer_tolerates_non_dict_line(tmp_path):
+    """Non-dict lines around the footer must not crash; get_footer returns the
+    real footer (graceful degradation, mirroring _read_existing_provenance)."""
+    p = tmp_path / "run_metrics.jsonl"
+    p.write_text('true\n{"type": "run_header"}\n{"type": "run_footer"}\nnull\n')
+    assert get_footer(p)["type"] == "run_footer"
+
+
+def test_get_cycle_history_tolerates_non_dict_line(tmp_path):
+    """get_cycle_history's list-comprehension calls .get('type') on EVERY record,
+    so a single non-dict line anywhere aborted the whole pass with AttributeError."""
+    p = tmp_path / "run_metrics.jsonl"
+    p.write_text(
+        '{"type": "run_header"}\n'
+        '{"type": "step", "cycle": 0}\n'
+        "42\n"
+        '{"type": "step", "cycle": 1}\n'
+    )
+    history = get_cycle_history(p)
+    assert [h["cycle"] for h in history] == [0, 1]
+
+
+def test_list_runs_tolerates_non_dict_line_before_header(tmp_path):
+    """A non-dict line BEFORE the header made list_runs's next(.get("type"))
+    crash on it first; AttributeError escaped the except clause and crashed the
+    sweep instead of skipping the run."""
+    d = tmp_path / "bad_run"
+    d.mkdir()
+    (d / "run_metrics.jsonl").write_text(
+        '42\n{"type": "run_header", "run_id": "r1"}\n{"type": "run_footer"}\n'
+    )
+    runs = list_runs(tmp_path)
+    # The run is still discovered — the corrupt line is skipped, not fatal.
+    assert [r["run_id"] for r in runs] == ["r1"]
