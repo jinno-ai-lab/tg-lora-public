@@ -363,6 +363,216 @@ class TestNoBareDictReprPrintedToStdout:
 
 
 # ---------------------------------------------------------------------------
+# Structural guard (layer 3): forbid hand-built JSON assembled from strings
+# ---------------------------------------------------------------------------
+
+# Layer 2 above (``TestNoBareDictReprPrintedToStdout``) closes the ONE shape that
+# actually bit this repo — ``print(<dict comprehension>)`` serializing via
+# ``repr``. But the standing audit claim is broader than that one shape: "every
+# JSON emitter uses ``json.dumps`` / ``orjson.dumps``; zero hand-built JSON". A
+# developer can still hand-build a JSON object four OTHER ways the repr-print
+# guard is structurally blind to, each producing an un-validated string that
+# looks like JSON and can reintroduce the exact ``judge_invalid_json`` rejection:
+#
+#   * f-string opening a JSON object:        f'{{"a": {v}}}'
+#   * string concatenation opening JSON:     '{"a": ' + str(v) + '}'
+#   * .format() on a JSON-object template:   '{"a": {}}'.format(v)
+#   * %-format on a JSON-object template:    '{"a": %s}' % v
+#
+# None is a ``print(<dict>)``, so layer 2 stays green while a brand-new
+# hand-built JSON emitter ships — the precise "newly created hand-built JSON
+# site" regression the make-run feedback asked to FAIL on rather than re-assert
+# in prose. This layer makes "zero hand-built JSON" a durable, structurally
+# enforced guarantee instead of a one-time audit (prose drifts; an AST scan
+# does not). A4/A2 now rest on a regression test, not a comment.
+_JSON_OBJ_OPENERS = ('{"', '["')
+
+
+def _opens_with_json_object(text: str) -> bool:
+    """True iff ``text`` opens a JSON object/array document (``{"`` / ``["``).
+
+    ``lstrip`` first: prose that merely *contains* a JSON fragment does NOT open
+    one. The chunker-fidelity corpus builds ``_MEETING_JSON + ' Reference:
+    {"id": "mtg-7"}.'`` whose suffix constant starts with ``' Reference:'``, not
+    ``'{"'`` — a real site this guard must NOT flag. The hand-built-JSON
+    regression always opens the document at the START of the assembled string
+    (``'{"a": ' + ...``), so requiring the opener at the start keeps the guard
+    precise without an allowlist that would itself drift.
+    """
+    return text.lstrip().startswith(_JSON_OBJ_OPENERS)
+
+
+def _joined_str_literal_text(node: ast.JoinedStr) -> str:
+    """Concatenate only the literal ``str`` parts of an f-string, skipping the
+    ``{expr}`` holes, so ``f'{{"a": {v}}}'`` reduces to ``'{"a": }'``."""
+    return "".join(
+        part.value
+        for part in node.values
+        if isinstance(part, ast.Constant) and isinstance(part.value, str)
+    )
+
+
+def _hand_built_json_sites_in_source(source: str) -> list[tuple[int, str]]:
+    """Line + kind of every hand-built-JSON string-assembly site in ``source``.
+
+    Sibling of :func:`_repr_print_lines`: same source-parse shape, policing the
+    four string-assembly kinds layer 2 (``print(<dict repr>)``) cannot see.
+    Returns ``(lineno, kind)`` for each of ``f-string`` / ``+ concat`` /
+    ``.format()`` / ``%-format``.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    sites: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        # f-string whose literal text opens a JSON object.
+        if isinstance(node, ast.JoinedStr) and _opens_with_json_object(
+            _joined_str_literal_text(node)
+        ):
+            sites.append((node.lineno, "f-string"))
+            continue
+        # .format() on a JSON-object template constant.
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "format"
+            and isinstance(node.func.value, ast.Constant)
+            and isinstance(node.func.value.value, str)
+            and _opens_with_json_object(node.func.value.value)
+        ):
+            sites.append((node.lineno, ".format()"))
+            continue
+        # %-format on a JSON-object template constant.
+        if (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Mod)
+            and isinstance(node.left, ast.Constant)
+            and isinstance(node.left.value, str)
+            and _opens_with_json_object(node.left.value)
+        ):
+            sites.append((node.lineno, "%-format"))
+            continue
+        # + concatenation with an operand that opens a JSON object.
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            for op in (node.left, node.right):
+                if (
+                    isinstance(op, ast.Constant)
+                    and isinstance(op.value, str)
+                    and _opens_with_json_object(op.value)
+                ):
+                    sites.append((node.lineno, "+ concat"))
+                    break
+    return sites
+
+
+def _hand_built_json_sites(root: Path) -> list[tuple[Path, int, str]]:
+    """Every hand-built-JSON string-assembly site under ``root``.
+
+    Sibling of :func:`_repr_prints_under`: walks ``*.py`` and lifts
+    :func:`_hand_built_json_sites_in_source` to a tree-wide scan.
+    """
+    sites: list[tuple[Path, int, str]] = []
+    for py in sorted(root.rglob("*.py")):
+        for line, kind in _hand_built_json_sites_in_source(
+            py.read_text(encoding="utf-8")
+        ):
+            sites.append((py, line, kind))
+    return sites
+
+
+class TestNoHandBuiltJsonStringAssembly:
+    """Layer 3 of the ``judge_invalid_json`` defense: forbid hand-built JSON
+    assembled from strings across ``src/`` and ``scripts/``.
+
+    Layer 1 is the per-emitter strict round-trip map
+    (:class:`TestJsonEmitterSurfaceIsGuarded`); layer 2
+    (:class:`TestNoBareDictReprPrintedToStdout`) forbids ``print(<dict/set
+    repr>)``. This layer closes the REMAINING hand-built-JSON shapes those two
+    are blind to — an f-string / concatenation / ``.format()`` / ``%-format``
+    that opens a JSON object (``'{"a": ' + ...``). Each bypasses the serializer,
+    so a placeholder that breaks strict JSON (a ``NaN``, a bare quote, a trailing
+    comma) sails straight to stdout / a file / a judge and re-raises the exact
+    ``Expecting ... delimiter`` / ``Expecting property name enclosed in double
+    quotes`` rejection. Forbidding the assembly statically means the "zero
+    hand-built JSON" audit claim can no longer be undone by a one-line
+    regression — it fails here, in CI, the moment such a site is created.
+    """
+
+    def test_no_hand_built_json_assembly_in_src(self):
+        sites = _hand_built_json_sites(ROOT / "src")
+        assert not sites, (
+            "src/ must emit JSON only via json.dumps/orjson.dumps — a string "
+            "assembled by hand (f-string / + / .format() / %-format opening a "
+            "JSON object) bypasses the serializer and can reintroduce the "
+            "judge_invalid_json rejection. Use json.dumps instead: "
+            + ", ".join(f"{p.relative_to(ROOT)}:{n}({k})" for p, n, k in sites)
+        )
+
+    def test_no_hand_built_json_assembly_in_scripts(self):
+        sites = _hand_built_json_sites(ROOT / "scripts")
+        assert not sites, (
+            "scripts/ must emit JSON only via json.dumps/orjson.dumps — a "
+            "string assembled by hand bypasses the serializer and can "
+            "reintroduce the judge_invalid_json rejection. Use json.dumps "
+            "instead: "
+            + ", ".join(f"{p.relative_to(ROOT)}:{n}({k})" for p, n, k in sites)
+        )
+
+    @pytest.mark.parametrize(
+        "kind,source",
+        [
+            ("f-string", 'print(f\'{{"a": {v}}}\')\n'),
+            ("+ concat", 'x = \'{"a": \' + str(v) + \'}\'\n'),
+            (".format()", 'x = \'{"a": {}}\'.format(v)\n'),
+            ("%-format", 'x = \'{"a": %s}\' % v\n'),
+        ],
+    )
+    def test_guard_catches_each_assembly_shape(self, kind, source):
+        """Non-vacuity: each of the four hand-built-JSON shapes is flagged with
+        its kind, so the guard can never silently degrade into a no-op that lets
+        a new emitter reintroduce the rejection."""
+        sites = _hand_built_json_sites_in_source(source)
+        assert sites, f"guard failed to catch the {kind} hand-built-JSON shape"
+        assert sites[0][1] == kind, (
+            f"expected {kind!r} shape, got {sites[0][1]!r} for source:\n{source}"
+        )
+
+    def test_guard_does_not_flag_clean_patterns(self):
+        """Positive control: the guard must NOT flag the legitimate patterns it
+        shares the source tree with — or it over-rejects and the catch-tests
+        above pass for the wrong reason.
+
+          * ``json.dumps({"a": 1})`` — a dict LITERAL through the serializer
+            (the dict is ``ast.Dict``, not a string; invisible to this guard).
+          * ``f"loss={v}"`` — a plain f-string that does not open a JSON object.
+          * ``"<...>{instruction}".format(...)`` / ``tmpl.format(...)`` — a chat
+            template constant and a Name receiver (open with ``<`` / a Name, not
+            ``{"``); ``scripts/prepare_data.py`` CHAT_TEMPLATE is this shape.
+          * ``' Reference: {"id": "mtg-7"}.' + suffix`` — prose that CONTAINS a
+            JSON fragment but does not OPEN one (the chunker-fidelity corpus at
+            ``scripts/measure_extraction_fidelity_delta.py``).
+          * ``json.loads('{"a": 1}')`` — a gold/fixture string handed to the
+            parser, not an assembled emitter.
+          * ``print([1, 2, 3])`` — a list (valid JSON anyway).
+        """
+        clean = (
+            'import json\n'
+            'print(json.dumps({"a": 1}))\n'
+            'print(f"loss={v}")\n'
+            'tmpl = "<|im_start|>user {instruction}"\n'
+            'tmpl.format(instruction=v)\n'
+            '"<|im_start|>user {instruction}".format(instruction=v)\n'
+            "note = ' Reference: {\"id\": \"mtg-7\"}.' + suffix\n"
+            'print([1, 2, 3])\n'
+            "gold = json.loads('{\"a\": 1}')\n"
+        )
+        assert _hand_built_json_sites_in_source(clean) == [], (
+            "guard over-rejects a legitimate pattern"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Coverage map: assert the JSON-emitting surface is closed as a category
 # ---------------------------------------------------------------------------
 
@@ -374,13 +584,17 @@ class TestJsonEmitterSurfaceIsGuarded:
     without a guard shows up as a deliberate-omission gap rather than silent
     drift. (This is a documentation-as-test pin, not a coverage tool.)
 
-    Two complementary layers close the category: (1) the per-emitter strict
+    Three complementary layers close the category: (1) the per-emitter strict
     round-trip map below proves each listed CLI's stdout/file strict-parses;
     (2) ``TestNoBareDictReprPrintedToStdout`` is a STRUCTURAL AST prohibition
     that forbids ``print(<dict/set repr>)`` across ``src/`` + ``scripts/`` — the
     one-line regression shape the per-emitter map cannot prevent (and the shape
     ``src/eval/json_generation.py`` carried until ``format_score_summary``
-    replaced it)."""
+    replaced it); (3) ``TestNoHandBuiltJsonStringAssembly`` forbids the OTHER
+    hand-built-JSON shapes layer 2 is blind to — an f-string / ``+`` /
+    ``.format()`` / ``%-format`` that opens a JSON object — so the "zero
+    hand-built JSON" claim holds against a newly created string-assembly site,
+    not just a ``print(<dict>)``."""
 
     GUARDED_EMITTERS = {
         # (script, guard location)
