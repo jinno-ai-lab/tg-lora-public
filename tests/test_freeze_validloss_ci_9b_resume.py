@@ -21,6 +21,8 @@ GPU arm — the real model is never loaded here.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from scripts.run_freeze_validloss_ci_9b import (
@@ -575,6 +577,59 @@ def test_load_ledger_tolerates_torn_trailing_line(tmp_path):
     cached = load_ledger(ledger, fp)
     assert ("candidate", 0) in cached
     assert ("candidate", 1) not in cached  # malformed line skipped, not fatal
+
+
+def test_load_ledger_tolerates_non_dict_jsonl_lines(tmp_path):
+    """A valid-JSON-but-non-object line (a bare array / scalar / string from a
+    torn flush or a non-ledger file pointed here by mistake) must be skipped,
+    not crash the resume.
+
+    Same non-dict-after-json.loads crash class parse_jsonl / load_run /
+    run_query closed (680bfa5): without the ``isinstance(rec, dict)`` guard,
+    ``rec.get("type")`` raises ``AttributeError`` on the first non-object line
+    (mutation-proven: drop the guard and this test raises). This is the load-
+    bearing verdict-run ledger reader — its caller invokes it UNCAUGHT, so a
+    crash here bricks the §4 resume rather than degrading.
+    """
+    ledger = tmp_path / "ledger.jsonl"
+    fp = _fp()
+    specs = _arm_specs(
+        active_indices=SCOPE, scope_sorted=SCOPE_SORTED, base_seed=0, depth=3,
+        n_candidate=2, n_surrogate=0, n_control=0, n_baseline=0,
+    )
+    for spec in specs:
+        append_arm_to_ledger(ledger, fp, spec, 1.0 + spec["index"], {"ok": spec["index"]})
+    # Interleave non-object lines (all valid JSON, none a dict) among the arms.
+    lines = ledger.read_text(encoding="utf-8").splitlines()
+    lines.insert(1, "[1, 2, 3]")       # valid JSON list  -> rec.get would raise
+    lines.insert(3, "42")              # valid JSON int   -> rec.get would raise
+    lines.append('"not-an-object"')    # valid JSON string at the tail
+    ledger.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    cached = load_ledger(ledger, fp)
+    # The three non-dict lines are skipped; both valid arms survive intact.
+    assert set(cached) == {("candidate", 0), ("candidate", 1)}
+    assert cached[("candidate", 0)][0] == pytest.approx(1.0)
+    assert cached[("candidate", 1)][0] == pytest.approx(2.0)
+
+
+def test_load_ledger_non_dict_header_degrades_to_fresh(tmp_path):
+    """A non-object FIRST line (the would-be header — a non-ledger file pointed
+    here by mistake) must not crash either; it is skipped and the next dict line
+    takes the header role. A genuine arm line read as header fails the
+    ``type == "header"`` check, so the ledger degrades to stale (``{}`` → fresh
+    re-run) rather than replaying corrupt arms or aborting. Same guard, distinct
+    crash site (the header-position ``rec.get``).
+    """
+    ledger = tmp_path / "ledger.jsonl"
+    fp = _fp()
+    # A bare scalar as line 0, then a valid arm record with NO real header.
+    arm = json.dumps({
+        "type": "arm", "role": "candidate", "index": 0,
+        "valid_loss": 9.99, "provenance": {},
+    })
+    ledger.write_text("null\n" + arm + "\n", encoding="utf-8")
+    assert load_ledger(ledger, fp) == {}  # null skipped, arm≠header → stale
 
 
 # --- _collect_arms resume behavior ------------------------------------------

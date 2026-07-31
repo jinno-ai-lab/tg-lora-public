@@ -1247,10 +1247,11 @@ def load_ledger(path, fingerprint: dict) -> dict:
     Returns ``{}`` when the file is absent. The first JSONL line is the header;
     if its ``fingerprint`` does not match, the whole file is treated as stale (a
     previous config's run) and ``{}`` is returned — the run then executes every
-    arm fresh and rewrites the ledger with the new header. Malformed lines (a
-    partially-flushed trailing line from a crashed append) are skipped with a
-    warning rather than aborting the resume, so a torn write cannot brick the
-    ledger.
+    arm fresh and rewrites the ledger with the new header. Malformed lines — a
+    partially-flushed trailing line from a crashed append, or a valid-JSON-but-
+    non-object line (a bare scalar / array / string from a torn flush or a
+    non-ledger file pointed here by mistake) — are skipped with a warning rather
+    than aborting the resume, so a torn write cannot brick the ledger.
     """
     p = Path(path)
     if not p.exists():
@@ -1269,6 +1270,17 @@ def load_ledger(path, fingerprint: dict) -> dict:
                     "Ledger %s:%d: skipping malformed line — likely a torn "
                     "write from a crashed run; the resume continues.",
                     p, lineno,
+                )
+                continue
+            # Valid JSON but not an object (a bare scalar / array / string) would
+            # make ``rec.get`` below raise ``AttributeError`` and abort the resume
+            # — skip-and-degrade, the same non-dict-after-json.loads crash class
+            # already hardened in parse_jsonl / load_run / run_query (680bfa5).
+            if not isinstance(rec, dict):
+                logger.warning(
+                    "Ledger %s:%d: skipping non-object JSON line (got %s) — "
+                    "the resume continues.",
+                    p, lineno, type(rec).__name__,
                 )
                 continue
             if not header_seen:
