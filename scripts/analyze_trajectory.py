@@ -37,7 +37,24 @@ def _load_run_metrics(path: str | Path) -> list[dict[str, Any]]:
 
     text = p.read_text(encoding="utf-8")
     if p.suffix == ".jsonl":
-        records = [json.loads(line) for line in text.strip().splitlines() if line.strip()]
+        # A line that is valid JSON but NOT a dict (a bare scalar / array /
+        # string from a corrupt or hand-edited metrics.jsonl) parses fine, yet
+        # TrajectoryAnalyzer.from_dicts calls rec.get(...) on every record with
+        # no isinstance guard, so one non-dict line raised an uncaught
+        # AttributeError that aborted the trajectory analysis. Same
+        # non-dict-after-json.loads crash class already hardened in the sibling
+        # readers (compare_runs.load_run / run_query.parse_jsonl / run_metrics /
+        # the §4 verdict ledger readers). Skip non-dict lines so this function
+        # honours its list[dict[str, Any]] contract; genuine invalid-JSON still
+        # raises from json.loads.
+        records = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if isinstance(rec, dict):
+                records.append(rec)
     else:
         data = json.loads(text)
         if isinstance(data, list):

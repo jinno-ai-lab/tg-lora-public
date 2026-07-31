@@ -132,6 +132,37 @@ class TestAnalyzeTrajectoryE2E:
         r = _run_cli(str(tmp_path / "nope.jsonl"))
         assert r.returncode == 2
 
+    def test_e2e_skips_non_dict_jsonl_lines(self, tmp_path: Path):
+        """A valid-JSON-but-non-dict line (array/scalar from a corrupt or
+        hand-edited metrics.jsonl) is skipped, not crashed.
+
+        Without the ``isinstance(rec, dict)`` guard in ``_load_run_metrics``,
+        ``TrajectoryAnalyzer.from_dicts`` calls ``rec.get(...)`` on the non-dict
+        record and raises an uncaught ``AttributeError`` → the CLI exits non-zero
+        with a traceback. Mutation-proven: drop the guard and returncode != 0.
+        Same non-dict-after-json.loads crash class the sibling readers guard
+        (``compare_runs.load_run`` / ``run_query.parse_jsonl`` / ``run_metrics``
+        / the §4 verdict ledger readers).
+        """
+        recs = _converging_records(5)
+        # Interleave non-dict lines (array, bare scalar) among valid records.
+        lines = [
+            json.dumps(recs[0]),
+            "[1, 2, 3]",  # valid JSON, but a list -> rec.get would raise
+            json.dumps(recs[1]),
+            "42",         # valid JSON, but an int -> rec.get would raise
+            json.dumps(recs[2]),
+            json.dumps(recs[3]),
+            json.dumps(recs[4]),
+        ]
+        jsonl = tmp_path / "m.jsonl"
+        jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        r = _run_cli(str(jsonl), "--output", str(tmp_path / "report.json"))
+        assert r.returncode == 0, f"stderr: {r.stderr}"
+        report = json.loads((tmp_path / "report.json").read_text())
+        # All five valid dict records survived; the list and int lines dropped.
+        assert report["total_points"] == 5
+
     def test_e2e_insufficient_data(self, tmp_path: Path):
         """Single data point → exit 2 (need >= 2 points)."""
         jsonl = _write_jsonl(tmp_path / "m.jsonl", [{"cycle": 0, "train_loss": 2.0}])

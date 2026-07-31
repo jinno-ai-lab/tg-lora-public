@@ -25,7 +25,26 @@ def load_json_eval(run_dir: Path) -> list[dict]:
     path = run_dir / "json_eval_log.jsonl"
     if not path.exists():
         return []
-    return [json.loads(l) for l in open(path) if l.strip()]
+    # A line that is valid JSON but NOT a dict (a bare scalar / array / string
+    # from a corrupt or hand-edited json_eval_log.jsonl) parses fine, yet every
+    # downstream access — r.get(metric) in backwards_to_target, last.get('cycle'),
+    # and the direct subscript r[xkey] in the plot loop — assumes a dict and
+    # raised an uncaught AttributeError/TypeError that aborted the whole
+    # JSON-extraction efficiency analysis. Same non-dict-after-json.loads crash
+    # class already hardened in the sibling readers (compare_runs.load_run /
+    # run_query.parse_jsonl / run_metrics / the §4 verdict ledger readers); this
+    # reader was the one the sweep missed. Skip the non-dict line rather than
+    # crash; genuine invalid-JSON still raises from json.loads below. Reading the
+    # whole file (not holding an open handle) mirrors the sibling idiom.
+    records: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        rec = json.loads(line)
+        if isinstance(rec, dict):
+            records.append(rec)
+    return records
 
 
 def backwards_to_target(rows: list[dict], metric: str, target: float) -> float | None:
