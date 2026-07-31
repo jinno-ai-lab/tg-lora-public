@@ -23,6 +23,13 @@ def load_run_metrics(
         if not line.strip():
             continue
         record = orjson.loads(line)
+        # A valid-JSON-but-non-object line parses yet makes ``record.get("type")``
+        # raise AttributeError and abort the whole ablation summary — the same
+        # non-dict-after-loads crash class load_run (374468d) closed. Skip the
+        # stray line and degrade; genuine invalid-JSON still raises from
+        # orjson.loads (fail-loud preserved, matching load_run's posture).
+        if not isinstance(record, dict):
+            continue
         kind = record.get("type", "step")
         if kind == "run_header":
             header = record

@@ -117,6 +117,14 @@ def extract_best_valid_loss(path: str | Path) -> tuple[float, dict[str, Any]]:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            # A valid-JSON-but-non-object line (a bare array/scalar/string from a
+            # torn flush or a non-ledger file pointed here by mistake) parses yet
+            # would make ``record.get("type")`` raise AttributeError and brick
+            # §4 deposit formation — the same non-dict-after-json.loads crash class
+            # load_ledger (414f455) / load_run (374468d) closed. Skip-and-degrade,
+            # matching the torn-write ``JSONDecodeError`` handler above.
+            if not isinstance(record, dict):
+                continue
             rtype = record.get("type")
             if rtype == "run_header":
                 run_id = record.get("run_id", run_id)

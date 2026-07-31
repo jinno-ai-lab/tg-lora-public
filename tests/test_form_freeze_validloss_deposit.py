@@ -219,6 +219,31 @@ def test_extract_skips_non_finite_step_losses(tmp_path: Path) -> None:
     assert prov["best_valid_loss_source"] == "min_loss_valid_step"
 
 
+def test_extract_skips_non_dict_jsonl_lines(tmp_path: Path) -> None:
+    # A valid-JSON-but-non-object line (a bare array/scalar/string from a torn
+    # flush or a non-ledger file pointed here by mistake) parses yet made
+    # ``record.get("type")`` raise an uncaught AttributeError that bricked §4
+    # deposit formation — the same non-dict-after-json.loads crash class
+    # load_ledger (414f455) / load_run (374468d) closed on the sibling §4
+    # readers. Skip the stray line and salvage the honest finite step minimum.
+    p = tmp_path / "with_nondict.jsonl"
+    p.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "run_header", "run_id": "nd", "seed": 1}),
+                json.dumps({"type": "step", "step": 0, "loss_valid": 1.30}),
+                "[1, 2, 3]",  # non-dict line — would crash record.get("type")
+                json.dumps({"type": "step", "step": 1, "loss_valid": 1.06}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    value, prov = extract_best_valid_loss(p)
+    assert value == pytest.approx(1.06)
+    assert prov["best_valid_loss_source"] == "min_loss_valid_step"
+
+
 def test_extract_raises_when_entire_run_non_finite(tmp_path: Path) -> None:
     # A FULLY diverged run (every step AND the footer non-finite) has no citable
     # arm result. Rather than silently deposit NaN it fails LOUD — the same

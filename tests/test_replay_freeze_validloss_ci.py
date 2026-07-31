@@ -46,6 +46,7 @@ from src.tg_lora.freeze_surrogate_ci import surrogate_valid_loss_ci
 from src.tg_lora.freeze_surrogate_gate import SURPASSES, TIES, UNDERSHOOTS
 
 from scripts.replay_freeze_validloss_ci import (
+    _load_committed_ledger,
     format_replay,
     load_samples,
     main,
@@ -4278,3 +4279,36 @@ class TestReplayEntrypointIntegration:
         # the distinct exit 78, which only load_samples' OperatorError can
         # produce (the gate returns 0 / 2, never 78).
         assert main([str(f)]) == 78
+
+
+class TestCommittedLedgerNonDictLine:
+    """The verdict-judge ledger reader honors its 'never trust a half-readable
+    ledger' contract for valid-JSON-but-non-object lines, not only unparseable
+    ones — the same non-dict-after-json.loads crash class load_ledger (414f455)
+    / load_run (374468d) closed on the sibling §4 readers."""
+
+    def test_non_dict_line_distrusts_whole_ledger(self, tmp_path):
+        # The docstring promises 'a line fails to parse ... never trust a half-
+        # readable ledger' → cross-checks skip in every case. But a valid-JSON-
+        # but-non-object line (bare array/scalar/string) bypassed the
+        # ``except (OSError, ValueError)`` (json.loads succeeds) and was returned
+        # in records, later crashing ``_ledger_arm_losses_by_role`` at
+        # ``rec.get('type')`` on the §4 verdict-judge path. A non-dict line must
+        # distrust the whole ledger (return None), identical to an unparseable
+        # line — not crash and not silently return a half-poisoned record list.
+        witness = tmp_path / "witness.jsonl"
+        lines = [
+            json.dumps({"type": "header", "run_id": "r1"}),
+            "[1, 2, 3]",  # valid JSON, NOT a dict — a half-readable ledger
+            json.dumps(
+                {
+                    "type": "arm",
+                    "role": "candidate",
+                    "index": 0,
+                    "valid_loss": 1.5,
+                }
+            ),
+        ]
+        witness.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        data = {"ledger_witness_path": "witness.jsonl"}
+        assert _load_committed_ledger(data, tmp_path / "deposit.json") is None

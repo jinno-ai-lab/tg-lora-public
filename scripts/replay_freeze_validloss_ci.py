@@ -1235,7 +1235,19 @@ def _load_committed_ledger(
                 line = line.strip()
                 if not line:
                     continue
-                records.append(json.loads(line))
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    # A valid-JSON-but-non-object line (bare scalar/array/string)
+                    # parses yet is not a usable ledger record. The docstring
+                    # promises "a line fails to parse ... never trust a half-
+                    # readable ledger" → cross-checks skip in every case, but a
+                    # non-dict line bypassed the ``except (OSError, ValueError)``
+                    # and later crashed ``_ledger_arm_losses_by_role`` at
+                    # ``rec.get("type")``. Route it through that same parse-failure
+                    # handler (return None → cross-checks skip), identical to how
+                    # an unparseable (invalid-JSON) line is already handled.
+                    raise ValueError(f"non-dict JSONL line in committed ledger {path}")
+                records.append(record)
     except (OSError, ValueError):
         return None
     return records
