@@ -20,10 +20,23 @@ sys.path.append(str(repo_root))
 def load_yaml(path: Path):
     try:
         with open(path, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f)
+            data = yaml.safe_load(f)
     except Exception as e:
         print(f"ERROR: Failed to load YAML at {path}: {e}")
         sys.exit(1)
+    # yaml.safe_load returns None for an empty file and a bare list/scalar/string
+    # for a non-mapping file — all of which would crash the caller's `.get(...)`
+    # / `["key"]` with an uncaught AttributeError/TypeError. Fail loud here so a
+    # malformed plan/config produces a single readable error instead of a
+    # traceback (same non-dict-after-deserialize crash class guarded for json/orjson
+    # by tests/test_json_loads_dict_guard.py).
+    if not isinstance(data, dict):
+        print(
+            f"ERROR: YAML at {path} is not a top-level mapping (expected a dict); "
+            f"got {type(data).__name__}."
+        )
+        sys.exit(1)
+    return data
 
 def save_yaml(data, path: Path):
     try:
@@ -40,10 +53,12 @@ def validate_and_patch_config(config_path: Path, experiment_id: str):
         sys.exit(1)
         
     config = load_yaml(config_path)
-    if 'experiment' not in config:
-        config['experiment'] = {}
-        
-    exp = config['experiment']
+    exp = config.get('experiment')
+    if not isinstance(exp, dict):
+        # `experiment:` missing or a non-dict value (scalar/list) — normalize to a
+        # dict so exp.get(...) below can't crash with AttributeError.
+        exp = {}
+        config['experiment'] = exp
     modified = False
     
     if not exp.get('paper_experiment', False):
@@ -83,8 +98,11 @@ def main():
     print(f"Loading experiment plan from {plan_path}...")
     plan_data = load_yaml(plan_path)
     plan = plan_data.get('experiment_plan')
-    if not plan:
-        print("ERROR: YAML must contain 'experiment_plan' root element")
+    # `experiment_plan:` must be a non-empty mapping: a missing/None value, an
+    # empty dict, or a non-dict (list/scalar) all make the downstream plan.get(...)
+    # calls meaningless or crashing — guard the non-dict crash class here.
+    if not isinstance(plan, dict) or not plan:
+        print("ERROR: YAML must contain 'experiment_plan' root element (a non-empty mapping)")
         sys.exit(1)
 
     experiment_id = plan.get('experiment_id')
