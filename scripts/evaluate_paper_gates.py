@@ -44,6 +44,15 @@ def _load_summary(path: str | Path) -> dict[str, Any]:
         print(f"ERROR: {p} not found", file=sys.stderr)
         sys.exit(2)
     data = json.loads(p.read_text())
+    # A valid-JSON-but-non-object file (bare array/scalar/string) parses fine
+    # yet ``"<key>" in data`` raises TypeError on a scalar non-dict — the same
+    # non-dict-after-json.loads crash class hardened in the sibling readers.
+    if not isinstance(data, dict):
+        print(
+            f"ERROR: {p} is not a JSON object (got {type(data).__name__})",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     if "aggregate" not in data:
         print("ERROR: aggregate key not found in summary", file=sys.stderr)
         sys.exit(2)
@@ -577,7 +586,20 @@ def _check_g2(
         if frp.exists():
             try:
                 frontier_payload = json.loads(frp.read_text())
-                frontier_state = "loaded"
+                # A valid-JSON-but-non-object file (bare array/scalar/string)
+                # parses fine yet the ``.get(...)`` accesses below raise an
+                # uncaught AttributeError — the same non-dict-after-json.loads
+                # crash class hardened in the sibling readers. Route it through
+                # the existing "unreadable" state (frontier stays INSUFFICIENT)
+                # rather than crashing mid-gate.
+                if not isinstance(frontier_payload, dict):
+                    frontier_state = "unreadable"
+                    read_error = ValueError(
+                        f"{frp}: expected a JSON object, "
+                        f"got {type(frontier_payload).__name__}"
+                    )
+                else:
+                    frontier_state = "loaded"
             except (json.JSONDecodeError, OSError) as exc:
                 frontier_state = "unreadable"
                 read_error = exc
@@ -663,7 +685,18 @@ def _check_g3(
         if ep.exists():
             try:
                 eval_data = json.loads(ep.read_text())
-            except (json.JSONDecodeError, OSError) as exc:
+                # A valid-JSON-but-non-object file (bare array/scalar/string)
+                # parses fine yet the ``eval_data.get(...)`` accesses below
+                # raise an uncaught AttributeError — the same non-dict-after-
+                # json.loads crash class hardened in the sibling readers. Raise
+                # ValueError so it joins the existing "present but unreadable"
+                # path (INSUFFICIENT EVIDENCE), identical to a corrupt file.
+                if not isinstance(eval_data, dict):
+                    raise ValueError(
+                        f"{ep}: expected a JSON object, "
+                        f"got {type(eval_data).__name__}"
+                    )
+            except (ValueError, OSError) as exc:
                 # A present-but-unreadable required input means the external-
                 # quality claim was never measured, not disproven — the same
                 # honesty contract as the missing-input path below. The check

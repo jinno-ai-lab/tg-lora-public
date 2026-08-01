@@ -277,6 +277,15 @@ def load_deterministic_batch_plan_manifest(
     path: str | Path,
 ) -> DeterministicBatchPlanManifest:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
+    # A valid-JSON-but-non-object manifest (bare array/scalar/string) parses
+    # fine yet ``from_dict`` subscripts/``.get``s it and crashes with an
+    # uncaught TypeError/AttributeError — the same non-dict-after-json.loads
+    # crash class hardened in the sibling readers (io.load_jsonl etc.). Fail
+    # loud at the load seam with a clear message instead.
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"{path}: expected a JSON object, got {type(data).__name__}"
+        )
     return DeterministicBatchPlanManifest.from_dict(data)
 
 

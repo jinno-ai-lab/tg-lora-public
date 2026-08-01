@@ -37,6 +37,15 @@ def _parse_args() -> argparse.Namespace:
 
 def _load_summary(path: str | Path) -> dict[str, Any]:
     data = json.loads(Path(path).read_text())
+    # A valid-JSON-but-non-object file (bare array/scalar/string) parses fine
+    # yet the dict accesses below (``data["cold"]`` / ``data.get(...)``) would
+    # raise an uncaught TypeError/AttributeError — the same non-dict-after-
+    # json.loads crash class hardened in the sibling readers. Fail loud here
+    # rather than abort mid-build.
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"{path}: expected a JSON object, got {type(data).__name__}"
+        )
     if "aggregate" in data and "per_seed" in data:
         return data
 

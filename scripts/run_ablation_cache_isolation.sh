@@ -259,6 +259,8 @@ for seed_dir in sorted(base.glob("seed_*")):
                 alt_path = seed_dir / "condition_b_baseline_cache" / "coldwarm" / "summary.json"
                 if alt_path.exists():
                     summary = json.loads(alt_path.read_text())
+                    if not isinstance(summary, dict):  # non-dict JSON parses but crashes summary["warm"]
+                        continue
                     row["A_baseline_wall_seconds"] = summary["warm"]["baseline"]["wall_seconds"]
                     row["A_baseline_gpu_peak_mb"] = summary["warm"]["baseline"].get("gpu_peak_mb")
                     row["A_baseline_best_valid_loss"] = summary["warm"]["baseline"]["best_valid_loss"]
@@ -268,6 +270,9 @@ for seed_dir in sorted(base.glob("seed_*")):
             print(f"WARNING: Missing {cond_key} for seed {seed}")
             continue
         summary = json.loads(summary_path.read_text())
+        if not isinstance(summary, dict):  # non-dict JSON parses but crashes summary["warm"]
+            print(f"WARNING: {cond_key} summary for seed {seed} is not a JSON object; skipping")
+            continue
         # For B and C, the "tg_lora" side contains the condition results
         if cond_key == "B_baseline_cache":
             side = summary["warm"]["tg_lora"]

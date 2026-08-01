@@ -393,6 +393,18 @@ def main() -> None:
         print(f"ERROR: gate report not found: {gate_path}", file=sys.stderr)
         sys.exit(2)
     gate_data = json.loads(gate_path.read_text())
+    # A valid-JSON-but-non-object gate report (bare array/scalar/string) parses
+    # fine yet ``gate_data.get(...)`` below raises an uncaught AttributeError —
+    # the same non-dict-after-json.loads crash class hardened in the sibling
+    # readers. Fail loud (the gate report is a required input), matching the
+    # missing-file posture above.
+    if not isinstance(gate_data, dict):
+        print(
+            f"ERROR: gate report {gate_path} is not a JSON object "
+            f"(got {type(gate_data).__name__})",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     gate_results = gate_data.get("gates", [])
 
     # Load aggregate summary (explicit or auto-discovered)
@@ -407,6 +419,17 @@ def main() -> None:
         s_path = Path(summary_path)
         if s_path.exists():
             summary = json.loads(s_path.read_text())
+            # A valid-JSON-but-non-object summary degrades the same as a missing
+            # one (it is an optional input): warn + leave ``summary`` as None so
+            # downstream ``summary.get(...)`` accessors don't crash with the
+            # non-dict-after-json.loads AttributeError.
+            if not isinstance(summary, dict):
+                print(
+                    f"WARNING: summary {s_path} is not a JSON object "
+                    f"(got {type(summary).__name__}); ignoring",
+                    file=sys.stderr,
+                )
+                summary = None
         else:
             print(f"WARNING: summary not found: {s_path}", file=sys.stderr)
 
@@ -422,6 +445,16 @@ def main() -> None:
         f_path = Path(frontier_path)
         if f_path.exists():
             frontier = json.loads(f_path.read_text())
+            # Same non-dict-after-json.loads guard as ``summary`` above: a
+            # valid-JSON-but-non-object frontier report is an optional input, so
+            # degrade to None + warn rather than crash downstream accessors.
+            if not isinstance(frontier, dict):
+                print(
+                    f"WARNING: frontier report {f_path} is not a JSON object "
+                    f"(got {type(frontier).__name__}); ignoring",
+                    file=sys.stderr,
+                )
+                frontier = None
         else:
             print(f"WARNING: frontier report not found: {f_path}", file=sys.stderr)
 

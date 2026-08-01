@@ -34,13 +34,19 @@ zero false positives.
 
 Scope is ``src/`` + ``scripts/`` ``.py`` files (the crash class spans both), plus
 a best-effort line-scan of ``scripts/*.sh`` for the same pattern in shell-embedded
-``python -c`` / heredoc blocks (the six readers fixed alongside this guard lived
-there and were missed by the earlier ``.py``-only patches). Whole-file
-``data = loads(path.read_text())`` summary loads that are dict-by-construction
-(torn-write failure is already fail-loud via the atomic-json-deposit axis, and a
-torn file raises ``JSONDecodeError`` rather than parsing to a non-dict) are out of
-scope: this guard targets the recurring *line-reader* class, not theoretical
-whole-file corruption.
+``python -c`` / heredoc blocks (the readers fixed alongside this guard lived
+there and were missed by the earlier ``.py``-only patches). BOTH per-line JSONL
+readers AND whole-file ``data = loads(path.read_text())`` readers are in scope:
+the original carve-out assumed a whole-file load is dict-by-construction (a torn
+write raises ``JSONDecodeError``), but a *valid-JSON-but-non-object* whole file
+(bare array/scalar/string — a hand-edited, externally-written, or wrong-format
+file) parses fine and then crashes ``data.get(...)`` / ``data["k"]`` with the same
+uncaught ``AttributeError``/``TypeError``. The whole-file readers fixed in the
+comprehensive sweep (consolidate / evaluate_paper_gates / frontier_report /
+precompute / deterministic_batch_plan / export_paper_results / compare_paper_*
++ the ``*.sh`` summary loaders) proved this is a real, not theoretical, failure
+mode, so the exclusion was removed — the guard now enforces "every reader" as
+the steering feedback asked.
 """
 
 from __future__ import annotations
@@ -65,26 +71,6 @@ def _is_loads_call(node: ast.AST) -> bool:
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id in _JSON_NAMES
     )
-
-
-def _is_whole_file_arg(arg: ast.expr) -> bool:
-    """True iff the loads argument is a whole-file/whole-line blob read —
-    ``loads(path.read_text())`` / ``loads(f.read())`` / ``loads(fh.readline())``.
-
-    Distinguishes the recurring *per-line JSONL reader* crash class (in scope)
-    from a single whole-file summary/config load (out of scope). The latter reads
-    a dict-by-construction file whose only non-dict failure mode is a torn write,
-    and a torn write raises ``JSONDecodeError`` (fail-loud via the atomic-json-
-    deposit axis) rather than parsing to a non-dict — so it never produced the
-    ``AttributeError`` the recurring line-reader class did. Excluding it keeps the
-    guard focused on the regression that actually recurred (7 prior per-reader
-    patches + 3 shell defects were ALL per-line readers) instead of churning
-    guards onto dict-by-construction summary loaders.
-    """
-    if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute):
-        if arg.func.attr in {"read_text", "read", "readlines", "readline"}:
-            return True
-    return False
 
 
 def _isinstance_dict_names(nodes: list[ast.AST]) -> set[str]:
@@ -149,13 +135,12 @@ def _is_string_subscript(node: ast.AST) -> bool:
 
 
 def _loads_assigned_target(value: ast.expr) -> bool:
-    """True iff *value* yields raw loads output that may contain non-dict elements:
-    a direct per-line ``loads(<line_var>)`` call, or a comprehension of
-    ``loads(...)`` with NO ``isinstance`` dict filter (``[loads(l) for l in f]``).
-    Whole-file loads (``loads(path.read_text())``) are excluded — see
-    :func:`_is_whole_file_arg`."""
+    """True iff *value* yields raw loads output that may contain non-dict
+    elements: a direct ``loads(...)`` call (per-line OR whole-file — both can
+    parse a valid-JSON non-object), or a comprehension of ``loads(...)`` with NO
+    ``isinstance`` dict filter (``[loads(l) for l in f]``)."""
     if _is_loads_call(value) and value.args:
-        return not _is_whole_file_arg(value.args[0])
+        return True
     if isinstance(value, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
         if _is_loads_call(value.elt) and not _comp_has_dict_filter(value):
             return True
@@ -204,14 +189,11 @@ def _find_defects(tree: ast.AST, filename: str) -> list[tuple[int, str]]:
 
         for n in nodes:
             # P1: chained loads(...).get(...) — no room for a guard, always bad.
-            # (Whole-file ``loads(p.read_text()).get()`` is excluded — see
-            # ``_is_whole_file_arg``.)
             if (
                 isinstance(n, ast.Attribute)
                 and n.attr == "get"
                 and _is_loads_call(n.value)
                 and n.value.args
-                and not _is_whole_file_arg(n.value.args[0])
             ):
                 defects.append((n.lineno, "chained json.loads(...).get(...)"))
                 continue
@@ -316,12 +298,6 @@ def _sh_defects(path: Path) -> list[tuple[int, str]]:
         m = _NAMED_LOADS_RE.search(line)
         if m:
             var = m.group(1)
-            # Whole-file loads (``loads(path.read_text())`` / ``loads(f.read())``)
-            # are out of scope — same exclusion as the .py AST guard. A torn write
-            # of a dict-by-construction summary raises JSONDecodeError, not a
-            # non-dict AttributeError, so it never joined the recurring class.
-            if re.search(r"\.(read_text|read|readlines|readline)\(", line):
-                continue
             window = "\n".join(lines[i : i + 4])
             guarded = f"isinstance({var}, dict)" in window or "isinstance" in window
             accessed = bool(
@@ -365,6 +341,11 @@ def test_no_unguarded_loads_dict_access_in_sh() -> None:
         # loop var over a loads list, then .get.
         "def r(f):\n    recs = [json.loads(l) for l in f]\n"
         "    for r in recs:\n        r.get('type')\n",
+        # Whole-file load (named var), .get, no isinstance — now in scope
+        # (a valid-JSON-but-non-object file crashes .get just like a per-line).
+        "def r(p):\n    data = json.loads(p.read_text())\n    return data.get('x')\n",
+        # Whole-file load, chained .get — no room for a guard; now in scope.
+        "def r(p):\n    return json.loads(p.read_text()).get('x')\n",
     ],
 )
 def test_checker_flags_unguarded_shapes(snippet: str) -> None:
@@ -395,10 +376,6 @@ def test_checker_flags_unguarded_shapes(snippet: str) -> None:
         # Whole-file load guarded by isinstance.
         "def r(p):\n    data = json.loads(p.read_text())\n"
         "    return data.get('x') if isinstance(data, dict) else None\n",
-        # Whole-file load — OUT OF SCOPE (dict-by-construction summary; a torn
-        # write raises JSONDecodeError, not a non-dict). Not flagged even unguarded.
-        "def r(p):\n    data = json.loads(p.read_text())\n    return data.get('x')\n",
-        "def r(p):\n    return json.loads(p.read_text()).get('x')\n",
     ],
 )
 def test_checker_passes_guarded_shapes(snippet: str) -> None:

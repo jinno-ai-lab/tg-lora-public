@@ -390,6 +390,17 @@ def main() -> None:
         total_cache_gib = 0.0
         for shard_path in shard_paths:
             shard_summary = json.loads(shard_path.with_suffix(".json").read_text())
+            # A valid-JSON-but-non-object shard summary (bare array/scalar/
+            # string) parses fine yet the ``shard_summary["build_seconds"]``
+            # accesses below raise an uncaught TypeError — the same non-dict-
+            # after-json.loads crash class hardened in the sibling readers. A
+            # malformed shard summary means an inconsistent cache, so fail loud
+            # rather than silently under-counting the aggregate metrics.
+            if not isinstance(shard_summary, dict):
+                raise ValueError(
+                    f"{shard_path.with_suffix('.json')}: expected a JSON object, "
+                    f"got {type(shard_summary).__name__}"
+                )
             shard_details.append(shard_summary)
             worker_seconds.append(float(shard_summary["build_seconds"]))
             total_examples += int(shard_summary["examples"])

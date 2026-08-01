@@ -34,6 +34,14 @@ def load_aggregate(path: str | Path) -> dict[str, Any]:
     if not p.exists():
         raise FileNotFoundError(f"Aggregate summary not found: {p}")
     data = json.loads(p.read_text())
+    # A valid-JSON-but-non-object file (bare array/scalar/string) parses fine
+    # yet ``"<key>" in data`` raises TypeError on a scalar non-dict — the same
+    # non-dict-after-json.loads crash class hardened in the sibling readers.
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Invalid aggregate summary at {p}: expected a JSON object, "
+            f"got {type(data).__name__}"
+        )
     if "per_seed" not in data and "aggregate" not in data:
         raise ValueError("Invalid aggregate summary: missing 'per_seed' or 'aggregate' key")
     return data

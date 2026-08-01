@@ -97,6 +97,7 @@ from src.utils.checkpoint import (
     save_periodic_cycle_checkpoint,
     save_training_state,
 )
+from src.utils.io import load_jsonl
 from src.utils.logging import ensure_dir
 from src.utils.memory import count_parameters
 from src.utils.mlflow_logger import MLflowLogger
@@ -1026,8 +1027,10 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     # by the analysis script from the recorded gold_* trajectory.
     gold_eval_records: list[dict] = []
     if cfg.eval.get("gold_eval_enabled", False) and cfg.data.get("gold_test_path"):
-        with open(cfg.data.gold_test_path) as _gold_file:
-            gold_eval_records = [json.loads(line) for line in _gold_file if line.strip()]
+        # Route through io.load_jsonl so a valid-JSON-but-non-dict line in the
+        # gold-eval JSONL is skipped (not crashed on) downstream — the same
+        # non-dict-after-json.loads guard the sibling readers use.
+        gold_eval_records = load_jsonl(cfg.data.gold_test_path)
         logger.info(
             "Gold eval enabled: %d records from %s (every %d cycles)",
             len(gold_eval_records),
@@ -1373,8 +1376,9 @@ def train_tg_lora(cfg: DictConfig, resume_path: str | None = None) -> None:
     if tg_cfg.get("json_eval_enabled", False):
         json_eval_path = tg_cfg.get("json_eval_path", "")
         if json_eval_path:
-            with open(json_eval_path) as _jf:
-                json_eval_records = [json.loads(line) for line in _jf if line.strip()]
+            # Same non-dict-after-json.loads guard as the gold-eval loader
+            # above: io.load_jsonl skips valid-JSON-but-non-dict lines.
+            json_eval_records = load_jsonl(json_eval_path)
             logger.info(
                 "JSON eval enabled: %d records from %s (every %d cycles)",
                 len(json_eval_records),

@@ -99,6 +99,14 @@ def build_frontier_report(run_infos: list[dict[str, Any]]) -> dict[str, Any]:
         summary: dict[str, Any] = {}
         if summary_exists:
             summary = json.loads(summary_path.read_text())
+            # A valid-JSON-but-non-object summary parses fine yet
+            # ``_read_peak_mb(summary, ...)`` does ``summary.get("aggregate", {})``
+            # and crashes with AttributeError — the same non-dict-after-json.loads
+            # crash class hardened in the sibling readers. Degrade to the empty
+            # dict (the pre-load default) so the report omits peak stats instead
+            # of aborting.
+            if not isinstance(summary, dict):
+                summary = {}
 
         baseline_status = determine_status(
             exit_code=info["baseline_exit"],
@@ -189,6 +197,17 @@ def _read_run_meta(run_dir: Path) -> dict[str, Any]:
     if metadata_path.exists():
         try:
             raw = json.loads(metadata_path.read_text())
+            # A valid-JSON-but-non-object metadata file (bare array/scalar/
+            # string) parses fine yet the ``raw["seeds"]`` / ``raw.get(...)``
+            # accesses below raise an uncaught TypeError/AttributeError — the
+            # same non-dict-after-json.loads crash class hardened in the sibling
+            # readers. Raise ValueError so it joins the existing ``except`` and
+            # falls back to the legacy per-file readers.
+            if not isinstance(raw, dict):
+                raise ValueError(
+                    f"{metadata_path}: expected a JSON object, "
+                    f"got {type(raw).__name__}"
+                )
             # Handle frontier sweep format (has "seeds" array)
             if "seeds" in raw:
                 seeds = raw["seeds"]

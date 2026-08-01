@@ -143,6 +143,8 @@ rows = []
 for summary_path in sorted(base.glob('seed_*/coldwarm/summary.json')):
     seed = summary_path.parents[1].name.replace('seed_', '')
     summary = json.loads(summary_path.read_text())
+    if not isinstance(summary, dict):  # non-dict JSON (array/scalar) parses but crashes summary['cold']
+        continue
     cold = summary['cold']
     warm = summary['warm']
     rows.append(
