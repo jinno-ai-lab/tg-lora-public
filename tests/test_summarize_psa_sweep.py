@@ -189,6 +189,30 @@ class TestLoadRun:
         self._write_jsonl(path, [{"type": "step", "cycle": 1}])
         assert load_run(path) is None
 
+    def test_skips_non_dict_lines(self, tmp_path):
+        """A valid-JSON-but-non-dict line must degrade, not crash the summary.
+
+        A bare array / scalar parses from ``json.loads`` yet has no ``.get``, so
+        without the guard ``obj.get("type")`` raises ``AttributeError`` and
+        aborts the whole PSA sweep. Mutation-proven: removing the isinstance
+        guard fails this test with ``AttributeError: 'list' object has no
+        attribute 'get'``.
+        """
+        from scripts.summarize_psa_sweep import load_run
+
+        path = tmp_path / "run_metrics.jsonl"
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "run_header"}) + "\n")
+            f.write("[1, 2, 3]\n")  # bare array — json.loads OK, .get crashes
+            f.write(json.dumps({"type": "step", "cycle": 1, "loss_train": 2.5}) + "\n")
+            f.write('"oops"\n')  # bare scalar string
+            f.write(json.dumps({"type": "run_footer", "best_valid_loss": 2.1}) + "\n")
+        result = load_run(path)
+        assert result is not None
+        assert len(result["records"]) == 1
+        assert result["records"][0]["cycle"] == 1
+        assert result["footer"]["best_valid_loss"] == 2.1
+
 
 class TestEndToEnd:
     """Integration test with synthetic ablation directory."""

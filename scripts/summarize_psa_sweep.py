@@ -20,6 +20,17 @@ def load_run(path: Path) -> dict | None:
     with open(path) as f:
         for line in f:
             obj = json.loads(line)
+            # A line that is valid JSON but NOT a dict (a bare array / scalar /
+            # string from a corrupt or hand-edited run_metrics.jsonl) parses
+            # fine, yet ``obj.get("type")`` below assumes a dict and raised an
+            # uncaught ``AttributeError`` that aborted the whole PSA sweep
+            # summary instead of being skipped. Same non-dict-after-json.loads
+            # crash class already hardened in the sibling readers:
+            # compare_runs.load_run (374468d) and analyze_json_experiment.
+            # load_json_eval (6b1da5a). Skip the non-dict line rather than
+            # crash; genuine invalid-JSON still raises from ``json.loads`` above.
+            if not isinstance(obj, dict):
+                continue
             t = obj.get("type")
             if t == "run_header":
                 header = obj

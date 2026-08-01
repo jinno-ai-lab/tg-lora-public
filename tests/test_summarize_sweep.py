@@ -202,3 +202,27 @@ class TestLoadRun:
         accepted = sum(1 for r in result["records"] if r.get("tg_lora_accepted"))
         assert accepted == 2
         assert len(result["records"]) == 3
+
+    def test_skips_non_dict_lines(self, tmp_path):
+        """A valid-JSON-but-non-dict line must degrade, not crash the summary.
+
+        A bare array / scalar parses from ``json.loads`` yet has no ``.get``, so
+        without the guard ``obj.get("type")`` raises ``AttributeError`` and
+        aborts the whole sweep. Mutation-proven: removing the isinstance guard
+        fails this test with ``AttributeError: 'list' object has no attribute
+        'get'``.
+        """
+        from scripts.summarize_sweep import load_run
+
+        path = tmp_path / "run_metrics.jsonl"
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "run_header", "model": "test"}) + "\n")
+            f.write("[1, 2, 3]\n")  # bare array — json.loads OK, .get crashes
+            f.write(json.dumps({"type": "step", "cycle": 1, "loss_train": 2.5}) + "\n")
+            f.write("42\n")  # bare scalar
+            f.write(json.dumps({"type": "run_footer", "best_valid_loss": 2.1}) + "\n")
+        result = load_run(path)
+        assert result is not None
+        assert result["header"]["model"] == "test"
+        assert len(result["records"]) == 1
+        assert result["records"][0]["cycle"] == 1
