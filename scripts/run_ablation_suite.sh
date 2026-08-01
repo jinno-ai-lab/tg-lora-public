@@ -119,7 +119,10 @@ for run_dir in sorted(base.iterdir()):
         rows.append((run_dir.name, "NO_METRICS", "", "", ""))
         continue
 
-    records = [orjson.loads(line) for line in path.open("rb")]
+    # Filter to dict records: ``r.get("type")`` below assumes each record is a
+    # dict, so a valid-JSON-but-non-object line would raise AttributeError. Same
+    # non-dict-after-json.loads guard as compare_runs.load_run / parse_jsonl.
+    records = [r for r in (orjson.loads(line) for line in path.open("rb")) if isinstance(r, dict)]
     footer = next((r for r in reversed(records) if r.get("type") == "run_footer"), None)
     last_step = next((r for r in reversed(records) if r.get("type") == "step"), None)
 

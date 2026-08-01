@@ -257,6 +257,8 @@ def main():
             with open(bl_metrics_path, "r", encoding="utf-8") as f:
                 for line in f:
                     data = json.loads(line)
+                    if not isinstance(data, dict):
+                        continue
                     # Find exact target steps
                     step = data.get("step") if data.get("step") is not None else data.get("global_step")
                     if step in target_steps:
@@ -277,6 +279,8 @@ def main():
             with open(tg_metrics_path, "r", encoding="utf-8") as f:
                 for line in f:
                     data = json.loads(line)
+                    if not isinstance(data, dict):
+                        continue
                     if data.get("is_step_aligned_full_eval", False):
                         target = data.get("aligned_target")
                         val_loss = data.get("loss_valid")
@@ -309,6 +313,8 @@ def main():
             with open(bl_metrics_path, "r", encoding="utf-8") as f:
                 for line in f:
                     data = json.loads(line)
+                    if not isinstance(data, dict):
+                        continue
                     if "best_valid_loss" in data:
                         bl_best_val = data["best_valid_loss"]
                         
@@ -318,6 +324,8 @@ def main():
             with open(tg_metrics_path, "r", encoding="utf-8") as f:
                 for line in f:
                     data = json.loads(line)
+                    if not isinstance(data, dict):
+                        continue
                     if "best_valid_loss" in data or "loss_valid" in data:
                         tg_final_metrics = data
         tg_best_val = tg_final_metrics.get("best_valid_loss", float("nan"))

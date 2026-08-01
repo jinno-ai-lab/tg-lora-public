@@ -256,6 +256,11 @@ if __name__ == "__main__":  # pragma: no cover -- CLI self-test, exercised by `p
         preds, golds = [], []
         for line in open(path):
             r = json.loads(line)
+            # Skip valid-JSON-but-non-object lines: ``r["completion"]`` below
+            # would raise TypeError on a non-dict. Same non-dict-after-json.loads
+            # guard as io.load_jsonl / score_json_extraction.
+            if not isinstance(r, dict):
+                continue
             preds.append(r["completion"])
             golds.append(json.loads(r["completion"]))
         scores = score_json_extraction(preds, golds)

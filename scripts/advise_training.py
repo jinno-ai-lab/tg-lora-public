@@ -48,9 +48,17 @@ def _load_jsonl(path: str | Path) -> list[dict[str, Any]]:
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                rec = json.loads(line)
             except json.JSONDecodeError as e:
                 print(f"WARNING: Skipping malformed line {line_num}: {e}", file=sys.stderr)
+                continue
+            # Valid JSON but not an object (a bare array/scalar/string) parses
+            # yet ``rec.get("type")`` in ``_extract_cycle_records`` would raise
+            # an uncaught AttributeError — skip it, same non-dict-after-json.loads
+            # guard as ``parse_jsonl`` / ``load_run`` / ``io.load_jsonl``.
+            if not isinstance(rec, dict):
+                continue
+            records.append(rec)
     return records
 
 

@@ -297,6 +297,8 @@ for run_dir in sorted(base.iterdir()):
     with open(metrics) as f:
         for line in f:
             obj = json.loads(line)
+            if not isinstance(obj, dict):
+                continue
             t = obj.get("type")
             if t == "step":
                 records.append(obj)

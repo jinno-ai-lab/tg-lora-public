@@ -1236,6 +1236,12 @@ def _ledger_has_matching_header(path, fingerprint: dict) -> bool:
         rec = json.loads(first)
     except (json.JSONDecodeError, OSError):
         return False
+    # A valid-JSON-but-non-object first line (bare scalar/array/string) parses
+    # yet ``rec.get`` below would raise AttributeError, escaping the except
+    # above (which catches only JSONDecodeError/OSError) — guard it, matching
+    # the sibling ``_read_ledger_header`` / ``load_ledger`` non-dict handling.
+    if not isinstance(rec, dict):
+        return False
     return rec.get("type") == "header" and _fingerprint_matches(
         rec.get("fingerprint"), fingerprint
     )

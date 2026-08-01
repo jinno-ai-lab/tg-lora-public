@@ -76,8 +76,15 @@ def load_run_metrics(run_dir: Path) -> list[dict]:
     with open(metrics_path) as f:
         for line in f:
             line = line.strip()
-            if line:
-                records.append(json.loads(line))
+            if not line:
+                continue
+            rec = json.loads(line)
+            # Skip valid-JSON-but-non-object lines (bare array/scalar/string):
+            # ``extract_loss_and_time`` calls ``r.get("type")`` on every record,
+            # which would raise an uncaught AttributeError on a non-dict. Same
+            # non-dict-after-json.loads guard as ``parse_jsonl`` / ``load_run``.
+            if isinstance(rec, dict):
+                records.append(rec)
     return records
 
 

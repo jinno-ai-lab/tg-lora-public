@@ -67,8 +67,14 @@ def load_raw(path: Path) -> list[dict]:
     records = []
     with open(path, encoding="utf-8") as f:
         for line in f:
-            if line.strip():
-                records.append(json.loads(line))
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            # Skip valid-JSON-but-non-object lines: ``format_record`` calls
+            # ``raw.get(...)`` on each record, which would raise AttributeError
+            # on a non-dict. Same non-dict-after-json.loads guard as io.load_jsonl.
+            if isinstance(rec, dict):
+                records.append(rec)
     return records
 
 

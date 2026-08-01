@@ -110,7 +110,8 @@ import json
 steps = 0
 with open('${metrics}') as f:
     for line in f:
-        if json.loads(line).get('type') == 'step':
+        obj = json.loads(line)
+        if isinstance(obj, dict) and obj.get('type') == 'step':
             steps += 1
 print(steps)
 ")

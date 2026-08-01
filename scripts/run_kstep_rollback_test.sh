@@ -122,6 +122,8 @@ best, final = None, None
 with open('${d}/run_metrics.jsonl', 'rb') as f:
     for line in f:
         r = orjson.loads(line)
+        if not isinstance(r, dict):
+            continue
         if r['type'] == 'run_footer':
             best = r.get('best_valid_loss', 'N/A')
             final = r.get('final_train_loss', 'N/A')

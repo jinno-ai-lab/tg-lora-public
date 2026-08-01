@@ -185,6 +185,11 @@ def main():
         with open(metrics_path) as f:
             for line in f:
                 d = json.loads(line)
+                # Skip valid-JSON-but-non-object lines: ``d.get("type")`` below
+                # assumes a dict and a non-dict would raise AttributeError. Same
+                # non-dict-after-json.loads guard as the sibling metrics readers.
+                if not isinstance(d, dict):
+                    continue
                 if d.get("type") == "step" and "loss_valid" in d:
                     c = d.get("cycle")
                     if c is not None:

@@ -53,7 +53,7 @@ import json
 with open('${metrics}') as f:
     for line in f:
         obj = json.loads(line)
-        if obj.get('type') == 'run_header':
+        if isinstance(obj, dict) and obj.get('type') == 'run_header':
             print(obj.get('run_id', ''))
             break
 " 2>/dev/null)

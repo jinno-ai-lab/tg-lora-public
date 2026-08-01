@@ -150,7 +150,13 @@ if __name__ == "__main__":  # pragma: no cover -- CLI smoke, exercised by `pytho
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     test_path = Path("data/jsonex_test.jsonl")
-    records = [json.loads(line) for line in open(test_path) if line.strip()]
+    # Filter to dict records: ``record["completion"]`` is accessed downstream in
+    # evaluate_json_extraction_run, so a valid-JSON-but-non-object line would
+    # crash with TypeError. Same non-dict-after-json.loads guard as io.load_jsonl.
+    records = [
+        r for r in (json.loads(line) for line in open(test_path) if line.strip())
+        if isinstance(r, dict)
+    ]
     model_id = os.environ.get("MODEL_ID")
     if not model_id:
         print("Set MODEL_ID to run generation; skipping (no model).")

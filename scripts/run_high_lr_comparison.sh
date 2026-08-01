@@ -167,7 +167,10 @@ for d in sorted(base.iterdir()):
     results.append((name, "NO_METRICS", "", "", ""))
     continue
 
-  lines = [json.loads(l) for l in metrics.read_text().strip().split("\n")]
+  # Filter to dict records: ``l.get("type")`` below assumes each line is a dict,
+  # so a valid-JSON-but-non-object line would raise AttributeError. Same
+  # non-dict-after-json.loads guard as compare_runs.load_run / parse_jsonl.
+  lines = [l for l in (json.loads(x) for x in metrics.read_text().strip().split("\n")) if isinstance(l, dict)]
   footer = next((l for l in reversed(lines) if l.get("type") == "run_footer"), None)
   steps = [l for l in lines if l.get("type") == "step"]
   total_bp = steps[-1].get("total_backward_passes", "") if steps else ""

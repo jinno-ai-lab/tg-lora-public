@@ -78,9 +78,22 @@ def save_jsonl(records: list[dict], path: str | Path) -> None:
 
 
 def load_jsonl(path: str | Path) -> list[dict]:
+    # Honor the ``list[dict]`` contract at the read seam, not just the write
+    # seam: a line that is valid JSON but NOT a dict (a bare array/scalar/string
+    # from a corrupt or hand-edited file) parses fine, yet every consumer
+    # (eval_downstream / eval_format / eval_task ``rec.get(...)``) accesses the
+    # records as dicts — so one non-dict line raised an uncaught
+    # ``AttributeError`` that aborted the whole eval, the same non-dict-after-
+    # json.loads crash class already hardened in the sibling readers
+    # (parse_jsonl / load_run / run_metrics). Skip non-dict lines so this helper
+    # returns only usable records; genuine invalid-JSON still raises from
+    # ``orjson.loads``. On an all-dict file (the only well-formed case) this is
+    # a no-op, byte-identical to the prior per-record append.
     records = []
     with open(path, "rb") as f:
         for line in f:
             if line.strip():
-                records.append(orjson.loads(line))
+                rec = orjson.loads(line)
+                if isinstance(rec, dict):
+                    records.append(rec)
     return records

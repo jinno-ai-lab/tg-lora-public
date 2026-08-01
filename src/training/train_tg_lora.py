@@ -649,6 +649,13 @@ def _check_and_save_linearity_budget_checkpoint(
                     with open(baseline_metrics_path, "r", encoding="utf-8") as f:
                         for line in f:
                             data = json.loads(line)
+                            # Skip valid-JSON-but-non-object lines so one corrupt
+                            # line no longer aborts the whole target's scan (the
+                            # broad ``except Exception`` below caught the resulting
+                            # AttributeError but bailed the loop early). Same
+                            # non-dict-after-json.loads guard as parse_jsonl.
+                            if not isinstance(data, dict):
+                                continue
                             step = data.get("step") if data.get("step") is not None else data.get("global_step")
                             if step == target:
                                 val_loss = data.get("loss_valid")

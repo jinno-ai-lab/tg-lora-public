@@ -33,7 +33,13 @@ def main():
     args = ap.parse_args()
 
     test_path = Path("data/jsonex_test.jsonl")
-    records = [json.loads(l) for l in open(test_path) if l.strip()][: args.n]
+    # Filter to dict records: ``record["completion"]`` is accessed downstream, so
+    # a valid-JSON-but-non-object line would crash with TypeError. Same
+    # non-dict-after-json.loads guard as io.load_jsonl.
+    records = [
+        r for r in (json.loads(l) for l in open(test_path) if l.strip())
+        if isinstance(r, dict)
+    ][: args.n]
     print(f"Loaded {len(records)} test records", flush=True)
 
     # 4bit (bitsandbytes) requires CUDA; fall back to bf16 on MPS/CPU so the
