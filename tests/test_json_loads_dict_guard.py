@@ -14,15 +14,20 @@ guard makes that the LAST per-reader patch by failing CI on any *new* unguarded
 reader instead of waiting for a crash report.
 
 What it catches (AST, so comments/docstrings don't false-positive — only real
-expressions):
+expressions) — every shape of the non-dict-after-json.loads crash class, not
+just the dominant ``.get`` shape:
 
-* **P1 (chained)** — ``json.loads(x).get(...)`` / ``orjson.loads(x)[...]``: the
-  loads result is dict-accessed inline with no place to put a guard. Always a
-  defect; refactor to ``obj = loads(x); if isinstance(obj, dict) and obj.get(...)``.
+* **P1 (chained)** — ``json.loads(x).get(...)`` / ``.keys()`` / ``.items()`` /
+  ``.values()`` / ``["k"]``: the loads result is dict-accessed inline with no
+  place to put a guard. Always a defect; refactor to
+  ``obj = loads(x); if isinstance(obj, dict) and obj.get(...)``.
 * **P2 (named var)** — ``obj = loads(...)`` (or ``recs = [loads(l) for l in f]``
   with NO ``isinstance`` filter in the comprehension) whose value is later
-  ``.get()`` / ``["str"]`` / ``[i].get()``-accessed without an
-  ``isinstance(obj, dict)`` check anywhere in the enclosing scope.
+  ``.get()`` / ``.keys()`` / ``.items()`` / ``.values()`` / ``["str"]`` /
+  ``[i].get()``-accessed without an ``isinstance(obj, dict)`` check anywhere in
+  the enclosing scope. The dict-*reader* methods (get/keys/items/values) are all
+  watched: none of list/str/int/bool/None defines them, so each crashes with the
+  same uncaught ``AttributeError`` on a valid-JSON-but-non-object value.
 
 Scopes are walked per-function (nested function bodies are analyzed
 independently, not folded into the parent). The ``isinstance`` guard is matched
@@ -59,6 +64,21 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _JSON_NAMES = {"json", "orjson"}
+# The non-mutating dict-*reader* access methods. A loads result is one of the
+# JSON value types (dict / list / str / int / float / bool / None); NONE of
+# list / str / int / float / bool / None defines ``.keys`` / ``.items`` /
+# ``.values``, so calling any of these on a valid-JSON-but-non-object value
+# raises the SAME uncaught ``AttributeError`` as ``.get`` and aborts the whole
+# reader. The guard watches all four (not just ``.get``) so the structural
+# closure covers every shape of the non-dict-after-json.loads crash class, not
+# merely the dominant ``.get`` shape — a ``.keys()`` reader is a real pattern
+# (two guarded sites in eval_downstream / eval_format) that would otherwise need
+# its own per-reader patch, defeating the guard's "last per-reader patch"
+# purpose. Mutating methods (pop / setdefault / popitem / update / ...) and
+# names that also exist on list (pop / copy / clear) are deliberately OUT OF
+# SCOPE: they don't fit the unambiguous non-mutating-reader shape and would risk
+# false positives.
+_DICT_ACCESS_ATTRS = frozenset({"get", "keys", "items", "values"})
 _SCOPE_STOPPERS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
 
@@ -188,25 +208,28 @@ def _find_defects(tree: ast.AST, filename: str) -> list[tuple[int, str]]:
                     changed = True
 
         for n in nodes:
-            # P1: chained loads(...).get(...) — no room for a guard, always bad.
+            # P1: chained loads(...).<dict-method>(...) — no room for a guard, always bad.
             if (
                 isinstance(n, ast.Attribute)
-                and n.attr == "get"
+                and n.attr in _DICT_ACCESS_ATTRS
                 and _is_loads_call(n.value)
                 and n.value.args
             ):
-                defects.append((n.lineno, "chained json.loads(...).get(...)"))
+                defects.append(
+                    (n.lineno, f"chained json.loads(...).{n.attr}(...)")
+                )
                 continue
-            # P2a: <loads_target>.get(...)
+            # P2a: <loads_target>.<dict-method>(...)
             if (
                 isinstance(n, ast.Attribute)
-                and n.attr == "get"
+                and n.attr in _DICT_ACCESS_ATTRS
                 and isinstance(n.value, ast.Name)
                 and n.value.id in loads_targets
                 and n.value.id not in guarded
             ):
                 defects.append(
-                    (n.lineno, f"unguarded {n.value.id}.get(...) after json.loads")
+                    (n.lineno,
+                     f"unguarded {n.value.id}.{n.attr}(...) after json.loads")
                 )
                 continue
             # P2b: <loads_target>["key"]
@@ -220,17 +243,18 @@ def _find_defects(tree: ast.AST, filename: str) -> list[tuple[int, str]]:
                     (n.lineno, f"unguarded {n.value.id}[\"key\"] after json.loads")
                 )
                 continue
-            # P2c: <loads_target>[i].get(...) (list of loads records, then .get)
+            # P2c: <loads_target>[i].<dict-method>(...) (list of loads records)
             if (
                 isinstance(n, ast.Attribute)
-                and n.attr == "get"
+                and n.attr in _DICT_ACCESS_ATTRS
                 and isinstance(n.value, ast.Subscript)
                 and isinstance(n.value.value, ast.Name)
                 and n.value.value.id in loads_targets
                 and n.value.value.id not in guarded
             ):
                 defects.append(
-                    (n.lineno, f"unguarded {n.value.value.id}[...].get(...) after json.loads")
+                    (n.lineno,
+                     f"unguarded {n.value.value.id}[...].{n.attr}(...) after json.loads")
                 )
 
     return defects
@@ -246,8 +270,9 @@ def _py_files() -> list[Path]:
 
 
 def test_no_unguarded_loads_dict_access_in_py() -> None:
-    """Every ``json/orjson.loads`` result that is ``.get``/``["key"]``-accessed in
-    ``src/`` + ``scripts/`` ``.py`` must be ``isinstance(..., dict)``-guarded."""
+    """Every ``json/orjson.loads`` result that is dict-accessed
+    (``.get``/``.keys``/``.items``/``.values``/``["key"]``) in ``src/`` +
+    ``scripts/`` ``.py`` must be ``isinstance(..., dict)``-guarded."""
     offenders: list[str] = []
     parse_errors: list[str] = []
     for src_file in _py_files():
@@ -265,47 +290,58 @@ def test_no_unguarded_loads_dict_access_in_py() -> None:
         + "\n".join(parse_errors)
     )
     assert not offenders, (
-        "Every json/orjson.loads result that is .get()/[\"key\"]-accessed must be "
-        "guarded by isinstance(..., dict) — an unguarded access crashes with "
-        "AttributeError on a valid-JSON-but-non-object line (bare array/scalar/"
-        "string), aborting the whole reader. Add `if not isinstance(obj, dict): "
-        "continue` (or filter in the comprehension) — see io.load_jsonl / "
-        "parse_jsonl / compare_runs.load_run for the established idiom. "
-        "Offending sites:\n" + "\n".join(offenders)
+        "Every json/orjson.loads result that is dict-accessed (.get/.keys/.items/"
+        ".values/[\"key\"]) must be guarded by isinstance(..., dict) — an unguarded "
+        "access crashes with AttributeError on a valid-JSON-but-non-object line "
+        "(bare array/scalar/string), aborting the whole reader. Add "
+        "`if not isinstance(obj, dict): continue` (or filter in the comprehension) "
+        "— see io.load_jsonl / parse_jsonl / compare_runs.load_run for the "
+        "established idiom. Offending sites:\n" + "\n".join(offenders)
     )
 
 
 # --- shell-embedded python: the six readers fixed here lived in scripts/*.sh ---
 
 _NAMED_LOADS_RE = re.compile(r"(\w+)\s*=\s*(?:json|orjson)\.loads\(")
-_CHAINED_LOADS_GET_RE = re.compile(r"(?:json|orjson)\.loads\([^)\n]*\)\s*\.\s*get\(")
+# Chained loads(...).<dict-reader-method>(...) — get/keys/items/values all crash
+# identically on a non-dict (none exist on list/str/int/bool/None).
+_CHAINED_LOADS_ACCESS_RE = re.compile(
+    r"(?:json|orjson)\.loads\([^)\n]*\)\s*\.\s*(?:get|keys|items|values)\("
+)
 
 
 def _sh_defects(path: Path) -> list[tuple[int, str]]:
     """Best-effort scan of shell-embedded python for the same crash class.
 
-    Catches the chained form (``json.loads(line).get('type')``) and the named-var
-    form (``obj = json.loads(line)`` on one line, ``obj.get(...)`` / ``obj['x']``
-    on the next, with no ``isinstance(obj, dict)`` nearby). Shell quoting makes a
-    full extraction brittle, so this is a line-scan — but it covers the exact
-    shapes the six fixed .sh readers used.
+    Catches the chained form (``json.loads(line).get('type')`` / ``.keys()`` /
+    ``.items()`` / ``.values()``) and the named-var form (``obj =
+    json.loads(line)`` on one line, ``obj.get(...)`` / ``obj.keys()`` /
+    ``obj['x']`` on the next, with no ``isinstance(obj, dict)`` nearby). Shell
+    quoting makes a full extraction brittle, so this is a line-scan — but it
+    covers the exact shapes the six fixed .sh readers used, generalized from
+    ``.get`` to the full non-mutating dict-reader method set so a future embedded
+    ``.keys()`` reader can't slip through either.
     """
     defects: list[tuple[int, str]] = []
     lines = path.read_text(encoding="utf-8").splitlines()
     for i, line in enumerate(lines):
-        if _CHAINED_LOADS_GET_RE.search(line):
-            defects.append((i + 1, "chained json.loads(...).get(...)"))
+        if _CHAINED_LOADS_ACCESS_RE.search(line):
+            defects.append((i + 1, "chained json.loads(...).<dict-method>(...)"))
         m = _NAMED_LOADS_RE.search(line)
         if m:
             var = m.group(1)
             window = "\n".join(lines[i : i + 4])
             guarded = f"isinstance({var}, dict)" in window or "isinstance" in window
             accessed = bool(
-                re.search(rf"{re.escape(var)}\s*\.\s*get\(", window)
+                re.search(
+                    rf"{re.escape(var)}\s*\.\s*(?:get|keys|items|values)\(", window
+                )
                 or re.search(rf"{re.escape(var)}\s*\[\s*['\"]", window)
             )
             if accessed and not guarded:
-                defects.append((i + 1, f"unguarded {var}.get/[] after json.loads"))
+                defects.append(
+                    (i + 1, f"unguarded {var}.<dict-method>/[] after json.loads")
+                )
     return defects
 
 
@@ -346,6 +382,16 @@ def test_no_unguarded_loads_dict_access_in_sh() -> None:
         "def r(p):\n    data = json.loads(p.read_text())\n    return data.get('x')\n",
         # Whole-file load, chained .get — no room for a guard; now in scope.
         "def r(p):\n    return json.loads(p.read_text()).get('x')\n",
+        # Non-.get dict-reader methods on a loads result crash identically
+        # (list/str/int/bool/None define no .keys/.items/.values) — the same
+        # crash class, so the guard must flag them, not just .get. Named-var form.
+        "def r(p):\n    obj = json.loads(p.read_text())\n    return list(obj.keys())\n",
+        "def r(p):\n    obj = json.loads(p.read_text())\n    return dict(obj.items())\n",
+        "def r(p):\n    obj = json.loads(p.read_text())\n    return sum(1 for _ in obj.values())\n",
+        # Non-.get dict method, chained — no room for a guard.
+        "def r(p):\n    return list(json.loads(p.read_text()).keys())\n",
+        # List of loads records, then [i].items() — no isinstance filter in the comp.
+        "def r(f):\n    recs = [json.loads(l) for l in f]\n    return dict(recs[0].items())\n",
     ],
 )
 def test_checker_flags_unguarded_shapes(snippet: str) -> None:
@@ -376,6 +422,9 @@ def test_checker_flags_unguarded_shapes(snippet: str) -> None:
         # Whole-file load guarded by isinstance.
         "def r(p):\n    data = json.loads(p.read_text())\n"
         "    return data.get('x') if isinstance(data, dict) else None\n",
+        # Non-.get dict method, guarded by isinstance — must NOT false-positive.
+        "def r(p):\n    obj = json.loads(p.read_text())\n"
+        "    return list(obj.keys()) if isinstance(obj, dict) else []\n",
     ],
 )
 def test_checker_passes_guarded_shapes(snippet: str) -> None:
