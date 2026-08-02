@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# prepare-commit-msg hook -- structural guard against empty / normalization-only
+# commits.
+#
+# WHY THIS EXISTS
+#   AI-Hub make-run feedback (policy 0.3.15, bullet 4): the prior commit-hygiene
+#   guard (`make check-commit-substantive`, scripts/check_substantive_diff.py)
+#   was OPT-IN -- it only ran when a human remembered to invoke it. The make-run
+#   runner just calls `git commit`, bypassing it, so empty / whitespace-only
+#   `chore(make-run): ...` commits flowed into main and were rejected by the
+#   value judge ("target repository produced zero commits"). This hook makes the
+#   SAME check fire AUTOMATICALLY at commit time, reusing the existing checker
+#   (no parallel implementation -- not a second source of truth for "substantive").
+#
+# INSTALL (once per clone / worktree):
+#   make install-hooks
+#
+# BEHAVIOUR
+#   * staged diff is substantive            -> allow
+#   * staged diff is empty / ws-only        -> reject   (the make-run anti-pattern)
+#   * merge / squash / amend (`$2` source)  -> allow    (no staged delta by design)
+#   * TG_LORA_ALLOW_EMPTY_COMMIT=1         -> allow    (operator escape hatch)
+#
+# NOTE: `git commit --no-verify` does NOT bypass prepare-commit-msg (unlike the
+# pre-commit / commit-msg hooks), so this guard cannot be silenced by accident.
+# Use the env-var escape hatch above for a deliberate empty commit, or
+# `make uninstall-hooks` to remove it.
+
+set -u
+
+source="${2:-}"
+
+# Sources that legitimately carry no staged content delta. `$2` is the commit
+# source as passed by git: message | template | merge | squash | commit (amend).
+case "$source" in
+    merge|squash|commit)
+        exit 0
+        ;;
+esac
+
+# Operator escape hatch for a deliberate empty commit.
+if [ "${TG_LORA_ALLOW_EMPTY_COMMIT:-0}" = "1" ]; then
+    exit 0
+fi
+
+# Locate the checker. Prefer the symlink-resolved location of THIS hook (so a
+# `make install-hooks` symlink finds the checked-in checker from any clone or
+# linked worktree); fall back to git's notion of the worktree root.
+checker=""
+_real=$(readlink -f "$0" 2>/dev/null || true)
+if [ -n "$_real" ]; then
+    _cand="$(dirname "$_real")/../check_substantive_diff.py"
+    [ -f "$_cand" ] && checker="$_cand"
+fi
+if [ -z "$checker" ]; then
+    _root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    [ -n "$_root" ] && checker="$_root/scripts/check_substantive_diff.py"
+fi
+if [ -z "$checker" ] || [ ! -f "$checker" ]; then
+    echo "prepare-commit-msg: could not locate check_substantive_diff.py -- allowing commit (guard inactive)." >&2
+    exit 0
+fi
+
+# The checker is stdlib-only (argparse/subprocess/sys); a system interpreter is
+# sufficient, so the hook does not depend on the repo venv being activated.
+PYBIN=""
+for _c in python3 python; do
+    if command -v "$_c" >/dev/null 2>&1; then PYBIN="$_c"; break; fi
+done
+if [ -z "$PYBIN" ]; then
+    echo "prepare-commit-msg: no python interpreter on PATH -- allowing commit (guard inactive)." >&2
+    exit 0
+fi
+
+# Exit codes from check_substantive_diff.py: 0 substantive | 3 empty | 4
+# normalization-only | 1 unexpected | 2 argparse. Reject ONLY on the two verdict
+# codes that name the make-run churn; fail open (allow) on anything unexpected
+# so a transient git/env glitch cannot lock out all commits.
+output=$("$PYBIN" "$checker" --staged 2>&1)
+status=$?
+case "$status" in
+    0)
+        exit 0
+        ;;
+    3|4)
+        echo "prepare-commit-msg: rejecting non-substantive commit (empty or whitespace-only staged diff)." >&2
+        echo "$output" >&2
+        echo "  merge/squash/amend are exempt; set TG_LORA_ALLOW_EMPTY_COMMIT=1 to force an empty commit." >&2
+        exit 1
+        ;;
+    *)
+        echo "prepare-commit-msg: checker returned status $status -- allowing commit (guard inconclusive)." >&2
+        echo "$output" >&2
+        exit 0
+        ;;
+esac

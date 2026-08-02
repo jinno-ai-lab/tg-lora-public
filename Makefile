@@ -7,7 +7,7 @@
 	compare compare-prefix compare-prefix-cold compare-prefix-warm compare-prefix-coldwarm compare-report paper-memory paper-memory-dry-run paper-memory-one-shot paper-memory-compare-modes paper-memory-all-modes paper-memory-evaluate-gates paper-memory-external-eval paper-memory-frontier-sweep paper-memory-cache-ablation cosine-n-ablation cosine-n-ablation-dry-run cosine-n-skip-ablation cosine-n-skip-ablation-dry-run precompute-prefix-cache ablation sweep accel-sweep \
 	bench-optimizer bench-prefix-cache bench-prefix-cache-one-shot analyze-prefix-break-even analyze-prefix-break-even-ci bench-velocity-ops bench-velocity-ops-ci bench-velocity-ops-save-baseline \
        test test-accel test-cov test-integration test-trajectory test-cli-help lint format clean clean-data clean-runs \
-       diagnose recover ci gates-ci check-status \
+       diagnose recover ci gates-ci check-status install-hooks uninstall-hooks \
        convert-mlx train-mlx train-mlx-baseline train-mlx-continuous train-mlx-upstream train-mlx-smoke mlx-data compare-mlx \
        help
 
@@ -618,6 +618,30 @@ check-commit-substantive: ## Commit-hygiene guard: fail if HEAD's diff is empty 
                          ## content delta) -- skip/squash before judging (TASK-0192).
                          ## Use RANGE="A..B" for an arbitrary pair, STAGED=1 for the index.
 	$(PYTHON_VENV) scripts/check_substantive_diff.py $(if $(STAGED),--staged,--range $(or $(RANGE),HEAD^..HEAD))
+
+install-hooks: ## Install checked-in git hooks (scripts/hooks/*) so the
+               ## prepare-commit-msg empty-commit guard fires automatically at
+               ## commit time. Idempotent; run once per clone/worktree. Reuses
+               ## scripts/check_substantive_diff.py (the check-commit-substantive
+               ## logic) -- no second source of truth. AI-Hub feedback bullet 4.
+	@HOOKS_DIR=$$(git rev-parse --git-path hooks); \
+	echo "installing hooks into $$HOOKS_DIR"; \
+	for h in scripts/hooks/*; do \
+		[ -f "$$h" ] || continue; \
+		name=$$(basename "$$h"); \
+		chmod +x "$$h"; \
+		ln -sf "$$(cd scripts/hooks && pwd)/$$name" "$$HOOKS_DIR/$$name"; \
+		echo "  linked $$name -> $$h"; \
+	done
+
+uninstall-hooks: ## Remove the repo-installed git hooks (reverses install-hooks).
+	@HOOKS_DIR=$$(git rev-parse --git-path hooks); \
+	for h in scripts/hooks/*; do \
+		[ -f "$$h" ] || continue; \
+		name=$$(basename "$$h"); \
+		rm -f "$$HOOKS_DIR/$$name"; \
+		echo "  removed $$name"; \
+	done
 
 lint: ## Run linting
 	$(PYTHON_VENV) -m ruff check src/ tests/ scripts/
