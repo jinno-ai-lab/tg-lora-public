@@ -41,7 +41,7 @@ help: ## Show this help
 setup: ## Full environment setup (conda + deps + latest transformers)
 	bash scripts/setup_env.sh
 
-install: ## Install into existing venv
+install: install-hooks ## Install into existing venv (also deploys git hooks)
 	$(PYTHON) -m venv $(VENV) || true
 	$(PIP) install -U pip setuptools wheel
 	$(PIP) install -e ".[dev]"
@@ -624,15 +624,12 @@ install-hooks: ## Install checked-in git hooks (scripts/hooks/*) so the
                ## commit time. Idempotent; run once per clone/worktree. Reuses
                ## scripts/check_substantive_diff.py (the check-commit-substantive
                ## logic) -- no second source of truth. AI-Hub feedback bullet 4.
-	@HOOKS_DIR=$$(git rev-parse --git-path hooks); \
-	echo "installing hooks into $$HOOKS_DIR"; \
-	for h in scripts/hooks/*; do \
-		[ -f "$$h" ] || continue; \
-		name=$$(basename "$$h"); \
-		chmod +x "$$h"; \
-		ln -sf "$$(cd scripts/hooks && pwd)/$$name" "$$HOOKS_DIR/$$name"; \
-		echo "  linked $$name -> $$h"; \
-	done
+               ## Wired as a prerequisite of `install` so the standard setup
+               ## deploys the guard (a fresh clone/worktree otherwise ships
+               ## inert). The recipe lives in scripts/install_hooks.sh so the
+               ## deployment is testable (tests/test_install_hooks.py runs it
+               ## against a sandbox HOOKS_DIR).
+	@bash scripts/install_hooks.sh
 
 uninstall-hooks: ## Remove the repo-installed git hooks (reverses install-hooks).
 	@HOOKS_DIR=$$(git rev-parse --git-path hooks); \
