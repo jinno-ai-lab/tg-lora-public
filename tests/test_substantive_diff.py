@@ -79,6 +79,46 @@ def test_verdict_pure_addition_of_real_line_is_substantive():
 
 
 # --------------------------------------------------------------------------- #
+# Binary-file change (no +/- text body) must read substantive, not empty       #
+# --------------------------------------------------------------------------- #
+# Regression guard for the prepare-commit-msg hook: git emits
+# `Binary files ... differ` with NO +/- content lines, so the line counter
+# formerly read (0, 0) -> verdict "empty" -> exit 3 -> the hook REJECTED a
+# legitimate binary commit (e.g. a committed .pt/.safetensors fixture). A binary
+# delta is substantive by definition.
+
+
+def test_content_line_counts_counts_binary_marker_as_content():
+    # git's exact format for a newly-added binary file.
+    binary_add = (
+        "diff --git a/weights.pt b/weights.pt\n"
+        "new file mode 100644\n"
+        "index 0000000..5bcf3dd\n"
+        "Binary files /dev/null and b/weights.pt differ\n"
+    )
+    assert content_line_counts(binary_add) == (1, 0)
+
+
+def test_verdict_substantive_for_binary_only_diff():
+    # Both the raw and the -w diff carry the binary marker (whitespace flags do
+    # not strip it), so the verdict must be substantive, not empty.
+    binary = "Binary files a/weights.pt and b/weights.pt differ\n"
+    assert substantive_verdict(binary, binary) == "substantive"
+    # And an add via /dev/null is substantive too.
+    binary_add = "Binary files /dev/null and b/weights.pt differ\n"
+    assert substantive_verdict(binary_add, binary_add) == "substantive"
+
+
+def test_verdict_substantive_when_binary_accompanies_text_reflow():
+    # A commit that reflows whitespace in a text file AND changes a binary file
+    # is substantive: the binary marker survives in the -w diff, so the verdict
+    # must not collapse to normalization-only on the text reflow.
+    raw = _HUNK + "-hello world\n+hello   world\n" + "Binary files a/x and b/x differ\n"
+    ws = "Binary files a/x and b/x differ\n"
+    assert substantive_verdict(raw, ws) == "substantive"
+
+
+# --------------------------------------------------------------------------- #
 # End-to-end git integration (the feedback's actual churn scenario)           #
 # --------------------------------------------------------------------------- #
 
@@ -166,6 +206,26 @@ def test_guard_flags_staged_normalization_only(tmp_path):
 
     proc = _run_guard(repo, "--staged")
     assert proc.returncode == EXIT_NORMALIZATION_ONLY, proc.stderr
+
+
+def test_guard_passes_staged_binary_add(tmp_path):
+    """Pre-commit use (--staged): a newly staged BINARY file (no +/- text body,
+    git emits `Binary files ... differ`) is substantive -- it must NOT be
+    rejected as empty. Without the binary-marker branch this returned EXIT_EMPTY
+    (reproduced), which would make the prepare-commit-msg hook block a legitimate
+    fixture / artifact commit."""
+    repo = tmp_path
+    _new_repo(repo)
+    note = repo / "note.md"
+    note.write_text("hello\n")
+    _git(repo, "add", "note.md")
+    _git(repo, "commit", "-q", "-m", "baseline")
+    # Real non-UTF8 bytes so git classifies the file as binary.
+    (repo / "weights.pt").write_bytes(b"\x00\x01\x02\xff\xfe-substantive")
+    _git(repo, "add", "weights.pt")
+
+    proc = _run_guard(repo, "--staged")
+    assert proc.returncode == EXIT_SUBSTANTIVE, proc.stderr
 
 
 def test_main_returns_substantive_for_this_repos_last_commit():

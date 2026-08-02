@@ -50,6 +50,13 @@ def content_line_counts(diff_text: str) -> tuple[int, int]:
     ``index`` meta-lines are excluded, so a diff that merely touches many files
     without a real edit still reads as zero content lines. ``\\ No newline`` and
     context lines are also ignored.
+
+    A ``Binary files ... differ`` marker carries no ``+``/``-`` text lines but
+    IS a real content change (e.g. a committed ``.pt``/``.safetensors`` fixture);
+    it is counted as one added content line so a binary-only diff classifies as
+    ``substantive`` rather than the false-negative ``empty`` that would block a
+    legitimate binary commit at the prepare-commit-msg gate. ``-w`` does not
+    strip this marker, so the whitespace-ignored diff agrees.
     """
     added = 0
     removed = 0
@@ -77,6 +84,13 @@ def content_line_counts(diff_text: str) -> tuple[int, int]:
             added += 1
         elif line.startswith("-"):
             removed += 1
+        elif line.startswith("Binary files "):
+            # git emits `Binary files a/x and b/x differ` (or `/dev/null and
+            # b/x differ` for an add) with no +/- text body. It is a real
+            # content delta -- count it so the verdict is "substantive", not the
+            # false-negative "empty" that would reject a legitimate binary
+            # commit (the prepare-commit-msg hook maps exit 3 -> reject).
+            added += 1
     return added, removed
 
 
