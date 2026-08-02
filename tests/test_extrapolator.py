@@ -772,3 +772,150 @@ def test_subspace_m9_scaling():
     assert math.isclose(norms[10], 10 * norms[1], rel_tol=1e-4)
     assert math.isclose(norms[20], 20 * norms[1], rel_tol=1e-4)
 
+
+# ---------------------------------------------------------------------------
+# subspace_m9_fit_step -- error contract + v0-prior branch coverage.
+#
+# The happy path (sufficient non-degenerate history, default history-mean
+# prior) is pinned by test_subspace_m9_fit_step / test_subspace_m9_scaling
+# above. The cases below pin the *unguarded-by-happy-path* behaviour the SOP
+# calls the error contract + boundary set (STEP 3a): the two short-circuit
+# guards, the two anomaly raises, and the one behavioural fork in how the
+# prior direction v0 is chosen. subspace_m9_fit_step is a *production* path
+# (called from the train_tg_lora loop, src/training/train_tg_lora.py), so a
+# scope mismatch surfacing as a clear "M9 ..." ValueError instead of a cryptic
+# torch broadcast error deep in the finite-difference fit is real operator
+# value. Each assertion is mutation-killable: drop the raise / flip the branch
+# and the test REDs.
+# ---------------------------------------------------------------------------
+
+
+def _m9_history_entry(pairs, *, fill="randn"):
+    """One trajectory history entry shaped like the model's active LoRA params.
+
+    ``fill='randn'`` -> a healthy non-degenerate delta; ``fill='zeros'`` -> the
+    zero-padding anomaly the >=50% guard exists to catch.
+    """
+    if fill == "randn":
+        return {name: torch.randn_like(p) * 0.01 for name, p in pairs}
+    return {name: torch.zeros_like(p) for name, p in pairs}
+
+
+def _zero_loss(_batch):
+    """Loss function with no dependency on the (unmodelled) batch contents; the
+    M9 guards under test raise / short-circuit before any fit matters."""
+    return 0.0
+
+
+def _m9_inputs():
+    """Common model / active-names / batch / loss for the M9 contract tests."""
+    model = FakeLoRAModel()
+    pairs = list(iter_lora_params(model))
+    active_names = {name for name, _ in pairs}
+    batch = {"input_ids": torch.tensor([[1, 2, 3]])}
+    return model, pairs, active_names, batch
+
+
+def test_m9_empty_history_short_circuits():
+    """Empty history short-circuits to an empty delta without running the fit
+    (the ``not history`` half of the ``not history or not active_names`` guard)."""
+    from src.tg_lora.extrapolator import subspace_m9_fit_step
+
+    model, _pairs, active_names, batch = _m9_inputs()
+    delta, stats = subspace_m9_fit_step(
+        model=model,
+        history=[],
+        active_names=active_names,
+        batch=batch,
+        loss_fn=_zero_loss,
+    )
+    assert delta == {}
+    assert stats == {}
+
+
+def test_m9_empty_active_names_short_circuits():
+    """Symmetric guard: ``not active_names`` also short-circuits even when the
+    trajectory history is non-empty (the other half of the same guard)."""
+    from src.tg_lora.extrapolator import subspace_m9_fit_step
+
+    model, pairs, _active_names, batch = _m9_inputs()
+    history = [_m9_history_entry(pairs)]
+    delta, stats = subspace_m9_fit_step(
+        model=model,
+        history=history,
+        active_names=set(),
+        batch=batch,
+        loss_fn=_zero_loss,
+    )
+    assert delta == {}
+    assert stats == {}
+
+
+def test_m9_dimension_mismatch_raises():
+    """A history delta whose flattened size disagrees with the model's active
+    parameter count -- the symptom of a trainable_lora_scope mismatch -- must
+    raise a clear ``M9 Dimension Mismatch`` ValueError, NOT propagate as a
+    cryptic torch broadcast/view error deep in the finite-difference fit."""
+    from src.tg_lora.extrapolator import subspace_m9_fit_step
+
+    model, pairs, active_names, batch = _m9_inputs()
+    first_name, first_p = pairs[0]
+    # Replace one active param's history tensor with a different element count
+    # so total flattened numel != the model's active parameter count.
+    bad_entry = {
+        name: (
+            torch.zeros(first_p.numel() + 5)
+            if name == first_name
+            else torch.randn_like(p) * 0.01
+        )
+        for name, p in pairs
+    }
+    with pytest.raises(ValueError, match=r"M9 Dimension Mismatch"):
+        subspace_m9_fit_step(
+            model=model,
+            history=[bad_entry],
+            active_names=active_names,
+            batch=batch,
+            loss_fn=_zero_loss,
+        )
+
+
+def test_m9_anomalous_zero_elements_raises():
+    """A history delta that is >= 50% zeros (zero-padding / scope-mismatch
+    symptom) must raise a clear ``M9 Anomalous Zero Elements`` ValueError
+    instead of silently fitting a degenerate all-zero subspace."""
+    from src.tg_lora.extrapolator import subspace_m9_fit_step
+
+    model, pairs, active_names, batch = _m9_inputs()
+    zero_history = [_m9_history_entry(pairs, fill="zeros")]
+    with pytest.raises(ValueError, match=r"M9 Anomalous Zero Elements"):
+        subspace_m9_fit_step(
+            model=model,
+            history=zero_history,
+            active_names=active_names,
+            batch=batch,
+            loss_fn=_zero_loss,
+        )
+
+
+def test_m9_velocity_direction_prior_branch():
+    """Passing ``velocity_direction`` selects the velocity-EMA prior
+    (``v0_source == 'velocity_ema'``) -- the behavioural fork away from the
+    default history-mean prior. v0 is built before the coefficient fit, so
+    ``fit_steps=0`` still exercises the branch and keeps the test fast."""
+    from src.tg_lora.extrapolator import subspace_m9_fit_step
+
+    model, pairs, active_names, batch = _m9_inputs()
+    history = [_m9_history_entry(pairs) for _ in range(3)]
+    velocity_direction = {name: torch.randn_like(p) * 0.01 for name, p in pairs}
+    _delta, stats = subspace_m9_fit_step(
+        model=model,
+        history=history,
+        active_names=active_names,
+        batch=batch,
+        loss_fn=_zero_loss,
+        fit_steps=0,
+        velocity_direction=velocity_direction,
+    )
+    assert stats["v0_source"] == "velocity_ema"
+
