@@ -74,6 +74,20 @@ class TestPureResolvers:
         cands = cs.resolve_parent_path("docs/GOAL.md", tmp_path)
         assert (tmp_path / "docs" / "GOAL.md") in cands
 
+    def test_parent_non_namespaced_feature_uses_full_specs_path(self, tmp_path: Path):
+        # A feature that lives under specs/ but is NOT the ``tg-lora/`` namespace
+        # (e.g. specs/freeze-ci-operator-errors/) has no ``<feature>/`` shorthand:
+        # its parent must be written as the full repo-root-relative path, which
+        # the resolver treats as root-relative. The shorthand
+        # ``<feature>/architecture.md`` resolves root-relative too and would miss
+        # a specs/-resident file -- the exact drift that left 5 TASK anchors red.
+        cands = cs.resolve_parent_path(
+            "specs/freeze-ci-operator-errors/architecture.md", tmp_path
+        )
+        assert (
+            tmp_path / "specs" / "freeze-ci-operator-errors" / "architecture.md"
+        ) in cands
+
     def test_link_resolves_file_relative(self, tmp_path: Path):
         child = tmp_path / "specs" / "child.md"
         link_target = cs.resolve_link_path("../parent.md", child)
