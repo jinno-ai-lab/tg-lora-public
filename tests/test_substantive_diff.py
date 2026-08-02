@@ -239,3 +239,66 @@ def test_main_returns_substantive_for_this_repos_last_commit():
         text=True,
     )
     assert proc.returncode == EXIT_SUBSTANTIVE, proc.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Cross-commit oscillation (range-mode catches net-zero across a range)       #
+# --------------------------------------------------------------------------- #
+# AI-Hub make-run feedback item #3: commit A "normalizes" (collapses a file,
+# real line removals) and commit B "make-run" re-expands it byte-for-byte to
+# the original tree. Across the range START..B the net diff is ZERO -- `git
+# diff --quiet START B` exits 0 -- yet NEITHER commit is empty /
+# normalization-only *individually*: A removes real lines, B adds them back.
+# So the make-run loop's per-commit view (`HEAD^..HEAD` on each) reads both as
+# `substantive` and the oscillation slips through unflagged.
+#
+# The guard's `--range` mode is the correct tool for cross-commit churn: given
+# the revspec that SPANS the oscillation it compares START..END trees, finds the
+# net delta empty, and returns `empty`. This regression test pins that property
+# so a refactor of range-mode handling (or the empty-verdict branch) cannot
+# silently regress the ONE detection path the make-run loop must adopt to catch
+# this churn (by invoking the checker `--range <start>..<end>` rather than
+# per-commit). It does NOT add a new guard -- it pins an existing, named,
+# previously-untested branch. Empirically verified against a throwaway repo
+# before this test was written.
+
+
+def test_guard_range_flags_cross_commit_oscillation(tmp_path):
+    """Commit A collapses a file, commit B re-expands it to the byte-identical
+    original tree -- the feedback's exact `git diff --quiet` net-zero churn.
+
+    Per-commit (`HEAD^..HEAD` on B) the guard reads `substantive`: B's
+    re-expansion is a real addition, so the make-run loop's per-commit view
+    does NOT flag the oscillation. But `--range START..B` (spanning both
+    commits) compares identical trees and returns `empty` -- the recipe the
+    make-run loop must adopt to catch cross-commit churn once invoked
+    per-range."""
+    repo = tmp_path
+    _new_repo(repo)
+    spine = repo / "spine.yml"
+    spine.write_text("a: 1\nb: 2\nc: 3\n")
+    _git(repo, "add", "spine.yml")
+    _git(repo, "commit", "-q", "-m", "baseline (expanded tree)")
+    start = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    # Commit A: collapse (remove real lines). Substantive when checked alone.
+    spine.write_text("a: 1\n")
+    _git(repo, "add", "spine.yml")
+    _git(repo, "commit", "-q", "-m", "A: normalize/collapse (-2 lines)")
+
+    # Commit B: re-expand to the BYTE-IDENTICAL baseline tree. Substantive
+    # alone (a real addition), but net-zero across start..B.
+    spine.write_text("a: 1\nb: 2\nc: 3\n")
+    _git(repo, "add", "spine.yml")
+    _git(repo, "commit", "-q", "-m", "B: re-expand to original")
+    b = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    # Per-commit view (the make-run loop's current behaviour): B reads
+    # substantive, so the oscillation is NOT flagged commit-by-commit.
+    proc_per_commit = _run_guard(repo, "--range", "HEAD^..HEAD")
+    assert proc_per_commit.returncode == EXIT_SUBSTANTIVE, proc_per_commit.stderr
+
+    # Range view spanning the oscillation: identical START..B trees -> the net
+    # diff is empty -> flagged. This is the regression this test pins.
+    proc_range = _run_guard(repo, "--range", f"{start}..{b}")
+    assert proc_range.returncode == EXIT_EMPTY, proc_range.stderr
