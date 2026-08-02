@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -74,16 +75,54 @@ def _lora_type(key: str) -> str:
     return "?"
 
 
+_TRAJECTORY_SNAPSHOT_CYCLE_RE = re.compile(r"_(\d+)$")
+
+
+def _cycle_from_artifact_stem(stem: str):
+    """Return the trailing cycle index encoded in a trajectory-delta snapshot
+    file stem, or ``None`` if the stem doesn't end in ``_<digits>``.
+
+    Trajectory-delta artifacts are named ``..._<cycle>`` (the canonical producer
+    writes e.g. ``tg_lora_after_pilot_cycle_000005``), so the final
+    ``_``-segment is the integer cycle. A stray ``.pt`` that doesn't follow
+    that convention (``training_state``, ``optimizer``, ``adapter_model`` …)
+    returns ``None`` so the caller can SKIP it instead of letting ``int()``
+    raise and abort the whole analysis — same skip-over-crash idiom as the
+    hardened ``src.utils.checkpoint._sorted_trajectory_delta_artifact_files``
+    regex, which this ad-hoc loader predates and didn't share.
+    """
+    m = _TRAJECTORY_SNAPSHOT_CYCLE_RE.search(stem)
+    return int(m.group(1)) if m else None
+
+
 def load_snapshots(art_dir: str):
-    """Load trajectory delta snapshots, return dict[cycle] -> dict[key] -> tensor."""
+    """Load trajectory delta snapshots, return dict[cycle] -> dict[key] -> tensor.
+
+    Files under ``art_dir`` that aren't cycle-suffixed trajectory-delta
+    snapshots (a stray ``training_state.pt`` / ``optimizer.pt`` / a bare
+    tensor) are skipped with a stderr warning instead of crashing the analysis
+    with an uncaught ``ValueError`` / ``KeyError`` / ``TypeError`` — previously
+    one unrelated ``.pt`` in the dir aborted the whole run.
+    """
     files = sorted(Path(art_dir).glob("*.pt"))
     snapshots = {}
     for f in files:
-        name = f.stem
-        # extract cycle number
-        cyc_str = name.split("_")[-1]
-        cyc = int(cyc_str)
+        cyc = _cycle_from_artifact_stem(f.stem)
+        if cyc is None:
+            print(
+                f"[skip] {f.name}: not a cycle-suffixed trajectory-delta "
+                f"snapshot (no trailing '_<digits>'); ignoring.",
+                file=sys.stderr,
+            )
+            continue
         t = torch.load(str(f), map_location="cpu", weights_only=False)
+        if not isinstance(t, dict) or not isinstance(t.get("delta_tensors"), dict):
+            print(
+                f"[skip] {f.name}: missing a 'delta_tensors' mapping; not a "
+                f"trajectory-delta snapshot; ignoring.",
+                file=sys.stderr,
+            )
+            continue
         deltas = t["delta_tensors"]
         # keep original shapes for SVD, store as float
         data = {k: v.float() for k, v in deltas.items()}
