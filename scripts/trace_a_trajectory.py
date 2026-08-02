@@ -18,20 +18,46 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
+def load_trajectory_snapshots(artifact_dir):
+    """Load every trajectory-delta snapshot under ``artifact_dir`` in sorted
+    filename order, returning a list of their ``delta_tensors`` mappings.
+
+    The artifacts dir an operator points this at realistically holds a stray
+    ``.pt`` that isn't a trajectory-delta snapshot (``training_state.pt`` /
+    ``optimizer.pt`` / ``adapter_model.pt`` / a bare saved tensor). Pre-fix the
+    loader dict-accessed ``art["delta_tensors"]`` unconditionally, so ONE such
+    unrelated file aborted the whole trace with an uncaught ``KeyError`` /
+    ``TypeError`` instead of degrading over the conforming snapshots. Such files
+    are now skipped with a stderr warning — the same skip-over-crash idiom as
+    ``scripts.layer_quadrant_map.load_snapshots`` and the hardened
+    ``src.utils.checkpoint._sorted_trajectory_delta_artifact_files`` regex.
+    """
+    snapshots = []
+    for f in sorted(Path(artifact_dir).glob("*.pt")):
+        art = torch.load(f, map_location="cpu", weights_only=False)
+        if not isinstance(art, dict) or not isinstance(art.get("delta_tensors"), dict):
+            print(
+                f"[skip] {f.name}: not a trajectory-delta snapshot "
+                f"(no 'delta_tensors' mapping); ignoring.",
+                file=sys.stderr,
+            )
+            continue
+        snapshots.append(art["delta_tensors"])
+    return snapshots
+
+
 def main():
     artifact_dir = Path("runs/p1_r2_spectrum/trajectory_delta_artifacts")
-    files = sorted(artifact_dir.glob("*.pt"))
-    n = len(files)
-    print(f"=== A-Direction Trajectory Trace ===")
+    all_deltas = load_trajectory_snapshots(artifact_dir)
+    n = len(all_deltas)
+    print("=== A-Direction Trajectory Trace ===")
     print(f"Cycles: {n}")
-
-    # Load all deltas
-    all_deltas = []
-    all_meta = []
-    for f in files:
-        art = torch.load(f, map_location="cpu", weights_only=False)
-        all_deltas.append(art["delta_tensors"])
-        all_meta.append(art["metadata"])
+    if not all_deltas:
+        print(
+            f"Error: no trajectory-delta snapshots found in {artifact_dir}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Target tensors: lora_A of out_proj and in_proj_qkv (strongest signal)
     tnames = sorted(all_deltas[0].keys())
