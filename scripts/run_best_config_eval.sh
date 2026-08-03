@@ -47,23 +47,22 @@ for dir in "${SWEEP_DIR}"/tg_lora_9b_accel_*; do
 done
 
 if [[ -z "${RUN_DIR}" ]]; then
-    # Try matching by experiment name pattern
+    # Try matching by the run_id inside each candidate's run_metrics.jsonl.
+    # Delegate to run_metrics_reader.py so a malformed metrics file fails LOUD
+    # (stderr cause + non-zero exit) instead of the old inline reader's
+    # `2>/dev/null` swallow: a corrupt line raised JSONDecodeError, the
+    # traceback was eaten, run_id came back empty, and the operator saw only a
+    # misleading "Could not find run directory" — never the corrupt file.
+    # `|| continue` keeps searching sibling dirs; the helper has already written
+    # the cause to stderr, so the failure is VISIBLE (not silent) without
+    # aborting the whole sweep on one bad sibling.
     for dir in "${SWEEP_DIR}"/tg_lora_9b_accel_*; do
         metrics="${dir}/run_metrics.jsonl"
-        if [[ -f "$metrics" ]]; then
-            run_id=$(${VENV_PYTHON} -c "
-import json
-with open('${metrics}') as f:
-    for line in f:
-        obj = json.loads(line)
-        if isinstance(obj, dict) and obj.get('type') == 'run_header':
-            print(obj.get('run_id', ''))
+        [[ -f "$metrics" ]] || continue
+        run_id=$("${VENV_PYTHON}" "$(dirname "$0")/run_metrics_reader.py" "${metrics}") || continue
+        if [[ "${run_id}" == "${BEST_RUN}" ]]; then
+            RUN_DIR="$dir"
             break
-" 2>/dev/null)
-            if [[ "${run_id}" == "${BEST_RUN}" ]]; then
-                RUN_DIR="$dir"
-                break
-            fi
         fi
     done
 fi
