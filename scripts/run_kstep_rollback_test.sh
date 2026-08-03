@@ -116,21 +116,20 @@ _run_baseline "b_lr2e-3"    "0.002"
 echo "=== Summary ==="
 for d in "${OUTPUT_BASE}"/*/; do
     name=$(basename "${d}")
-    footer=$(${VENV_PYTHON} -c "
-import orjson, sys
-best, final = None, None
-with open('${d}/run_metrics.jsonl', 'rb') as f:
-    for line in f:
-        r = orjson.loads(line)
-        if not isinstance(r, dict):
-            continue
-        if r['type'] == 'run_footer':
-            best = r.get('best_valid_loss', 'N/A')
-            final = r.get('final_train_loss', 'N/A')
-            ppl = r.get('perplexity', 'N/A')
-            wall = r.get('total_wall_seconds', 0)
-            print(f'${name}  best_valid={best}  final_train={final}  ppl={ppl}  wall={wall:.0f}s')
-            break
-" 2>/dev/null || echo "${name}  (no footer yet)")
-    echo "  ${footer}"
+    metrics="${d}/run_metrics.jsonl"
+    # Delegate to run_footer_reader.py so a corrupt run_metrics.jsonl fails LOUD
+    # (the summary row flags it + the reader writes the cause to stderr) instead
+    # of the old inline reader's `2>/dev/null || echo "(no footer yet)"` swallow:
+    # a corrupt line raised JSONDecodeError, the traceback was eaten, and the
+    # shell printed the SAME "(no footer yet)" it prints for a run still in
+    # progress — masking a *corrupt* file as a *normal transient*. The reader
+    # splits the two: exit 3 = no run_footer record yet (the normal mid-run
+    # state, no stderr), exit 2 = corrupt (cause already on stderr).
+    rc=0
+    summary=$("${VENV_PYTHON}" "$(dirname "$0")/run_footer_reader.py" "${metrics}") || rc=$?
+    case "${rc}" in
+        0)  echo "  ${name}  ${summary}" ;;
+        3)  echo "  ${name}  (no footer yet)" ;;
+        *)  echo "  ${name}  (run_metrics.jsonl unreadable — see warning above)" ;;
+    esac
 done
