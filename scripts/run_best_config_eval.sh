@@ -17,19 +17,20 @@ if [[ ! -f "${RANKING_JSON}" ]]; then
     exit 1
 fi
 
-# Extract best run ID from ranking.json
-BEST_RUN=$(${VENV_PYTHON} -c "
-import json
-with open('${RANKING_JSON}') as f:
-    data = json.load(f)
-if not isinstance(data, dict):
-    data = {}
-best = data.get('best_run', {})
-print(best.get('run_id', ''))
-" 2>/dev/null)
+# Extract best run ID from ranking.json. Delegate to best_run_reader.py so a
+# malformed or wrong-shape ranking.json fails LOUD (stderr cause + non-zero
+# exit) instead of the old inline reader's silent swallow: a malformed file
+# raised behind `2>/dev/null` and `set -e` killed the shell with ZERO output,
+# while a valid-JSON-but-non-object file was silently coerced to `{}` and
+# surfaced only as a misleading "could not determine best run".
+BEST_RUN=$("${VENV_PYTHON}" "$(dirname "$0")/best_run_reader.py" "${RANKING_JSON}") || {
+    # best_run_reader.py already wrote the cause to stderr.
+    echo "Error: Could not determine best run from ${RANKING_JSON}" >&2
+    exit 1
+}
 
 if [[ -z "${BEST_RUN}" ]]; then
-    echo "Error: Could not determine best run from ranking.json"
+    echo "Error: ${RANKING_JSON}: best_run.run_id resolved empty" >&2
     exit 1
 fi
 
