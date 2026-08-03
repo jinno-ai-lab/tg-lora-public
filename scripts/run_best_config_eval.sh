@@ -125,18 +125,19 @@ ${VENV_PYTHON} -m lm_eval \
 
 echo ""
 echo "=== Evaluation Results ==="
-${VENV_PYTHON} -c "
-import json
-with open('${EVAL_DIR}/lm_eval_results.json') as f:
-    data = json.load(f)
-if isinstance(data, dict) and 'results' in data:
-    results = data['results']
-    for task, metrics in results.items():
-        acc = metrics.get('acc,none', metrics.get('acc_norm,none', 'N/A'))
-        print(f'  {task}: {acc}')
-else:
-    print(json.dumps(data, indent=2))
-"
+# Delegate to lm_eval_results_reader.py so a malformed or wrong-shape
+# lm_eval_results.json fails LOUD (stderr cause + non-zero exit) instead of the
+# old inline reader's silent swallow: the `else: print(json.dumps(data, indent=2))`
+# branch pretty-printed an unexpected shape (a schema drift / hand-edit / future
+# lm-eval version wrapping the payload differently) with NO signal that the
+# per-task table failed to build — the operator could mistake a broken parse for
+# a successful eval. The reader still dumps the raw payload to stdout on a shape
+# mismatch (so the data isn't hidden) and writes the cause to stderr; the
+# non-zero exit is treated as non-fatal here because the eval already succeeded
+# and the artifact is durable — but the signal is no longer silent.
+if ! "${VENV_PYTHON}" "$(dirname "$0")/lm_eval_results_reader.py" "${EVAL_DIR}/lm_eval_results.json"; then
+    echo "Warning: per-task results table could not be built (see stderr above); raw payload was dumped to stdout." >&2
+fi
 
 echo ""
 echo "Results saved to: ${EVAL_DIR}/lm_eval_results.json"
