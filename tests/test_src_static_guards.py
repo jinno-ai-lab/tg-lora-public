@@ -37,6 +37,16 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TARGET = REPO_ROOT / "src"
 
+# ruff's *historical* default selection was E4/E7/E9/F (imports / statement /
+# runtime / pyflakes) — the exact defect classes these guards pin (E741 ambiguous
+# name, F401 unused import, F841 dead local, F821 undefined name). ruff (>=~0.11)
+# EXPANDED its default to also include many style rules (isort / pyupgrade /
+# simplify / ...), so a bare ``ruff check`` became a moving target that surfaced
+# ~100 expanded-default findings unrelated to those classes. Pinning the set via
+# ``--select`` makes the lint-clean invariant deterministic across ruff versions
+# rather than dependent on the default du jour.
+_CANONICAL_LINT_RULES = ("E4", "E7", "E9", "F")
+
 
 def _run_ruff(
     target: Path, select: Sequence[str] = ()
@@ -44,9 +54,11 @@ def _run_ruff(
     ruff = shutil.which("ruff")
     cmd: list[str] = [ruff, "check"]
     if select:
-        # ruff's default rule set is E4/E7/E9/F — it deliberately EXCLUDES the
-        # pycodestyle W rules. ``select`` opts a specific rule back in so a guard
-        # can police a defect class the default-clean check is blind to (W605).
+        # ``--select`` REPLACES ruff's default selection with exactly the listed
+        # rules (it does not extend the default). A guard policing the canonical
+        # lint set passes ``_CANONICAL_LINT_RULES``; a guard policing a defect
+        # class that set is blind to (e.g. W605 invalid escapes) passes its own
+        # single rule — see :func:`test_src_tree_has_no_invalid_escape_sequences`.
         cmd += ["--select", ",".join(select)]
     cmd.append(str(target))
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -60,20 +72,24 @@ def test_src_tree_is_ruff_clean() -> None:
     audit's standing claim false. See the module docstring for the cleanup this
     locks in and the deliberate ``src/``-only scope.
 
-    Scope note: this runs ruff's *default* rule set (E4/E7/E9/F), which excludes
-    the pycodestyle ``W`` rules — so it does NOT catch invalid escape sequences
-    (W605). Those are policed separately by
+    Scope note: this PINS ruff's canonical lint set (E4/E7/E9/F) via ``--select``
+    rather than relying on ``ruff``'s default selection. ruff (>=~0.11) expanded
+    its default to include many style rules (isort / pyupgrade / simplify / ...),
+    which would otherwise surface ~100 findings unrelated to this guard's defect
+    classes and make the invariant depend on the installed ruff version. The
+    pinned set excludes the pycodestyle ``W`` rules, so it does NOT catch invalid
+    escape sequences (W605) — those are policed separately by
     :func:`test_src_tree_has_no_invalid_escape_sequences`, because a ``\\*`` in a
-    docstring passes this default check while Python emits a ``DeprecationWarning``
-    on every import (a ``SyntaxWarning`` from 3.12).
+    docstring passes this check while Python emits a ``DeprecationWarning`` on
+    every import (a ``SyntaxWarning`` from 3.12).
     """
     if shutil.which("ruff") is None:
         pytest.skip("ruff not on PATH; cannot enforce the cleanliness guard")
 
     assert TARGET.is_dir(), f"src/ tree not found at {TARGET}"
-    proc = _run_ruff(TARGET)
+    proc = _run_ruff(TARGET, select=_CANONICAL_LINT_RULES)
     assert proc.returncode == 0, (
-        "src/ must be ruff-clean across the default rule set (E4/E7/E9/F) — a "
+        "src/ must be ruff-clean across the canonical lint set (E4/E7/E9/F) — a "
         "non-zero count regresses the src/ lint-clean invariant and makes the "
         "audit's standing claim false. ruff output:\n" + (proc.stdout + proc.stderr).strip()
     )

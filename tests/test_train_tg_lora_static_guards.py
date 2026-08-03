@@ -48,6 +48,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TARGET = REPO_ROOT / "src" / "training" / "train_tg_lora.py"
 
+# Canonical ruff lint set (E4/E7/E9/F), pinned via ``--select``: ruff (>=~0.11)
+# expanded its default to include many style rules, so a bare ``ruff check`` is a
+# moving target. See ``tests/test_src_static_guards.py`` for the full rationale.
+_CANONICAL_LINT_RULES = "E4,E7,E9,F"
+
 
 def test_training_entry_point_has_no_undefined_names() -> None:
     """``train_tg_lora.py`` must be free of F821 (undefined-name) defects.
@@ -80,11 +85,11 @@ def _run_ruff(target: Path, select: str | None) -> subprocess.CompletedProcess[s
 
 
 def test_training_entry_point_is_ruff_clean() -> None:
-    """``train_tg_lora.py`` must be ``ruff``-clean (zero findings, all rules).
+    """``train_tg_lora.py`` must be ``ruff``-clean across the canonical lint set.
 
     The F821 guard above pins the two historical ``NameError`` defects. This
-    guard pins the *whole* file's cleanliness — every rule, not just F821 — so
-    the audit's standing claim that the main training entry point is lint-clean
+    guard pins the *whole* file's cleanliness — every canonical rule, not just
+    F821 — so the audit's standing claim that the main training entry point is lint-clean
     (it was long described as carrying "2 pre-existing errors (F841 + E741)"
     that had in fact drifted to a single E741, with the F841 a write-only local
     pyflakes could no longer see once ``train_tg_lora`` started calling
@@ -96,16 +101,21 @@ def test_training_entry_point_is_ruff_clean() -> None:
     Like the F821 guard this runs ``ruff`` on the file path (the module's
     line-1 ``src.data`` import is unimportable in this public mirror) and skips
     when ``ruff`` is absent.
+
+    The set is PINNED via ``--select`` rather than relying on ``ruff``'s default:
+    ruff (>=~0.11) expanded its default to include style rules (isort / pyupgrade
+    / simplify / ...) unrelated to this guard's defect classes, which would
+    otherwise make the invariant depend on the installed ruff version.
     """
     if shutil.which("ruff") is None:
         pytest.skip("ruff not on PATH; cannot enforce the cleanliness guard")
 
     assert TARGET.is_file(), f"training entry point not found at {TARGET}"
-    proc = _run_ruff(TARGET, select=None)
+    proc = _run_ruff(TARGET, select=_CANONICAL_LINT_RULES)
     assert proc.returncode == 0, (
-        "src/training/train_tg_lora.py must be ruff-clean (zero findings across "
-        "all rules) — a non-zero count regresses the lint-clean invariant and "
-        "makes the audit's standing claim false. ruff output:\n"
+        "src/training/train_tg_lora.py must be ruff-clean across the canonical "
+        "lint set (E4/E7/E9/F) — a non-zero count regresses the lint-clean "
+        "invariant and makes the audit's standing claim false. ruff output:\n"
         + (proc.stdout + proc.stderr).strip()
     )
 
