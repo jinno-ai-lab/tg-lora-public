@@ -22,6 +22,8 @@ BEST_RUN=$(${VENV_PYTHON} -c "
 import json
 with open('${RANKING_JSON}') as f:
     data = json.load(f)
+if not isinstance(data, dict):
+    data = {}
 best = data.get('best_run', {})
 print(best.get('run_id', ''))
 " 2>/dev/null)

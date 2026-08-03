@@ -1,5 +1,5 @@
-"""Static guard: every ``json/orjson.loads`` → ``.get`` / ``["key"]`` access is
-``isinstance(..., dict)``-guarded — close the non-dict-after-json.loads crash class.
+"""Static guard: every ``json/orjson.load(s)`` → ``.get`` / ``["key"]`` access is
+``isinstance(..., dict)``-guarded — close the non-dict-after-json.loads/load crash class.
 
 This is the structural closure the steering feedback asked for after the THIRD
 one-at-a-time patch of the identical crash class (compare_runs.load_run 374468d,
@@ -83,11 +83,17 @@ _SCOPE_STOPPERS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
 
 def _is_loads_call(node: ast.AST) -> bool:
-    """True iff *node* is a ``json.loads(...)`` / ``orjson.loads(...)`` call."""
+    """True iff *node* is a ``json``/``orjson`` ``.loads(...)`` or ``.load(...)``
+    call. Both spellings are the SAME non-dict-after-parse crash class:
+    ``json.load(f)`` (whole-file / file-object form) parses a valid-JSON-but-
+    non-object just as ``json.loads(s)`` does, so a subsequent
+    ``.get``/``.keys``/``["k"]`` crashes identically. Matching only ``loads``
+    left the ``load`` spelling as a structural blind spot — it escaped every
+    prior per-reader pass and the comprehensive sweep."""
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "loads"
+        and node.func.attr in ("load", "loads")
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id in _JSON_NAMES
     )
@@ -270,9 +276,11 @@ def _py_files() -> list[Path]:
 
 
 def test_no_unguarded_loads_dict_access_in_py() -> None:
-    """Every ``json/orjson.loads`` result that is dict-accessed
+    """Every ``json/orjson.load(s)`` result that is dict-accessed
     (``.get``/``.keys``/``.items``/``.values``/``["key"]``) in ``src/`` +
-    ``scripts/`` ``.py`` must be ``isinstance(..., dict)``-guarded."""
+    ``scripts/`` ``.py`` must be ``isinstance(..., dict)``-guarded. Both the
+    ``loads`` (string) and ``load`` (file-object) forms are matched — same
+    non-dict-after-parse crash class."""
     offenders: list[str] = []
     parse_errors: list[str] = []
     for src_file in _py_files():
@@ -302,11 +310,14 @@ def test_no_unguarded_loads_dict_access_in_py() -> None:
 
 # --- shell-embedded python: the six readers fixed here lived in scripts/*.sh ---
 
-_NAMED_LOADS_RE = re.compile(r"(\w+)\s*=\s*(?:json|orjson)\.loads\(")
-# Chained loads(...).<dict-reader-method>(...) — get/keys/items/values all crash
-# identically on a non-dict (none exist on list/str/int/bool/None).
+# ``loads?`` matches BOTH ``json.loads(`` (string form) and ``json.load(``
+# (file-object form) — same non-dict crash class (see ``_is_loads_call``): a
+# valid-JSON-but-non-object file parses either way, then ``.get``/``[]`` crashes.
+_NAMED_LOADS_RE = re.compile(r"(\w+)\s*=\s*(?:json|orjson)\.loads?\(")
+# Chained load(s)(...).<dict-reader-method>(...) — get/keys/items/values all
+# crash identically on a non-dict (none exist on list/str/int/bool/None).
 _CHAINED_LOADS_ACCESS_RE = re.compile(
-    r"(?:json|orjson)\.loads\([^)\n]*\)\s*\.\s*(?:get|keys|items|values)\("
+    r"(?:json|orjson)\.loads?\([^)\n]*\)\s*\.\s*(?:get|keys|items|values)\("
 )
 
 
@@ -325,8 +336,13 @@ def _sh_defects(path: Path) -> list[tuple[int, str]]:
     defects: list[tuple[int, str]] = []
     lines = path.read_text(encoding="utf-8").splitlines()
     for i, line in enumerate(lines):
+        # Commented-out code (leading ``#``) never executes — it can't crash, so
+        # the line-scan must not flag a ``load(s)`` reader that lives only in a
+        # comment (e.g. an illustrative ``#   d=json.load(open(p))`` recipe).
+        if line.lstrip().startswith("#"):
+            continue
         if _CHAINED_LOADS_ACCESS_RE.search(line):
-            defects.append((i + 1, "chained json.loads(...).<dict-method>(...)"))
+            defects.append((i + 1, "chained json.load(s)(...).<dict-method>(...)"))
         m = _NAMED_LOADS_RE.search(line)
         if m:
             var = m.group(1)
@@ -340,13 +356,13 @@ def _sh_defects(path: Path) -> list[tuple[int, str]]:
             )
             if accessed and not guarded:
                 defects.append(
-                    (i + 1, f"unguarded {var}.<dict-method>/[] after json.loads")
+                    (i + 1, f"unguarded {var}.<dict-method>/[] after json.load(s)")
                 )
     return defects
 
 
 def test_no_unguarded_loads_dict_access_in_sh() -> None:
-    """Shell-embedded python in ``scripts/*.sh`` must guard ``loads`` → ``.get``."""
+    """Shell-embedded python in ``scripts/*.sh`` must guard ``load(s)`` → ``.get``."""
     offenders: list[str] = []
     for sh in sorted((REPO_ROOT / "scripts").glob("*.sh")):
         for line, kind in _sh_defects(sh):
@@ -392,6 +408,12 @@ def test_no_unguarded_loads_dict_access_in_sh() -> None:
         "def r(p):\n    return list(json.loads(p.read_text()).keys())\n",
         # List of loads records, then [i].items() — no isinstance filter in the comp.
         "def r(f):\n    recs = [json.loads(l) for l in f]\n    return dict(recs[0].items())\n",
+        # json.load (file-object form) — SAME crash class as loads: a valid-JSON
+        # non-object file parses, then .get crashes. The ``load`` spelling must
+        # not escape the guard. Named-var form.
+        "def r(f):\n    data = json.load(f)\n    return data.get('x')\n",
+        # json.load, chained .get — no room for a guard; must still flag.
+        "def r(f):\n    return json.load(f).get('x')\n",
     ],
 )
 def test_checker_flags_unguarded_shapes(snippet: str) -> None:

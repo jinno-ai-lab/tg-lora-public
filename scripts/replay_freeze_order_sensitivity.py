@@ -88,6 +88,11 @@ def load_result(path: str | Path) -> dict[str, Any]:
     p = Path(path)
     with p.open() as fh:
         data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"{p}: expected a JSON object (order-sensitivity report) — got "
+            f"{type(data).__name__}"
+        )
     for key in ("by_order", "by_seed"):
         value = data.get(key)
         if not isinstance(value, list) or len(value) < 2:
