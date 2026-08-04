@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -140,10 +141,79 @@ def evaluate_and_suggest(data_ok, summary_data):
     print("  -> Run external evaluation (ARC, HellaSwag, etc.) to pass G3:")
     print("  Command: make paper-memory-external-eval")
 
+def parse_gpu_holders(apps_csv):
+    """Parse ``nvidia-smi --query-compute-apps=pid,process_name,used_memory``
+    CSV output into a list of ``{pid, name, mem}`` dicts, one per process
+    holding GPU compute. An empty/whitespace result (no compute apps) yields
+    ``[]`` — i.e. the GPU looks free. Pure: takes the CSV text so it is testable
+    without a real GPU. Tolerant of malformed rows (too few columns → skipped),
+    since nvidia-smi's CSV is the only input and a half-parsed line must not
+    brick the status check."""
+
+    holders = []
+    for line in apps_csv.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        # pid, process_name, used_memory — name itself may contain commas on
+        # some drivers, so keep everything from field 1 onward as the name and
+        # treat the final field as the memory figure when there are extras.
+        if len(parts) < 3:
+            continue
+        holders.append({"pid": parts[0], "name": parts[1], "mem": parts[-1]})
+    return holders
+
+
+def query_gpu_compute_apps():
+    """Return ``nvidia-smi --query-compute-apps`` stdout (CSV) or ``None`` when
+    nvidia-smi is absent, times out, or exits non-zero. GPU assessment is
+    INFORMATIONAL — a host with no GPU (CI, CPU-only dev box, MLX Track-B) must
+    still pass ``make status`` — so any failure to probe degrades to "cannot
+    assess", never to a status-check failure."""
+
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def report_gpu_availability():
+    """Surface GPU availability so the operator can decide whether the GPU-bound
+    next lever — the 9B target-scale run (GOAL §4) — is actionable THIS cycle.
+
+    This is the recurring question the auto-loop kept answering with another
+    report-tooling hardening pass instead of resolving: "is the GPU available,
+    and if not, what holds it?". Naming the holder process (e.g. a sibling
+    project's ``llama-server``) turns an opaque "GPU busy" into a concrete
+    unblock ("stop PID X"). Informational only: a busy/absent GPU never fails
+    the status check — it only changes which next step is actionable — so this
+    section writes to stdout and returns normally under every outcome."""
+
+    print("\n=== GPU Availability (next-lever readiness) ===")
+    apps_csv = query_gpu_compute_apps()
+    if apps_csv is None:
+        print("[ ] nvidia-smi not available — cannot assess GPU (CPU-only / no-NVIDIA host).")
+        return
+    holders = parse_gpu_holders(apps_csv)
+    if not holders:
+        print("[+] No compute apps on the GPU — it appears FREE for the 9B lever.")
+        return
+    print(f"[!] GPU is held by {len(holders)} compute app(s):")
+    for h in holders:
+        print(f"    PID {h['pid']:<10} {h['mem']:<10} {h['name']}")
+    print("    -> Stop the holder(s) above to make the GPU-bound 9B run actionable.")
+
+
 def main():
     data_ok = check_datasets()
     summary_data = check_experiment_runs()
     evaluate_and_suggest(data_ok, summary_data)
+    report_gpu_availability()
 
 if __name__ == "__main__":
     main()
