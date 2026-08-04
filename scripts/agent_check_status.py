@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import sys
 from pathlib import Path
 
 def count_lines(filepath):
@@ -81,14 +82,34 @@ def check_experiment_runs():
             summary_path = None
             
     if summary_path and summary_path.exists():
+        # Fail loud on a corrupt summary instead of degrading to the misleading
+        # "Run the paper-memory suite" recommendation. A parse failure here means
+        # the suite already RAN and its ``aggregate_summary.json`` artifact is
+        # DAMAGED, so re-running the expensive suite (the prior None -> "run
+        # again" path) burns GPU without addressing the corruption — and leaves
+        # corruption indistinguishable from "no summary yet". Surface the file +
+        # cause on stderr and exit non-zero so an operator (or the Makefile
+        # status target) knows the check failed on a CORRUPT artifact, not a
+        # missing one. Same fail-loud posture as scripts/best_run_reader.py et
+        # al.; the recovery instruction's "Exception丸呑み -> propagate" rule
+        # (the old broad ``except Exception`` also masked e.g. a PermissionError
+        # as a parse failure).
         try:
-            with open(summary_path, 'r') as f:
-                data = json.load(f)
-            print(f"[+] Loaded {summary_path.name}")
-            return data
-        except Exception as e:
-            print(f"[-] Failed to parse summary json: {e}")
-            
+            data = json.loads(summary_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            sys.stderr.write(
+                f"[-] {summary_path} is corrupt: not valid JSON "
+                f"({exc.msg} at line {exc.lineno} column {exc.colno}). The "
+                f"summary is DAMAGED, not missing — investigate the file "
+                f"instead of re-running the paper-memory suite.\n"
+            )
+            raise SystemExit(2)
+        except OSError as exc:
+            sys.stderr.write(f"[-] {summary_path} unreadable ({exc}).\n")
+            raise SystemExit(2)
+        print(f"[+] Loaded {summary_path.name}")
+        return data
+
     return None
 
 def evaluate_and_suggest(data_ok, summary_data):
