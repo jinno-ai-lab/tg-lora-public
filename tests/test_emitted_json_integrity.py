@@ -721,6 +721,7 @@ JSON_DUMPS_EMITTER_FILES: tuple[str, ...] = (
     'scripts/inspect_model.py',
     'scripts/layer_mode_analysis.py',
     'scripts/layer_quadrant_map.py',
+    'scripts/lm_eval_results_reader.py',
     'scripts/lookup_batch_plan.py',
     'scripts/measure_extraction_fidelity_delta.py',
     'scripts/measure_predictability.py',
