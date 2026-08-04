@@ -182,31 +182,75 @@ def query_gpu_compute_apps():
     return proc.stdout
 
 
+def src_data_pipeline_present() -> bool:
+    """Whether the private ``src.data`` data pipeline ships in this checkout.
+
+    The 9B target-scale run (GOAL §4) depends on ``src.data`` to produce/serve
+    its 9B samples. On the PUBLIC mirror that pipeline is deliberately stripped
+    (DATA/Cat-C — see PURPOSE.md), so the 9B lever is NOT actionable from this
+    checkout regardless of GPU state; on the PRIVATE checkout it ships and the
+    run's real readiness gate is GPU availability. Resolved from ``__file__``
+    (not CWD) so the answer is stable however ``make status`` is invoked, and a
+    module-level function so tests can inject both contexts without a GPU."""
+    repo_root = Path(__file__).resolve().parents[1]
+    return (repo_root / "src" / "data").is_dir()
+
+
 def report_gpu_availability():
-    """Surface GPU availability so the operator can decide whether the GPU-bound
-    next lever — the 9B target-scale run (GOAL §4) — is actionable THIS cycle.
+    """Surface what concretely blocks the 9B target-scale lever THIS cycle.
 
     This is the recurring question the auto-loop kept answering with another
     report-tooling hardening pass instead of resolving: "is the GPU available,
-    and if not, what holds it?". Naming the holder process (e.g. a sibling
-    project's ``llama-server``) turns an opaque "GPU busy" into a concrete
-    unblock ("stop PID X"). Informational only: a busy/absent GPU never fails
-    the status check — it only changes which next step is actionable — so this
-    section writes to stdout and returns normally under every outcome."""
+    and does freeing it actually unblock the 9B run?". The lever has TWO
+    distinct blocks, only one of which is GPU — and conflating them (the prior
+    copy always said "stop the holder to make the GPU-bound 9B run actionable")
+    sent the operator to free a GPU that, on this public mirror, cannot move the
+    lever:
 
-    print("\n=== GPU Availability (next-lever readiness) ===")
+    * DATA-blocked (this public mirror): ``src.data`` is stripped (DATA/Cat-C),
+      so freeing the GPU does NOT make the lever actionable here — the §4
+      verdict runs are already harvested as TIES and the only remaining open is
+      private-``src.data`` absolute loss. Naming this stops the operator burning
+      a cycle on a GPU free-up that cannot move the lever.
+    * GPU-blocked (private checkout, ``src.data`` present): name the holder
+      process (e.g. a sibling project's ``llama-server``) to turn an opaque
+      "GPU busy" into a concrete unblock ("stop PID X").
+
+    Informational only: any outcome writes to stdout and returns normally — a
+    busy/absent GPU or a stripped pipeline never fails the status check; it only
+    changes which next step is actionable."""
+
+    print("\n=== 9B Lever Readiness (next-lever block) ===")
+    data_present = src_data_pipeline_present()
+    if not data_present:
+        # The public mirror: the lever's block is the missing data pipeline, NOT
+        # the GPU. State this up front so the GPU lines below read as the
+        # informational context they are, not as the lever's gate.
+        print("[!] 9B lever is DATA-blocked, not GPU-blocked.")
+        print("    private src.data is stripped from this public mirror (DATA/Cat-C);")
+        print("    freeing the GPU will NOT make the 9B run actionable here. The §4")
+        print("    verdict runs are already harvested as TIES; the remaining open is")
+        print("    private-src.data absolute loss (actionable only in the private checkout).")
+
     apps_csv = query_gpu_compute_apps()
     if apps_csv is None:
         print("[ ] nvidia-smi not available — cannot assess GPU (CPU-only / no-NVIDIA host).")
         return
     holders = parse_gpu_holders(apps_csv)
     if not holders:
-        print("[+] No compute apps on the GPU — it appears FREE for the 9B lever.")
+        print("[+] No compute apps on the GPU — it appears FREE.")
+        if data_present:
+            print("    -> GPU free AND src.data present: the 9B lever is actionable this cycle.")
+        else:
+            print("    -> But the lever stays DATA-blocked here — not actionable from this mirror.")
         return
     print(f"[!] GPU is held by {len(holders)} compute app(s):")
     for h in holders:
         print(f"    PID {h['pid']:<10} {h['mem']:<10} {h['name']}")
-    print("    -> Stop the holder(s) above to make the GPU-bound 9B run actionable.")
+    if data_present:
+        print("    -> Stop the holder(s) above to make the GPU-bound 9B run actionable.")
+    else:
+        print("    -> Freeing this GPU will NOT move the lever — it is DATA-blocked (see above).")
 
 
 def main():
