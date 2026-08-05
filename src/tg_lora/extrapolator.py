@@ -888,11 +888,27 @@ def subspace_m9_fit_step(
     fit_steps: int = 1,
     velocity_direction: dict[str, torch.Tensor] | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
-    """Prior-based Subspace Learning (M9) using finite-difference gradient fitting.
-    
-    1. Reconstructs subspace (v0, pc1, pc2) from history.
-    2. Gram-Schmidt orthogonalizes PC1 and PC2 with respect to v0.
-    3. Fits coefficients (alpha, beta1, beta2) using K steps of finite-difference gradient descent.
+    """Prior-based subspace extrapolation (M9).
+
+    The finite-difference coefficient fit from the original design was found to
+    be harmful (alpha noise std≈4.46 swamped the descent signal), so the
+    production path is *pure v0 extrapolation*::
+
+        W_extrap = W_t + selected_N * w_traj * v0
+
+    where ``v0`` is the unit velocity-EMA prior (or the history-mean fallback)
+    and ``w_traj`` is the median history-delta norm. The pc1/pc2 subspace the
+    fit would have explored is deliberately NOT built: with the fit disabled the
+    coefficients are fixed at ``(alpha, beta1, beta2) = (1, 0, 0)``, so pc1/pc2
+    were multiplied by zero and contributed nothing but wasted compute (plus a
+    latent ``0 * NaN`` weight-corruption vector) on every production cycle.
+    ``fit_lr`` / ``fit_steps`` / ``fd_epsilon`` are retained on the signature
+    only for caller compatibility and are no-ops until the fit is re-enabled.
+
+    Steps:
+    1. Build the unit prior ``v0`` (velocity EMA if provided, else history mean).
+    2. Scale by ``selected_N * w_traj`` to form the extrapolation delta.
+    3. Evaluate loss at the extrapolated point for diagnostics (no fit applied).
     """
     stats = {}
     if not history or not active_names:
@@ -961,76 +977,35 @@ def subspace_m9_fit_step(
             v0 = torch.zeros_like(mean_delta)
         stats["v0_source"] = "history_mean"
 
-    # PCA for pc1, pc2 (only relevant when beta != 0)
-    _center = deltas_stack.mean(dim=0)
-    centered_deltas = deltas_stack - _center
-    q = min(4, len(history))
-    if q >= 2:
-        U, S_val, V = torch.pca_lowrank(centered_deltas, q=q, niter=4)
-        pc1 = V[:, 0]
-        pc2 = V[:, 1]
-    elif q == 1:
-        pc1 = centered_deltas[0]
-        if pc1.norm() > 1e-8:
-            pc1 = pc1 / pc1.norm()
-        pc2 = torch.zeros_like(pc1)
-    else:
-        pc1 = torch.zeros_like(v0)
-        pc2 = torch.zeros_like(v0)
-
-    # Gram-Schmidt Orthogonalization (v0 -> pc1 -> pc2)
-    def gram_schmidt_flat(vectors: list[torch.Tensor]) -> list[torch.Tensor]:
-        ortho = []
-        for v in vectors:
-            v_ortho = v.clone()
-            for u in ortho:
-                proj = torch.dot(v_ortho, u) * u
-                v_ortho -= proj
-            norm = v_ortho.norm()
-            if norm > 1e-8:
-                ortho.append(v_ortho / norm)
-            else:
-                ortho.append(torch.zeros_like(v))
-        return ortho
-
-    ortho_basis = gram_schmidt_flat([v0, pc1, pc2])
-    v0_ortho = ortho_basis[0]
-    u1 = ortho_basis[1]
-    u2 = ortho_basis[2]
-
-    # Convert back to dicts
+    # Convert the unit prior v0 back to per-tensor dict form. v0 is already
+    # unit-norm (or all-zeros on the degenerate fallback), so no further
+    # normalization is needed — the Gram-Schmidt pass an earlier revision ran
+    # here left the first basis vector v0 unchanged.
     template_dict = {k: v.clone().cpu() for k, v in original_state.items()}
-    v0_dict = unflatten_tensor_dict(v0_ortho.float(), template_dict)
-    u1_dict = unflatten_tensor_dict(u1.float(), template_dict)
-    u2_dict = unflatten_tensor_dict(u2.float(), template_dict)
+    v0_dict = unflatten_tensor_dict(v0.float(), template_dict)
 
-    # Helper function to compute loss
-    def compute_loss_at(a: float, b1: float, b2: float) -> float:
+    # Fixed coefficients: FD fitting bypassed (see docstring) — pure v0
+    # extrapolation: W_extrap = W_t + selected_N * w_traj * v0.
+    alpha, beta1, beta2 = 1.0, 0.0, 0.0
+
+    def compute_loss_at(a: float) -> float:
         for name, p in params.items():
-            delta_val = selected_N * a * w_traj * v0_dict[name].to(p.device) + b1 * u1_dict[name].to(p.device) + b2 * u2_dict[name].to(p.device)
+            delta_val = selected_N * a * w_traj * v0_dict[name].to(p.device)
             p.data.copy_(original_state[name].to(p.device) + delta_val)
         loss = loss_fn(batch)
         restore_model()
         return loss
 
-    # Fixed coefficients: FD fitting bypassed for diagnostic run.
-    # Motivation: alpha std=4.46 noise in previous run made fitting harmful.
-    # This uses pure v0 extrapolation: W_extrap = W_t + N * w_traj * v0
-    alpha, beta1, beta2 = 1.0, 0.0, 0.0
-    initial_loss = compute_loss_at(alpha, beta1, beta2)
+    initial_loss = compute_loss_at(alpha)
     stats["loss_initial"] = initial_loss
     stats["loss_final"] = initial_loss  # no fitting → same loss
     stats["alpha_fit"] = alpha
     stats["beta1_fit"] = beta1
     stats["beta2_fit"] = beta2
 
-    # Compose final update delta dict (without applying, caller will apply or commit)
-    final_delta_dict = {}
-    for name in params.keys():
-        final_delta_dict[name] = (
-            selected_N * alpha * w_traj * v0_dict[name]
-            + beta1 * u1_dict[name]
-            + beta2 * u2_dict[name]
-        )
+    # Compose final update delta dict (caller applies / commits).
+    final_delta_dict = {
+        name: selected_N * alpha * w_traj * v0_dict[name] for name in params.keys()
+    }
 
     return final_delta_dict, stats
