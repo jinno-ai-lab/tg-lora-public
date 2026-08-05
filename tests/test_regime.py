@@ -104,6 +104,58 @@ class TestRegimeDetector:
         assert det.consume_reset_signal() is False
 
 
+class TestRegimeZScoreTransition:
+    """The statistical z-score transition branch (regime.py lines 135-138).
+
+    The existing transition tests (``test_transition_on_sudden_change`` et al.)
+    feed a perfectly-uniform stable phase — every velocity identical (-0.1) —
+    so the "older" window has zero variance and ``_classify`` routes through the
+    near-zero-variance absolute-deviation fallback (lines 128-133), NEVER the
+    statistical z-score outlier test that is the module's headline transition
+    detector (``z = |v_last - older_mean| / older_std > transition_z``).
+
+    This class exercises that z-score branch directly: a stable phase whose
+    "older" velocities carry REAL (non-zero) variance, followed by a velocity
+    that is a genuine statistical outlier. It also pins the negative case
+    (real variance but the latest velocity is within the z threshold -> STABLE),
+    so the branch's threshold logic is covered in both directions.
+    """
+
+    def test_zscore_transition_when_outlier_with_real_variance(self):
+        # Velocities: [-0.10, -0.12, -0.10, -0.09, -0.80].
+        # older window = vels[:-3] = [-0.10, -0.12] -> var = 1e-4 (>= 1e-10, so
+        # the z-score ELSE branch is taken, not the near-zero-variance fallback),
+        # z = |(-0.80) - (-0.11)| / 0.01 = 69 >> transition_z(2.0) -> TRANSITION.
+        det = RegimeDetector(window=8, min_history=3, transition_z=2.0)
+        for loss in (5.0, 4.90, 4.78, 4.68, 4.59, 3.79):
+            regime = det.update(loss)
+
+        older = list(det._velocities)[:-3]
+        older_mean = sum(older) / len(older)
+        older_var = sum((v - older_mean) ** 2 for v in older) / len(older)
+        assert older_var >= 1e-10  # routes through the z-score branch, not the fallback
+
+        assert regime == Regime.TRANSITION
+        assert det.transition_count == 1
+        assert det.consume_reset_signal() is True
+
+    def test_zscore_stays_stable_when_outlier_within_threshold(self):
+        # Same real-variance older window, but the latest velocity (-0.10) is
+        # NOT an outlier: z = 1.0 <= transition_z(2.0) -> STABLE.
+        det = RegimeDetector(window=8, min_history=3, transition_z=2.0)
+        for loss in (5.0, 4.90, 4.78, 4.68, 4.59, 4.49):
+            regime = det.update(loss)
+
+        older = list(det._velocities)[:-3]
+        older_mean = sum(older) / len(older)
+        older_var = sum((v - older_mean) ** 2 for v in older) / len(older)
+        assert older_var >= 1e-10  # confirms the z-score branch was evaluated
+
+        assert regime == Regime.STABLE
+        assert det.transition_count == 0
+        assert det.consume_reset_signal() is False
+
+
 class TestRegimeDetectorStateRoundtrip:
     """state_dict / load_state_dict for the resume-state-loss axis.
 
