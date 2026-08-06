@@ -1,0 +1,152 @@
+{
+  "verdict": "SURPASSES",
+  "passes": true,
+  "significant_surpasses": true,
+  "is_material": true,
+  "material_margin": 0.0,
+  "is_thin_evidence": true,
+  "candidate_mean": 1.5168982580304147,
+  "surrogate_mean": 1.595217813923955,
+  "point_improvement": 0.07831955589354034,
+  "lower": 0.07236741911619915,
+  "upper": 0.08427169267088175,
+  "confidence": 0.95,
+  "n_bootstrap": 10000,
+  "candidate_losses": [
+    1.517235135473311,
+    1.5165613805875182
+  ],
+  "surrogate_losses": [
+    1.58960255458951,
+    1.6008330732584
+  ],
+  "candidate_order": [
+    31,
+    30,
+    29,
+    28,
+    27,
+    26,
+    25,
+    24
+  ],
+  "device": "cuda",
+  "model": "Qwen/Qwen3.5-9B",
+  "architecture": "homogeneous",
+  "lora_rank_pattern": null,
+  "dataset": "databricks/databricks-dolly-15k",
+  "total_steps": 20,
+  "warmup_steps": 6,
+  "depth": 3,
+  "spacing": 4,
+  "n_candidate": 2,
+  "n_surrogate": 2,
+  "base_seed": 0,
+  "active_scope": [
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "scope_label": "last_25_percent",
+  "n_active_layers": 8,
+  "scope_trainable_params": 10819584,
+  "seq_len": 1024,
+  "train_examples": 8,
+  "valid_examples": 10,
+  "use_local_loss": true,
+  "proxy_scale": false,
+  "reduced_budget": true,
+  "cfg_max_steps": 1500,
+  "candidate_final_ce_train_loss_mean": 1.2557453494518995,
+  "candidate_train_valid_gap": 0.26115290857851514,
+  "regime": "generalization",
+  "candidate_cost_reduction": {
+    "level": 1,
+    "reduction_rate": 0.09375,
+    "progressive_backward_flops": 290.0,
+    "full_backward_flops": 320.0,
+    "realized_reduction_rate": 0.0,
+    "level1_realization_ceiling": 0.0,
+    "realized_depth": 3,
+    "frozen_at_epoch": {
+      "31": 6,
+      "30": 10,
+      "29": 14
+    },
+    "cost_model": "uniform_per_layer"
+  },
+  "candidate_provenance": [
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.0005035400390625,
+      "final_ce_train_loss": 1.2575516179203987
+    },
+    {
+      "frozen_layers": [
+        29,
+        30,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 0.00048828125,
+      "final_ce_train_loss": 1.2539390809834003
+    }
+  ],
+  "surrogate_provenance": [
+    {
+      "frozen_layers": [
+        25,
+        28,
+        31
+      ],
+      "n_trainable_params": 6787072,
+      "last_train_loss": 5.7697296142578125e-05,
+      "final_ce_train_loss": 1.3125764317810535
+    },
+    {
+      "frozen_layers": [
+        26,
+        28,
+        29
+      ],
+      "n_trainable_params": 6687744,
+      "last_train_loss": 0.000377655029296875,
+      "final_ce_train_loss": 1.3194156363606453
+    }
+  ],
+  "control_losses": [],
+  "control_order": [
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "n_control": 0,
+  "control_provenance": [],
+  "direction": null,
+  "baseline_losses": [],
+  "n_baseline": 0,
+  "baseline_provenance": [],
+  "baseline": null,
+  "citable_as_target_scale": true,
+  "citable_as_full_section4_verdict": false,
+  "resumed_arm_count": 0,
+  "ledger_path": "/home/jinno/ai-hub/worktrees/tg-lora-public-instruction-20260806-232742-947787/runs/datafile_repro_stage/freeze_validloss_ci_9b_datafile_repro_ledger.jsonl",
+  "run_log_path": "/home/jinno/ai-hub/worktrees/tg-lora-public-instruction-20260806-232742-947787/runs/datafile_repro_stage/freeze_validloss_ci_9b_datafile_repro_runlog.json",
+  "run_log_sha256": "beebe3076280ba2bcf4d24f549878c0f14d1ad3baa34d25ea14ffb0252884542",
+  "evidence_hash": "3efcd6112bfa6faf821c32020b3a0da17d8db403746e6ffec94e63a6d4c6fe0b"
+}
