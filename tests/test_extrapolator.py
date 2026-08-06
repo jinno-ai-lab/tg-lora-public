@@ -919,3 +919,140 @@ def test_m9_velocity_direction_prior_branch():
     )
     assert stats["v0_source"] == "velocity_ema"
 
+
+# ---------------------------------------------------------------------------
+# subspace_m9_fit_step -- pure-v0 extrapolation behavior lock (refactor aa27111).
+#
+# aa27111 dropped the pca_lowrank + Gram-Schmidt (u1, u2) basis because the FD
+# coefficient fit is permanently bypassed at (alpha,beta1,beta2)=(1,0,0), so
+# u1/u2 were multiplied by exactly zero -- dead compute plus a latent
+# ``0 * NaN`` weight-corruption vector whenever pca_lowrank returned NaN on
+# degenerate input. That refactor shipped a reliability claim ("removes the
+# 0*NaN vector, locks pure-v0 extrapolation") but no test: under every existing
+# M9 test the value of ``alpha`` is unpinned (test_subspace_m9_scaling only
+# checks norm~linearity in N, which is invariant under any alpha), so a future
+# agent can silently re-enable the FD fit or reintroduce a PCA subspace and
+# resurrect the corruption vector while staying green.
+#
+# These tests lock the claim directly: under the degenerate histories the
+# removed subspace used to feed (rank-deficient, single-element, zero-norm),
+# the returned delta must (a) be free of NaN/Inf, (b) equal the closed form
+# ``selected_N * w_traj * v0`` reconstructed *independently* from history, and
+# (c) report the fixed (1,0,0) coefficients. Each assertion is mutation-
+# killable: flip alpha, re-add a subspace term, or drop the zero-norm fallback
+# and the test REDs.
+# ---------------------------------------------------------------------------
+
+
+def _m9_expected_flat_delta(history, active_names, selected_N):
+    """Independently reconstruct the closed-form M9 delta
+    ``selected_N * w_traj * v0`` (history-mean prior) as a flat vector.
+
+    Mirrors only the *math* of the pure-v0 path -- not the function's internals
+    -- using the same sorted-key flatten order as ``flatten_tensor_dict``, so a
+    divergence between this and the function's output is a real behavior change
+    rather than mirrored bookkeeping. ``w_traj`` is the median history-delta
+    norm and ``v0`` is the unit history-mean (or zeros on the zero-norm
+    fallback)."""
+    from src.tg_lora.extrapolator import flatten_tensor_dict
+
+    flat_deltas = torch.stack(
+        [
+            flatten_tensor_dict(
+                {k: v for k, v in d.items() if k in active_names}
+            ).double()
+            for d in history
+        ]
+    )
+    w_traj = flat_deltas.norm(dim=1).median().item()
+    mean_delta = flat_deltas.mean(dim=0)
+    mean_norm = mean_delta.norm().item()
+    v0 = mean_delta / mean_norm if mean_norm > 1e-8 else torch.zeros_like(mean_delta)
+    return selected_N * w_traj * v0
+
+
+@pytest.mark.parametrize(
+    "scenario", ["rank_deficient", "single_element", "zero_norm_mean"]
+)
+def test_m9_delta_is_pure_v0_closed_form_and_finite_under_degenerate_history(
+    scenario,
+):
+    """Behavior lock for aa27111's pure-v0 extrapolation under the degenerate
+    histories the removed PCA/Gram-Schmidt subspace used to consume.
+
+    Scenarios (the feedback's named degenerate inputs):
+      * rank_deficient -- 3 identical (collinear) deltas -> rank-1 history.
+      * single_element -- a single history entry (q==1 in the old PCA branch).
+      * zero_norm_mean -- two cancelling deltas whose mean has zero norm, so
+        v0 falls back to zeros via the history_mean branch.
+
+    For each: the delta is finite (no 0*NaN corruption vector), equals the
+    closed form ``selected_N * w_traj * v0``, and stats report (1,0,0)."""
+    from src.tg_lora.extrapolator import flatten_tensor_dict, subspace_m9_fit_step
+
+    model, pairs, active_names, batch = _m9_inputs()
+    base = {name: torch.randn_like(p) * 0.01 for name, p in pairs}
+    if scenario == "rank_deficient":
+        history = [dict(base), dict(base), dict(base)]
+    elif scenario == "single_element":
+        history = [dict(base)]
+    else:  # zero_norm_mean: +d then -d -> mean cancels to zero norm
+        history = [dict(base), {name: -v.clone() for name, v in base.items()}]
+
+    selected_N = 5
+    delta, stats = subspace_m9_fit_step(
+        model=model,
+        history=history,
+        active_names=active_names,
+        batch=batch,
+        loss_fn=_zero_loss,
+        selected_N=selected_N,
+    )
+
+    # (a) finite -- the corruption-vector lock (0 * NaN would fail here).
+    flat_out = flatten_tensor_dict(delta).double()
+    assert torch.isfinite(flat_out).all(), "M9 delta has non-finite elements"
+
+    # (b) closed form selected_N * w_traj * v0, reconstructed independently.
+    expected = _m9_expected_flat_delta(history, active_names, selected_N)
+    assert torch.allclose(flat_out, expected, atol=1e-6), (
+        f"M9 delta deviates from pure-v0 closed form (scenario={scenario})"
+    )
+
+    # (c) fixed (1,0,0) coefficients -- alpha=1 is otherwise unpinned.
+    assert stats["alpha_fit"] == 1.0
+    assert stats["beta1_fit"] == 0.0
+    assert stats["beta2_fit"] == 0.0
+
+
+def test_m9_zero_norm_velocity_prior_yields_finite_zero_delta():
+    """The velocity-EMA prior branch's degenerate fallback (the feedback's
+    zero-norm delta-input case, on the velocity path): a zero-norm
+    ``velocity_direction`` must yield an all-zero, fully-finite delta -- not the
+    ``0 * NaN`` corruption vector -- and report (1,0,0). This is the symmetric
+    counterpart of the history-mean zero-norm fallback above; v0 is built from
+    velocity_direction here, so the healthy history only supplies ``w_traj``."""
+    from src.tg_lora.extrapolator import flatten_tensor_dict, subspace_m9_fit_step
+
+    model, pairs, active_names, batch = _m9_inputs()
+    history = [_m9_history_entry(pairs) for _ in range(3)]  # healthy -> w_traj > 0
+    velocity_direction = {name: torch.zeros_like(p) for name, p in pairs}
+    delta, stats = subspace_m9_fit_step(
+        model=model,
+        history=history,
+        active_names=active_names,
+        batch=batch,
+        loss_fn=_zero_loss,
+        selected_N=5,
+        velocity_direction=velocity_direction,
+    )
+
+    flat_out = flatten_tensor_dict(delta).double()
+    assert torch.isfinite(flat_out).all(), "M9 delta has non-finite elements"
+    # v0 is zeros -> delta is exactly zero (selected_N * finite_w_traj * 0 == 0).
+    assert torch.allclose(flat_out, torch.zeros_like(flat_out), atol=1e-9)
+    assert stats["v0_source"] == "velocity_ema"
+    assert stats["alpha_fit"] == 1.0
+    assert stats["beta1_fit"] == 0.0
+    assert stats["beta2_fit"] == 0.0
+
