@@ -3923,6 +3923,184 @@ def test_assert_dolly_content_non_empty_passes_real_dolly_row():
     )
 
 
+# --- _load_dolly_records local-file ingestion (--data-file, GOAL §7) ---------
+# The streaming ``datasets.load_dataset(..., streaming=True)`` path above is the
+# default. ``--data-file`` opts into ingesting a LOCAL Dolly-shaped JSONL (the
+# scripts/download_data.py + scripts/prepare_data.py output shape) INSTEAD — so a
+# citable §4 verdict does not hinge on a live network fetch (§7 independent
+# reproducibility) and an offline host can still boot the run. These drive the
+# REAL local loader body (no ``datasets`` monkeypatch needed — the local path
+# never imports it) and prove the two honesty guards fire IDENTICALLY on a local
+# file (a hand-edited / wrong-schema / partially-empty dump aborts just as a
+# malformed streamed dataset would), the reader mirrors prepare_data.load_raw
+# (blank + non-dict lines skipped; a non-JSON line raises), and a local dump is
+# DROP-IN EQUIVALENT to streaming the same records (same capped + seeded-shuffled
+# output) — the §7 property the flag exists for.
+
+
+def _write_dolly_jsonl(path, rows):
+    """Write ``rows`` (dicts) as one JSON object per line — the download_data.py /
+    prepare_data.py output shape the local loader ingests."""
+    path.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_load_dolly_records_reads_local_file_without_streaming(tmp_path, monkeypatch):
+    """A ``--data-file`` run ingests the local JSONL and NEVER calls
+    ``datasets.load_dataset`` — the offline / reproducible path. If the dispatch
+    ever regressed to streaming, the monkeypatched ``load_dataset`` would fire
+    and this test would go RED."""
+    import datasets
+
+    def _boom(*args, **kwargs):
+        raise AssertionError(
+            "the --data-file path must NOT call datasets.load_dataset"
+        )
+
+    monkeypatch.setattr(datasets, "load_dataset", _boom)
+    path = tmp_path / "dolly.jsonl"
+    rows = [
+        {"instruction": f"inst {i}", "context": "", "response": f"resp {i}"}
+        for i in range(8)
+    ]
+    _write_dolly_jsonl(path, rows)
+
+    out = _load_dolly_records(
+        "databricks/databricks-dolly-15k", 8, 7, data_file=str(path)
+    )
+    assert len(out) == 8
+    # Same record SET as the input (the seeded shuffle permutes in place only).
+    assert {tuple(sorted(r.items())) for r in out} == {
+        tuple(sorted(r.items())) for r in rows
+    }
+    # The three Dolly keys are extracted exactly as the streaming path extracts
+    # them, so downstream build_sft_example is unaffected by the ingestion source.
+    assert all(set(r) == {"instruction", "context", "response"} for r in out)
+
+
+def test_load_dolly_records_local_file_rejects_schema_mismatch(tmp_path):
+    """A local dump whose rows lack ``instruction``/``response`` hits the SAME
+    schema guard the streaming path hits — a wrong-schema local file must abort,
+    not silently feed empty records (the corrupt-but-green §4 hazard the guard
+    exists for). The guard fires on the local path too because both paths funnel
+    through the identical row-validation body."""
+    path = tmp_path / "wrong.jsonl"
+    _write_dolly_jsonl(path, [{"prompt": f"q{i}", "completion": f"a{i}"} for i in range(8)])
+    with pytest.raises(ValueError, match="lack required field"):
+        _load_dolly_records(
+            "databricks/databricks-dolly-15k", 8, 7, data_file=str(path)
+        )
+
+
+def test_load_dolly_records_local_file_rejects_empty_response(tmp_path):
+    """A local record with a present-but-empty ``response`` hits the SAME
+    non-empty-content guard on every consumed row — the second door into the
+    corrupt-but-green hazard. Fires on a LATER row (the row-0 schema check passes
+    because the key exists)."""
+    path = tmp_path / "dolly.jsonl"
+    rows = [
+        {"instruction": f"inst {i}", "context": "", "response": f"resp {i}"}
+        for i in range(8)
+    ]
+    rows[3]["response"] = ""  # present key, empty value, on a LATER row
+    _write_dolly_jsonl(path, rows)
+    with pytest.raises(ValueError, match="empty/whitespace"):
+        _load_dolly_records(
+            "databricks/databricks-dolly-15k", 8, 7, data_file=str(path)
+        )
+
+
+def test_load_dolly_records_local_file_skips_blank_and_nondict_lines(tmp_path):
+    """The local reader mirrors scripts.prepare_data.load_raw: blank lines and
+    valid-JSON-but-non-object lines (a bare scalar/array) are skipped, so a dump
+    with a trailing blank or a stray non-object line still loads its dict rows
+    cleanly. (A non-JSON line raises json.JSONDecodeError — see the next test.)"""
+    path = tmp_path / "dolly.jsonl"
+    # Intersperse a blank line, a bare-string line, and a bare-array line among
+    # valid dict rows. (A list + join, not implicit concat, because each valid
+    # line is a ``json.dumps(...)`` expression, not a string literal.)
+    lines = [
+        json.dumps({"instruction": "inst 0", "context": "", "response": "resp 0"}),
+        "",  # blank line
+        '"a stray string line"',
+        json.dumps({"instruction": "inst 1", "context": "", "response": "resp 1"}),
+        '["a bare array"]',
+        json.dumps({"instruction": "inst 2", "context": "", "response": "resp 2"}),
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out = _load_dolly_records(
+        "databricks/databricks-dolly-15k", 100, 7, data_file=str(path)
+    )
+    assert len(out) == 3  # only the 3 dict rows; blank/string/array skipped
+
+
+def test_load_dolly_records_local_file_raises_on_non_json_line(tmp_path):
+    """A genuinely non-JSON line (a torn / corrupt dump) raises rather than
+    silently truncating the record stream — a §4 verdict must not train on a
+    silently-shortened input. ``load_raw`` propagates the same json.JSONDecodeError."""
+    path = tmp_path / "torn.jsonl"
+    path.write_text(
+        json.dumps({"instruction": "inst 0", "context": "", "response": "resp 0"}) + "\n"
+        "{this is not valid json\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(json.JSONDecodeError):
+        _load_dolly_records(
+            "databricks/databricks-dolly-15k", 100, 7, data_file=str(path)
+        )
+
+
+def test_load_dolly_records_local_file_caps_to_max_rows(tmp_path):
+    """The cap takes the FIRST ``max_rows`` records in file order before the
+    seeded shuffle (mirroring the streaming path's cap-then-shuffle), so a local
+    run draws the identical record window as a streaming run over the same
+    ordered dump."""
+    path = tmp_path / "dolly.jsonl"
+    rows = [
+        {"instruction": f"inst {i}", "context": "", "response": f"resp {i}"}
+        for i in range(10)
+    ]
+    _write_dolly_jsonl(path, rows)
+    out = _load_dolly_records(
+        "databricks/databricks-dolly-15k", 4, 7, data_file=str(path)
+    )
+    assert len(out) == 4
+    # The cap window is rows[0:4] in file order; the shuffle only permutes them.
+    assert {tuple(sorted(r.items())) for r in out} == {
+        tuple(sorted(r.items())) for r in rows[:4]
+    }
+
+
+def test_load_dolly_records_local_is_byte_identical_to_streaming(tmp_path, monkeypatch):
+    """DROP-IN EQUIVALENCE (the §7 reproducibility claim): a local dump of a
+    dataset and a streaming read of the SAME rows, under the SAME
+    max_rows + seed, yield the IDENTICAL capped + seeded-shuffled record set —
+    so a verdict banked from one source is reproducible from the other. This is
+    the load-bearing property that makes ``--data-file`` a reproducibility
+    substitute rather than a new experiment."""
+    import datasets
+
+    rows = [
+        {"instruction": f"inst {i}", "context": f"ctx {i}" if i % 2 else "",
+         "response": f"resp {i}"}
+        for i in range(12)
+    ]
+    # Streaming path: monkeypatch load_dataset to yield the same rows.
+    monkeypatch.setattr(datasets, "load_dataset", _fake_load_dataset(rows))
+    streamed = _load_dolly_records(
+        "databricks/databricks-dolly-15k", 12, 7
+    )
+    # Local path: write the same rows to a JSONL.
+    path = tmp_path / "dolly.jsonl"
+    _write_dolly_jsonl(path, rows)
+    local = _load_dolly_records(
+        "databricks/databricks-dolly-15k", 12, 7, data_file=str(path)
+    )
+    assert streamed == local
+
+
 class TestModuleDocstringAccurate:
     """The module ``__doc__`` must not contradict the tested 4-axis citation gate.
 

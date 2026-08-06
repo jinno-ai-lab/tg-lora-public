@@ -446,8 +446,9 @@ def test_launcher_reads_no_data_config_field_and_data_surface_fingerprinted():
     """``DataConfig`` isolation guard — the prompt/data-contract surface the
     feedback loop asks to keep honest: the §4 arm path builds its inputs
     ENTIRELY from fingerprinted CLI args (``dataset`` / ``max_dataset_rows`` /
-    ``base_seed`` / ``seq_len`` / ``train_examples`` / ``valid_examples`` →
-    ``_load_dolly_records`` + ``build_real_batches``). The ``cfg.data`` section
+    ``base_seed`` / ``seq_len`` / ``train_examples`` / ``valid_examples`` /
+    ``data_file`` → ``_load_dolly_records`` + ``build_real_batches``). The
+    ``cfg.data`` section
     (the ``train_tg_lora`` dataset PATHS / ``max_seq_len``) must NEVER feed an
     arm: if a future change starts reading ``cfg.data.X`` into the §4 path, two
     runs differing only in that value would share a fingerprint and silently
@@ -480,6 +481,7 @@ def test_launcher_reads_no_data_config_field_and_data_surface_fingerprinted():
     for key in (
         "dataset", "max_dataset_rows", "base_seed",
         "seq_len", "train_examples", "valid_examples",
+        "data_file",
     ):
         assert key in sample, (
             f"Data-surface key {key!r} is absent from _config_fingerprint — "
@@ -511,6 +513,20 @@ def test_fingerprint_changes_with_lora_dropout():
     """``lora_dropout`` changes the arm's regularization; the ledger must not
     replay arms trained under a different dropout."""
     assert _fp(lora_dropout=0.0) != _fp(lora_dropout=0.1)
+
+
+def test_fingerprint_changes_with_data_file():
+    """``--data-file`` selects the ingestion SOURCE (a local Dolly JSONL vs the
+    HF-hub stream) — the two are NOT interchangeable inputs. A local-file arm
+    trained on a frozen dump must NOT replay from a streaming-banked ledger entry
+    (the hub could serve a revised/different byte stream under the same id), and
+    two different local dumps are different inputs too. So the literal path must
+    re-key the fingerprint — else a corrupt-but-green §4 verdict (GOAL §7) where
+    a verdict reproduces against a DIFFERENT input than the one it was banked on.
+    The default ``None`` (streaming, what every committed deposit uses) stays
+    byte-identical, so this only reseeds the local-file path."""
+    assert _fp(data_file="dolly_dump_a.jsonl") != _fp()
+    assert _fp(data_file="dolly_dump_a.jsonl") != _fp(data_file="dolly_dump_b.jsonl")
 
 
 def test_fingerprint_changes_with_lora_target_modules():

@@ -369,10 +369,49 @@ def _assert_dolly_content_non_empty(
         )
 
 
+def _iter_local_dolly_rows(data_file):
+    """Yield dict rows from a local Dolly-shaped JSONL, in file order.
+
+    The file is the output shape :mod:`scripts.download_data` /
+    :mod:`scripts.prepare_data` produce — one JSON object per line with
+    ``instruction`` / ``context`` / ``response`` — so the §4 verdict run can
+    ingest a pre-downloaded Dolly dump instead of streaming it from the HF hub
+    at run time (GOAL §7 independent reproducibility: a citable verdict must
+    not hinge on a live network fetch of a dataset the hub could revise or
+    withhold; an offline / firewalled host can still boot the run). The reader
+    mirrors :func:`scripts.prepare_data.load_raw` — the reader for EXACTLY this
+    file format — so the loader and the producer agree on what a record is:
+    blank lines are skipped, a valid-JSON-but-non-object line (a bare scalar /
+    array from a hand-edit) is skipped, and a non-JSON line raises
+    ``json.JSONDecodeError`` (a corrupt dump aborts rather than silently
+    truncating the record stream — the producer writes clean JSONL, and a §4
+    verdict must not train on a silently-shortened input). Rows that ARE
+    objects but lack the Dolly fields still hit :func:`_assert_dolly_schema`
+    downstream (the corrupt-but-green guard fires loud).
+
+    File order is preserved so the cap-then-seeded-shuffle in
+    :func:`_load_dolly_records` is reproducible: a ``download_data.py`` dump
+    writes records in the hub's iteration order, so a local-file run yields the
+    identical capped + shuffled record set as a streaming run over the same
+    dataset — drop-in equivalent, the §7 reproducibility property this exists
+    for.
+    """
+    import json
+
+    with open(data_file, encoding="utf-8") as fh:
+        for raw in fh:
+            if not raw.strip():
+                continue
+            rec = json.loads(raw)  # raises JSONDecodeError on a non-JSON line
+            if isinstance(rec, dict):
+                yield rec
+
+
 def _load_dolly_records(
-    dataset: str, max_rows: int, seed: int
+    dataset: str, max_rows: int, seed: int, *, data_file=None
 ) -> list[dict]:
-    """Load + shuffle Dolly records via the public ``datasets`` path.
+    """Load + shuffle Dolly records via the public ``datasets`` path OR a local
+    JSONL dump.
 
     Seeded locally so candidate and surrogate arms see the identical record
     order independent of the global RNG / arm call order (the same
@@ -383,14 +422,35 @@ def _load_dolly_records(
     (:func:`_assert_dolly_content_non_empty`) so a record with an empty
     instruction/response aborts loudly too — instead of silently feeding
     empty/degenerate records downstream. Both are DATA-axis honesty guards for
-    the private-``src.data`` drop-in path.
+    the private-``src.data`` drop-in path, and BOTH fire identically on the
+    local-file path (:func:`_iter_local_dolly_rows`) — a local dump is drop-in
+    equivalent to streaming the same dataset ONLY because it runs the same
+    guards, so a hand-edited / wrong-schema / partially-empty local file aborts
+    just as a malformed streamed dataset would.
+
+    ``data_file`` (default ``None``) selects the ingestion SOURCE: when set, a
+    local Dolly-shaped JSONL is read via :func:`_iter_local_dolly_rows` INSTEAD
+    of streaming ``dataset`` from the HF hub (the ``datasets`` import is skipped
+    entirely, so a local-file run never touches the network — the offline /
+    reproducible path). When ``None`` (the default, and what every committed
+    deposit uses) the streaming path is byte-identical to before: the
+    ``from datasets import load_dataset`` happens lazily here so ``--help`` and
+    a ``--data-file`` run work without the ``datasets`` dependency installed.
+    The literal ``data_file`` path is recorded in the resume-ledger fingerprint
+    (:func:`_config_fingerprint`) so a local-file re-fire never replays
+    streaming-banked arms (the two sources are not interchangeable ledger
+    entries — see the fingerprint's ``data_file`` docstring).
     """
     import random as _random
-    from datasets import load_dataset
 
-    ds = load_dataset(dataset, split="train", streaming=True)
+    if data_file is not None:
+        rows = _iter_local_dolly_rows(data_file)
+    else:
+        from datasets import load_dataset
+
+        rows = load_dataset(dataset, split="train", streaming=True)
     records: list[dict] = []
-    for i, row in enumerate(ds):
+    for i, row in enumerate(rows):
         if i >= max_rows:
             break
         if i == 0:
@@ -1030,6 +1090,7 @@ def _config_fingerprint(
     load_in_4bit: bool,
     bnb_4bit_quant_type: str,
     bnb_4bit_compute_dtype: str,
+    data_file=None,
 ) -> dict:
     """The run-config identity that defines an arm's result.
 
@@ -1093,6 +1154,23 @@ def _config_fingerprint(
     one asymmetry the prefix-feature cache already guards (its
     ``test_different_load_in_4bit_*`` / ``_dtype`` / ``_bnb_4bit_quant_type``
     pins) but the resume ledger did not.
+
+    ``data_file`` (default ``None``) selects the ingestion SOURCE: a local
+    Dolly-shaped JSONL (:func:`_iter_local_dolly_rows`) vs the HF-hub stream.
+    A local path is NOT a content-addressed identity the way the ``dataset``
+    hub id is — its bytes are whatever the operator dumped (a filtered Dolly,
+    a different split, a stale copy) — so an arm banked from one source MUST NOT
+    replay under another: a streaming-banked ledger silently replayed onto a
+    ``--data-file`` re-fire (or vice versa) would measure a different input and
+    report it as the same verdict, the same corrupt-but-green §4 (GOAL §7)
+    hazard ``dataset`` / ``max_dataset_rows`` prevent. The literal path string
+    (``str(data_file)``) is the closest analog to the content-addressed hub id
+    for a local file: two distinct paths are treated as distinct sources even
+    when their bytes coincide (conservative — a re-run, never a false ledger
+    hit), while ``None`` keeps the streaming fingerprint byte-identical to
+    before. The path is stable across re-fires of the same invocation, so a
+    local-file run resumes its OWN ledger correctly; cross-source replay stays
+    impossible, which is the point.
     """
     return {
         "ledger_version": LEDGER_VERSION,
@@ -1120,6 +1198,7 @@ def _config_fingerprint(
         "load_in_4bit": bool(load_in_4bit),
         "bnb_4bit_quant_type": str(bnb_4bit_quant_type),
         "bnb_4bit_compute_dtype": str(bnb_4bit_compute_dtype),
+        "data_file": str(data_file) if data_file is not None else None,
     }
 
 
@@ -1359,6 +1438,7 @@ def _ledger_seal_ready(
     max_dataset_rows, use_local_loss, learning_rate, base_seed,
     architecture, lora_r, lora_alpha, lora_dropout, lora_target_modules,
     dtype, load_in_4bit, bnb_4bit_quant_type, bnb_4bit_compute_dtype,
+    data_file=None,
     n_candidate, n_surrogate, n_control, n_baseline,
 ) -> dict | None:
     """Is the ledger a complete, config-matched bank of THIS run's arms?
@@ -1401,6 +1481,7 @@ def _ledger_seal_ready(
         dtype=dtype, load_in_4bit=load_in_4bit,
         bnb_4bit_quant_type=bnb_4bit_quant_type,
         bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,
+        data_file=data_file,
     )
     for key, val in requested.items():
         if key == "active_scope":
@@ -1577,6 +1658,7 @@ def run_ci_9b(
     output=None,
     architecture: str = HOMOGENEOUS,
     run_log_path=None,
+    data_file=None,
 ) -> dict:
     """Run the real-9B candidate+surrogate sweep and return the §4 verdict dict.
 
@@ -1640,6 +1722,7 @@ def run_ci_9b(
         load_in_4bit=cfg.model.get("load_in_4bit", True),
         bnb_4bit_quant_type=cfg.model.get("bnb_4bit_quant_type", "nf4"),
         bnb_4bit_compute_dtype=cfg.model.get("bnb_4bit_compute_dtype", "bfloat16"),
+        data_file=data_file,
         n_candidate=n_candidate,
         n_surrogate=n_surrogate, n_control=n_control, n_baseline=n_baseline,
     ) if ledger_path is not None else None
@@ -1692,7 +1775,7 @@ def run_ci_9b(
         )
 
         logger.info("Loading + tokenizing Dolly (%s) ...", dataset)
-        records = _load_dolly_records(dataset, max_dataset_rows, base_seed)
+        records = _load_dolly_records(dataset, max_dataset_rows, base_seed, data_file=data_file)
         train_batches = build_real_batches(
             tokenizer, records, n_examples=train_examples, device=device,
             max_seq_len=seq_len, offset=0,
@@ -1746,6 +1829,7 @@ def run_ci_9b(
         load_in_4bit=cfg.model.get("load_in_4bit", True),
         bnb_4bit_quant_type=cfg.model.get("bnb_4bit_quant_type", "nf4"),
         bnb_4bit_compute_dtype=cfg.model.get("bnb_4bit_compute_dtype", "bfloat16"),
+        data_file=data_file,
     )
     if ledger_path is not None:
         logger.info(
@@ -2430,6 +2514,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dataset", default=DEFAULT_DATASET)
     p.add_argument("--max-dataset-rows", type=int, default=DEFAULT_MAX_DATASET_ROWS)
     p.add_argument(
+        "--data-file", default=None,
+        help=(
+            "Ingest a LOCAL Dolly-shaped JSONL instead of streaming --dataset "
+            "from the HF hub at run time (GOAL §7 independent reproducibility "
+            "/ offline runs). The file is the scripts/download_data.py or "
+            "scripts/prepare_data.py output shape — one JSON object per line "
+            "with instruction/context/response — read by the SAME schema + "
+            "non-empty-content honesty guards as the streaming path, so a local "
+            "dump of --dataset is drop-in equivalent (same capped + seeded-"
+            "shuffled record set). The path is recorded in the resume-ledger "
+            "fingerprint, so a local-file re-fire does NOT replay streaming-"
+            "banked arms (and vice versa) — different ingestion sources are not "
+            "interchangeable ledger entries. Default None = stream --dataset "
+            "(byte-identical to before; the 'datasets' import is skipped only "
+            "when --data-file is set, so a local-file run never touches the "
+            "network)."
+        ),
+    )
+    p.add_argument(
         "--architecture", default=HOMOGENEOUS, choices=ARCHITECTURES,
         help=(
             "LoRA architecture: homogeneous (default — uniform rank, the "
@@ -2823,6 +2926,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 load_in_4bit=cfg.model.get("load_in_4bit", True),
                 bnb_4bit_quant_type=cfg.model.get("bnb_4bit_quant_type", "nf4"),
                 bnb_4bit_compute_dtype=cfg.model.get("bnb_4bit_compute_dtype", "bfloat16"),
+                data_file=args.data_file,
                 n_candidate=args.n_candidate,
                 n_surrogate=args.n_surrogate, n_control=args.n_control,
                 n_baseline=args.n_baseline,
@@ -2914,6 +3018,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output=args.output,
             architecture=args.architecture,
             run_log_path=args.run_log,
+            data_file=args.data_file,
         )
     except IncompleteResumeError as exc:
         # The resumed ledger banked only one side of the A/B, so no verdict can
