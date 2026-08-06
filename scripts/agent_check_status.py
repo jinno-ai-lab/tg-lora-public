@@ -196,6 +196,27 @@ def src_data_pipeline_present() -> bool:
     return (repo_root / "src" / "data").is_dir()
 
 
+def data_blocked_operator_decision() -> list[str]:
+    """The operator's forward decision set when the 9B lever is DATA-blocked.
+
+    The status report diagnoses the block (``src.data`` stripped, DATA/Cat-C);
+    this completes the *decision* by stating what the operator can actually DO
+    — the three forward options that advance the loop off its terminal state.
+    Surfacing them here (inside ``make status``, the command the operator
+    already runs) is the disciplined alternative to the loop's recurring
+    peripheral-plumbing churn: the block got re-derived every iteration because
+    the DECISION behind it was never printed in the tool the operator reads.
+    """
+    return [
+        "Operator decision (the loop's terminal state here — pick one to advance):",
+        "  (A) Accept SHIP as final for this public mirror — the §4 arc is complete",
+        "      (both citable faithful TIES + quality-vs-full-backprop SURPASSES, harvested).",
+        "  (B) Run the private-src.data absolute-loss leg in the PRIVATE checkout, where",
+        "      src.data ships — the one remaining open scientific question (DATA/Cat-C).",
+        "  (C) Define a NEW Cat-A deliverable to pivot the loop off the exhausted §4 arc.",
+    ]
+
+
 def report_gpu_availability():
     """Surface what concretely blocks the 9B target-scale lever THIS cycle.
 
@@ -231,6 +252,8 @@ def report_gpu_availability():
         print("    freeing the GPU will NOT make the 9B run actionable here. The §4")
         print("    verdict runs are already harvested as TIES; the remaining open is")
         print("    private-src.data absolute loss (actionable only in the private checkout).")
+        for _decision_line in data_blocked_operator_decision():
+            print(_decision_line)
 
     apps_csv = query_gpu_compute_apps()
     if apps_csv is None:

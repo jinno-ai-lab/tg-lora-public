@@ -202,3 +202,43 @@ def test_report_gpu_availability_no_nvidia_smi_does_not_fail(monkeypatch) -> Non
     mod.report_gpu_availability()  # must not raise
     out = buf.getvalue()
     assert "cannot assess" in out
+
+
+def test_data_blocked_operator_decision_surfaces_three_forward_options() -> None:
+    """The DECISION behind the DATA-block diagnosis: the three forward options
+    that advance the loop off its terminal state. The status report previously
+    stopped at 'DATA-blocked, not actionable here' — diagnosing the block
+    without surfacing the decision the operator must make. This pins that the
+    decision (A: accept SHIP, B: private src.data leg, C: new Cat-A pivot) is
+    now returned, so the loop stops re-deriving the block every iteration
+    instead of acting on the choice behind it."""
+    mod = _load_module()
+    lines = mod.data_blocked_operator_decision()
+    joined = "\n".join(lines)
+    # A header announcing this is the operator's decision, not more measurement.
+    assert "Operator decision" in joined
+    # The three forward options — each a distinct, actionable choice.
+    assert "(A)" in joined and "SHIP" in joined                       # accept SHIP-as-final
+    assert "(B)" in joined and "absolute-loss" in joined              # private src.data leg
+    assert "(C)" in joined and "Cat-A" in joined                      # pivot via new deliverable
+
+
+def test_report_gpu_availability_data_blocked_surfaces_decision(monkeypatch) -> None:
+    """Integration: when the lever is DATA-blocked the report does not stop at
+    the diagnosis — it also prints the operator's forward decision, so ``make
+    status`` reads as a decision the operator can act on, not merely a block.
+    Mutation pin: removing the ``data_blocked_operator_decision`` call from the
+    DATA-blocked branch drops all three option markers from the output."""
+    mod = _load_module()
+    monkeypatch.setattr(mod, "query_gpu_compute_apps", lambda: "")  # GPU free, irrelevant
+    import sys
+    from io import StringIO
+
+    buf = StringIO()
+    monkeypatch.setattr(sys, "stdout", buf)
+    mod.report_gpu_availability()
+    out = buf.getvalue()
+    assert "DATA-blocked" in out
+    assert "Operator decision" in out
+    assert "(A)" in out and "(B)" in out and "(C)" in out
+
