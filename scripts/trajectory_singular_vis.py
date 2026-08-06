@@ -16,14 +16,12 @@ Surrogates: shuffled-cycle T distribution for noise floor estimation.
 import argparse
 import re
 import sys
-from collections import OrderedDict
 from pathlib import Path
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import numpy as np
 import torch
 
@@ -412,7 +410,7 @@ def plot_convergence_summary(
     fig, ax = plt.subplots(figsize=(max(10, n_s * 0.3), 5))
     x = np.arange(n_s)
     colors = ["#2196F3" if not np.isnan(c) else "#BBBBBB" for c in conv_arr]
-    bars = ax.bar(x, conv_arr, color=colors, edgecolor="none")
+    ax.bar(x, conv_arr, color=colors, edgecolor="none")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=90, fontsize=6)
     ax.set_ylabel("Convergence cycle (first T < surrogate p5)")
@@ -439,7 +437,6 @@ def save_csv(
     """Save full time-series table and convergence summary as CSV."""
     import csv
 
-    n_s = len(series_list)
     n_t = len(cycles)
     labels = make_series_labels(series_list)
 

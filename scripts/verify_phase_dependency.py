@@ -10,7 +10,6 @@ Controls:
   3. Per-tensor: avoid global aggregation masking individual variation
 """
 
-import math
 import sys
 from pathlib import Path
 

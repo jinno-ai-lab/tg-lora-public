@@ -118,10 +118,6 @@ def main():
     tnames = sorted(art0["delta_tensors"].keys())
     del art0
 
-    # Load basic results
-    with open(args.ts_json) as f:
-        basic = json.load(f)
-
     # ─── Phase 1: Load all deltas ───
     print("Loading deltas...")
     all_deltas = []  # list of dicts

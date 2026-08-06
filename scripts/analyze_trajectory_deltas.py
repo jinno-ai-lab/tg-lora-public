@@ -16,7 +16,6 @@ Usage:
 
 import argparse
 import json
-import math
 import re
 import sys
 from pathlib import Path
@@ -31,7 +30,7 @@ from src.tg_lora.layer_delta_analysis import (
     analyze_tensor_deltas,
     group_by_layer_type,
 )
-from src.tg_lora.layer_type import LayerType, classify_layer_type
+from src.tg_lora.layer_type import LayerType
 
 
 def find_artifacts(artifact_dir: Path) -> list[tuple[int, Path]]:
@@ -61,17 +60,17 @@ def compute_incremental_deltas(
     Loads one pair at a time to bound memory.
     """
     increments = []
-    prev_meta, prev_tensors = None, None
+    prev_tensors = None
 
     for step, path in artifacts:
-        meta, tensors = load_artifact(path)
+        _, tensors = load_artifact(path)
 
         if step < start_step:
-            prev_meta, prev_tensors = meta, tensors
+            prev_tensors = tensors
             continue
 
         if prev_tensors is None:
-            prev_meta, prev_tensors = meta, tensors
+            prev_tensors = tensors
             continue
 
         # Incremental delta = current cumulative - previous cumulative
@@ -83,7 +82,7 @@ def compute_incremental_deltas(
                 incr[name] = tensors[name].clone()
 
         increments.append(incr)
-        prev_meta, prev_tensors = meta, tensors
+        prev_tensors = tensors
 
     return increments
 

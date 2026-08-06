@@ -173,7 +173,6 @@ def main():
                 i0, i1 = perm[pi], perm[pi + 1]
                 cos_surr[si, pi % (n_t - 1), sh] = subspace_cosine(valid_V[i0], valid_V[i1])
 
-    surr_median = np.nanmedian(cos_surr, axis=2)
     surr_p05 = np.nanpercentile(cos_surr, 5, axis=2)
     surr_p95 = np.nanpercentile(cos_surr, 95, axis=2)
 
@@ -410,7 +409,6 @@ def main():
         if c1 in loss_map and (c1 - 1) in loss_map:
             l_before = loss_map.get(c0, np.nan)
             l_at = loss_map.get(c1, np.nan)
-            l_after = loss_map.get(c1 + 1, np.nan) if c1 + 1 in loss_map else np.nan
             if not np.isnan(l_before) and not np.isnan(l_at):
                 delta = l_at - l_before
                 stalled = abs(delta) < 0.005 or delta > 0

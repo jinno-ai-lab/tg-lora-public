@@ -332,7 +332,6 @@ def main():
     print(f"  {len(keys)} tensors")
 
     # ── per-phase computation ──────────────────────────────────────────
-    results = {}
     all_S = {}
     all_N_raw = {}
     all_null = {}
@@ -448,8 +447,8 @@ def main():
         ]
         leg1 = ax.legend(handles=module_patches, title="Module",
                          loc="upper left", fontsize=7, ncol=2)
-        leg2 = ax.legend(handles=class_markers, title="Classification",
-                         loc="upper right", fontsize=8)
+        ax.legend(handles=class_markers, title="Classification",
+                  loc="upper right", fontsize=8)
         ax.add_artist(leg1)
 
         ax.set_xlabel("Direction Stability S (cosine)", fontsize=12)

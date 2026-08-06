@@ -1,11 +1,9 @@
 import argparse
 import logging
-import os
 import gc
 import time
 from pathlib import Path
 import torch
-import numpy as np
 
 from src.model.load_model import load_base_model, load_tokenizer, apply_lora
 from src.model.lora_utils import configure_trainable_lora_scope
@@ -152,7 +150,6 @@ def main():
     logger.info(f"Running Verification 1 (w_traj scale prior) at target cycle {args.target_cycle}...")
     norms = deltas_stack.norm(dim=1)
     w_traj = float(norms.median().item())
-    w_traj_mean = float(norms.mean().item())
     
     # Calculate v0 as the normalized mean direction of all past accepted deltas
     mean_delta = deltas_stack.mean(dim=0)

@@ -1,6 +1,5 @@
 import argparse
 import logging
-import os
 import gc
 from pathlib import Path
 import torch
@@ -8,7 +7,7 @@ from torch.utils.data import DataLoader
 
 from src.model.load_model import load_base_model, load_tokenizer, apply_lora
 from src.model.lora_utils import configure_trainable_lora_scope
-from src.data.build_seed_dataset import load_dataset, LoraDataset
+from src.data.build_seed_dataset import load_dataset
 from src.training.trainer_loop import create_optimizer, forward_backward, optimizer_step
 from src.training.config_schema import load_validate_and_build_config
 from src.training.trajectory_delta_artifact import load_trajectory_delta_artifact

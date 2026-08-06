@@ -4,7 +4,6 @@ Produces 4 figures + B-filter surrogate test + SNR map.
 Input: r=2 P1 run (11 cycles) trajectory deltas. No additional training.
 """
 
-import math
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -78,7 +77,6 @@ def main():
     art0 = torch.load(pilot_files[0], map_location="cpu", weights_only=False)
     tnames = sorted(art0["delta_tensors"].keys())
     del art0
-    n_t = len(tnames)
 
     all_dA = {tn: [] for tn in tnames}
     all_dB = {tn: [] for tn in tnames}
@@ -114,7 +112,6 @@ def main():
 
     for tn in a_tensors:
         layer, module, lt = parse(tn)
-        tn_B = tn.replace("lora_A", "lora_B")
 
         # Stack ΔA as [n_cycles, 2*4096] for temporal SVD
         dA_flat = np.array([d.flatten().numpy() for d in all_dA[tn]])  # [11, 8192]

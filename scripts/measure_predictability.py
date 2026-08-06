@@ -159,7 +159,6 @@ def main():
     indices = torch.randperm(len(train_dataset)).tolist()
 
     idx_ptr = 0  # Global index pointer into shuffled data
-    sample_idx = 0
 
     for cycle in range(n_cycles):
         t0 = time.time()
@@ -291,11 +290,6 @@ def main():
         cycle_delta = lora_delta(w_before, w_after)
         cycle_result["cycle_delta_norm"] = global_norm(cycle_delta)
 
-        # ─── Consecutive cycle predictability ───
-        if len(all_step_deltas) >= 2:
-            # Full cycle delta predictability
-            prev = all_step_deltas[-1]["delta"] if cycle > 0 else None
-
         elapsed = time.time() - t0
         cycle_result["elapsed"] = elapsed
 
@@ -339,7 +333,6 @@ def main():
         cycle_deltas_seq = []
         for cyc in range(n_cycles):
             r = results[cyc]
-            w_before_cycle = None  # Don't have individual cycle deltas stored as tensors
             # Use sum of step deltas as proxy
             full_delta = None
             for sd in all_step_deltas:

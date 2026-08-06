@@ -1,8 +1,6 @@
 import argparse
 import logging
-import os
 import gc
-import time
 from pathlib import Path
 import torch
 import numpy as np
@@ -13,7 +11,6 @@ from src.model.lora_utils import configure_trainable_lora_scope
 from src.data.build_seed_dataset import load_dataset
 from src.training.config_schema import load_validate_and_build_config
 from src.training.trajectory_delta_artifact import load_trajectory_delta_artifact
-from src.eval.eval_loss import eval_loss
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("offline-subspace-validation-multi-fold")
@@ -469,7 +466,6 @@ def main():
         v_passed_lr = mean_sub_lr - std_sub_lr > 0.002
         f.write(f"| (2) - (4) | Tuned LR vs Subspace Fit | {mean_sub_lr:.6f} | {std_sub_lr:.6f} | {'**SIGNIFICANT PASS**' if v_passed_lr else 'FAIL'} |\n")
         
-        v_passed_oracle = mean_sub_oracle - std_sub_oracle > 0.0
         f.write(f"| (5) - (4) | Oracle vs Subspace Fit | {mean_sub_oracle:.6f} | {std_sub_oracle:.6f} | {'**Subspace > Oracle (Generalization)**' if mean_sub_oracle > 0 else 'Oracle > Subspace'} |\n\n")
         
         f.write("### Verdict & Interpretation\n")

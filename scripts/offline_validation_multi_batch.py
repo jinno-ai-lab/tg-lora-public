@@ -1,8 +1,6 @@
 import argparse
 import logging
-import os
 import gc
-import time
 from pathlib import Path
 import torch
 import numpy as np
@@ -13,7 +11,6 @@ from src.model.lora_utils import configure_trainable_lora_scope
 from src.data.build_seed_dataset import load_dataset
 from src.training.config_schema import load_validate_and_build_config
 from src.training.trajectory_delta_artifact import load_trajectory_delta_artifact
-from src.eval.eval_loss import eval_loss
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("offline-multi-batch-validation")
