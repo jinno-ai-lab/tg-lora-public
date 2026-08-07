@@ -1309,17 +1309,21 @@ class TestNineBHonestyGateReplay:
     """
 
     def test_reduced_budget_9b_deposits_are_not_citable_as_full_verdict(self):
-        # PRIMARY mutation proof: the five reduced-budget 9B deposits (20/96
+        # PRIMARY mutation proof: the six reduced-budget 9B deposits (20/96
         # steps vs cfg_max_steps=1500) are NOT citable as the complete §4
         # verdict. Before the fix the replay gate honored only scale+context and
         # read these True; the budget axis (re-derived from total_steps vs
         # cfg_max_steps) now withholds — reverting the gate to the 2-axis form
-        # flips these back to True and fails this test.
+        # flips these back to True and fails this test. (Count grew 5→6 at
+        # `e135736` when the `--data-file` reproducibility artifact
+        # `freeze_validloss_ci_9b_datafile_repro.json` was harvested as a
+        # reduced-budget deposit per TASK-0239; the gate logic is unchanged
+        # and the mutation proof is preserved by the per-fixture loop below.)
         reduced = [
             p for p in _9b_deposit_fixtures()
             if load_samples(p).get("reduced_budget") is True
         ]
-        assert len(reduced) == 5, "expected exactly five reduced 9B deposits"
+        assert len(reduced) == 6, "expected exactly six reduced 9B deposits"
         for fixture in reduced:
             data = load_samples(fixture)
             out = replay_to_json(fixture, data, replay_samples(data))
