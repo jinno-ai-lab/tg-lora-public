@@ -27,11 +27,24 @@ branch=`ship`, 2026-07-29）。
 `dataset=databricks/databricks-dolly-15k`, `citable_as_full_section4_verdict=True`,
 `citable_as_target_scale=True`, `n_baseline=3`.
 
-**解釈**: Progressive Freezing は full backprop に対して**品質を保持したコスト削減**（P1 品質保持 = SURPASSES、
-両 leg）だが、random-order surrogate に対する loss 改善は target scale では**信号にならない**（TIES）。
-すなわち Progressive Freezing の寄与は「品質保持型の効率化」であり、loss 改善手法ではない — という
-null 含みの正直な結論。（参考: deposits の `candidate_cost_reduction.realized_reduction_rate = 0.0` は、
-名目 reduction_rate≈0.11 に対し実現コスト削除が 0 であることを記録する。別軸の研究課題として残る。）
+**解釈 — 2 軸を分けて（GOAL §7: 予測力は loss 着地で検証するまで信用しない）**:
+
+§4 の研究問い（GOAL §3.1「valid_loss 劣化 vs FLOPs 削減の frontier」）は品質とコストの **2 軸** を持つ。
+citable な読者が「cost-reduction win」と誤読しないよう、両軸を明示する:
+
+- **品質軸（loss）**: full backprop に対し品質を保持（P1 品質保持 = **SURPASSES**、両 leg）。
+  random-order surrogate に対する loss 改善は target scale では**信号にならない**（**TIES**）。
+- **コスト軸（realized backward 削減）**: 本 SHIP の prod path である **Level-1（progressive freeze）
+  の実現 backward 削減 = 0.0**（in-vivo 検証済 — `tests/test_progressive_freeze_invivo.py::
+  test_level1_freeze_only_cuts_no_backward_in_vivo` が backward traversal 数の不変を直接 assert する）。
+  名目 `reduction_rate ≈ 0.11` は weight-grad FLOP 算術だが、Level-1 は activation gradient を貫通させるため
+  実 backward traversal は減らない（機構: `src/tg_lora/freeze_cost.py::realizable_reduction` の
+  Level-1 ceiling）。**実現コスト削減を得るには Level-2 suffix cut（Phase-3 実験経路 = SHIP 対象外）が必要。**
+
+よって SHIP の正確な意味は **「品質保持手法として採用」** であり、**「実現コスト削減手法としての採用」ではない**。
+品質軸 = SURPASSES / loss-surrogate 軸 = TIES / コスト軸 Level-1 実現値 = 0.0 — いずれも回答済の null 含みの
+正直な結論。commit 済み deposit の `realized_reduction_rate = 0.0` がこのコスト軸主張の機械検証可能な根拠
+（本 doc の全主张と同様、`tests/test_section4_terminal_verdict.py` が live deposit に対して pin する）。
 
 ## 2. §7 自己完結再現性（citable ≠ reproducible — 本 mirror で閉じた）
 

@@ -140,3 +140,41 @@ def test_section7_offline_datafile_rail_is_proven_self_contained() -> None:
     # is AST-pinned by the test this report cites — assert it exists so the
     # report's cross-reference is never left dangling.
     assert SELF_CONTAINED_TEST.is_file()
+
+
+def test_report_foregrounds_level1_realized_cost_reduction_is_zero() -> None:
+    """The §4 research question (GOAL §3.1) has TWO axes — quality (loss) and
+    cost (realized backward reduction). The verdict cleanly answers quality
+    (SURPASSES vs full backprop; TIES vs surrogate), but the COST axis returns
+    realized 0.0 at the shipped Level-1 prod path: a Level-1 freeze stops the
+    weight grad yet still propagates the activation gradient, so no backward
+    traversal is elided (in-vivo-verified). This test refuses to let the citable
+    artifact bury that null under a "cost-reduction win" headline — the §7 risk
+    this repo exists to prevent ("don't let a predictor's promise outrun its
+    measured landing", applied to the cost claim the SHIP framing implies).
+
+    Cross-checked GPU-free against (1) the report prose stating the Level-1
+    realized reduction is 0.0, (2) the LIVE deposited samples agreeing at 0.0,
+    and (3) the in-vivo evidence test that PROVES ~0 existing (so the claim is
+    never left as a bare assertion). Mutation: reverting §1 to a bare
+    "品質を保持したコスト削減" headline while dropping the realized=0.0 caveat ->
+    marker RED; editing a deposit's realized_reduction_rate off 0.0 -> live
+    cross-check RED; deleting the cited in-vivo test -> provenance RED."""
+    text = _report()
+    # The verdict states the Level-1 realized backward reduction is 0.0 (a cost
+    # caveat foregrounding the null), not a "cost-reduction win" headline that
+    # outruns the in-vivo measurement.
+    assert "実現 backward 削減 = 0.0" in text          # mutation: drop the cost-null caveat -> RED
+    assert "realized_reduction_rate = 0.0" in text      # the deposit field the claim rests on
+    # The LIVE deposited samples agree: both full-budget legs realize 0.0 at the
+    # Level-1 prod path (the §4 SHIP target) — not a hand-stated prose number.
+    for deposit_path in (HOMOG_DEPOSIT, HETEROG_DEPOSIT):
+        deposit = json.loads(deposit_path.read_text())
+        assert deposit["candidate_cost_reduction"]["realized_reduction_rate"] == 0.0
+    # The in-vivo evidence that PROVES Level-1 realizes ~0 (not just asserts it)
+    # is the test this report cites — assert it exists AND carries the assertion,
+    # so the cross-reference is never dangling, exactly like the §7 self-contained
+    # provenance check above.
+    invivo = REPO_ROOT / "tests" / "test_progressive_freeze_invivo.py"
+    assert invivo.is_file()
+    assert "test_level1_freeze_only_cuts_no_backward_in_vivo" in invivo.read_text()
