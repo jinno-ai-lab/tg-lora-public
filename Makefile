@@ -7,7 +7,7 @@
 	compare compare-prefix compare-prefix-cold compare-prefix-warm compare-prefix-coldwarm compare-report paper-memory paper-memory-dry-run paper-memory-one-shot paper-memory-compare-modes paper-memory-all-modes paper-memory-evaluate-gates paper-memory-external-eval paper-memory-frontier-sweep paper-memory-cache-ablation cosine-n-ablation cosine-n-ablation-dry-run cosine-n-skip-ablation cosine-n-skip-ablation-dry-run precompute-prefix-cache ablation sweep accel-sweep \
 	bench-optimizer bench-prefix-cache bench-prefix-cache-one-shot analyze-prefix-break-even analyze-prefix-break-even-ci bench-velocity-ops bench-velocity-ops-ci bench-velocity-ops-save-baseline \
        test test-accel test-cov test-integration test-trajectory test-cli-help lint format clean clean-data clean-runs \
-       diagnose recover ci gates-ci check-status install-hooks uninstall-hooks \
+       diagnose recover ci gates-ci check-status loop-halt-check install-hooks uninstall-hooks \
        convert-mlx train-mlx train-mlx-baseline train-mlx-continuous train-mlx-upstream train-mlx-smoke mlx-data compare-mlx \
        help
 
@@ -663,6 +663,9 @@ clean-runs: ## Remove all experiment runs (careful!)
 check-status: ## Run agent autonomy status check to find next steps
 	chmod +x scripts/agent_check_status.py
 	$(PYTHON_VENV) scripts/agent_check_status.py
+
+loop-halt-check: ## §4/MS-008 halt guard — exit 77=SKIP (awaiting operator ratification, no trigger: emit NO axis commit / no halt-doc), 0=PROCEED. Loop consults this before any axis commit (scripts/loop_halt_guard.py + loop_axis_state.json).
+	$(PYTHON_VENV) scripts/loop_halt_guard.py --repo-root .
 
 diagnose: ## Run health check on GPU, checkpoint, config, or logs
 	$(PYTHON_VENV) scripts/diagnose.py $(ARGS)

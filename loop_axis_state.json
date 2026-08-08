@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "axis": "section4-9b-verdict",
+  "status": "awaiting_ratification",
+  "entered_at": {
+    "commit": "31424a9",
+    "task": "TASK-0240",
+    "date": "2026-08-07",
+    "note": "AI-Hub feedback judged the 4th consecutive halt-doc (TASK-0236/0237/0238/0240) NOT VALUABLE: 'a genuine halt emits no commit; the halt-doc's own existence contradicts the halt it claims'. This tracker + scripts/loop_halt_guard.py make 'stop' structural: the next iteration consults the guard and SKIPs (produces nothing) instead of emitting a 5th halt-doc. The guard's own commit trips none of the three triggers (proven by test_guard_commit_does_not_self_unblock), so it is consistent with halting — unlike a halt-doc."
+  },
+  "verdict": "SHIP (operator-landed via 6c75fda). Both citable full §4 verdicts are TIES (homog 4b88ca8 / heterog 1224057); P1 quality-preservation SURPASSES x2 legs (6ca9255). §4 arc is DONE in this checkout; the only remaining open is private-src.data absolute-loss vs the PRODUCTION baseline (DATA/Cat-C), stripped from this mirror.",
+  "ratification_options": {
+    "a": "draft publishable-negative MS-008 closeout — blocked on mirror: primary evidence anchor reports/close-the-loop/* is absent (operator infra). Witness: closeout_approved.",
+    "b": "propose/open MS-009 prefix-cache axis — requires an operator-opened feedback thread; opening it unilaterally is the churn feedback warns against. Witness: new_ms_axis_opened (operator flips the signal below).",
+    "c": "saturated -> report to operator and halt — CURRENT state. feedback's own directive ('the correct autonomous action between now and ratification is to halt-and-idle')."
+  },
+  "triggers": {
+    "9b_leg_fired": "An operator-side 9B run fired -> a new tests/fixtures/freeze_validloss_ci_9b*.json appears (count > baseline.nine_b_deposit_count). Unblocks passive mirror-side harvest + citable-replay gate.",
+    "closeout_approved": "Operator drafts+approves the closeout -> reports/close-the-loop/close_the_loop_funnel_go_nogo_*.{json,md} appears. Unblocks passive spec/doc cross-link mirroring.",
+    "new_ms_axis_opened": "Operator opens a new measurable axis -> operator_signals.new_ms_axis_opened is set to the axis id (e.g. MS-009). Unblocks that axis's own TASK."
+  },
+  "baseline": {
+    "nine_b_deposit_count": 10,
+    "measured_at_commit": "31424a9",
+    "glob": "tests/fixtures/freeze_validloss_ci_9b*.json",
+    "note": "File count at entry (6 reduced-budget deposits + 2 full-budget deposits + 2 run-log witnesses = 10). Honesty-asserted against the live repo by test_state_baseline_is_honest."
+  },
+  "operator_signals": {
+    "new_ms_axis_opened": null
+  },
+  "self_unblock_guard": "This file is the source of truth for status=awaiting_ratification. A guard/halt commit MUST NOT flip status, MUST NOT raise baseline.nine_b_deposit_count, and MUST NOT set operator_signals.new_ms_axis_opened — doing any of those is the unilateral un-skip this guard exists to prevent. Committing scripts/loop_halt_guard.py itself adds none of those three signals (proven by test_guard_commit_does_not_self_unblock), so the guard commit is consistent with the halt. Only a witnessed external trigger (real 9B run / operator closeout / operator axis-open flip) clears should_skip()."
+}
