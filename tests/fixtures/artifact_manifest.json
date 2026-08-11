@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "base_dir": "tests/fixtures",
+  "artifact_count": 25,
+  "scope": "structural-integrity: path / sha256 / size (NOT content axes)",
+  "artifacts": [
+    {
+      "path": "advise_loop/run_metrics_real_producer.jsonl",
+      "sha256": "cf9f2d1f52e1d7dce86164e024c2e2a231cc4f5a30aeb5eb1bf5685ec8940ba1",
+      "size": 43873
+    },
+    {
+      "path": "freeze_order_sensitivity_proxy.json",
+      "sha256": "a9728f71565fe4c91e1f7f36cd4b7a00eeca1e649ec84f126f60c3dfd71a277b",
+      "size": 1826
+    },
+    {
+      "path": "freeze_validloss_9b_target.json",
+      "sha256": "3a1a8f3200d19caf851e5724f471be9104cc959095ef518a016686f54434699b",
+      "size": 1207
+    },
+    {
+      "path": "freeze_validloss_ci_9b_baseline.json",
+      "sha256": "477bbf192ff57b0df409490c2ae2da353d008373d47e5fb78a889c5d9fdac023",
+      "size": 4939
+    },
+    {
+      "path": "freeze_validloss_ci_9b_datafile_repro.json",
+      "sha256": "402a2e5bab39ce21ffd2683167a9f8172ff86dbdd21aa621965261d943e71c1b",
+      "size": 3606
+    },
+    {
+      "path": "freeze_validloss_ci_9b_datafile_repro_ledger.jsonl",
+      "sha256": "562b95a93a825cf65deb504bbffd17187084e2d9e938317343c52aa8dd33b27b",
+      "size": 2058
+    },
+    {
+      "path": "freeze_validloss_ci_9b_datafile_repro_runlog.json",
+      "sha256": "8177abef3adcbeb0aa1c4ec3f2567dcb7765be1a4b7c3e3d5436142513ce99a1",
+      "size": 4638
+    },
+    {
+      "path": "freeze_validloss_ci_9b_direction.json",
+      "sha256": "383d361ab124e74e2996b1d22aab0898d4ae00a61eae3460c9fca97c4c92eb1f",
+      "size": 4007
+    },
+    {
+      "path": "freeze_validloss_ci_9b_full.json",
+      "sha256": "42435ba084d9646737e03ec341b666acda2c89640d1e7954051463edf561ef13",
+      "size": 4723
+    },
+    {
+      "path": "freeze_validloss_ci_9b_full_heterogeneous.json",
+      "sha256": "e68e75efada3cef5ee9cb9415534f39ed9f94ffa0c0f3224947c704a83ee109f",
+      "size": 6028
+    },
+    {
+      "path": "freeze_validloss_ci_9b_full_heterogeneous_ledger.jsonl",
+      "sha256": "75d5f029c1e0b4cfa7b712260ee878953f5f06b46bedcf0a3a3b363afb144256",
+      "size": 4089
+    },
+    {
+      "path": "freeze_validloss_ci_9b_full_ledger.jsonl",
+      "sha256": "94b2c3bb5a3ce40acb2c4ff19d31dc6d1714954c17f131f9b81f8b05fd31eedd",
+      "size": 3037
+    },
+    {
+      "path": "freeze_validloss_ci_9b_generalization.json",
+      "sha256": "5124188bc564967f18d8edc2cb0b66b433fac9570b51901117b63b207ebe7023",
+      "size": 3938
+    },
+    {
+      "path": "freeze_validloss_ci_9b_heterogeneous_generalization.json",
+      "sha256": "84eecfcabd76cdf84e5c822f95d5ebdb275375d8f31d87a13e4f8d6ace686950",
+      "size": 4966
+    },
+    {
+      "path": "freeze_validloss_ci_9b_heterogeneous_generalization_runlog.json",
+      "sha256": "610c9d6198b0fba846109e88c1156fb5b0a2b9e6b5159e0d34f722be158c80df",
+      "size": 24952
+    },
+    {
+      "path": "freeze_validloss_ci_9b_surrogate.json",
+      "sha256": "77031f088b4d55628e8d45200c73f0cdb79d379fdbb760c48d5937c64acad8e3",
+      "size": 2821
+    },
+    {
+      "path": "freeze_validloss_generalize_proxy.json",
+      "sha256": "6af4ba6945201a9b6741c5843f2a9a44e48a5cd21fdf86d9a34ddf5624514178",
+      "size": 1037
+    },
+    {
+      "path": "freeze_validloss_heterogeneous_generalize_proxy.json",
+      "sha256": "4f288b6b35908efc7cc1e0be53902590ead3e4208904406c5c27025f5b1809f2",
+      "size": 1070
+    },
+    {
+      "path": "freeze_validloss_heterogeneous_generalize_thin_proxy.json",
+      "sha256": "03d82ad1cb00dbc0a13e83c77760d95efe27156cf619066438496b772d9b9be9",
+      "size": 928
+    },
+    {
+      "path": "freeze_validloss_negative_control_proxy.json",
+      "sha256": "a47c484209b63959dffccd1713b06f5b4e7298c40f9fe3b6b20d4d9965d01ce4",
+      "size": 1136
+    },
+    {
+      "path": "freeze_validloss_negative_control_surrogate_proxy.json",
+      "sha256": "a5da21ec9142397ff02e040902049532b615a5c704dde6ea38be38a5bf500b87",
+      "size": 1190
+    },
+    {
+      "path": "freeze_validloss_target_dropin_plumbing.json",
+      "sha256": "cd8deb507604a86c3af9ef08d4f8e3a3447acdf6c2b6e0439f98fc0929207339",
+      "size": 1990
+    },
+    {
+      "path": "prefix_break_even_canonical_summary.json",
+      "sha256": "7462820c03e88c51bc875125c0e3a1013e6cfbf5ef9b8166b1e846407b4470de",
+      "size": 2596
+    },
+    {
+      "path": "probe_9b_memory_frontier.json",
+      "sha256": "09902fe259274a6de954a69b1f83a4646dab24a92c2e897b01c0e2c1e1de6295",
+      "size": 4193
+    },
+    {
+      "path": "section4_decision_snapshot_2026-07-28.json",
+      "sha256": "aded2320cd8a9222577e107f4b457635b45e55e4ea237c87c6e09bc65c12c5d2",
+      "size": 5698
+    }
+  ]
+}
