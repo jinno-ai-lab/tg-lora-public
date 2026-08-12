@@ -90,6 +90,11 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
+# Standalone-CLI bootstrap: running this script directly puts its own directory
+# (``scripts/``) — not the repo root — on sys.path, so the in-repo ``src.*`` /
+# ``scripts.*`` imports below fail unless the repo root is made importable first.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from src.tg_lora.freeze_surrogate_ci import (
     SurrogateValidLossCI,
     format_surrogate_valid_loss_ci,

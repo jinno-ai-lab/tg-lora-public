@@ -110,6 +110,11 @@ from omegaconf import OmegaConf
 from pydantic import ValidationError
 
 # Shared A/B instrument pieces (the harness this deposits through).
+# Standalone-CLI bootstrap: running this script directly puts its own directory
+# (``scripts/``) — not the repo root — on sys.path, so the in-repo ``src.*`` /
+# ``scripts.*`` imports below fail unless the repo root is made importable first.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from scripts.run_freeze_validloss_ci import resolve_device
 from src.model.lora_utils import (
     configure_trainable_lora_scope,

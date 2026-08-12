@@ -5,6 +5,13 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
+import sys
+
+# Standalone-CLI bootstrap: running this script directly puts its own directory
+# (``scripts/``) — not the repo root — on sys.path, so the in-repo ``src.*`` /
+# ``scripts.*`` imports below fail unless the repo root is made importable first.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from src.model.load_model import load_base_model, load_tokenizer, apply_lora
 from src.model.lora_utils import configure_trainable_lora_scope
 from src.data.build_seed_dataset import load_dataset

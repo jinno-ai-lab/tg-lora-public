@@ -1,19 +1,29 @@
-"""CLI smoke tests: verify all Python scripts import and respond to --help (TASK-0124).
+"""CLI smoke tests: verify every argparse entry-point responds to --help.
 
-Each argparse-based script must exit 0 with --help. Scripts using raw
-sys.argv are verified via import only.
+The parametrization is **auto-discovered**, not hand-picked: every
+``scripts/*.py`` with an ``if __name__ == "__main__"`` guard is swept, split by
+whether it constructs an :class:`argparse.ArgumentParser` (``--help`` must exit 0)
+or uses raw ``sys.argv`` (import-only — its top-level imports must resolve when
+invoked the way users invoke it). Adding a new CLI script needs no edit here; it
+is covered the moment it lands under ``scripts/``. See :func:`_discover`.
 
 This suite is also the **bootstrap-defect canary**: it fails the moment a
 script can no longer find the repo root and thus cannot import an in-repo
-``src.*`` / ``scripts.*`` module (the ``sys.path.insert(repo_root)`` idiom the
-TASK-0146..0148 series added to every standalone CLI). To keep that signal
-honest, a ``--help`` failure is *classified* — only a genuine in-repo import
-break fails the suite; a failure caused by an unavailable optional/heavy
-dependency (``peft``/``datasets``/...) or the private ``src.data`` pipeline
-(stripped from this public mirror) is reported as ``xfail`` so it can no longer
-mask a real regression. See :func:`_classify_cli_help_failure`.
+``src.*`` / ``scripts.*`` module (the ``sys.path.insert(repo_root)`` idiom every
+standalone CLI must carry). To keep that signal honest, each script is launched
+as a subprocess with ``PYTHONPATH`` **stripped** (see :data:`_SUBPROCESS_ENV`)
+so it runs under a clean path — as in real CI — rather than inheriting this AI
+Hub worktree's ``PYTHONPATH=/home/jinno/ai-hub`` (whose regular
+``scripts/__init__.py`` package shadows the repo's namespace ``scripts/``, per
+PEP 420, and would mask every ``from scripts.X import`` as a false failure).
+A residual ``--help`` failure is then *classified* — only a genuine in-repo
+import break (or a missing optional dependency, or the private ``src.data``
+pipeline stripped from this public mirror) is surfaced; see
+:func:`_classify_cli_help_failure`.
 """
 
+import ast
+import os
 import re
 import subprocess
 import sys
@@ -23,9 +33,16 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# In-repo top-level packages: a failure to import one of these means the script
-# cannot resolve the repo root — i.e. the bootstrap defect this canary catches.
-_INREPO_TOPLEVELS = ("src", "scripts")
+# Subprocess environment with ``PYTHONPATH`` stripped. The AI Hub shell sets
+# ``PYTHONPATH=/home/jinno/ai-hub``; its regular ``scripts/__init__.py`` package
+# shadows the repo's namespace ``scripts/`` (PEP 420: a regular package found
+# *anywhere* on sys.path wins over a namespace package found *earlier*), so a
+# subprocess that inherits it reports a false ``No module named 'scripts.X'`` for
+# every ``from scripts.X import`` — masking scripts that work perfectly under CI.
+# Stripping PYTHONPATH makes the subprocess's bootstrap put the repo root (and
+# thus the repo's own ``scripts/``) on sys.path uncontested, so the canary reads
+# the script's true CI behavior. (Real CI has no ``/home/jinno/ai-hub`` on path.)
+_SUBPROCESS_ENV = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
 # ``src.data`` is the private data pipeline, absent from this public mirror; its
 # absence is a mirror limitation, not a bootstrap regression.
 _PRIVATE_INREPO_MODULES = ("src.data",)
@@ -45,19 +62,140 @@ _PRIVATE_PIPELINE_ORIGIN = re.compile(r"\bsrc\.data\.\w+|src/data/\w+\.py")
 _MODULE_LOAD_FAILURE = re.compile(r"ModuleNotFoundError|ImportError|SyntaxError")
 
 
+# ---------------------------------------------------------------------------
+# Auto-discovery: every __main__-guarded scripts/*.py entry point.
+# ---------------------------------------------------------------------------
+
+
+def _has_main_guard(tree: ast.AST) -> bool:
+    """True iff the module has an ``if __name__ == "__main__":`` guard."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and isinstance(node.test, ast.Compare):
+            left = node.test.left
+            if isinstance(left, ast.Name) and left.id == "__name__":
+                return True
+    return False
+
+
+def _has_argparse_entry_point(tree: ast.AST) -> bool:
+    """True iff the module constructs an :class:`argparse.ArgumentParser`.
+
+    Covers both ``argparse.ArgumentParser()`` and a bare ``ArgumentParser()``
+    (after ``from argparse import ArgumentParser``), anywhere in the module —
+    including a parser built lazily inside ``main()``.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "ArgumentParser":
+                return True
+            if isinstance(func, ast.Name) and func.id == "ArgumentParser":
+                return True
+    return False
+
+
+def _imports_scripts_package(tree: ast.AST) -> bool:
+    """True iff the module has a top-level import of the ``scripts`` package.
+
+    ``from scripts.X import ...`` / ``import scripts.X``. These resolve only
+    when the repo root (the parent of ``scripts/``) is on ``sys.path`` — which a
+    bare ``python scripts/foo.py`` invocation does NOT provide (it puts
+    ``scripts/`` itself on the path). A script with such an import MUST carry
+    the repo-root bootstrap, or it is broken under direct invocation.
+    """
+    for node in tree.body:  # top-level statements only
+        if isinstance(node, ast.Import):
+            if any(alias.name.split(".")[0] == "scripts" for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.split(".")[0] == "scripts":
+                return True
+    return False
+
+
+def _has_repo_root_bootstrap(source: str) -> bool:
+    """True iff the source puts the repo root on ``sys.path``.
+
+    Recognizes the whole family of equivalent idioms in the tree — the inline
+    ``sys.path.insert(0, str(Path(__file__).resolve().parents[1]))`` form, the
+    ``append`` variant, and the named-constant form
+    ``repo_root = Path(__file__).resolve().parents[1]; sys.path.append(...)``.
+    The invariant signal across all: a ``sys.path.insert``/``append`` call
+    together with a ``parents[1]`` repo-root computation from ``__file__`` (the
+    repo root is one directory above ``scripts/``). The guard polices the
+    *presence* of a bootstrap, not its exact form, so it does not churn
+    pre-existing equivalent idioms.
+    """
+    has_path_op = ("sys.path.insert" in source) or ("sys.path.append" in source)
+    return has_path_op and ("parents[1]" in source) and ("__file__" in source)
+
+
+def _discover():
+    """Return ``(argparse_scripts, import_only_scripts)`` under ``scripts/``.
+
+    A script with a ``__main__`` guard is an entry point. If it builds an
+    ``ArgumentParser`` it must answer ``--help``; otherwise it is invoked with
+    raw ``sys.argv`` and is checked import-only. Files without a ``__main__``
+    guard (pure library modules such as ``git_utils.py``) are not entry points
+    and are skipped.
+    """
+    argparse_scripts: list[str] = []
+    import_only: list[str] = []
+    for path in sorted((ROOT / "scripts").glob("*.py")):
+        try:
+            tree = ast.parse(path.read_text())
+        except SyntaxError:
+            # A script that won't even parse is its own defect; surface it via
+            # the argparse arm (which will fail loud with the SyntaxError).
+            argparse_scripts.append(str(path.relative_to(ROOT)))
+            continue
+        if not _has_main_guard(tree):
+            continue
+        rel = str(path.relative_to(ROOT))
+        (argparse_scripts if _has_argparse_entry_point(tree) else import_only).append(rel)
+    return argparse_scripts, import_only
+
+
+ARGPARSE_SCRIPTS, IMPORT_ONLY_SCRIPTS = _discover()
+
+
+# ---------------------------------------------------------------------------
+# Failure classification.
+# ---------------------------------------------------------------------------
+
+
+def _inrepo_module_exists(module: str) -> bool:
+    """True iff ``module`` (dotted) resolves to a file/package in this checkout.
+
+    ``src.tg_lora.freeze_cost`` → ``src/tg_lora/freeze_cost.py``;
+    ``src.model`` → ``src/model/__init__.py`` (a package);
+    ``scripts.compare_runs`` → ``scripts/compare_runs.py``.
+    """
+    rel = Path(*module.split("."))
+    return (ROOT / rel.with_suffix(".py")).exists() or (ROOT / rel / "__init__.py").exists()
+
+
 def _classify_cli_help_failure(stderr: str) -> str:
     """Classify the root cause of a failed ``script --help``.
 
+    The subprocess is run with ``PYTHONPATH`` stripped (see
+    :data:`_SUBPROCESS_ENV`), so the AI Hub worktree's regular-package shadow of
+    ``scripts`` cannot arise — a ``scripts.*`` import resolves to this repo's own
+    namespace ``scripts/``.
+
     Returns one of:
 
-    - ``"bootstrap_defect"``: the script failed to import an in-repo module
-      (``src.*`` other than the private ``src.data``, or ``scripts.*``), or the
-      failure was not a ``ModuleNotFoundError`` at all (e.g. ``SyntaxError`` /
+    - ``"bootstrap_defect"``: a genuine in-repo import break — a ``src.*`` module
+      whose leaf EXISTS in this checkout (the bootstrap should resolve ``src`` to
+      this repo), ANY ``scripts.*`` ``ModuleNotFoundError`` (under a stripped
+      PYTHONPATH that means a missing bootstrap or a missing sibling — both real
+      defects), or a non-``No module named`` failure (``SyntaxError`` /
       ``ImportError: cannot import name``). This is the actionable signal the
-      canary exists to surface — it should FAIL the suite.
+      canary surfaces — it FAILs.
     - ``"known_unavailable"``: the script failed *only* because an external
-      dependency or the private ``src.data`` pipeline is absent from this
-      checkout. Not a regression; the caller reports it as ``xfail``.
+      dependency (``peft``/``torch``/...) or the private ``src.data`` pipeline
+      (stripped from this public mirror) is absent. Not a regression; the caller
+      ``xfail``s.
 
     A successful ``--help`` (exit 0) never reaches this function.
     """
@@ -78,8 +216,21 @@ def _classify_cli_help_failure(stderr: str) -> str:
     if _failure_originates_from_private_pipeline(stderr):
         return "known_unavailable"
     top_level = module.split(".", 1)[0]
-    if top_level in _INREPO_TOPLEVELS:
+    if top_level == "src":
+        # ``src.X``: if the leaf EXISTS in this repo, the script is missing the
+        # bootstrap that resolves ``src`` to this checkout — a real, fixable
+        # defect. If the leaf does NOT exist here, it is a genuinely
+        # missing/private submodule (not a regression).
+        return "bootstrap_defect" if _inrepo_module_exists(module) else "known_unavailable"
+    if top_level == "scripts":
+        # Under the stripped PYTHONPATH ``scripts`` resolves to this repo's
+        # namespace ``scripts/`` (the AI Hub regular-package shadow is gone), so a
+        # ``scripts.X`` ``ModuleNotFoundError`` is a real defect — the script
+        # either lacks the repo-root bootstrap (``scripts`` not importable) or the
+        # sibling genuinely does not exist. (The static guard in TestDiscovery
+        # catches the missing-bootstrap case at the source.)
         return "bootstrap_defect"
+    # External dependency (peft / torch / transformers / datasets / ...).
     return "known_unavailable"
 
 
@@ -102,41 +253,6 @@ def _failure_originates_from_private_pipeline(stderr: str) -> bool:
     """
     return bool(_PRIVATE_PIPELINE_ORIGIN.search(stderr))
 
-# Scripts using argparse (exit 0 on --help)
-ARGPARSE_SCRIPTS = [
-    "scripts/advise_training.py",
-    "scripts/analyze_benchmark.py",
-    "scripts/analyze_prefix_cache_break_even.py",
-    "scripts/analyze_sensitivity.py",
-    "scripts/analyze_trajectory.py",
-    "scripts/benchmark_optimizer_lifecycle.py",
-    "scripts/benchmark_prefix_cache.py",
-    "scripts/benchmark_velocity_ops.py",
-    "scripts/check_spine_anchors.py",
-    "scripts/compare_experiment_configs.py",
-    "scripts/compare_paper_memory_modes.py",
-    "scripts/compare_runs.py",
-    "scripts/consolidate_paper_results.py",
-    "scripts/diagnose.py",
-    "scripts/download_data.py",
-    "scripts/evaluate_paper_gates.py",
-    "scripts/export_paper_results.py",
-    "scripts/frontier_report.py",
-    "scripts/generate_sweep_dashboard.py",
-    "scripts/inspect_model.py",
-    "scripts/lookup_batch_plan.py",
-    "scripts/precompute_prefix_cache_parallel.py",
-    "scripts/prepare_data.py",
-    "scripts/recover.py",
-    "scripts/run_paper_external_eval.py",
-    "scripts/summarize_sweep.py",
-]
-
-# Scripts using raw sys.argv (no --help) — import-only check
-IMPORT_ONLY_SCRIPTS = [
-    "scripts/analyze_accel_sweep.py",
-]
-
 
 @pytest.fixture(name="argparse_script_path", params=ARGPARSE_SCRIPTS, ids=lambda s: Path(s).name)
 def _argparse_script_path_fixture(request):
@@ -155,16 +271,18 @@ class TestCLIHelpSmoke:
         """Script exits 0 and prints usage with --help.
 
         If ``--help`` fails, the cause is classified so the suite only fails on
-        a genuine bootstrap defect (an in-repo import break), not on a missing
-        optional dependency or the private ``src.data`` pipeline.
+        a genuine bootstrap defect (an in-repo import break that a repo-root
+        bootstrap would fix), not on a missing optional dependency, the private
+        ``src.data`` pipeline, or this venv's editable ``scripts`` shadow.
         """
         r = subprocess.run(
             [sys.executable, argparse_script_path, "--help"],
             capture_output=True,
             check=False,
             text=True,
-            timeout=15,
+            timeout=20,
             cwd=str(ROOT),
+            env=_SUBPROCESS_ENV,
         )
         if r.returncode != 0:
             cause = _classify_cli_help_failure(r.stderr)
@@ -191,12 +309,7 @@ class TestCLIHelpSmoke:
         A bare ``python scripts/X.py`` puts the script's own directory — NOT the
         repo root — on ``sys.path``, so an in-repo ``scripts.*`` / ``src.*``
         import that resolves only via a repo-root bootstrap breaks at import
-        time. The previous check used ``importlib.util.spec_from_file_location``
-        under ``python -c``: that builds a spec WITHOUT executing the module, and
-        ``python -c`` additionally puts the CWD on ``sys.path`` — so a script
-        broken under real invocation passed here silently (it never reached the
-        classifier, which is why ``analyze_accel_sweep.py`` shipped broken).
-        Run the script as a real subprocess instead and route any module-load
+        time. Run the script as a real subprocess and route any module-load
         failure through :func:`_classify_cli_help_failure`, so a genuine bootstrap
         defect fails loud rather than silently passing.
 
@@ -208,8 +321,9 @@ class TestCLIHelpSmoke:
             capture_output=True,
             check=False,
             text=True,
-            timeout=15,
+            timeout=20,
             cwd=str(ROOT),
+            env=_SUBPROCESS_ENV,
         )
         if r.returncode == 0:
             return
@@ -228,11 +342,71 @@ class TestCLIHelpSmoke:
         )
 
 
+class TestDiscovery:
+    """Pin the auto-discovery so the parametrization can't silently rot.
+
+    The contract: every ``__main__``-guarded ``scripts/*.py`` is swept, split by
+    argparse presence; library modules (no ``__main__`` guard) are skipped.
+    """
+
+    def test_covers_every_main_guarded_script(self):
+        main_guarded = {
+            p.name
+            for p in (ROOT / "scripts").glob("*.py")
+            if _has_main_guard(ast.parse(p.read_text()))
+        }
+        swept = {Path(s).name for s in ARGPARSE_SCRIPTS} | {
+            Path(s).name for s in IMPORT_ONLY_SCRIPTS
+        }
+        assert swept == main_guarded, (
+            f"discovery drift — swept != main-guarded: "
+            f"missing={main_guarded - swept} extra={swept - main_guarded}"
+        )
+
+    def test_known_library_module_is_skipped(self):
+        # git_utils.py has no __main__ guard (pure library) → not an entry point.
+        assert "scripts/git_utils.py" not in ARGPARSE_SCRIPTS + IMPORT_ONLY_SCRIPTS
+
+    def test_import_only_arm_is_nonempty_and_excludes_argparse_scripts(self):
+        # The raw-sys.argv arm must stay populated (analyze_accel_sweep.py is the
+        # canonical member) and must not overlap the argparse arm.
+        assert IMPORT_ONLY_SCRIPTS, "import-only arm unexpectedly empty"
+        assert not (set(ARGPARSE_SCRIPTS) & set(IMPORT_ONLY_SCRIPTS))
+
+    def test_scripts_package_import_requires_repo_root_bootstrap(self):
+        """Every script importing from the ``scripts`` package carries the bootstrap.
+
+        ``from scripts.X import ...`` resolves only via the repo root on
+        ``sys.path``; a bare ``python scripts/foo.py`` puts ``scripts/`` (not its
+        parent) on the path, so the import breaks under direct invocation
+        without the ``sys.path.insert(repo_root)`` idiom. The runtime canary's
+        subprocess strips PYTHONPATH so ``scripts`` resolves to this repo, which
+        makes a missing-bootstrap ``scripts.*`` import surface as a defect — but
+        only if that script is actually swept. This STATIC guard is the
+        belt-and-suspenders check that catches the defect at the source even for
+        a script not yet wired into a parametrized arm, and documents the
+        invariant every ``scripts.*`` importer must satisfy.
+        """
+        offenders = []
+        for path in (ROOT / "scripts").glob("*.py"):
+            source = path.read_text()
+            tree = ast.parse(source)
+            if _imports_scripts_package(tree) and not _has_repo_root_bootstrap(source):
+                offenders.append(path.name)
+        assert not offenders, (
+            "scripts importing from the `scripts` package lack the repo-root "
+            "bootstrap (would break under direct invocation / be masked as a "
+            f"venv shadow by the runtime canary): {offenders}"
+        )
+
+
 class TestClassifyCliHelpFailure:
     """Pin the canary's failure discrimination so it can't silently rot.
 
-    The contract: an in-repo import break is a ``bootstrap_defect`` (the suite
-    must fail); a missing optional dependency or the private ``src.data``
+    The contract: a genuine in-repo import break (``src.*`` leaf that exists
+    here; any ``scripts.*`` failure under the stripped-PYTHONPATH subprocess; a
+    non-``No module named`` failure) is a ``bootstrap_defect`` (the suite must
+    fail); only a missing optional dependency or the private ``src.data``
     pipeline is ``known_unavailable`` (the suite xfails). Any other failure
     shape is surfaced as a defect rather than swallowed.
     """
@@ -286,35 +460,69 @@ class TestClassifyCliHelpFailure:
     @pytest.mark.parametrize(
         "stderr",
         [
-            # Same downstream module name (src.utils.io) but NO src.data frame —
-            # a genuine in-repo import break, which must STILL fail the suite.
-            # Proves the downstream attribution is root-cause-based, not masking.
-            "No module named 'src.utils.io'",
-            "No module named 'src.model'",
-            (
-                "Traceback (most recent call last):\n"
-                "  File \"scripts/foo.py\", line 3, in <module>\n"
-                "    from src.model.lora_utils import iter_lora_params\n"
-                "ModuleNotFoundError: No module named 'src.model'"
-            ),
+            # ``scripts.*`` whose sibling EXISTS in this repo: the canary runs the
+            # subprocess with PYTHONPATH stripped, so ``scripts`` resolves to this
+            # repo's namespace ``scripts/`` — a failure here means the script lacks
+            # the repo-root bootstrap (``scripts`` not importable) → real defect.
+            "No module named 'scripts.compare_runs'",
+            "No module named 'scripts.run_paper_external_eval'",
+            "No module named 'scripts.replay_freeze_validloss_ci'",
+            # ``scripts.*`` whose sibling does NOT exist: a genuinely broken
+            # import → defect.
+            "No module named 'scripts.totally_missing'",
         ],
-        ids=["src.utils.io-bare", "src.model-bare", "src.model-in-chain"],
+        ids=["compare_runs-exists", "run_paper_external_eval-exists",
+             "replay_freeze_validloss_ci-exists", "sibling-missing"],
     )
-    def test_downstream_attribution_does_not_mask_real_inrepo_defect(self, stderr):
+    def test_scripts_import_failure_is_defect(self, stderr):
+        # Under the stripped-PYTHONPATH subprocess, there is no scripts shadow to
+        # hide behind: a ``scripts.*`` ModuleNotFoundError is always a real defect
+        # (missing bootstrap or missing sibling). The static guard in TestDiscovery
+        # is the primary check for the missing-bootstrap case; this pins the
+        # runtime classifier so it never masks a scripts.* failure as xfail.
         assert _classify_cli_help_failure(stderr) == "bootstrap_defect"
 
     @pytest.mark.parametrize(
         "stderr",
         [
+            # A ``src.*`` whose module EXISTS in this repo (or the bare top-level
+            # ``src``): the script is missing the repo-root bootstrap that resolves
+            # ``src`` to this checkout (the editable leak otherwise hands it a stale
+            # private ``src``). A real, fixable defect — this is the canary's signal.
             "No module named 'src'",  # repo root not on sys.path at all
-            "No module named 'src.model'",  # repo root importable, submodule lost
+            "No module named 'src.model'",  # repo root importable, package lost
+            "No module named 'src.tg_lora.freeze_cost'",  # leaf module
+            "No module named 'src.model.load_model'",  # deeper leaf
             "No module named 'src.utils.device'",
             "No module named 'src.tg_lora.prefix_feature_cache'",
-            "No module named 'scripts.compare_runs'",  # sibling script import lost
         ],
-        ids=["missing-root-src", "src.model", "src.utils.submod", "src.tg_lora.submod", "scripts.sibling"],
+        ids=["missing-root-src", "src.model", "freeze_cost", "load_model", "device", "prefix_feature_cache"],
     )
-    def test_inrepo_import_break_is_bootstrap_defect(self, stderr):
+    def test_existing_src_leaf_is_bootstrap_defect(self, stderr):
+        assert _classify_cli_help_failure(stderr) == "bootstrap_defect"
+
+    def test_missing_src_leaf_is_known_unavailable(self):
+        # A src.* import whose leaf does NOT exist in this repo (genuinely
+        # missing / private submodule not mapped by the pipeline regex) is not a
+        # bootstrap regression.
+        assert (
+            _classify_cli_help_failure("No module named 'src.tg_lora.no_such_leaf'")
+            == "known_unavailable"
+        )
+
+    def test_downstream_attribution_does_not_mask_real_inrepo_defect(self):
+        # The discriminating case for the private-pipeline attribution: a
+        # traceback whose final error names a src.* leaf that EXISTS here (so it
+        # WOULD be a defect bare), carried in a chain that does NOT run through
+        # ``src.data``. The :func:`_failure_originates_from_private_pipeline`
+        # regex must NOT match (no ``src.data`` frame), so this stays a defect —
+        # proving the downstream attribution is root-cause-based, not masking.
+        stderr = (
+            "Traceback (most recent call last):\n"
+            "  File \"scripts/foo.py\", line 3, in <module>\n"
+            "    from src.model.lora_utils import iter_lora_params\n"
+            "ModuleNotFoundError: No module named 'src.model'"
+        )
         assert _classify_cli_help_failure(stderr) == "bootstrap_defect"
 
     @pytest.mark.parametrize(

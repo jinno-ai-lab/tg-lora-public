@@ -37,6 +37,12 @@ except ImportError:
     print("matplotlib required: pip install matplotlib")
     sys.exit(1)
 
+# Allow running as a standalone CLI (``python scripts/analyze_dynfreeze_experiment.py``):
+# a bare script invocation puts ``scripts/`` — not the repo root — on sys.path, so the
+# in-repo ``src.*`` imports below fail with ``ModuleNotFoundError`` unless the repo root
+# is made importable first. Mirrors benchmark_prefix_cache.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from src.tg_lora.freeze_cost import (
     Level1RealizationRecord,
     ReductionSample,

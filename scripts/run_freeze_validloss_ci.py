@@ -104,12 +104,18 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Standalone-CLI bootstrap: running this script directly puts its own directory
+# (``scripts/``) — not the repo root — on sys.path, so the in-repo ``src.*`` /
+# ``scripts.*`` imports below fail unless the repo root is made importable first.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.model.lora_utils import geometric_rank_schedule, set_trainable_lora_layers
 from src.tg_lora.activation_matching import ActivationMatchingLoss

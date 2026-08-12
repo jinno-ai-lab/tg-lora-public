@@ -78,12 +78,18 @@ import itertools
 import json
 import random
 import sys
+from pathlib import Path
 from typing import Sequence
 
 
 # Reuse the verdict runner's fixtures so the diagnostic trains the *same*
 # progressive-freeze trio on the *same* learnable proxy — the decomposition is
 # over the identical arm the §4 verdict is drawn from, not a parallel model.
+# Standalone-CLI bootstrap: running this script directly puts its own directory
+# (``scripts/``) — not the repo root — on sys.path, so the in-repo ``src.*`` /
+# ``scripts.*`` imports below fail unless the repo root is made importable first.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from scripts.run_freeze_validloss_ci import (
     ARCHITECTURES,
     DEFAULT_BASE_SEED,

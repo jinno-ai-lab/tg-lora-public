@@ -22,6 +22,13 @@ from typing import Callable
 import torch
 from omegaconf import OmegaConf
 
+import sys
+
+# Standalone-CLI bootstrap: running this script directly puts its own directory
+# (``scripts/``) — not the repo root — on sys.path, so the in-repo ``src.*`` /
+# ``scripts.*`` imports below fail unless the repo root is made importable first.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from src.model.load_model import apply_lora, load_base_model
 from src.tg_lora.activation_cache import (
     _get_decoder_layers,

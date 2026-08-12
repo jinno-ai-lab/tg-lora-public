@@ -12,6 +12,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import sys
+
+# Standalone-CLI bootstrap: running this script directly puts its own directory
+# (``scripts/``) — not the repo root — on sys.path, so the in-repo ``src.*`` /
+# ``scripts.*`` imports below fail unless the repo root is made importable first.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from scripts.compare_runs import load_run
 
 
