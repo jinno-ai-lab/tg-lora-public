@@ -9,6 +9,20 @@
 
 ---
 
+## Loop halt state（未達マイルストーン着手前の必須 pre-flight）
+
+§4 / MS-008 軸は現在 **status=awaiting_ratification**（operator の ratify 待ち）。
+`未達マイルストーン` から仕事を選ぶ前に **必ず `make loop-halt-check` を実行**すること:
+
+- exit **77**（SKIP）→ いかなる axis work も行わず、何も produce しない（ TASK-0240 参照）。
+- exit **0** → `loop_axis_state.json` の `triggers` が示す該当軸の最小 step のみ実行する。
+
+判定の正本は `scripts/loop_halt_guard.py` + `loop_axis_state.json`（baseline =
+`tests/fixtures/freeze_validloss_ci_9b*.json` の commit 済み件数）。unblock は
+operator の 3 trigger（新規 9B deposit / closeout 承認 / 新 MS 軸の open）のみ。
+
+---
+
 ## 達成済みマイルストーン（skip 対象）
 
 | ID | マイルストーン | 状態 | 根拠 |

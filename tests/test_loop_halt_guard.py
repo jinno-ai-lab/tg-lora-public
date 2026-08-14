@@ -138,6 +138,42 @@ def test_live_repo_witnesses_all_false():
     }
 
 
+# ── entrypoint wiring contracts ──────────────────────────────────────────────
+#
+# The guard exists only in the Makefile. The goaldev agent picks work from the
+# entrypoint docs (PURPOSE.md / AGENTS.md), so those docs must route every
+# future iteration through ``make loop-halt-check`` before touching the
+# awaiting_ratification axis. These contracts prevent the silent drift of that
+# wiring — if either reference disappears, the structural "stop" becomes
+# unreachable from the agent's read path again.
+
+
+def test_purpose_entrypoint_routes_through_halt_check():
+    """PURPOSE.md must reference the pre-flight and the state file."""
+    text = (REPO_ROOT / "PURPOSE.md").read_text(encoding="utf-8")
+    assert "make loop-halt-check" in text, (
+        "PURPOSE.md no longer routes readers through `make loop-halt-check` — "
+        "the halt guard is unreachable from the goaldev entrypoint"
+    )
+    assert "loop_axis_state.json" in text, (
+        "PURPOSE.md no longer points at loop_axis_state.json — readers cannot "
+        "find the halt state's source of truth"
+    )
+
+
+def test_agents_entrypoint_routes_through_halt_check():
+    """AGENTS.md must reference the pre-flight and the state file."""
+    text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    assert "make loop-halt-check" in text, (
+        "AGENTS.md no longer routes readers through `make loop-halt-check` — "
+        "the halt guard is unreachable from the goaldev entrypoint"
+    )
+    assert "loop_axis_state.json" in text, (
+        "AGENTS.md no longer points at loop_axis_state.json — readers cannot "
+        "find the halt state's source of truth"
+    )
+
+
 # ── permissive defaults ──────────────────────────────────────────────────────
 
 

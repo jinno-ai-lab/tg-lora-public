@@ -1,5 +1,11 @@
 # AGENTS.md — TG-LoRA 運用指示書
 
+## Loop halt pre-flight（必須）
+
+§4 / MS-008 軸は awaiting_ratification 中 — axis work の前に必ず `make loop-halt-check`
+を実行すること（exit 77 = SKIP なら何も produce しない。正本: `scripts/loop_halt_guard.py` +
+`loop_axis_state.json`）。
+
 ## プロジェクト概要
 
 **TG-LoRA** (Tangent-Gradient LoRA): 勾配速度ベクトルの外挿によるLoRA学習の効率化手法。
