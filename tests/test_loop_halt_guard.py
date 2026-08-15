@@ -17,6 +17,8 @@ SKIP (produce nothing) instead of emitting another halt-doc. These tests prove:
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -270,3 +272,39 @@ def test_cli_json_output_is_valid(tmp_path, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["skip"] is True
     assert out["status"] == AWAITING
+
+
+def test_cli_make_target_reaches_guard_without_venv(tmp_path):
+    """``make loop-halt-check`` must reach the guard where .venv is absent.
+
+    The entrypoint contracts above route every iteration through this make
+    target, but AI Hub executes the repo from fresh worktrees that have no
+    ``.venv`` — there the default ``PYTHON_VENV`` (``.venv/bin/python``) used
+    to die with exit 127, and GNU make cannot propagate the guard's exit 77
+    anyway (a failing recipe line collapses to make exit 2), so SKIP and a
+    broken pre-flight were indistinguishable at the make surface. The target
+    now (a) falls back to any working stdlib interpreter and (b) translates:
+    a guard verdict of 0/77 is echoed as an explicit ``verdict rc=N`` line with
+    make exiting 0; only a broken pre-flight exits non-zero. Simulate a
+    venv-less checkout (point VENV at an absent path, clear any PYTHON_VENV
+    override) and assert the live repo's SKIP verdict is still reached.
+    """
+    env = {**os.environ, "VENV": str(tmp_path / "absent-venv")}
+    env.pop("PYTHON_VENV", None)
+    proc = subprocess.run(
+        ["make", "loop-halt-check"],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (
+        f"make loop-halt-check exited {proc.returncode} in a venv-less "
+        f"checkout — the pre-flight is unreachable or broken exactly where "
+        f"the loop runs:\n{proc.stdout}\n{proc.stderr}"
+    )
+    assert "verdict rc=77" in proc.stdout, (
+        f"the live repo's SKIP verdict did not surface through make:\n"
+        f"{proc.stdout}\n{proc.stderr}"
+    )
+    assert "BROKEN" not in proc.stdout + proc.stderr

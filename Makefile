@@ -664,8 +664,32 @@ check-status: ## Run agent autonomy status check to find next steps
 	chmod +x scripts/agent_check_status.py
 	$(PYTHON_VENV) scripts/agent_check_status.py
 
-loop-halt-check: ## §4/MS-008 halt guard — exit 77=SKIP (awaiting operator ratification, no trigger: emit NO axis commit / no halt-doc), 0=PROCEED. Loop consults this before any axis commit (scripts/loop_halt_guard.py + loop_axis_state.json).
-	$(PYTHON_VENV) scripts/loop_halt_guard.py --repo-root .
+# loop-halt-check is the pre-flight every entrypoint doc (PURPOSE.md/AGENTS.md)
+# routes through, and AI Hub executes this repo from fresh worktrees that have
+# no .venv — there the default PYTHON_VENV (.venv/bin/python) dies with exit
+# 127, so the mandated pre-flight was unreachable exactly where the loop runs.
+# The guard is pure stdlib, so fall back to any working interpreter:
+# PYTHON_VENV if executable, else $(PYTHON), else python3.
+#
+# GNU make cannot propagate a target recipe's exit 77 (any failing recipe line
+# becomes "エラー N" and make exits 2), so the docs' old "exit 77 = SKIP"
+# contract was unobservable through make — and SKIP and a broken pre-flight
+# were indistinguishable (both make exit 2). The recipe therefore translates:
+# a guard verdict of 0 (PROCEED) or 77 (SKIP) is echoed as an explicit
+# `verdict rc=N` line and make exits 0; any other rc is BROKEN (loud non-zero).
+# Verify with `VENV=/nonexistent make loop-halt-check` (must print the verdict
+# line and exit 0) and plain `make loop-halt-check` in the live repo.
+loop-halt-check: ## §4/MS-008 halt guard — verdict rc=77 SKIP (awaiting operator ratification, no trigger: emit NO axis commit / no halt-doc) / rc=0 PROCEED; make exits 0 for either verdict, non-zero only if the pre-flight itself is BROKEN. Loop consults this before any axis commit (scripts/loop_halt_guard.py + loop_axis_state.json).
+	@PY="$(PYTHON_VENV)"; \
+	[ -x "$$PY" ] || PY="$(PYTHON)"; \
+	command -v "$$PY" >/dev/null 2>&1 || PY=python3; \
+	"$$PY" scripts/loop_halt_guard.py --repo-root .; RC=$$?; \
+	if [ "$$RC" -eq 0 ] || [ "$$RC" -eq 77 ]; then \
+		echo "[make loop-halt-check] verdict rc=$$RC (77=SKIP produce nothing / 0=PROCEED)"; \
+	else \
+		echo "[make loop-halt-check] BROKEN rc=$$RC — pre-flight failed; NOT a SKIP verdict" >&2; \
+		exit $$RC; \
+	fi
 
 diagnose: ## Run health check on GPU, checkpoint, config, or logs
 	$(PYTHON_VENV) scripts/diagnose.py $(ARGS)

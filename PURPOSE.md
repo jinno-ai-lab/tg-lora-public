@@ -14,8 +14,13 @@
 §4 / MS-008 軸は現在 **status=awaiting_ratification**（operator の ratify 待ち）。
 `未達マイルストーン` から仕事を選ぶ前に **必ず `make loop-halt-check` を実行**すること:
 
-- exit **77**（SKIP）→ いかなる axis work も行わず、何も produce しない（ TASK-0240 参照）。
-- exit **0** → `loop_axis_state.json` の `triggers` が示す該当軸の最小 step のみ実行する。
+- 判定 **SKIP**（`verdict rc=77` 行、`SKIP (halt — produce nothing)` 表示）→ いかなる
+  axis work も行わず、何も produce しない（ TASK-0240 参照）。
+- 判定 **PROCEED**（`verdict rc=0` 行）→ `loop_axis_state.json` の `triggers` が示す
+  該当軸の最小 step のみ実行する。
+- どちらの判定でも `make` 自身は exit 0 で完了する（GNU make は recipe の 77 を
+  伝播できないため、判定は rc 行で読む）。**make の非ゼロ終了（`BROKEN`）は
+  pre-flight 自体の故障**であり SKIP ではない — axis work も行わず故障を報告すること。
 
 判定の正本は `scripts/loop_halt_guard.py` + `loop_axis_state.json`（baseline =
 `tests/fixtures/freeze_validloss_ci_9b*.json` の commit 済み件数）。unblock は
