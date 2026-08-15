@@ -29,6 +29,11 @@ import torch
 
 from src.tg_lora.psa import _power_iteration_pc1
 from src.tg_lora.psa_null_baseline import (
+    ALIGNMENT_NULL,
+    ALIGNMENT_SIGNAL,
+    alignment_z_score,
+    decide_alignment_signal,
+    null_alignment_ratio_distribution,
     prior_vs_surrogate_alignment,
     random_unit_directions,
 )
@@ -201,3 +206,124 @@ class TestRandomUnitDirections:
     def test_zero_returns_empty(self):
         assert random_unit_directions(0, 8).shape == (0, 8)
         assert random_unit_directions(5, 0).shape == (5, 0)
+
+
+# ── §7 calibrated decision boundary (the rank1_z analog for the PC1 direction) ─
+
+
+# Realistic per-tensor calibration regimes: (n_history, numel, n_grad).
+# n_history = PSA ring-buffer snapshots; numel = one LoRA tensor's flat size;
+# n_grad = held-out gradient samples.
+_CALIB_REGIMES = [(16, 4096, 64), (8, 256, 64), (32, 4096, 128)]
+
+
+def _null_dist(n_history: int, numel: int, n_grad: int, *, seed: int = 2026, trials: int = 200):
+    return null_alignment_ratio_distribution(
+        numel,
+        n_history,
+        n_grad,
+        n_trials=trials,
+        n_surrogate=64,
+        generator=torch.Generator().manual_seed(seed),
+    )
+
+
+def _fresh_iid_ratio(n_history: int, numel: int, n_grad: int, seed: int) -> float:
+    """One iid-noise measurement from a SEPARATE seed stream (not a null sample)."""
+    g = torch.Generator().manual_seed(seed)
+    mat = torch.randn(n_history, numel, generator=g, dtype=torch.float32) * 0.1
+    guess = torch.randn(numel, generator=g, dtype=torch.float32)
+    prior = _power_iteration_pc1(mat, n_iters=20, initial_guess=guess)
+    prior = prior / (prior.norm() + 1e-12)
+    grads = torch.randn(n_grad, numel, generator=g, dtype=torch.float32) * 0.3
+    return prior_vs_surrogate_alignment(prior, grads, n_surrogate=64, generator=g)[
+        "alignment_ratio"
+    ]
+
+
+def _planted_spike_ratio(n_history: int, numel: int, n_grad: int, seed: int = 2027) -> float:
+    """A history AND held-out grads sharing one dominant direction -> real signal."""
+    g = torch.Generator().manual_seed(seed)
+    u = torch.randn(numel, generator=g, dtype=torch.float32)
+    u = u / u.norm()
+    mat = torch.stack(
+        [u * (t + 1) * 2.0 + torch.randn(numel, generator=g, dtype=torch.float32) * 0.05 for t in range(n_history)]
+    )
+    guess = torch.randn(numel, generator=g, dtype=torch.float32)
+    prior = _power_iteration_pc1(mat, n_iters=20, initial_guess=guess)
+    prior = prior / (prior.norm() + 1e-12)
+    grads = u.unsqueeze(0) + torch.randn(n_grad, numel, generator=g, dtype=torch.float32) * 0.05
+    return prior_vs_surrogate_alignment(prior, grads, n_surrogate=64, generator=g)[
+        "alignment_ratio"
+    ]
+
+
+class TestNullDecisionCalibration:
+    """The §7 decision basis — a calibrated iid null turns one measured
+    ``alignment_ratio`` into a go/no-go. Mirrors ``test_rank1_null_calibration.py``'s
+    discipline for the PC1 *direction* (``rank1_z`` covers the eigenvalue): the
+    null must center near 1.0, never false-positive on noise, and fire on signal.
+
+    This closes the gap ``docs/psa_axis_research_question.md`` §3/§4 left open —
+    §3 calibrated the null center and the signal but derived no decision boundary,
+    so the 9B live ``alignment_ratio`` would be a number with no threshold.
+    """
+
+    def test_iid_null_centers_near_one_across_regimes(self):
+        for n_history, numel, n_grad in _CALIB_REGIMES:
+            null = _null_dist(n_history, numel, n_grad)
+            assert null["mean"] == pytest.approx(1.0, abs=0.35), (
+                f"regime ({n_history},{numel},{n_grad}): null mean={null['mean']:.3f} "
+                "— the iid null must center near 1.0 (prior ≈ random direction), "
+                "else the decision boundary is biased against real signal."
+            )
+
+    def test_iid_null_decides_no_false_positive(self):
+        """A fresh iid measurement must be decided NULL, not SIGNAL — no false
+        positive on noise (the §7 honesty gate). Mirrors rank1's frac(z>3)<0.05."""
+        for n_history, numel, n_grad in _CALIB_REGIMES:
+            null = _null_dist(n_history, numel, n_grad)
+            false_signals = sum(
+                1
+                for s in range(60)
+                if decide_alignment_signal(
+                    _fresh_iid_ratio(n_history, numel, n_grad, seed=9000 + s), null
+                )
+                == ALIGNMENT_SIGNAL
+            )
+            assert false_signals / 60 < 0.05, (
+                f"regime ({n_history},{numel},{n_grad}): {false_signals}/60 fresh iid "
+                "measurements decided SIGNAL — the null false-positives, defeating "
+                "the §7 gate (a noise prior would greenlight PSA)."
+            )
+
+    def test_planted_spike_decides_signal(self):
+        """Positive control: a real shared spike must be decided SIGNAL with z≫1.
+        Without this the null tests above could pass vacuously."""
+        n_history, numel, n_grad = 16, 1024, 64
+        null = _null_dist(n_history, numel, n_grad, seed=2026)
+        ratio = _planted_spike_ratio(n_history, numel, n_grad)
+        assert decide_alignment_signal(ratio, null) == ALIGNMENT_SIGNAL, (
+            f"planted-spike ratio={ratio:.3f} vs null p99={null['p99']:.3f} — a real "
+            "shared spike must clear the calibrated boundary."
+        )
+        assert alignment_z_score(ratio, null) > 10.0, (
+            f"planted-spike z={alignment_z_score(ratio, null):.1f} — well above the "
+            "null, not borderline (else the gate is too lenient)."
+        )
+
+    def test_zscore_is_zero_at_null_mean(self):
+        null = _null_dist(16, 4096, 64)
+        assert alignment_z_score(null["mean"], null) == pytest.approx(0.0, abs=1e-6)
+
+    def test_decision_boundary_is_p99(self):
+        """Pin the conservative rule: just below p99 -> NULL, just above -> SIGNAL.
+        Triangulated with the null (below) and signal (above) tests above."""
+        null = _null_dist(16, 4096, 64)
+        assert decide_alignment_signal(null["p99"] * 0.999, null) == ALIGNMENT_NULL
+        assert decide_alignment_signal(null["p99"] * 1.001, null) == ALIGNMENT_SIGNAL
+
+    def test_null_distribution_is_deterministic(self):
+        a = _null_dist(16, 4096, 64, seed=555)
+        b = _null_dist(16, 4096, 64, seed=555)
+        assert a == b

@@ -43,7 +43,25 @@ alignment_ratio     = prior_alignment / surrogate_alignment
 `layer_delta_analysis.rank1_z` は rank-1 **固有値**優位性の MP null を持つが、PSA が増幅する**方向ベクトル**の
 surrogate は別問題（固有値 spike があっても eigenvector が増幅対象勾配と整合するとは限らない）。本 leaf がその区別を閉じる。
 両軸の null/signal assertion は実測値で校正され、実装 mutation（`**2` 削除 / prior 無視）で RED 化を確認済み
-（`tests/test_psa_null_baseline.py`、10 tests / GPU-free）。
+（`tests/test_psa_null_baseline.py` / GPU-free）。
+
+### 3.1 校正済み決定境界（go/no-go）— AI-Hub feedback で閉じた
+
+§3 は null の**中心**（≈1.0）と signal（>>1.0）を校正したが、**決定境界**（測った ratio が signal か null か）を持たず、
+9B live leg は「数値は出るが go/no-go 基準がない」状態だった（feedback の指す operator-facing な測定決定の欠落）。
+`rank1_z` は閉形式 MP 帰無から z-score を導出するが、方向の二乗エネルギー比には閉形式帰無がないため、Monte-Carlo 帰無で境界を導出する:
+
+```
+null   = null_alignment_ratio_distribution(numel, n_history, n_grad, n_trials=256, ...)
+         # iid ノイズで全パイプライン（prior 抽出 → ratio 測定）を n_trials 回回した経験帰無 {mean≈1.0, std, p99, max}
+z      = alignment_z_score(measured_ratio, null)        # rank1_z 類似の要約
+verdict = decide_alignment_signal(measured_ratio, null) # SIGNAL iff measured_ratio > null["p99"]（≤1% false-positive / GOAL §7）
+                                                       # else NULL（prior はランダム方向と区別できず PSA は勾配ノイズを注入するだけ）
+```
+
+iid 帰無は全 regime で中心 ≈1.0、fresh iid 測定の false-positive frac < 0.05、planted spike は z>10 で SIGNAL。
+決定方向の反転 mutation で `test_iid_null_decides_no_false_positive` / `test_planted_spike_decides_signal` /
+`test_decision_boundary_is_p99` が RED 化（mutation-proven）。
 
 ## 4. 何が残るか（Cat-C hand-off）
 
@@ -52,9 +70,15 @@ surrogate は別問題（固有値 spike があっても eigenvector が増幅�
  surrogate を下回る、または ≈1.0 なら PSA は §4 と同じく null として記録して閉じる。
  9B run は本 public mirror の `--data-file` offline rail（`079e8f1`/`e135736`）で自己完結再現可能。
 
+§3.1 の決定境界により、この 9B live 測定は「数値」ではなく**校正済み go/no-go** を出力する:
+実 ΔW history から抽出した prior と実勾配で `alignment_ratio` を測り、同一 `(numel, n_history, n_grad)` の
+Monte-Carlo 帰無に対して `decide_alignment_signal` を適用すれば SIGNAL/NULL が機械判定できる。
+境界なしでは判定不能な弱い実測（例: ratio ≈ 1.2）も、帰無の中心と広がりに対する z-score で原理的に判定できる。
+
 ## 5. Provenance
 
 - metric + surrogate: `src/tg_lora/psa_null_baseline.py`（`_random_like_with_norm` パターンの単位ベクトル版）。
-- behavior lock: `tests/test_psa_null_baseline.py`（null no-false-positive + signal detected + random-prior discrimination、mutation-proven）。
-- 関連 null: `src/tg_lora/layer_delta_analysis.py`（rank-1 固有値 z-score）、`tests/test_rank1_null_calibration.py`。
+- 決定境界: 同 leaf の `null_alignment_ratio_distribution`（Monte-Carlo 帰無）→ `alignment_z_score` / `decide_alignment_signal`（p99 境界）。`rank1_z` の方向ベクトル版。
+- behavior lock: `tests/test_psa_null_baseline.py`（null no-false-positive + signal detected + random-prior discrimination、mutation-proven）+ `TestNullDecisionCalibration`（帰無中心・false-positive・planted-spike・p99 境界・決定方向反転 mutation-proven、6 tests / 計 16）。
+- 関連 null: `src/tg_lora/layer_delta_analysis.py`（rank-1 固有値 z-score）、`tests/test_rank1_null_calibration.py`（本 iter の決定境界テストが mirror した idiom）。
 - §4 terminal context: [section4_terminal_verdict.md](section4_terminal_verdict.md) §4 (C)。

@@ -37,7 +37,17 @@ aligns with the gradients PSA would amplify. This leaf closes that distinction.
 
 import torch
 
-__all__ = ["prior_vs_surrogate_alignment", "random_unit_directions"]
+from src.tg_lora.psa import _power_iteration_pc1
+
+__all__ = [
+    "ALIGNMENT_NULL",
+    "ALIGNMENT_SIGNAL",
+    "alignment_z_score",
+    "decide_alignment_signal",
+    "null_alignment_ratio_distribution",
+    "prior_vs_surrogate_alignment",
+    "random_unit_directions",
+]
 
 
 def random_unit_directions(
@@ -136,3 +146,114 @@ def prior_vs_surrogate_alignment(
         "surrogate_alignment": surrogate_alignment,
         "alignment_ratio": ratio,
     }
+
+
+# Decision verdicts for the calibrated §7 go/no-go (see ``decide_alignment_signal``).
+ALIGNMENT_SIGNAL = "SIGNAL"
+ALIGNMENT_NULL = "NULL"
+
+
+def null_alignment_ratio_distribution(
+    numel: int,
+    n_history: int,
+    n_grad: int,
+    *,
+    n_trials: int = 256,
+    n_surrogate: int = 128,
+    n_extract_iters: int = 20,
+    generator: torch.Generator | None = None,
+) -> dict[str, float]:
+    """Monte-Carlo null distribution of ``alignment_ratio`` under iid noise.
+
+    The metric ``prior_vs_surrogate_alignment`` measures a *single* ratio; to
+    turn that number into a §7 go/no-go we need the ratio's distribution under
+    the null (prior AND held-out gradients both isotropic noise). A directional
+    squared-energy ratio has no closed-form null — unlike the rank-1
+    *eigenvalue*, whose null ``layer_delta_analysis`` derives in closed form
+    from Marchenko-Pastur (``rank1_z``). This function supplies the
+    Monte-Carlo analog: for each trial it runs the FULL production pipeline
+    (extract a PC1 prior from iid ΔW via ``_power_iteration_pc1``, measure its
+    ratio against iid held-out gradients) and collects the empirical null.
+
+    This is the prerequisite honesty gate ``docs/psa_axis_research_question.md``
+    §3/§4 left open: §3 calibrated the null *center* (≈1.0) and the signal
+    (>>1.0) but derived no decision boundary, so the 9B live ``alignment_ratio``
+    measurement would be a number with no threshold. The returned ``p99`` is
+    that threshold (≤1% false-positive rate); ``alignment_z_score`` gives the
+    ``rank1_z``-comparable summary.
+
+    Args:
+        numel: flattened parameter count of one LoRA tensor (the prior's dim).
+        n_history: ΔW snapshot count the prior is extracted from (PSA ring buf).
+        n_grad: number of held-out gradient samples (disjoint from history).
+        n_trials: Monte-Carlo null samples. Larger tightens ``p99``/``max``.
+        n_surrogate: random directions per trial (forwarded to the metric).
+        n_extract_iters: power-iteration steps (production default 20).
+        generator: optional ``torch.Generator`` — drives EVERY random draw
+            (history, extraction seed, gradients, surrogates) so the whole
+            distribution is reproducible from this one source.
+
+    Returns:
+        ``{"mean", "std", "p99", "max", "n_trials", "numel", "n_history",
+        "n_grad"}`` — the calibrated null. ``mean`` ≈ 1.0 confirms the prior is
+        no better than random under iid; ``p99`` is the ``decide_alignment_signal``
+        boundary; ``max`` is the most conservative (no false positive within the
+        sampled null).
+    """
+    gen = generator if generator is not None else torch.Generator().manual_seed(0)
+    ratios: list[float] = []
+    for _ in range(n_trials):
+        mat = torch.randn(n_history, numel, generator=gen, dtype=torch.float32) * 0.1
+        guess = torch.randn(numel, generator=gen, dtype=torch.float32)
+        prior = _power_iteration_pc1(mat, n_iters=n_extract_iters, initial_guess=guess)
+        prior = prior / (prior.norm() + 1e-12)
+        grads = torch.randn(n_grad, numel, generator=gen, dtype=torch.float32) * 0.3
+        result = prior_vs_surrogate_alignment(
+            prior, grads, n_surrogate=n_surrogate, generator=gen
+        )
+        ratios.append(result["alignment_ratio"])
+    samples = torch.tensor(ratios, dtype=torch.float32)
+    return {
+        "mean": float(samples.mean()),
+        "std": float(samples.std(unbiased=False)),
+        "p99": float(torch.quantile(samples, 0.99)),
+        "max": float(samples.max()),
+        "n_trials": int(n_trials),
+        "numel": int(numel),
+        "n_history": int(n_history),
+        "n_grad": int(n_grad),
+    }
+
+
+def alignment_z_score(measured_ratio: float, null: dict[str, float]) -> float:
+    """Standardize a measured ``alignment_ratio`` against the calibrated null.
+
+    The ``rank1_z`` analog for the PC1 *direction*: ``z = (ratio - null_mean) /
+    null_std``. A real signal clears z ≫ 1; an iid measurement sits at z ≈ 0.
+    Returns 0.0 when the null has no spread (degenerate / single-trial null).
+    """
+    std = float(null.get("std", 0.0) or 0.0)
+    if std <= 1e-12:
+        return 0.0
+    return (float(measured_ratio) - float(null["mean"])) / std
+
+
+def decide_alignment_signal(
+    measured_ratio: float,
+    null: dict[str, float],
+) -> str:
+    """§7 go/no-go: turn one measured ``alignment_ratio`` into a verdict.
+
+    ``SIGNAL`` iff the measured ratio exceeds the 99th percentile of the iid
+    null (≤1% false-positive rate — GOAL §7 "ランダム順サロゲートを超えた…
+    だけを有効と認定"). Otherwise ``NULL``: the prior is statistically
+    indistinguishable from a random direction and PSA would inject gradient
+    noise. Conservative by design — PSA reactivates only on unambiguous
+    directional signal. For a stricter boundary pass a null computed with more
+    trials and compare against ``null["max"]``.
+    """
+    return (
+        ALIGNMENT_SIGNAL
+        if float(measured_ratio) > float(null["p99"])
+        else ALIGNMENT_NULL
+    )
