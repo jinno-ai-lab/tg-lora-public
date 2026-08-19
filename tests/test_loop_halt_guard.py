@@ -308,3 +308,56 @@ def test_cli_make_target_reaches_guard_without_venv(tmp_path):
         f"{proc.stdout}\n{proc.stderr}"
     )
     assert "BROKEN" not in proc.stdout + proc.stderr
+
+
+def test_make_recipe_keeps_verdict_translation_static():
+    """Focused pin: the recipe must keep translating 0/77 into the verdict line.
+
+    This sibling branch itself is the recurrence proof — the family fix
+    (``1b8262f``) landed on sibling branches while this branch's base still
+    carried the raw ``$(PYTHON_VENV) scripts/loop_halt_guard.py`` recipe, and
+    nothing red on a fresh branch until the port. The static pin makes any
+    regression to a raw invocation (or loss of the BROKEN branch) red HERE,
+    without executing make.
+    """
+    text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    start = text.index("loop-halt-check:")
+    recipe = text[start : text.index("\n\n", start)]
+    assert 'verdict rc=$$RC' in recipe, (
+        "the canonical '[make loop-halt-check] verdict rc=N' line is gone — "
+        "the SKIP/PROCEED verdict is no longer machine-readable through make"
+    )
+    assert '[ "$$RC" -eq 0 ] || [ "$$RC" -eq 77 ]' in recipe, (
+        "the 0/77 whitelist is gone — a SKIP verdict would collapse back into "
+        "make exit 2, indistinguishable from a broken pre-flight"
+    )
+    assert "BROKEN" in recipe and "exit $$RC" in recipe, (
+        "the BROKEN branch no longer fails loudly on unexpected guard exits"
+    )
+
+
+def test_cli_make_target_broken_pre_flight_fails_loud(tmp_path):
+    """End-to-end negative: a broken pre-flight must exit non-zero as BROKEN.
+
+    Complements ``test_cli_make_target_reaches_guard_without_venv`` (the
+    happy path): an executable-but-failing interpreter (rc=3, neither 0 nor
+    77) must NOT be echoed as a verdict and must fail make — an executor must
+    never read a crashed pre-flight as permission to idle (SKIP) or proceed.
+    """
+    fake_interpreter = tmp_path / "fake-python"
+    fake_interpreter.write_text("#!/bin/sh\nexit 3\n", encoding="utf-8")
+    fake_interpreter.chmod(0o755)
+    env = {**os.environ, "PYTHON_VENV": str(fake_interpreter)}
+    proc = subprocess.run(
+        ["make", "loop-halt-check"],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 2, (
+        f"a broken pre-flight exited {proc.returncode} instead of failing "
+        f"make:\n{proc.stdout}\n{proc.stderr}"
+    )
+    assert "BROKEN rc=3" in proc.stderr
+    assert "verdict rc=" not in proc.stdout
