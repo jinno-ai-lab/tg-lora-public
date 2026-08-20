@@ -115,3 +115,5 @@ data_mlx_jsonex/
 # auto-added by instructions/10_storage/100_audit_storage_policy.md
 .aihub-session.json
 
+*.aihub-session*
+/*session*.json
