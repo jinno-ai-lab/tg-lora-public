@@ -44,12 +44,8 @@ tg-lora/
 │   │   ├── random_walk_controller.py  # ハイパーパラメータ適応探索
 │   │   ├── lora_state.py         # LoRA状態管理
 │   │   └── metrics.py            # 学習メトリクス
-│   ├── data/             # データパイプライン
-│   │   ├── build_seed_dataset.py # シードデータ構築
-│   │   ├── generate_open_data.py # LLMによるデータ生成
-│   │   ├── filter_dataset.py     # 品質フィルタリング
-│   │   ├── dedup.py              # 重複排除
-│   │   └── provenance.py         # 来歴追跡
+│   ├── (data/)           # ← private pipeline は public mirror で意図的 strip 済み
+│   │                       #   （src/data は不在。依存 tests ~130件 = pre-existing 失敗・非回帰）
 │   ├── training/         # 学習ループ
 │   │   ├── train_baseline_qlora.py
 │   │   ├── train_tg_lora.py
@@ -123,16 +119,38 @@ make prepare-data      # データ前処理・JSONL変換・分割
 3. **TG-LoRAの挙動確認** — velocity追跡、外挿の効果測定
 4. **lm-evaluation-harnessで定量評価** — ARC, HellaSwag, GSM8K, TruthfulQA
 
-### Component 2 設計移行（2026-06-05決定・現在最優先）
+### 現行路線と品質状況（2026-08-22 40系定期品質分析）
 
-TG-LoRA効率の1.24倍頭打ちを是正するため、**Prior-based Subspace Learning**設計へ移行します。
+**現行路線 = 第6期 Progressive Freezing + Activation Matching**（SYSTEM_CONSTITUTION.md / GOAL §1.6）。
+第1期〜第5期（velocity 外挿 / 漸進ランク ZO / B-filter / PSA 転換）は帰無基準により**棄却または保留済み**。
+旧「Component 2（Prior-based Subspace Learning）設計移行・現在最優先」記述（2026-06-05）は
+この優先順位が撤回された遺物 — `scripts/collect_true_gradients.py` / `offline_tg_w_validation.py`
+は保留置きのツールとして残存するが、新規作業の優先指示ではない。
 
-- **根本原因**: 固定方向 $v$ の上で、毎ステップの少サンプルlossによる手探りスケール調整（実装の退化）。
-- **是正策**: 軌跡から方向 $v$ とスケール $w_{\text{traj}}$ を prior として推定し、低次元係数 $\{\alpha, \beta_j\}$ のみをデータで緩やかに学習する。
-- **数値対策**: JVP非サポート（Qwen 4bit / bitsandbytes）のため有限差分で方向微分を求める。数値条件を改善するため「方向の単位化」「$w_{\text{traj}}$による無次元化」「補助方向の直交化」を適用。
-- **最優先アクション（Milestone 9）**: 本番実装前のオフライン検証。
-  - `scripts/collect_true_gradients.py` で軌跡（勾配）データを収集。
-  - `scripts/offline_tg_w_validation.py` で方向微分と数値正規化、低次元近似誤差を検証。
+**現状（2026-08-22時点）要約:**
+- §4 verdict: **SHIP landed**（2026-07-29 `section4_landed_decision.json` — 両 leg TIES at full budget
+  〔homogeneous cand 1.6947 vs surr 1.6960 / heterogeneous cand 1.7180 vs surr 1.7191〕+
+  P1 品質保持 SURPASSES 両 leg）
+- 分類Aタスク（コードで解決可能）: **枯渇** — MS-PF2 4/4・MS-PF3 2/2・MS-PF4 1/1 の全 Cat-A 変換完了。
+- テスト（2026-08-22 commit 858273b 実測・`--continue-on-collection-errors`）:
+  **4991 passed / 102 failed / 10 skipped / 3 xfailed / 17 collection errors**。
+  失敗・エラーは全て private `src.data` 剥離 + `peft` 等ヘビー依存不在に由来する **pre-existing・非回帰**。
+  品質 canary は `tests/test_cli_help_smoke.py`（**43 passed / 3 xfailed**）。
+- 品質保証体制: `make ci` = ruff（src/tests/scripts/mlx）+ spine anchor 159 本 + gates-ci + pytest。
+- コミット比率（直近30件）: コード系（feat+fix+test+refactor）16/30 = **53%**（改善水準 ≥50%）。
+- Loop halt pre-flight: **SKIP 判定**（`awaiting_ratification`）→ §4/MS-008 軸の axis work 禁止（冒頭節参照）。
+
+**次の最適行動:**
+- **人間（operator）**: (1) `loop_axis_state.json` の 3 trigger を ratify（新規 9B deposit /
+  closeout 承認 / 新 MS 軸 open）。(2) post-SHIP default 変更 D1/D2/D3 の決定
+  （`specs/oper-decision-surface/default-change-proposal.md` — 決定まで mainline freeze は OFF のまま）。
+  (3) private repo での production-baseline 絶対 loss 計測（Cat-C・本 mirror から実行不可）。
+- **AI**: 分類A枯渇 + halt SKIP 中 = 新規 axis work は行わない。§4 verdict run の再発火は
+  TIES の再現のみで新情報を生まない。`PURPOSE.md` 次の一手への追記は freeze guard
+  （`tests/test_purpose_next_steps_freeze.py`）で CI 強制阻止済み。
+
+---
+**本節は2026-08-22時点の40系定期品質分析（実測値: pytest フル実行 / git log / make loop-halt-check）に基づく。**
 
 
 ### データ戦略
