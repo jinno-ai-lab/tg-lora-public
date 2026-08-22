@@ -137,7 +137,7 @@ make prepare-data      # データ前処理・JSONL変換・分割
   失敗・エラーは全て private `src.data` 剥離 + `peft` 等ヘビー依存不在に由来する **pre-existing・非回帰**。
   品質 canary は `tests/test_cli_help_smoke.py`（**43 passed / 3 xfailed**）。
 - 品質保証体制: `make ci` = ruff（src/tests/scripts/mlx）+ spine anchor 233 本 + gates-ci + pytest。
-- コミット比率（直近30件）: コード系（feat+fix+test+refactor）16/30 = **53%**（改善水準 ≥50%）。
+- コミット比率（直近30件・4b926dd 基点）: コード系（feat+fix+test+refactor）15/30 = **50%**（改善水準 ≥50% を境界で維持。基点を pin しないと docs commit 1件で window が滑る — 旧記述 16/30=53% は 858273b 時点の値）。
 - Loop halt pre-flight: **SKIP 判定**（`awaiting_ratification`）→ §4/MS-008 軸の axis work 禁止（冒頭節参照）。
 
 **次の最適行動:**
