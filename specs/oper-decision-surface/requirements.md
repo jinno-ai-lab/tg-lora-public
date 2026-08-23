@@ -191,3 +191,11 @@
 - **分析記録**: [interview-record.md](interview-record.md)
 - **ユーザストーリー**: [user-stories.md](user-stories.md)
 - **受け入れ基準**: [acceptance-criteria.md](acceptance-criteria.md)
+
+
+<!-- spine:references:begin -->
+## Spine: external references
+
+- [§4 SHIP 後の default 変更提案 — `progressive_freeze_enabled` 既定値（operator hand-off）](default-change-proposal.md)
+
+<!-- spine:references:end -->
