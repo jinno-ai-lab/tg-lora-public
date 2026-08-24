@@ -361,3 +361,33 @@ def test_cli_make_target_broken_pre_flight_fails_loud(tmp_path):
     )
     assert "BROKEN rc=3" in proc.stderr
     assert "verdict rc=" not in proc.stdout
+
+
+def test_cli_make_target_proceed_verdict_surfaces(tmp_path):
+    """End-to-end dual coverage: the PROCEED half must surface through make.
+
+    ``test_cli_make_target_reaches_guard_without_venv`` pins the SKIP half
+    (live repo, rc=77) and ``test_cli_make_target_broken_pre_flight_fails_loud``
+    the BROKEN half (rc=3), but the recipe's rc=0 arm was only ever pinned as
+    static text — the live repo is awaiting_ratification, so `.` can never
+    exercise it. The recipe honors LOOP_HALT_REPO_ROOT exactly for this: point
+    the guard at a non-awaiting checkout and assert the executed PROCEED
+    verdict is echoed with make exiting 0. A whitelist that drops the 0 arm, or
+    a translation that mishandles it, goes red HERE — not as prose drift.
+    """
+    _write_state(tmp_path, status="ready")
+    proc = subprocess.run(
+        ["make", "loop-halt-check", f"LOOP_HALT_REPO_ROOT={tmp_path}"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (
+        f"a PROCEED verdict exited {proc.returncode} through make:\n"
+        f"{proc.stdout}\n{proc.stderr}"
+    )
+    assert "verdict rc=0" in proc.stdout, (
+        f"the PROCEED verdict did not surface through make:\n"
+        f"{proc.stdout}\n{proc.stderr}"
+    )
+    assert "BROKEN" not in proc.stdout + proc.stderr

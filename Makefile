@@ -679,11 +679,18 @@ check-status: ## Run agent autonomy status check to find next steps
 # `verdict rc=N` line and make exits 0; any other rc is BROKEN (loud non-zero).
 # Verify with `VENV=/nonexistent make loop-halt-check` (must print the verdict
 # line and exit 0) and plain `make loop-halt-check` in the live repo.
+#
+# The live repo is currently SKIP (awaiting_ratification), so the recipe's
+# rc=0 (PROCEED) arm cannot be exercised end-to-end against `.` — it was only
+# pinned as static text. LOOP_HALT_REPO_ROOT lets a test point the guard at a
+# non-awaiting checkout (`make loop-halt-check LOOP_HALT_REPO_ROOT=/tmp/x`)
+# so both halves of the verdict translation are executable contracts.
+LOOP_HALT_REPO_ROOT ?= .
 loop-halt-check: ## §4/MS-008 halt guard — verdict rc=77 SKIP (awaiting operator ratification, no trigger: emit NO axis commit / no halt-doc) / rc=0 PROCEED; make exits 0 for either verdict, non-zero only if the pre-flight itself is BROKEN. Loop consults this before any axis commit (scripts/loop_halt_guard.py + loop_axis_state.json).
 	@PY="$(PYTHON_VENV)"; \
 	[ -x "$$PY" ] || PY="$(PYTHON)"; \
 	command -v "$$PY" >/dev/null 2>&1 || PY=python3; \
-	"$$PY" scripts/loop_halt_guard.py --repo-root .; RC=$$?; \
+	"$$PY" scripts/loop_halt_guard.py --repo-root $(LOOP_HALT_REPO_ROOT); RC=$$?; \
 	if [ "$$RC" -eq 0 ] || [ "$$RC" -eq 77 ]; then \
 		echo "[make loop-halt-check] verdict rc=$$RC (77=SKIP produce nothing / 0=PROCEED)"; \
 	else \
