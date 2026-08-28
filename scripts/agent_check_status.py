@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import importlib.util
 import json
 import os
 import subprocess
@@ -113,9 +114,95 @@ def check_experiment_runs():
 
     return None
 
+def load_halt_guard_module():
+    """Load ``scripts/loop_halt_guard.py`` as a module, by file location.
+
+    The status check runs as a bare CLI (``make check-status`` →
+    ``python scripts/agent_check_status.py``), so the sibling guard is not
+    importable as a package member from every invocation context — load it by
+    path, the same idiom ``tests/test_agent_check_status_gpu.py`` uses to load
+    THIS script. Returns ``None`` when the guard is absent/unloadable: the halt
+    state is then simply not consultable, and this diagnostic keeps its legacy
+    recommendation flow rather than failing (a missing sibling must not brick
+    the status check)."""
+    guard_path = Path(__file__).resolve().parent / "loop_halt_guard.py"
+    try:
+        spec = importlib.util.spec_from_file_location("loop_halt_guard", guard_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        # Register BEFORE exec — the manual-loading recipe — so module-scoped
+        # machinery that resolves through sys.modules (the guard's frozen
+        # dataclass) finds the module instead of crashing on None.
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+    except (OSError, ImportError, SyntaxError):
+        return None
+    return module
+
+
+def loop_halt_decision():
+    """The loop-halt guard's verdict for the §4 / MS-008 axis, or ``None`` when
+    not consultable.
+
+    Resolved from the CURRENT WORKING DIRECTORY — the same convention as
+    ``check_datasets``' relative ``data`` globs and the guard CLI's own
+    ``--repo-root .`` default, so ``make check-status`` (always run from the
+    repo root) consults the repo's live ``loop_axis_state.json``. A corrupt
+    tracker (``JSONDecodeError`` subclasses ``ValueError``) degrades to ``None``
+    — a broken halt tracker must not brick the status check either."""
+    guard = load_halt_guard_module()
+    if guard is None:
+        return None
+    try:
+        return guard.should_skip(Path.cwd())
+    except (OSError, ValueError):
+        return None
+
+
+def halt_operator_decisions() -> list[str]:
+    """The operator's unblock set when the loop-halt guard says SKIP.
+
+    SKIP does not mean "nothing can be done" — it means the AGENT must produce
+    nothing while awaiting one of the three witnessed external triggers (see
+    ``loop_axis_state.json``). Surfacing them here keeps ``make check-status``
+    (the command the operator already runs) from routing anyone back into
+    ``make prepare-data`` / ``make paper-memory`` work the halt has suspended."""
+    return [
+        "Operator decision (halt is ACTIVE — one of the 3 triggers unblocks it):",
+        "  (A) Fire a real operator-side 9B run -> a new tests/fixtures/"
+        "freeze_validloss_ci_9b*.json",
+        "      deposit appears (count > baseline in loop_axis_state.json).",
+        "  (B) Draft + approve the MS-008 publishable-negative closeout ->",
+        "      reports/close-the-loop/close_the_loop_funnel_go_nogo_*.{json,md} appears.",
+        "  (C) Open a new measurable axis -> operator_signals.new_ms_axis_opened is set",
+        "      in loop_axis_state.json (e.g. MS-009).",
+    ]
+
+
 def evaluate_and_suggest(data_ok, summary_data):
     print("\n=== [3/3] Milestone & Next Step Evaluation ===")
-    
+
+    halt = loop_halt_decision()
+    if halt is not None and halt.skip:
+        # awaiting_ratification with no witnessed trigger: every command this
+        # stage normally recommends (make prepare-data / make paper-memory /
+        # make paper-memory-evaluate-gates) is axis work the halt suspends.
+        # Surface the verdict + the operator unblock set INSTEAD — the
+        # auto-diagnostic must not send anyone back into blocked work.
+        print("[!] Loop halt guard: SKIP (halt — produce nothing)")
+        print(f"    status:          {halt.status}")
+        print(f"    active_triggers: {halt.active_triggers or '(none)'}")
+        print(f"    reason:          {halt.reason}")
+        print("Recommendation:")
+        print("  -> Produce NOTHING this iteration. The usual next steps")
+        print("     (make prepare-data / make paper-memory / make")
+        print("     paper-memory-evaluate-gates) are BLOCKED by the halt.")
+        print("    Confirm the verdict with: make loop-halt-check")
+        for _decision_line in halt_operator_decisions():
+            print(_decision_line)
+        return
+
     if not data_ok:
         print("Recommendation:")
         print("  -> Run data preparation to set up the 5K Dolly dataset split.")

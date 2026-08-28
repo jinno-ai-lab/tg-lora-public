@@ -23,10 +23,25 @@ verified end-to-end. Reverting the reader to the old silent-swallow turns
 ``test_corrupt_summary_exits_loud_not_silent`` red (exit 0 + empty stderr under
 the swallow, AND the misleading "run the suite" recommendation emitted), which
 is the mutation the guard exists to prevent.
+
+Stage 3 additionally pins the LOOP-HALT AWARENESS contract: when the §4/MS-008
+axis is ``awaiting_ratification`` with no witnessed trigger (a
+``loop_axis_state.json`` in the invocation cwd — the guard CLI's own repo-root
+convention), the "what to do next" stage must surface the guard's SKIP verdict
+and the operator's 3-trigger unblock set INSTEAD of recommending ``make
+prepare-data`` / ``make paper-memory`` — those are axis work the halt suspends,
+and the auto-diagnostic must not route the operator (or a goaldev agent) back
+into blocked work. Removing the halt gate in ``evaluate_and_suggest`` turns
+``test_halt_skip_supplants_blocked_recommendations`` red (the blocked
+``make prepare-data`` recommendation reappears and the SKIP verdict vanishes).
+The not-SKIP paths stay pinned to the LEGACY recommendation flow so the gate
+cannot over-reach: a non-awaiting status and an absent tracker both keep
+``make prepare-data``.
 """
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -107,3 +122,55 @@ def test_missing_summary_does_not_crash(tmp_path: Path) -> None:
     result = _run(tmp_path)
     assert result.returncode == 0, result.stderr
     assert "aggregate_summary.json not found" in result.stdout
+
+
+def _write_halt_tracker(tmp_path: Path, status: str) -> None:
+    """Seed a ``loop_axis_state.json`` in the invocation cwd with the essential
+    guard fields (status / baseline / operator_signals), mirroring the shape of
+    the repo-root tracker the guard CLI reads."""
+    tracker = {
+        "schema_version": 1,
+        "axis": "section4-9b-verdict",
+        "status": status,
+        "baseline": {"nine_b_deposit_count": 10},
+        "operator_signals": {"new_ms_axis_opened": None},
+    }
+    (tmp_path / "loop_axis_state.json").write_text(
+        json.dumps(tracker), encoding="utf-8"
+    )
+
+
+def test_halt_skip_supplants_blocked_recommendations(tmp_path: Path) -> None:
+    """awaiting_ratification + no witnessed trigger: stage 3 must surface the
+    SKIP verdict and the operator unblock set, and must NOT recommend the
+    axis work the halt suspends (prepare-data / paper-memory)."""
+    _write_halt_tracker(tmp_path, "awaiting_ratification")
+    result = _run(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "SKIP (halt" in result.stdout
+    assert "awaiting_ratification" in result.stdout
+    assert "Operator decision" in result.stdout
+    assert "make loop-halt-check" in result.stdout
+    # Pin the RECOMMENDATION form ("Command: make …"), not the bare target
+    # name — the SKIP block itself legitimately names the suspended targets.
+    assert "Command: make prepare-data" not in result.stdout
+    assert "Command: make paper-memory" not in result.stdout
+
+
+def test_halt_not_active_keeps_legacy_recommendations(tmp_path: Path) -> None:
+    # status != awaiting_ratification (the guard returns PROCEED): the halt
+    # gate must not alter stage 3's legacy recommendation flow.
+    _write_halt_tracker(tmp_path, "ratified")
+    result = _run(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "Command: make prepare-data" in result.stdout
+    assert "SKIP (halt" not in result.stdout
+
+
+def test_no_halt_tracker_keeps_legacy_recommendations(tmp_path: Path) -> None:
+    # No loop_axis_state.json in cwd: the guard is permissive, stage 3 keeps
+    # its legacy flow — the status check never bricks on a missing tracker.
+    result = _run(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "Command: make prepare-data" in result.stdout
+    assert "SKIP (halt" not in result.stdout
