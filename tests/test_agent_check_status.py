@@ -42,6 +42,7 @@ cannot over-reach: a non-awaiting status and an absent tracker both keep
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -174,3 +175,40 @@ def test_no_halt_tracker_keeps_legacy_recommendations(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "Command: make prepare-data" in result.stdout
     assert "SKIP (halt" not in result.stdout
+
+
+def test_cli_make_check_status_reachable_without_venv(tmp_path: Path) -> None:
+    """E2E: ``make check-status`` must stay reachable in venv-less worktrees.
+
+    The halt-awareness contract above lives behind the Makefile target, but AI
+    Hub executes this repo from fresh worktrees that have no ``.venv`` — there
+    the default ``PYTHON_VENV`` (``.venv/bin/python``) died with exit 127, so
+    the diagnostic that surfaces the SKIP verdict was unreachable exactly where
+    agents consult it, and the ticket's acceptance grep
+    (``make check-status | grep -E 'SKIP|awaiting_ratification|Operator
+    decision'``) matched nothing because the recipe never reached the script.
+    The recipe now uses the same interpreter fallback as ``loop-halt-check``
+    (PYTHON_VENV if executable, else $(PYTHON), else python3 — the script is
+    pure stdlib). Simulate a venv-less checkout (point VENV at an absent path,
+    clear any PYTHON_VENV override) and assert the live repo's SKIP surfacing
+    still reaches stdout through make.
+    """
+    env = {**os.environ, "VENV": str(tmp_path / "absent-venv")}
+    env.pop("PYTHON_VENV", None)
+    proc = subprocess.run(
+        ["make", "check-status"],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (
+        f"make check-status exited {proc.returncode} in a venv-less checkout — "
+        f"the halt-aware diagnostic is unreachable exactly where the loop "
+        f"runs:\n{proc.stdout}\n{proc.stderr}"
+    )
+    for needle in ("SKIP", "awaiting_ratification", "Operator decision"):
+        assert needle in proc.stdout, (
+            f"the live repo's halt-state surfacing lost {needle!r} through "
+            f"make:\n{proc.stdout}\n{proc.stderr}"
+        )

@@ -660,9 +660,20 @@ clean-runs: ## Remove all experiment runs (careful!)
 
 # ── Operations ────────────────────────────────────────────────────────────────
 
+# check-status is the auto-diagnostic whose stage 3 surfaces the halt-guard
+# SKIP state — but AI Hub executes this repo from fresh worktrees with no
+# .venv, where the default PYTHON_VENV dies with exit 127 and the diagnostic
+# was unreachable exactly where agents/operators consult it (the acceptance
+# `make check-status | grep -E 'SKIP|awaiting_ratification|Operator decision'`
+# matched nothing because the recipe never reached the script). Same family
+# fallback as loop-halt-check below: PYTHON_VENV if executable, else $(PYTHON),
+# else python3 (the script is pure stdlib).
 check-status: ## Run agent autonomy status check to find next steps
 	chmod +x scripts/agent_check_status.py
-	$(PYTHON_VENV) scripts/agent_check_status.py
+	@PY="$(PYTHON_VENV)"; \
+	[ -x "$$PY" ] || PY="$(PYTHON)"; \
+	command -v "$$PY" >/dev/null 2>&1 || PY=python3; \
+	"$$PY" scripts/agent_check_status.py
 
 # loop-halt-check is the pre-flight every entrypoint doc (PURPOSE.md/AGENTS.md)
 # routes through, and AI Hub executes this repo from fresh worktrees that have
