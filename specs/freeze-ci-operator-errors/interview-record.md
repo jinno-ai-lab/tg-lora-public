@@ -1,9 +1,10 @@
 # freeze-ci-operator-errors 自動分析記録
 
 <!-- spine:anchor:begin -->
-> **Spine anchor**: [TG-LoRA アーキテクチャ設計](../tg-lora/architecture.md)
+> **Spine anchor**: [Tangent-Gradient LoRA (TG-LoRA) — 全体設計・研究指針 (GOAL)](../../docs/GOAL.md)
 >
-> - parent: `tg-lora/architecture.md`
+> - parent: `docs/GOAL.md`
+> - role: `feature_root`
 > - status: `canonical_child`
 <!-- spine:anchor:end -->
 
