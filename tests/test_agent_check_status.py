@@ -37,6 +37,16 @@ into blocked work. Removing the halt gate in ``evaluate_and_suggest`` turns
 The not-SKIP paths stay pinned to the LEGACY recommendation flow so the gate
 cannot over-reach: a non-awaiting status and an absent tracker both keep
 ``make prepare-data``.
+
+The same halt verdict now gates the TRAILING 9B Lever Readiness block: under
+SKIP the block must not print at all (a second "advance the 9B lever" decision
+menu contradicts the "produce nothing" verdict the operator just read), while
+PROCEED / no-tracker keep it. The non-SKIP pin drives the block through a FAKE
+``nvidia-smi`` injected via PATH so the block is proven to run to its GPU-probe
+conclusion hermetically (CI has no nvidia-smi; dev boxes may hold a real GPU).
+Removing the gate in ``main`` turns
+``test_halt_skip_suppresses_9b_lever_readiness_block`` red — the readiness
+block reappears under the SKIP verdict despite the fake probe succeeding.
 """
 
 from __future__ import annotations
@@ -61,10 +71,13 @@ _SUMMARY = f"{_SUITE}/aggregate_summary.json"
 _DATA_MIN_LINES = {"train.jsonl": 4500, "valid_quick.jsonl": 450, "test.jsonl": 450}
 
 
-def _run(cwd: Path) -> subprocess.CompletedProcess[str]:
+def _run(
+    cwd: Path, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(HELPER)],
         cwd=str(cwd),
+        env=env,
         capture_output=True,
         text=True,
         check=False,
@@ -175,6 +188,56 @@ def test_no_halt_tracker_keeps_legacy_recommendations(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "Command: make prepare-data" in result.stdout
     assert "SKIP (halt" not in result.stdout
+
+
+def _fake_nvidia_smi_env(tmp_path: Path, apps_csv: str) -> dict[str, str]:
+    """Env whose PATH fronts a fake ``nvidia-smi`` emitting ``apps_csv``.
+
+    ``report_gpu_availability`` probes the GPU via ``nvidia-smi`` resolved from
+    PATH; faking it keeps the pins hermetic (CI has no nvidia-smi; dev boxes
+    may hold a real sibling-project GPU) and lets the SKIP pin prove the block
+    is SUPPRESSED by the gate, not by a dead probe — under the fake, an
+    ungated run would print the block and the holder lines."""
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    tool = bin_dir / "nvidia-smi"
+    tool.write_text(
+        "#!/bin/sh\ncat <<'EOF'\n" + apps_csv + "\nEOF\n", encoding="utf-8"
+    )
+    tool.chmod(0o755)
+    return {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+    }
+
+
+def test_halt_skip_suppresses_9b_lever_readiness_block(tmp_path: Path) -> None:
+    """awaiting_ratification + no witnessed trigger: the trailing 9B Lever
+    Readiness block must NOT print after the SKIP verdict — the operator just
+    read "produce nothing" plus the 3-trigger unblock set, and a second
+    "advance the 9B lever" decision menu contradicts it. The fake nvidia-smi
+    (probe WOULD succeed) proves suppression is the halt gate's doing."""
+    _write_halt_tracker(tmp_path, "awaiting_ratification")
+    env = _fake_nvidia_smi_env(tmp_path, "4321, llama-server, 9000 MiB")
+    result = _run(tmp_path, env=env)
+    assert result.returncode == 0, result.stderr
+    assert "SKIP (halt" in result.stdout
+    assert "=== 9B Lever Readiness" not in result.stdout
+    assert "GPU is held by" not in result.stdout
+
+
+def test_halt_not_active_keeps_9b_lever_readiness_block(tmp_path: Path) -> None:
+    """Non-awaiting status (guard returns PROCEED): the gate must not
+    over-reach — the 9B readiness block keeps printing through to its GPU-probe
+    conclusion (holder line pinned via the fake nvidia-smi)."""
+    _write_halt_tracker(tmp_path, "ratified")
+    env = _fake_nvidia_smi_env(tmp_path, "4321, llama-server, 9000 MiB")
+    result = _run(tmp_path, env=env)
+    assert result.returncode == 0, result.stderr
+    assert "SKIP (halt" not in result.stdout
+    assert "=== 9B Lever Readiness" in result.stdout
+    assert "GPU is held by 1 compute app(s)" in result.stdout
+    assert "4321" in result.stdout
 
 
 def test_cli_make_check_status_reachable_without_venv(tmp_path: Path) -> None:

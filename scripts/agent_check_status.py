@@ -181,6 +181,13 @@ def halt_operator_decisions() -> list[str]:
 
 
 def evaluate_and_suggest(data_ok, summary_data):
+    """Print the milestone/next-step evaluation and return the guard's verdict.
+
+    The return value is the loop-halt guard's ``SkipDecision`` — skip or
+    PROCEED — or ``None`` when the guard/tracker is not consultable. The caller
+    (``main``) needs the verdict to gate the halt-inconsistent trailing stage:
+    under SKIP the 9B readiness block would hand the operator a second
+    "advance the lever" decision menu right after the "produce nothing" one."""
     print("\n=== [3/3] Milestone & Next Step Evaluation ===")
 
     halt = loop_halt_decision()
@@ -201,19 +208,19 @@ def evaluate_and_suggest(data_ok, summary_data):
         print("    Confirm the verdict with: make loop-halt-check")
         for _decision_line in halt_operator_decisions():
             print(_decision_line)
-        return
+        return halt
 
     if not data_ok:
         print("Recommendation:")
         print("  -> Run data preparation to set up the 5K Dolly dataset split.")
         print("  Command: make prepare-data")
-        return
-        
+        return halt
+
     if not summary_data:
         print("Recommendation:")
         print("  -> Run the 3-seed paper-memory suite to perform the core experiments.")
         print("  Command: make paper-memory")
-        return
+        return halt
         
     # Analyze summary data
     print("Current Experiment Results Summary:")
@@ -227,6 +234,7 @@ def evaluate_and_suggest(data_ok, summary_data):
     # If G3 is not run, run external quality evaluation
     print("  -> Run external evaluation (ARC, HellaSwag, etc.) to pass G3:")
     print("  Command: make paper-memory-external-eval")
+    return halt
 
 def parse_gpu_holders(apps_csv):
     """Parse ``nvidia-smi --query-compute-apps=pid,process_name,used_memory``
@@ -366,8 +374,14 @@ def report_gpu_availability():
 def main():
     data_ok = check_datasets()
     summary_data = check_experiment_runs()
-    evaluate_and_suggest(data_ok, summary_data)
-    report_gpu_availability()
+    halt = evaluate_and_suggest(data_ok, summary_data)
+    # SKIP verdict: stage 3 already printed the operator's halt-unblock set, and
+    # the 9B readiness block would append a second, halt-inconsistent
+    # "advance the lever" decision menu — suppress it for the same reason the
+    # stage-3 recommendations are supplanted. Guard not consultable (None) or
+    # PROCEED: the readiness block keeps its legacy unconditional behavior.
+    if halt is None or not halt.skip:
+        report_gpu_availability()
 
 if __name__ == "__main__":
     main()
