@@ -180,6 +180,42 @@ def halt_operator_decisions() -> list[str]:
     ]
 
 
+def halt_proceed_minimal_steps(active_triggers) -> list[str]:
+    """The minimal step for each FIRED trigger, in trigger order.
+
+    On PROCEED the loop's contract narrows to the fired axis only (PURPOSE.md:
+    "triggers が示す該当軸の最小 step のみ実行する") — so the surfaced step must
+    name that axis's next action, never the generic milestone menu."""
+    steps = {
+        "9b_leg_fired": [
+            "  [9b_leg_fired] New 9B deposit witnessed -> run the Cat-C minimal step:",
+            "    compare target-scale 9B absolute valid_loss against the",
+            "    PRODUCTION baseline (the one remaining §4 open).",
+        ],
+        "closeout_approved": [
+            "  [closeout_approved] Closeout anchor witnessed -> finalize the",
+            "    MS-008 publishable-negative closeout from the approved anchor.",
+        ],
+        "new_ms_axis_opened": [
+            "  [new_ms_axis_opened] New axis signal witnessed -> read",
+            "    loop_axis_state.json's triggers and run ONLY the new axis's",
+            "    minimal step (e.g. the MS-009 first step).",
+        ],
+    }
+    lines: list[str] = []
+    for trigger in active_triggers:
+        lines.extend(
+            steps.get(
+                trigger,
+                [
+                    f"  [{trigger}] Unknown trigger -> consult loop_axis_state.json",
+                    "    and run that axis's minimal step only.",
+                ],
+            )
+        )
+    return lines
+
+
 def evaluate_and_suggest(data_ok, summary_data):
     """Print the milestone/next-step evaluation and return the guard's verdict.
 
@@ -208,6 +244,21 @@ def evaluate_and_suggest(data_ok, summary_data):
         print("    Confirm the verdict with: make loop-halt-check")
         for _decision_line in halt_operator_decisions():
             print(_decision_line)
+        return halt
+
+    if halt is not None and not halt.skip and halt.active_triggers:
+        # PROCEED via a WITNESSED trigger: the contract narrows to the fired
+        # axis's minimal step only. Falling through to the generic
+        # prepare-data / paper-memory menu here is the D-2 misroute — the
+        # trigger fired, but the operator (or a goaldev agent) still cannot
+        # tell WHICH axis's minimal step to run.
+        print("[!] Loop halt guard: PROCEED (trigger witnessed)")
+        print(f"    status:          {halt.status}")
+        print(f"    active_triggers: {halt.active_triggers}")
+        print("Minimal step(s) for the fired axis ONLY:")
+        for _step_line in halt_proceed_minimal_steps(halt.active_triggers):
+            print(_step_line)
+        print("    Confirm the verdict with: make loop-halt-check")
         return halt
 
     if not data_ok:

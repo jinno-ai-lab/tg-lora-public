@@ -138,10 +138,17 @@ def test_missing_summary_does_not_crash(tmp_path: Path) -> None:
     assert "aggregate_summary.json not found" in result.stdout
 
 
-def _write_halt_tracker(tmp_path: Path, status: str) -> None:
+def _write_halt_tracker(
+    tmp_path: Path, status: str, witness: str | None = None
+) -> None:
     """Seed a ``loop_axis_state.json`` in the invocation cwd with the essential
     guard fields (status / baseline / operator_signals), mirroring the shape of
-    the repo-root tracker the guard CLI reads."""
+    the repo-root tracker the guard CLI reads.
+
+    ``witness`` optionally fires one of the guard's three external triggers in
+    the SAME cwd the subprocess will glob — the real witness artifacts the
+    guard's ``compute_witnesses`` reads (a 9B deposit fixture over baseline, a
+    close-the-loop anchor, or the operator axis-open signal)."""
     tracker = {
         "schema_version": 1,
         "axis": "section4-9b-verdict",
@@ -149,9 +156,26 @@ def _write_halt_tracker(tmp_path: Path, status: str) -> None:
         "baseline": {"nine_b_deposit_count": 10},
         "operator_signals": {"new_ms_axis_opened": None},
     }
+    if witness == "9b_deposit":
+        # 1 committed deposit fixture vs baseline 0 -> count > baseline fires.
+        tracker["baseline"] = {"nine_b_deposit_count": 0}
+    elif witness == "new_ms_axis":
+        tracker["operator_signals"]["new_ms_axis_opened"] = True
     (tmp_path / "loop_axis_state.json").write_text(
         json.dumps(tracker), encoding="utf-8"
     )
+    if witness == "9b_deposit":
+        fixtures = tmp_path / "tests" / "fixtures"
+        fixtures.mkdir(parents=True, exist_ok=True)
+        (fixtures / "freeze_validloss_ci_9b_witnessed.json").write_text(
+            "{}", encoding="utf-8"
+        )
+    elif witness == "closeout":
+        closeout = tmp_path / "reports" / "close-the-loop"
+        closeout.mkdir(parents=True, exist_ok=True)
+        (closeout / "close_the_loop_funnel_go_nogo_witnessed.json").write_text(
+            "{}", encoding="utf-8"
+        )
 
 
 def test_halt_skip_supplants_blocked_recommendations(tmp_path: Path) -> None:
@@ -169,6 +193,52 @@ def test_halt_skip_supplants_blocked_recommendations(tmp_path: Path) -> None:
     # name — the SKIP block itself legitimately names the suspended targets.
     assert "Command: make prepare-data" not in result.stdout
     assert "Command: make paper-memory" not in result.stdout
+
+
+def test_halt_proceed_9b_deposit_trigger_surfaces_minimal_step(tmp_path: Path) -> None:
+    """awaiting_ratification + the 9b_leg_fired witness (a committed deposit
+    count over baseline): the guard says PROCEED, and stage 3 must surface the
+    verdict, the FIRED trigger, and that axis's minimal step (the Cat-C 9B
+    PRODUCTION-baseline comparison) — not the generic prepare-data menu. This
+    is the D-2 misroute: the trigger fired, but without this block the operator
+    cannot tell WHICH axis's minimal step to run."""
+    _write_halt_tracker(tmp_path, "awaiting_ratification", witness="9b_deposit")
+    result = _run(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "PROCEED" in result.stdout
+    assert "9b_leg_fired" in result.stdout
+    assert "PRODUCTION baseline" in result.stdout
+    assert "Command: make prepare-data" not in result.stdout
+
+
+def test_halt_proceed_closeout_trigger_surfaces_minimal_step(tmp_path: Path) -> None:
+    """awaiting_ratification + the closeout_approved witness (a close-the-loop
+    anchor on mirror): PROCEED must surface the fired trigger and the closeout
+    minimal step (finalize the MS-008 publishable-negative closeout), keeping
+    the operator off the generic milestone menu."""
+    _write_halt_tracker(tmp_path, "awaiting_ratification", witness="closeout")
+    result = _run(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "PROCEED" in result.stdout
+    assert "closeout_approved" in result.stdout
+    assert "publishable-negative closeout" in result.stdout
+    assert "Command: make prepare-data" not in result.stdout
+
+
+def test_halt_proceed_new_ms_axis_trigger_surfaces_minimal_step(
+    tmp_path: Path,
+) -> None:
+    """awaiting_ratification + the new_ms_axis_opened witness (operator flipped
+    the axis-open signal): PROCEED must surface the fired trigger and point at
+    the NEW axis's minimal step only — the whole point of the signal is to
+    redirect work away from the old milestone flow."""
+    _write_halt_tracker(tmp_path, "awaiting_ratification", witness="new_ms_axis")
+    result = _run(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "PROCEED" in result.stdout
+    assert "new_ms_axis_opened" in result.stdout
+    assert "new axis" in result.stdout
+    assert "Command: make prepare-data" not in result.stdout
 
 
 def test_halt_not_active_keeps_legacy_recommendations(tmp_path: Path) -> None:
