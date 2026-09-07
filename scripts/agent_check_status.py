@@ -180,32 +180,40 @@ def halt_operator_decisions() -> list[str]:
     ]
 
 
+HALT_PROCEED_STEPS: dict[str, list[str]] = {
+    "9b_leg_fired": [
+        "  [9b_leg_fired] New 9B deposit witnessed -> run the Cat-C minimal step:",
+        "    compare target-scale 9B absolute valid_loss against the",
+        "    PRODUCTION baseline (the one remaining §4 open).",
+    ],
+    "closeout_approved": [
+        "  [closeout_approved] Closeout anchor witnessed -> finalize the",
+        "    MS-008 publishable-negative closeout from the approved anchor.",
+    ],
+    "new_ms_axis_opened": [
+        "  [new_ms_axis_opened] New axis signal witnessed -> read",
+        "    loop_axis_state.json's triggers and run ONLY the new axis's",
+        "    minimal step (e.g. the MS-009 first step).",
+    ],
+}
+
+
 def halt_proceed_minimal_steps(active_triggers) -> list[str]:
     """The minimal step for each FIRED trigger, in trigger order.
 
     On PROCEED the loop's contract narrows to the fired axis only (PURPOSE.md:
     "triggers が示す該当軸の最小 step のみ実行する") — so the surfaced step must
-    name that axis's next action, never the generic milestone menu."""
-    steps = {
-        "9b_leg_fired": [
-            "  [9b_leg_fired] New 9B deposit witnessed -> run the Cat-C minimal step:",
-            "    compare target-scale 9B absolute valid_loss against the",
-            "    PRODUCTION baseline (the one remaining §4 open).",
-        ],
-        "closeout_approved": [
-            "  [closeout_approved] Closeout anchor witnessed -> finalize the",
-            "    MS-008 publishable-negative closeout from the approved anchor.",
-        ],
-        "new_ms_axis_opened": [
-            "  [new_ms_axis_opened] New axis signal witnessed -> read",
-            "    loop_axis_state.json's triggers and run ONLY the new axis's",
-            "    minimal step (e.g. the MS-009 first step).",
-        ],
-    }
+    name that axis's next action, never the generic milestone menu.
+
+    The mapping lives at module level so
+    ``test_halt_proceed_steps_match_witness_triggers`` can pin its keys to the
+    trigger set ``loop_halt_guard.compute_witnesses`` produces: a trigger
+    renamed or added there without a step here must fail CI instead of
+    silently degrading to the Unknown-trigger fallback."""
     lines: list[str] = []
     for trigger in active_triggers:
         lines.extend(
-            steps.get(
+            HALT_PROCEED_STEPS.get(
                 trigger,
                 [
                     f"  [{trigger}] Unknown trigger -> consult loop_axis_state.json",

@@ -241,6 +241,48 @@ def test_halt_proceed_new_ms_axis_trigger_surfaces_minimal_step(
     assert "Command: make prepare-data" not in result.stdout
 
 
+def test_halt_proceed_steps_match_witness_triggers(tmp_path: Path) -> None:
+    """Drift guard for the PROCEED minimal-step surfacing: every trigger the
+    guard can fire must have a real step, and every step must belong to a real
+    trigger.
+
+    ``compute_witnesses`` is the only source of ``active_triggers`` (via
+    ``should_skip`` -> ``SkipDecision.active_triggers``), while the steps come
+    from a hand-maintained mapping in ``agent_check_status`` — two sets that
+    must agree but are edited in different files. Without this pin, renaming a
+    witness key (or adding a 4th trigger when a new MS axis opens) lets the
+    fired trigger silently degrade to the "Unknown trigger -> consult
+    loop_axis_state.json" fallback: the operator still cannot tell WHICH
+    axis's minimal step to run, so the D-2 misroute partially returns while
+    the three per-trigger tests above stay green (they only exercise today's
+    trigger names). Renaming a key in either file turns the set-equality red
+    with the drifted names spelled out in the failure message."""
+    from scripts.agent_check_status import (
+        HALT_PROCEED_STEPS,
+        halt_proceed_minimal_steps,
+    )
+    from scripts.loop_halt_guard import compute_witnesses
+
+    # Empty repo root + empty state: every witness VALUE is False, but the KEY
+    # set is exactly the triggers the guard can ever fire.
+    witness_triggers = compute_witnesses(tmp_path, {})
+    assert set(HALT_PROCEED_STEPS) == set(witness_triggers), (
+        "halt_proceed_minimal_steps drifted from compute_witnesses: "
+        f"steps-without-trigger={sorted(set(HALT_PROCEED_STEPS) - set(witness_triggers))} "
+        f"trigger-without-step={sorted(set(witness_triggers) - set(HALT_PROCEED_STEPS))}"
+    )
+
+    # The equality must protect the user-facing path: every fireable trigger
+    # renders a real step, and the fallback stays reserved for genuinely
+    # unknown triggers (the mapping cannot be "fixed" by deleting it).
+    for trigger in witness_triggers:
+        rendered = "\n".join(halt_proceed_minimal_steps([trigger]))
+        assert "Unknown trigger" not in rendered, trigger
+    assert "Unknown trigger" in "\n".join(
+        halt_proceed_minimal_steps(["__not_a_witness__"])
+    )
+
+
 def test_halt_not_active_keeps_legacy_recommendations(tmp_path: Path) -> None:
     # status != awaiting_ratification (the guard returns PROCEED): the halt
     # gate must not alter stage 3's legacy recommendation flow.
