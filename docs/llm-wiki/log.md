@@ -208,3 +208,9 @@ status: generated
 - Generated or refreshed repository wiki for `tg-lora-public`.
 - Source: deterministic ai-hub fallback writer.
 
+## 2026-09-26 — llm-wiki オンボーディング（スキャフォールド補完＋親候補草案の記録）
+
+contracts の llm-wiki-discipline 原則に基づくオンボーディング。欠損していた index.md・relations.md を新設し、親候補（business_operation_notes・推定草案）を記録した。既存 log.md は追記のみ。
+
+- **Verification**: 原則 `registry/principles/llm-wiki-discipline.yaml`（contracts リポ commit 3ab5768）。親候補は推定であり jinno確定待ち。
+
