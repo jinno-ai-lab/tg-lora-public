@@ -44,8 +44,9 @@ tg-lora/
 │   │   ├── random_walk_controller.py  # ハイパーパラメータ適応探索
 │   │   ├── lora_state.py         # LoRA状態管理
 │   │   └── metrics.py            # 学習メトリクス
-│   ├── (data/)           # ← private pipeline は public mirror で意図的 strip 済み
-│   │                       #   （src/data は不在。依存 tests ~130件 = pre-existing 失敗・非回帰）
+│   ├── data/             # ← 2026-09 以降 public-safe サブセットを同梱（559d47b + e4434a3）。
+│   │                       #   旧「strip 済み・src/data 不在」記述は失効 — 陳腐な pin test が
+│   │                       #   main CI 連続失敗（PR #1 滞留）の原因だった（2026-09-27 解消）
 │   ├── training/         # 学習ループ
 │   │   ├── train_baseline_qlora.py
 │   │   ├── train_tg_lora.py
