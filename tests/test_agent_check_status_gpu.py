@@ -94,13 +94,20 @@ def test_parse_gpu_holders_skips_malformed_rows() -> None:
     assert holders[0]["pid"] == "222"
 
 
-def test_src_data_pipeline_present_false_on_public_mirror() -> None:
-    """On this public mirror ``src.data`` is deliberately stripped (DATA/Cat-C),
-    so the probe reads False — the contract that drives the DATA-blocked (not
-    GPU-blocked) framing of the 9B lever below. Pins that the framing is not
-    accidentally inverted by a future port."""
+def test_src_data_pipeline_present_true_on_public_pipeline_checkout() -> None:
+    """Contract update (2026-09): the data pipeline now SHIPS in this repo, so
+    the probe reads True here. The Aug-04 premise behind the old
+    ``..._false_on_public_mirror`` pin — ``src.data`` deliberately stripped —
+    was invalidated when 559d47b landed ``build_seed_dataset``/``schema``
+    (required by ``train_tg_lora``'s import) and e4434a3 recovered the remaining
+    generic modules; the stale pin was the first of the layered main-CI
+    failures this care run resolves. The DATA-blocked framing itself stays
+    covered by the monkeypatched branch tests below."""
     mod = _load_module()
-    assert mod.src_data_pipeline_present() is False
+    assert mod.src_data_pipeline_present() is True
+    # The shipped subset is exactly what makes the probe True — pin it.
+    assert (REPO_ROOT / "src" / "data" / "build_seed_dataset.py").is_file()
+    assert (REPO_ROOT / "src" / "data" / "schema.py").is_file()
 
 
 def test_report_gpu_availability_mirror_held_gpu_is_data_blocked_not_gpu(monkeypatch) -> None:
@@ -154,11 +161,14 @@ def test_report_gpu_availability_private_checkout_held_gpu_is_gpu_blocked(monkey
 
 
 def test_report_gpu_availability_free_gpu(monkeypatch) -> None:
-    """No holders -> the report says the GPU looks free. On the mirror it
-    additionally states the lever stays DATA-blocked (free GPU does not make it
-    actionable here); in the private checkout it states the lever IS actionable."""
+    """No holders -> the report says the GPU looks free. With ``src.data``
+    absent (injected) it additionally states the lever stays DATA-blocked (free
+    GPU does not make it actionable); with it present it states the lever IS
+    actionable. The context is injected — the branch must not depend on the
+    live filesystem."""
     mod = _load_module()
     monkeypatch.setattr(mod, "query_gpu_compute_apps", lambda: "")
+    monkeypatch.setattr(mod, "src_data_pipeline_present", lambda: False)  # mirror
     import sys
     from io import StringIO
 
@@ -231,6 +241,7 @@ def test_report_gpu_availability_data_blocked_surfaces_decision(monkeypatch) -> 
     DATA-blocked branch drops all three option markers from the output."""
     mod = _load_module()
     monkeypatch.setattr(mod, "query_gpu_compute_apps", lambda: "")  # GPU free, irrelevant
+    monkeypatch.setattr(mod, "src_data_pipeline_present", lambda: False)  # mirror
     import sys
     from io import StringIO
 
