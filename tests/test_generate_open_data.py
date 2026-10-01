@@ -5,6 +5,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# Private-pipeline module (DATA/Cat-C) — skip cleanly on the public mirror
+# instead of erroring at collection (which aborts the entire run).
+pytest.importorskip("src.data.generate_open_data")
+
 from src.data.generate_open_data import generate_open_data
 
 

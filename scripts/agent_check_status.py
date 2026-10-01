@@ -345,9 +345,15 @@ def src_data_pipeline_present() -> bool:
     checkout regardless of GPU state; on the PRIVATE checkout it ships and the
     run's real readiness gate is GPU availability. Resolved from ``__file__``
     (not CWD) so the answer is stable however ``make status`` is invoked, and a
-    module-level function so tests can inject both contexts without a GPU."""
+    module-level function so tests can inject both contexts without a GPU.
+
+    Detects the pipeline by a private-only module marker, not by the bare
+    ``src/data`` directory: the mirror legitimately ships a minimal public
+    subset (``build_seed_dataset`` + ``schema``, needed by ``train_tg_lora``'s
+    import) since commit 559d47b, so a directory-existence check reads True on
+    the mirror and would invert the DATA-blocked framing this probe exists for."""
     repo_root = Path(__file__).resolve().parents[1]
-    return (repo_root / "src" / "data").is_dir()
+    return (repo_root / "src" / "data" / "filter_dataset.py").is_file()
 
 
 def data_blocked_operator_decision() -> list[str]:
