@@ -302,8 +302,46 @@ class TestOutputGuardMainIntegration:
 
         monkeypatch.setattr(mod, "run_ci_9b", _past)
         # Config lives under the repo root, not tmp_path; the pre-flight under
-        # test is upstream of the load, so stub the load to a dummy cfg.
-        monkeypatch.setattr(mod.OmegaConf, "load", lambda *a, **k: {})  # noqa: ARG001
+        # test is upstream of the load, so stub the load to a dummy cfg. It must
+        # be a real OmegaConf object that survives _load_cfg's Pydantic schema
+        # validation (REQ-301) — an empty mapping is an operator error (exit 78),
+        # so build the stub from the schema classes themselves (same recipe as
+        # test_prefix_feature_cache._pydantic_cfg).
+        from src.training.config_schema import (
+            BaselineConfig,
+            DataConfig,
+            ExperimentConfig,
+            LoggingConfig,
+            LoRAConfig,
+            ModelConfig,
+            TrainingConfig,
+        )
+
+        _valid_cfg = mod.OmegaConf.create(
+            BaselineConfig(
+                experiment=ExperimentConfig(name="fp-consistency", seed=7),
+                model=ModelConfig(name_or_path="dummy-model"),
+                lora=LoRAConfig(
+                    r=8, alpha=16, dropout=0.05, target_modules="all-linear"
+                ),
+                data=DataConfig(
+                    train_path="data/train.jsonl",
+                    valid_quick_path="data/valid_quick.jsonl",
+                    valid_full_path="data/valid_full.jsonl",
+                    max_seq_len=64,
+                ),
+                training=TrainingConfig(
+                    batch_size=1,
+                    grad_accumulation=1,
+                    learning_rate=1e-4,
+                    max_steps=10,
+                ),
+                logging=LoggingConfig(run_dir="runs/test"),
+            ).model_dump()
+        )
+        monkeypatch.setattr(
+            mod.OmegaConf, "load", lambda *a, **k: _valid_cfg
+        )  # noqa: ARG001
 
         with pytest.raises(_GotPastPreflight):
             mod.main([

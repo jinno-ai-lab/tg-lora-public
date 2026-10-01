@@ -25,6 +25,15 @@ from src.training.train_tg_lora import (build_training_summary,
 # ---------------------------------------------------------------------------
 
 
+def _write_mock_checkpoint_files(path) -> None:
+    """Write a stand-in artifact into the target dir so the real
+    ``save_checkpoint`` (with its fail-loud empty-save guard) sees a
+    non-empty staged dir, while the MagicMock still records every call."""
+    target = Path(path)
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "adapter_model.safetensors").write_bytes(b"mock-adapter")
+
+
 class _LoRAMockModel(torch.nn.Module):
     """Minimal nn.Module with LoRA-like named_parameters for testing."""
 
@@ -42,8 +51,7 @@ class _LoRAMockModel(torch.nn.Module):
                 torch.nn.Parameter(torch.randn(hidden, hidden) * 0.01),
             )
         self._loss_val = 2.0
-        self.save_pretrained = MagicMock()
-        self.save_pretrained.__wrapped__ = lambda path: None  # make it callable
+        self.save_pretrained = MagicMock(side_effect=_write_mock_checkpoint_files)
 
     def parameters(self):
         for p in super().parameters():
@@ -124,7 +132,14 @@ def _make_config(**overrides) -> OmegaConf:
     """Build a minimal OmegaConf config that train_tg_lora() accepts."""
     defaults = {
         "experiment": {"name": "test_run", "seed": 42},
-        "model": {"name_or_path": "dummy-model"},
+        "model": {
+            "name_or_path": "dummy-model",
+            # read unconditionally by prefix_feature_cache metadata (schema defaults)
+            "dtype": "bfloat16",
+            "load_in_4bit": True,
+            "bnb_4bit_quant_type": "nf4",
+            "bnb_4bit_compute_dtype": "bfloat16",
+        },
         "lora": {
             "r": 16,
             "alpha": 32,
@@ -192,7 +207,7 @@ def _patch_train_tg_lora_deps(model_loss=2.0, eval_losses=None):
     model._loss_val = model_loss
 
     tokenizer = MagicMock()
-    tokenizer.save_pretrained = MagicMock()
+    tokenizer.save_pretrained = MagicMock(side_effect=_write_mock_checkpoint_files)
 
     if eval_losses is None:
         eval_losses = [2.0]

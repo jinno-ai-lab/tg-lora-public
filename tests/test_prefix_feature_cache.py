@@ -664,6 +664,12 @@ class TestCacheFingerprintCompleteness:
             # values it produces (deterministic given weights + precision).
             "device_map": "runtime placement; does not change cached tensor values",
             "device": "runtime placement; does not change cached tensor values",
+            # Declared in DataConfig but read by NO consumer today (grep across
+            # src/ scripts/ configs/ finds only the schema declaration), so no
+            # code path can let it alter the cached bytes. If a consumer lands
+            # (e.g. train-split subsetting before caching), it MUST be moved to
+            # field_to_fingerprint_key with a matching metadata key.
+            "train_fraction": "declared-but-unused; no reader can change cached bytes today",
         }
 
         schema_fields = set(DataConfig.model_fields) | set(ModelConfig.model_fields)
