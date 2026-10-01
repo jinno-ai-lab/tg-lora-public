@@ -337,13 +337,15 @@ def query_gpu_compute_apps():
 
 
 def src_data_pipeline_present() -> bool:
-    """Whether the private ``src.data`` data pipeline ships in this checkout.
+    """Whether the ``src.data`` data pipeline ships in this checkout.
 
     The 9B target-scale run (GOAL §4) depends on ``src.data`` to produce/serve
-    its 9B samples. On the PUBLIC mirror that pipeline is deliberately stripped
-    (DATA/Cat-C — see PURPOSE.md), so the 9B lever is NOT actionable from this
-    checkout regardless of GPU state; on the PRIVATE checkout it ships and the
-    run's real readiness gate is GPU availability. Resolved from ``__file__``
+    its 9B samples. Since 2026-09 the pipeline code ships in this repo
+    (559d47b: ``build_seed_dataset`` / ``schema``, needed by ``train_tg_lora``'s
+    import; e4434a3 recovered the remaining generic modules), so the probe reads
+    True here and the run's real readiness gate is GPU availability; the
+    DATA-blocked framing in ``report_gpu_availability`` applies to checkouts
+    where the pipeline is genuinely absent. Resolved from ``__file__``
     (not CWD) so the answer is stable however ``make status`` is invoked, and a
     module-level function so tests can inject both contexts without a GPU."""
     repo_root = Path(__file__).resolve().parents[1]

@@ -64,8 +64,15 @@ class _MockModel(torch.nn.Module):
         super().__init__()
         self._loss_value = loss_value
         self.linear = torch.nn.Linear(1, 1)  # dummy parameter
-        self.save_pretrained = MagicMock()
-        self.save_pretrained.__wrapped__ = lambda path: None
+        self.save_pretrained = MagicMock(side_effect=self._write_stub)
+
+    @staticmethod
+    def _write_stub(path) -> None:
+        # save_checkpoint's empty-readback guard (a7bb73e) fails loud on a
+        # save that writes nothing, so the mocked save must produce a file.
+        dest = Path(path)
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "adapter_model.safetensors").write_bytes(b"stub")
 
     def __call__(self, **kwargs):
         out = MagicMock()
@@ -133,7 +140,9 @@ def _patch_all_deps(
     """Return patch targets for all external deps of train_baseline."""
     model = _MockModel(loss_value=model_loss)
     tokenizer = MagicMock()
-    tokenizer.save_pretrained = MagicMock()
+    tokenizer.save_pretrained = MagicMock(
+        side_effect=lambda path: (Path(path) / "tokenizer_config.json").write_bytes(b"{}")
+    )
 
     if eval_losses is None:
         eval_losses = [2.0]
@@ -277,7 +286,8 @@ class TestInitialization:
     def test_run_metrics_initialized(self):
         cfg, mocks = _run_baseline()
         run_dir = mocks["ensure_dir"].return_value
-        mocks["RunMetrics"].assert_called_once_with(run_dir, mode="baseline")
+        # Fresh run (no resume_path) -> append=False; a resume run appends.
+        mocks["RunMetrics"].assert_called_once_with(run_dir, mode="baseline", append=False)
 
     def test_write_header_called(self):
         cfg, mocks = _run_baseline()
