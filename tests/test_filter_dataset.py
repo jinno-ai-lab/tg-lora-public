@@ -1,9 +1,16 @@
 """Unit tests for src/data/filter_dataset.py."""
 
+import pytest
+
+pytest.importorskip(
+    "src.data.filter_dataset",
+    reason="private src.data pipeline stripped from this public mirror",
+)
+
 import orjson
 import torch
-
 from src.data.filter_dataset import filter_dataset
+
 from src.utils.io import load_jsonl
 
 

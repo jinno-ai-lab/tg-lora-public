@@ -347,7 +347,15 @@ def src_data_pipeline_present() -> bool:
     (not CWD) so the answer is stable however ``make status`` is invoked, and a
     module-level function so tests can inject both contexts without a GPU."""
     repo_root = Path(__file__).resolve().parents[1]
-    return (repo_root / "src" / "data").is_dir()
+    # The ``src/data`` DIRECTORY is public since 559d47b (it ships the
+    # intentionally-public build_seed_dataset + schema that train_tg_lora
+    # imports), so directory existence no longer means the private pipeline is
+    # here. The private pipeline is exactly the four modules 559d47b deliberately
+    # excluded (filter_dataset, dedup, provenance, generate_open_data); probe
+    # one of them as the private-only marker so this reads False on the public
+    # mirror and True on the private checkout — keeping the DATA-blocked (not
+    # GPU-blocked) framing honest in both.
+    return (repo_root / "src" / "data" / "filter_dataset.py").exists()
 
 
 def data_blocked_operator_decision() -> list[str]:

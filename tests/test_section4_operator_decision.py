@@ -31,7 +31,6 @@ from scripts.section4_operator_decision import (
     HETEROGENEOUS_DEPOSIT,
     HOMOGENEOUS_DEPOSIT,
     LANDING_RECORD_REL,
-    RECOVER_RERUN_ENTRYPOINT,
     REPO_ROOT,
     VALID_LAND_BRANCHES,
     VERDICT_WORKER_MODULE,
@@ -514,11 +513,15 @@ class TestUnblockStepAndArchitecturalInvariant:
         # The architectural invariant that blocks the recover.py --rerun path
         # (NOT the verdict run). Pinned (not fabricated): scripts/prepare_data.py
         # documents the strip and tests/test_filter_dataset.py + tests/test_dedup.py
-        # keep the interface without its implementation. If this pin flips, the
+        # hold the interface, skipping via importorskip while the private
+        # implementation is absent. Since 559d47b the ``src/data`` directory and
+        # build_seed_dataset.py are PUBLIC (train_tg_lora imports them), so the
+        # strip marker is the private-only module (filter_dataset) — not the
+        # directory, and not the entrypoint file. If this pin flips, the
         # PIVOT-branch + recover-path logic above must be revisited together — do
         # not just delete this test.
-        assert not (REPO_ROOT / "src" / "data").is_dir()
-        assert not (REPO_ROOT / RECOVER_RERUN_ENTRYPOINT).exists()
+        assert not (REPO_ROOT / "src" / "data" / "filter_dataset.py").exists()
+        assert (REPO_ROOT / "src" / "data" / "build_seed_dataset.py").exists()
         # ...but the stripped interface is still documented in this mirror:
         assert (REPO_ROOT / "tests" / "test_filter_dataset.py").exists()
         assert (REPO_ROOT / "tests" / "test_dedup.py").exists()

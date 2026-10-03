@@ -1,10 +1,15 @@
 """Unit tests for src/data/generate_open_data.py."""
 
-import torch
-from unittest.mock import MagicMock, patch
-
 import pytest
 
+pytest.importorskip(
+    "src.data.generate_open_data",
+    reason="private src.data pipeline stripped from this public mirror",
+)
+
+from unittest.mock import MagicMock, patch
+
+import torch
 from src.data.generate_open_data import generate_open_data
 
 
