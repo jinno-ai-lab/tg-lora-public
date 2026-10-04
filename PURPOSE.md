@@ -1331,3 +1331,54 @@ GOAL §3.1 Phase 4 / §4 step 5。最適スケジュールを LR/データ/r/シ
 > - **bug**: `_evaluate_full_eval_outcome`（L539）は `is_new_best = prev_best - full_loss > min_delta` を計算し docstring/commit `bce700b`「§5.3 min_delta」が「new best」を保証するが、canonical site（旧 L4362）で `is_new_best` を**束縛するのみで dead-read**（`should_stop`/`eval_reason` のみ使用）。5 つの `best_model` save site（2732/2869/3037/4362/4613）はすべて raw `full_loss < best_full_eval_loss` 比較（min_delta 無視）。同行の `cycle_state.record_full_eval`（cycle_state.py:252・`cycle_state.min_delta = early_stopping_min_delta`@1652 で同一 min_delta/prev_best）は正しく gate するため、sub-`min_delta` 改善（両 production config `0.01` で発火中）が `best_full_eval_loss` を下げ `best_model` を上書きする一方、`cycle_state.best_loss`（run 公式）は更新せず = **保存 best_model と報告 best_loss が silent diverge** + spurious「New best model」ログ。
 > - **fix（Z = policy AND monotonic-best）**: 5 site を `is_new_best/was_new_best and full_loss < best_full_eval_loss` へ gate。`record_full_eval` は `-> bool`（new-best を返す・後方互換）。第1 conjunct が §5.3 min_delta を適用、第2 conjunct が単調ベスト不変量（`best_full_eval_loss` 非増加）を保持 = 純 new-best gate のみだと旧 divergent checkpoint resume 時により良い best_model を悪化させる回帰を防ぐ（resume-safe）。byte-identical @ `min_delta=0.0`。
 > - **検証**: mutation-proven 5 軸（canonical/was_new_best → bare raw `<` で AST guard RED・全 was_new_best → X で resume integration test RED・canonical → X で AST guard RED・`record_full_eval` return None で 7 test RED・gate `>`→`>=` で境界 test RED）。221 passed zero regression（3 件は clean tree 同様 pre-existing 環境失敗）・ruff 0。baseline `train_baseline_qlora.py` は `min_delta` 無く raw `<` が一貫方策なので対象外。verdict/prose/plumbing でなく・deploy/eval で使われる保存アーティファクト+報告 metric を反転させる load-bearing 決定。詳細は [TASK-0202](specs/tg-lora/tasks/TASK-0202.md)。
+
+---
+
+## Autonomous Intent（TAS 機械可読・LOOP.md 由来・自動生成）
+
+以下は `LOOP.md` の機械転写です（TAS auto dispatch への注入用）。編集は LOOP.md 本体に対して行うこと（本セクションは再生成される）。
+
+### LOOP.md — tg-lora-public 自律改善ループ（bounded task）
+
+<!-- loop-md:spec v2 -->
+
+> 自律 run は**この文書だけを命令として**実行する。1 run = 1 改善。実行しない判断は「中断レポート」に書いて終わる。
+> この雛形はシステムが生成・管理している（上の `loop-md:spec v2` 行が管理印）。印付きのファイルは仕様更新時に自動で新版へ差し替わる。手動管理に切り替える（候補キューの追加・禁止事項の強化などの精緻化を保護する）には、**印の行を削除する** — 以後、自動更新は一切行われない。
+
+#### 実行単位
+
+入力: 次の優先順で候補を探し、**先頭の 1 件だけ**を実行する。
+1. `make test` の失敗（落ちる 1 件を直す）
+2. ソース内の TODO/FIXME
+3. README/docs の手順と実装の不一致
+
+出力: ①最小変更 ②検証 ③commit 1 件（push はしない — chain 完了後の自動反映は harness が行う）。**deploy・リリース・対外送信は実行禁止**。
+
+#### 手順
+
+1. **候補確定（目安 5 分）** — 上記の順で 1 件決める。既に直っている/安全でない → 次の候補へ。全て不適なら変更なしで中断レポート。
+2. **実装（最小・短時間）** — 触るファイルを必要最小限に。**1 run は 15〜30 分が目安** — 超えそうなら「時間分割」の規則に従う。
+3. **検証** — `make test`。**既存テストを壊したまま commit しない**（壊れたら修正するか変更を取り消す）。
+4. **commit** — `git add` は変更ファイルのみ・1 件（例: `fix: <1行要約>`）。
+5. **完了報告** — 変更ファイル・検証結果・残課題を最終出力に。
+
+#### 時間分割（長時間 run の禁止）
+
+長時間 run は fleet 全体の実行枠（並列 4）を塞ぎ、他リポを待たせる。そのため:
+
+- 30 分を超えそうな作業は**着手ではなく分割** — 今回は最初の 1 片だけ実装し、残りは完了報告の「残課題」に明記して終了する（次の run が引き継ぐ）。
+- 依存の追加・更新、大規模リファクタ、複数領域横断の変更は 1 run では行わない。分割案を TODO/ISSUES に書いて次回以降の候補にする。
+- 調査やビルド待ちが長引いたら切り上げ、判明した事実だけ残課題に残す。
+
+#### 禁止事項（違反 = run 失敗）
+
+- push / force-push / 履歴改変 / タグ・リリース操作 / deploy
+- 秘密（`.env`・トークン・認証情報）の読み出し・コミット・本番 API の実呼び出し（モックで検証）
+- 1 run で 2 つ目の改善に着手 / 依存のメジャー更新・破壊的リファクタ
+- 外部/upstream リポジトリの場合: upstream への push・PR・issue 操作
+- この文書の内容を残さない改変
+- tas リポジトリなど、対象外リポジトリのファイル編集
+
+#### 中断レポート
+
+安全な改善が無い・検証が通らない・時間切れのときは、変更を残さず、最終出力に「中断理由・確認した事実・次の候補への引き継ぎ」を書いて終わる。
