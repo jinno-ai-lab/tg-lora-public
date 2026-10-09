@@ -95,10 +95,12 @@ def test_parse_gpu_holders_skips_malformed_rows() -> None:
 
 
 def test_src_data_pipeline_present_false_on_public_mirror() -> None:
-    """On this public mirror ``src.data`` is deliberately stripped (DATA/Cat-C),
-    so the probe reads False — the contract that drives the DATA-blocked (not
-    GPU-blocked) framing of the 9B lever below. Pins that the framing is not
-    accidentally inverted by a future port."""
+    """This checkout IS the public mirror, so the probe reads False — the
+    contract that drives the DATA-blocked (not GPU-blocked) framing of the 9B
+    lever below. Pins that the framing is not accidentally inverted by a
+    future port. (Since e4434a3 the mirror ships the same ``src/data`` files
+    as the private repo, so the probe keys on repo identity — ``origin`` URL
+    — not file presence; this test also pins that identity read.)"""
     mod = _load_module()
     assert mod.src_data_pipeline_present() is False
 

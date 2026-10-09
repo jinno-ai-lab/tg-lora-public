@@ -337,17 +337,39 @@ def query_gpu_compute_apps():
 
 
 def src_data_pipeline_present() -> bool:
-    """Whether the private ``src.data`` data pipeline ships in this checkout.
+    """Whether this checkout is the PRIVATE repo — i.e. the 9B data lever is
+    actionable from here (its real readiness gate is GPU availability).
 
-    The 9B target-scale run (GOAL §4) depends on ``src.data`` to produce/serve
-    its 9B samples. On the PUBLIC mirror that pipeline is deliberately stripped
-    (DATA/Cat-C — see PURPOSE.md), so the 9B lever is NOT actionable from this
-    checkout regardless of GPU state; on the PRIVATE checkout it ships and the
-    run's real readiness gate is GPU availability. Resolved from ``__file__``
-    (not CWD) so the answer is stable however ``make status`` is invoked, and a
-    module-level function so tests can inject both contexts without a GPU."""
+    The 9B target-scale run (GOAL §4) depends on the private 9B DATA. On the
+    PUBLIC mirror that lever is NOT actionable regardless of GPU state
+    (DATA/Cat-C — see PURPOSE.md); on the PRIVATE checkout it is.
+
+    File presence can no longer distinguish the two checkouts: 559d47b's
+    "public subset only" scope (``build_seed_dataset`` + ``schema``) was undone
+    by the 2026-09-19 working-tree sweep e4434a3, which shipped the remaining
+    ``src/data`` modules (dedup / filter_dataset / generate_open_data /
+    provenance — generic public-safe data utilities, filter_dataset being
+    load-bearing for the public ``prepare-data`` token-audit path) to the
+    mirror. The old dir-existence / private-module-file probe therefore reads
+    True on BOTH checkouts and inverted the mirror's DATA-blocked framing.
+    The stable remaining signal is repo identity: the mirror's ``origin`` URL
+    names ``tg-lora-public``, the private checkout's names ``tg-lora``.
+    Resolved from ``__file__`` (not CWD) so the answer is stable however
+    ``make status`` is invoked; module-level so tests can inject both contexts
+    without a GPU. Undeterminable origin (no git, tarball copy) conservatively
+    reads False — the honest-on-mirror default."""
     repo_root = Path(__file__).resolve().parents[1]
-    return (repo_root / "src" / "data").is_dir()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    if proc.returncode != 0:
+        return False
+    url = proc.stdout.strip().rstrip("/").removesuffix(".git")
+    return url.rsplit("/", 1)[-1] != "tg-lora-public"
 
 
 def data_blocked_operator_decision() -> list[str]:

@@ -31,7 +31,6 @@ from scripts.section4_operator_decision import (
     HETEROGENEOUS_DEPOSIT,
     HOMOGENEOUS_DEPOSIT,
     LANDING_RECORD_REL,
-    RECOVER_RERUN_ENTRYPOINT,
     REPO_ROOT,
     VALID_LAND_BRANCHES,
     VERDICT_WORKER_MODULE,
@@ -489,14 +488,13 @@ class TestQualityPreservationAxis:
 
 
 class TestUnblockStepAndArchitecturalInvariant:
-    def test_unblock_step_names_private_repo_and_deliberate_strip(self):
+    def test_unblock_step_names_private_repo_and_deliberate_withholding(self):
         snap = assess_section4_decision()
         step = snap["unblock_step"]
         assert "private repo" in step.lower()
-        assert "deliberately stripped" in step
-        assert "scripts/prepare_data.py" in step
+        assert "deliberately withheld" in step
+        assert "private 9B corpus" in step
         assert "/home/jinno/tg-lora" in step
-        assert "half-port" in step  # the explicit don't-break-the-boundary warning
 
     def test_unblock_step_short_form_when_src_data_present(self):
         snap = assess_section4_decision(src_data_present=True)
@@ -510,20 +508,22 @@ class TestUnblockStepAndArchitecturalInvariant:
         assert "no re-fire is needed" in step or "no re-fire" in step.lower()
         assert "recover.py" in step
 
-    def test_src_data_is_deliberately_stripped_in_this_mirror(self):
+    def test_private_corpus_is_deliberately_withheld_in_this_mirror(self):
         # The architectural invariant that blocks the recover.py --rerun path
-        # (NOT the verdict run). Pinned (not fabricated): scripts/prepare_data.py
-        # documents the strip and tests/test_filter_dataset.py + tests/test_dedup.py
-        # keep the interface without its implementation. If this pin flips, the
-        # PIVOT-branch + recover-path logic above must be revisited together — do
-        # not just delete this test.
-        assert not (REPO_ROOT / "src" / "data").is_dir()
-        assert not (REPO_ROOT / RECOVER_RERUN_ENTRYPOINT).exists()
-        # ...but the stripped interface is still documented in this mirror:
+        # (NOT the verdict run). Since 559d47b/e4434a3 the generic src.data
+        # modules SHIP on this mirror — what is withheld is the private 9B
+        # corpus, so the block is keyed on repo identity (the fixture-pinned
+        # "stripped_deliberate" predicate), not file absence. If this pin
+        # flips, the PIVOT-branch + recover-path logic above must be revisited
+        # together — do not just delete this test.
+        snap = assess_section4_decision()
+        assert snap["src_data_status"] == "stripped_deliberate"
+        assert snap["recover_rerun_blocked_by_src_data"] is True
+        # ...and the modules that ship here are real files, not interfaces:
+        assert (REPO_ROOT / "src" / "data" / "build_seed_dataset.py").is_file()
+        assert (REPO_ROOT / "src" / "data" / "filter_dataset.py").is_file()
         assert (REPO_ROOT / "tests" / "test_filter_dataset.py").exists()
         assert (REPO_ROOT / "tests" / "test_dedup.py").exists()
-        prepare = (REPO_ROOT / "scripts" / "prepare_data.py").read_text()
-        assert "stripped from this public mirror" in prepare
 
     def test_verdict_worker_module_constant_points_at_the_worker(self):
         # Pins that VERDICT_WORKER_MODULE names the actual §4 verdict entry

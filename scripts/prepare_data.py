@@ -15,11 +15,10 @@ import logging
 import random
 from pathlib import Path
 
-# NOTE: ``src.data.filter_dataset`` lives in the private data pipeline that is
-# stripped from this public mirror. Importing it at module scope makes even
-# ``--help`` fail here; it is imported lazily inside ``prepare_dataset`` so the
-# argparse ``--help`` path works with only the stdlib (mirrors the existing lazy
-# ``load_tokenizer`` import in ``_load_audit_tokenizer``).
+# NOTE: ``src.data.filter_dataset`` is imported lazily inside ``prepare_dataset``
+# (not at module scope) so the argparse ``--help`` path works with only the
+# stdlib, mirroring the existing lazy ``load_tokenizer`` import in
+# ``_load_audit_tokenizer``. The module itself ships on this mirror.
 logger = logging.getLogger("tg-lora")
 
 CHAT_TEMPLATE = """<|im_start|>user

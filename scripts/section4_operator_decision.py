@@ -18,11 +18,14 @@ rather than prose:
    in this mirror (the committed TIES deposits are proof it was already fired
    here, on the 12 GB RTX 3060). The *recover.py* ``--rerun`` / ``train_tg_lora``
    corrective-re-run path is a DIFFERENT path: ``train_tg_lora`` imports
-   ``src.data.build_seed_dataset`` at module scope (line 16), and ``src.data`` is
-   **deliberately stripped** from this public mirror — so THAT path dies on
-   import, by design. A prior version of this surface keyed ``run_executable_here``
-   off the recover path's src.data import and so wrongly reported the verdict run
-   as non-executable; this version probes the verdict worker directly.
+   ``src.data.build_seed_dataset`` at module scope (line 16), and the private 9B
+   corpus that path needs is **deliberately withheld** from this public mirror —
+   THAT path is private-repo-only by design. (The generic ``src.data`` modules
+   themselves ship on this mirror since 559d47b/e4434a3, so the block is the
+   private corpus, not a missing import.) A prior version of this surface keyed
+   ``run_executable_here`` off the recover path's src.data import and so wrongly
+   reported the verdict run as non-executable; this version probes the verdict
+   worker directly.
 3. **GPU is a transient runtime factor**, not an architectural one: seq1024
    full-budget fits the 12 GB RTX 3060 under the suffix-only config (both legs
    were fired on exactly that hardware).
@@ -33,10 +36,10 @@ verdict run already fired on public Dolly) or **ACCEPT-NULL** (TIES as the hones
 null Progressive Freezing does not beat the random-order surrogate at full
 budget). **PIVOT** — establishing absolute-loss comparability via the private
 ``src.data`` quality filter — is *not* a public-mirror action: it is a
-private-repo action (``/home/jinno/tg-lora``) because ``src.data`` is stripped
-here by design. Executing PIVOT by half-porting ``src.data`` into this mirror
-would break the deliberate public/private boundary; the unblock step is to run it
-in the private repo, then deposit + replay here.
+private-repo action (``/home/jinno/tg-lora``) because the private 9B corpus is
+withheld here by design (the generic ``src.data`` modules ship on this mirror;
+the corpus does not). The unblock step is to run PIVOT in the private repo,
+then deposit + replay here.
 
 This command consolidates the two deposits + the verdict-worker executability
 probe into a single machine-verifiable snapshot so the operator (and the feedback
@@ -72,6 +75,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.agent_check_status import src_data_pipeline_present  # noqa: E402
 from scripts.replay_freeze_validloss_ci import load_samples, replay_samples  # noqa: E402
 from src.tg_lora.freeze_evidence_hash import evidence_hash  # noqa: E402
 from src.tg_lora.freeze_surrogate_gate import TIES  # noqa: E402
@@ -88,17 +92,9 @@ HETEROGENEOUS_DEPOSIT = "tests/fixtures/freeze_validloss_ci_9b_full_heterogeneou
 # imports NO ``src.data`` — so the verdict run has no architectural src.data
 # block (the committed TIES deposits are proof it was already fired here). This
 # corrects the prior decision surface that keyed executability off
-# ``train_tg_lora``'s src.data import — that is the recover.py ``--rerun`` path
-# (a DIFFERENT path, see :data:`RECOVER_RERUN_ENTRYPOINT`), not the verdict run.
+# ``train_tg_lora``'s src.data import — that is the recover.py ``--rerun``
+# corrective-re-run path (a DIFFERENT path), not the verdict run.
 VERDICT_WORKER_MODULE = "scripts.run_freeze_validloss_ci_9b"
-
-# The recover.py ``--rerun`` / ``train_tg_lora`` corrective-re-run path — the
-# entrypoint that DOES import ``src.data.build_seed_dataset`` at module scope
-# (line 16) and therefore IS architecturally non-executable in this mirror
-# (src.data deliberately stripped). This is a real block, but on the recover
-# path, NOT on the §4 verdict run above. ``present`` ⇒ the recover re-run is
-# importable here; absent ⇒ every recover re-run dies on import, GPU or not.
-RECOVER_RERUN_ENTRYPOINT = "src/data/build_seed_dataset.py"
 
 # seq1024 full-budget 9B QLoRA VRAM floor under the suffix-only config both legs
 # were fired with (RTX 3060, 12 GB). Informational only — a transient runtime
@@ -392,9 +388,11 @@ def assess_section4_decision(
         repo. Override (e.g. an empty ``tmp_path``) to exercise the
         arc-incomplete branch without touching the real deposits.
     src_data_present:
-        Override for the ``src.data`` strip invariant (the recover.py ``--rerun``
-        / ``train_tg_lora`` block and the PIVOT absolute-loss dependency).
-        ``None`` (default) probes the live checkout.
+        Override for the private-data-pipeline invariant (the recover.py
+        ``--rerun`` / ``train_tg_lora`` block and the PIVOT absolute-loss
+        dependency). ``None`` (default) probes the live checkout via
+        :func:`scripts.agent_check_status.src_data_pipeline_present` — a repo
+        identity probe (origin URL basename), not a file-presence check.
     verdict_worker_status:
         Override for the §4 verdict worker's import probe
         (:func:`_probe_verdict_worker`). ``None`` (default) runs the probe; pass
@@ -461,10 +459,16 @@ def assess_section4_decision(
         worker_reason = f"override: {verdict_worker_status}"
     run_executable_here = verdict_worker_status != "architectural_block"
 
-    # The recover.py --rerun / train_tg_lora corrective-re-run path IS src.data-
-    # blocked here — a real block, but on a DIFFERENT path than the verdict run.
+    # The recover.py --rerun / train_tg_lora corrective-re-run path IS private-
+    # data-blocked here — a real block, but on a DIFFERENT path than the verdict run.
     if src_data_present is None:
-        src_data_present = (root / RECOVER_RERUN_ENTRYPOINT).exists()
+        # Repo-identity probe (origin basename), NOT file presence: the generic
+        # src.data modules ship on this mirror since 559d47b/e4434a3, so a file
+        # check reads True here and misreads the mirror as private.
+        src_data_present = src_data_pipeline_present()
+    # "stripped_deliberate" is kept as the fixture-pinned predicate value; it
+    # now means "the private-data-dependent pipeline is deliberately not
+    # actionable on this mirror" (corpus withheld), not "files absent".
     src_data_status = "present" if src_data_present else "stripped_deliberate"
 
     # PIVOT (absolute-loss comparability vs the private-repo baseline via the
@@ -487,13 +491,14 @@ def assess_section4_decision(
             "summary": "TIES as the honest null (freeze-order gain is null at full budget)",
         },
         # PIVOT: establish absolute-loss comparability via the src.data quality
-        # filter. Needs src.data → deliberately stripped here → private-repo only.
+        # filter. Needs the private repo's src.data pipeline + private 9B corpus
+        # → private-repo only on this mirror.
         "pivot": {
             "executable_here": pivot_public_doable,
             "private_repo_only": not pivot_public_doable,
             "summary": (
                 "absolute-loss comparability via src.data — a private-repo action "
-                "(src.data is deliberately stripped from this public mirror)"
+                "(the private 9B corpus is deliberately withheld from this public mirror)"
                 if not pivot_public_doable
                 else "absolute-loss comparability via the now-present src.data pipeline"
             ),
@@ -546,17 +551,16 @@ def assess_section4_decision(
         "and the verdict run already fired on public Dolly — no re-fire is needed "
         "(it reproduces TIES). The sole remaining axis is ABSOLUTE-LOSS "
         "comparability vs the private-repo baseline, which needs the private "
-        "src.data quality filter: src.data is deliberately stripped from this "
-        "public mirror (see the note in scripts/prepare_data.py and the "
-        "interface-without-implementation in tests/test_filter_dataset.py + "
+        "src.data quality filter plus the private 9B corpus — the corpus is "
+        "deliberately withheld from this public mirror (the generic src.data "
+        "modules themselves ship here; see tests/test_filter_dataset.py + "
         "tests/test_dedup.py). Execute PIVOT in the private repo "
-        "(/home/jinno/tg-lora): port/refresh src/data/filter_dataset.py quality "
-        "filtering → re-fire the same corpus → form_freeze_validloss_deposit + "
-        "freeze-replay → deposit here. Do NOT half-port src.data into this mirror "
-        "(it breaks the deliberate boundary and cannot run without the full "
-        "private pipeline + corpus). NOTE: the recover.py `--rerun` / "
-        "train_tg_lora corrective-re-run path is a SEPARATE, src.data-blocked "
-        "path — that block does not apply to the verdict worker."
+        "(/home/jinno/tg-lora): run src/data/filter_dataset.py quality "
+        "filtering on the private corpus → re-fire the same corpus → "
+        "form_freeze_validloss_deposit + freeze-replay → deposit here. "
+        "NOTE: the recover.py `--rerun` / train_tg_lora corrective-re-run path "
+        "is a SEPARATE, private-data-blocked path — that block does not apply "
+        "to the verdict worker."
         if arc_complete and not pivot_public_doable
         else (
             "src.data is present — fire the run directly through "

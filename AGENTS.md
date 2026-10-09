@@ -44,8 +44,11 @@ tg-lora/
 │   │   ├── random_walk_controller.py  # ハイパーパラメータ適応探索
 │   │   ├── lora_state.py         # LoRA状態管理
 │   │   └── metrics.py            # 学習メトリクス
-│   ├── (data/)           # ← private pipeline は public mirror で意図的 strip 済み
-│   │                       #   （src/data は不在。依存 tests ~130件 = pre-existing 失敗・非回帰）
+│   ├── data/             # 全7モジュール同梱（e4434a3 以降。build_seed_dataset/schema は 559d47b、
+│   │                       #   dedup/filter_dataset/generate_open_data/provenance は汎用公開安全
+│   │                       #   ユーティリティ — filter_dataset は公開 prepare-data の token-audit
+│   │                       #   経路に必須）。9B lever が mirror から実行不可（Cat-C）なのは
+│   │                       #   private 9B DATA 由来で src/data ファイル不在ではない
 │   ├── training/         # 学習ループ
 │   │   ├── train_baseline_qlora.py
 │   │   ├── train_tg_lora.py
