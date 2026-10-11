@@ -1,7 +1,13 @@
 """Unit tests for src/data/filter_dataset.py."""
 
 import orjson
+import pytest
 import torch
+
+# ``src.data.filter_dataset`` is private-pipeline-only (stripped from this
+# public mirror, DATA/Cat-C) — skip the whole module there instead of failing
+# collection. It still runs in the private checkout, where the module ships.
+pytest.importorskip("src.data.filter_dataset")
 
 from src.data.filter_dataset import filter_dataset
 from src.utils.io import load_jsonl

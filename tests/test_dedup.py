@@ -4,6 +4,12 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import orjson
+import pytest
+
+# ``src.data.dedup`` is private-pipeline-only (stripped from this public
+# mirror, DATA/Cat-C) — skip the whole module there instead of failing
+# collection. It still runs in the private checkout, where the module ships.
+pytest.importorskip("src.data.dedup")
 
 from src.data.dedup import dedup_embedding, dedup_exact, find_duplicates
 from src.utils.io import load_jsonl

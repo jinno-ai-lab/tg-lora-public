@@ -5,6 +5,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# ``src.data.generate_open_data`` is private-pipeline-only (stripped from this
+# public mirror, DATA/Cat-C) — skip the whole module there instead of failing
+# collection. It still runs in the private checkout, where the module ships.
+pytest.importorskip("src.data.generate_open_data")
+
 from src.data.generate_open_data import generate_open_data
 
 
