@@ -336,18 +336,52 @@ def query_gpu_compute_apps():
     return proc.stdout
 
 
+def _git_origin_url(repo_root: Path) -> "str | None":
+    """The checkout's git ``origin`` URL, or None when unavailable (no .git —
+    e.g. a tarball download — or no origin remote configured)."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    url = out.stdout.strip()
+    return url or None
+
+
+def _is_public_mirror_origin(origin: "str | None") -> bool:
+    """Classify a git origin URL as the public mirror. ``None`` (no git
+    metadata) counts as the mirror: DATA-blocked is the conservative direction
+    — claiming "actionable" on unknown provenance is the dangerous error."""
+    if not origin:
+        return True
+    return "tg-lora-public" in origin
+
+
 def src_data_pipeline_present() -> bool:
     """Whether the private ``src.data`` data pipeline ships in this checkout.
 
     The 9B target-scale run (GOAL §4) depends on ``src.data`` to produce/serve
-    its 9B samples. On the PUBLIC mirror that pipeline is deliberately stripped
-    (DATA/Cat-C — see PURPOSE.md), so the 9B lever is NOT actionable from this
-    checkout regardless of GPU state; on the PRIVATE checkout it ships and the
-    run's real readiness gate is GPU availability. Resolved from ``__file__``
-    (not CWD) so the answer is stable however ``make status`` is invoked, and a
-    module-level function so tests can inject both contexts without a GPU."""
+    its 9B samples. On the PRIVATE checkout (jinno0/tg-lora) the pipeline ships
+    and the run's real readiness gate is GPU availability. This PUBLIC mirror
+    ALSO tracks a ``src/data`` snapshot (public-subset commit 559d47b
+    2026-06-13, later grown by the harness sweep e4434a3 2026-09-19), so a bare
+    directory check can no longer tell the two apart — but on the mirror those
+    modules are NOT the actionable private pipeline (DATA/Cat-C — see
+    PURPOSE.md): the 9B lever is NOT actionable here regardless of GPU state.
+    The two checkouts are therefore discriminated by the git ``origin`` URL,
+    keeping the DATA-blocked (not GPU-blocked) operator framing honest on the
+    mirror. Resolved from ``__file__`` (not CWD) so the answer is stable
+    however ``make status`` is invoked, and a module-level function so tests
+    can inject both contexts without a GPU."""
     repo_root = Path(__file__).resolve().parents[1]
-    return (repo_root / "src" / "data").is_dir()
+    if not (repo_root / "src" / "data").is_dir():
+        return False
+    return not _is_public_mirror_origin(_git_origin_url(repo_root))
 
 
 def data_blocked_operator_decision() -> list[str]:
