@@ -13,8 +13,15 @@ build/
 venv/
 env/
 
-# Data (large files) — root only, not src/data/ Python package
+# Data (large files) — root only
 /data/
+# src/data/ is the PRIVATE pipeline, deliberately stripped from this public
+# mirror (DATA/Cat-C). Ignoring it blocks the leftover-working-tree sweep path
+# (git add -A) that re-landed it (e4434a3, 2026-09-19) and kept base main
+# permanently red until f42af86 removed it again. Actual tracking is pinned by
+# tests/test_agent_check_status_gpu.py::test_src_data_pipeline_present_false_on_public_mirror,
+# which runs in the CI test job.
+/src/data/
 
 # Experiment outputs
 runs/
