@@ -38,12 +38,14 @@ jobs:
       # the auto-discovered bootstrap-defect canary (every scripts/*.py
       # entrypoint must answer --help / import cleanly under a clean PYTHONPATH;
       # it classifies the absent private pipeline as a mirror limitation, not a
-      # failure) plus the GPU-free gates job below.
+      # failure) plus the GPU-free gates job below. The pin file itself runs
+      # HERE so a src/data re-landing fails CI instead of only local runs
+      # (tests/test_mirror_strip_contract.py pins this wiring).
       - name: Run mirror canary tests
         env:
           CI: "1"
         run: |
-          pytest tests/test_cli_help_smoke.py -q --tb=short
+          pytest tests/test_cli_help_smoke.py tests/test_agent_check_status_gpu.py -q --tb=short
 
   # GPU-free CI gates that must run on every push/PR. These are the make targets
   # that previously existed only as local `make` entries with no CI invocation
