@@ -1,5 +1,12 @@
 """Unit tests for src/data/provenance.py."""
 
+import pytest
+
+pytest.importorskip(
+    "src.data.provenance",
+    reason="private src.data pipeline stripped from this public mirror",
+)
+
 from datetime import datetime, timezone
 
 from src.data.provenance import create_provenance

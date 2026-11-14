@@ -100,6 +100,14 @@ VERDICT_WORKER_MODULE = "scripts.run_freeze_validloss_ci_9b"
 # importable here; absent ⇒ every recover re-run dies on import, GPU or not.
 RECOVER_RERUN_ENTRYPOINT = "src/data/build_seed_dataset.py"
 
+# What "src.data is stripped" must be keyed on. Since 559d47b the
+# ``src/data`` directory and RECOVER_RERUN_ENTRYPOINT itself are PUBLIC (the
+# mirror intentionally ships build_seed_dataset + schema for train_tg_lora), so
+# keying presence on the entrypoint misreports the mirror as having the
+# pipeline. The private pipeline is exactly the module 559d47b deliberately
+# excluded — its absence (and only its absence) marks a stripped checkout.
+SRC_DATA_PRIVATE_MARKER = "src/data/filter_dataset.py"
+
 # seq1024 full-budget 9B QLoRA VRAM floor under the suffix-only config both legs
 # were fired with (RTX 3060, 12 GB). Informational only — a transient runtime
 # factor, not an architectural gate (the verdict worker imports cleanly here).
@@ -464,7 +472,7 @@ def assess_section4_decision(
     # The recover.py --rerun / train_tg_lora corrective-re-run path IS src.data-
     # blocked here — a real block, but on a DIFFERENT path than the verdict run.
     if src_data_present is None:
-        src_data_present = (root / RECOVER_RERUN_ENTRYPOINT).exists()
+        src_data_present = (root / SRC_DATA_PRIVATE_MARKER).exists()
     src_data_status = "present" if src_data_present else "stripped_deliberate"
 
     # PIVOT (absolute-loss comparability vs the private-repo baseline via the

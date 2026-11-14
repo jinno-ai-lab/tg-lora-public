@@ -1,11 +1,18 @@
 """Unit tests for src/data/dedup.py."""
 
+import pytest
+
+pytest.importorskip(
+    "src.data.dedup",
+    reason="private src.data pipeline stripped from this public mirror",
+)
+
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import orjson
-
 from src.data.dedup import dedup_embedding, dedup_exact, find_duplicates
+
 from src.utils.io import load_jsonl
 
 
