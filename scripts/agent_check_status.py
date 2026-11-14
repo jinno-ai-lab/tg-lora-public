@@ -353,6 +353,14 @@ def src_data_pipeline_present() -> bool:
     import) since commit 559d47b, so a directory-existence check reads True on
     the mirror and would invert the DATA-blocked framing this probe exists for."""
     repo_root = Path(__file__).resolve().parents[1]
+# The ``src/data`` DIRECTORY is public since 559d47b (it ships the
+    # intentionally-public build_seed_dataset + schema that train_tg_lora
+    # imports), so directory existence no longer means the private pipeline is
+    # here. The private pipeline is exactly the four modules 559d47b deliberately
+    # excluded (filter_dataset, dedup, provenance, generate_open_data); probe
+    # one of them as the private-only marker so this reads False on the public
+    # mirror and True on the private checkout — keeping the DATA-blocked (not
+    # GPU-blocked) framing honest in both.
     return (repo_root / "src" / "data" / "filter_dataset.py").is_file()
 
 

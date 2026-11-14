@@ -1,7 +1,5 @@
 # AUTOMATION.md — tg-lora-public
 
-大ゴール: AIによる全自動開発の実現。人間より圧倒的に効率的に。(fleet共通)
-
 ## 発火 (Driver)
 - crontab: 0本(2026-09-15 実測・全41行との突合)
 - GitHub Actions: 1本(実測: test.yml)
