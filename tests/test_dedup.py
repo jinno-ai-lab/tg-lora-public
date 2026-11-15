@@ -24,6 +24,11 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import orjson
+import pytest
+
+# Private-pipeline module (DATA/Cat-C) — skip cleanly on the public mirror
+# instead of erroring at collection (which aborts the entire run).
+pytest.importorskip("src.data.dedup")
 
 from src.data.dedup import dedup_embedding, dedup_exact, find_duplicates
 

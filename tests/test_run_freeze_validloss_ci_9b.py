@@ -3353,6 +3353,10 @@ class TestCudaOomTempfail:
         def _boom(**kwargs):
             raise torch.cuda.OutOfMemoryError("CUDA out of memory.")
         monkeypatch.setattr(mod, "run_ci_9b", _boom)
+        # The tests must reach the OOM classification on GPU-less hosts (CI):
+        # pretend a card is present and that the free-memory gate defers nothing.
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(mod, "gpu_free_memory_deferred", lambda _g: None)
 
         argv = [
             "--config", str(repo_root / "configs" / "9b_baseline_suffix_only_last25.yaml"),
@@ -3373,6 +3377,8 @@ class TestCudaOomTempfail:
         def _drift(**kwargs):
             raise RuntimeError("Pre-LoRA active scope drifted from the post-LoRA scope")
         monkeypatch.setattr(mod, "run_ci_9b", _drift)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(mod, "gpu_free_memory_deferred", lambda _g: None)
 
         argv = [
             "--config", str(repo_root / "configs" / "9b_baseline_suffix_only_last25.yaml"),

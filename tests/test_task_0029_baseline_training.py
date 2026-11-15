@@ -44,12 +44,21 @@ class _MockDataset(Dataset):
         }
 
 
+def _write_mock_checkpoint_files(path) -> None:
+    """Write a stand-in artifact into the target dir so the real
+    ``save_checkpoint`` (with its fail-loud empty-save guard) sees a
+    non-empty staged dir, while the MagicMock still records every call."""
+    target = Path(path)
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "adapter_model.safetensors").write_bytes(b"mock-adapter")
+
+
 class _MockModel(torch.nn.Module):
     def __init__(self, loss_value: float = 2.0):
         super().__init__()
         self._loss_value = loss_value
         self.linear = torch.nn.Linear(1, 1)
-        self.save_pretrained = MagicMock()
+        self.save_pretrained = MagicMock(side_effect=_write_mock_checkpoint_files)
 
     def __call__(self, **kwargs):
         out = MagicMock()
@@ -122,7 +131,7 @@ def _make_eval_results(eval_losses):
 def _patch_all_deps(model_loss=2.0, eval_losses=None):
     model = _MockModel(loss_value=model_loss)
     tokenizer = MagicMock()
-    tokenizer.save_pretrained = MagicMock()
+    tokenizer.save_pretrained = MagicMock(side_effect=_write_mock_checkpoint_files)
 
     if eval_losses is None:
         eval_losses = [2.0]
