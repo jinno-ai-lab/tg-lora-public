@@ -1194,7 +1194,7 @@ class TestLossCurveSkipsNullValues:
 
 
 class TestSupplySideHonestyNonInert:
-    """Closes the §5.2 honesty contract's supply side — TASK-0141 last mile.
+    r"""Closes the §5.2 honesty contract's supply side — TASK-0141 last mile.
 
     The receiver tests (``TestFullEvalLossHonestyE2E``) proved the gate wakes the
     moment honest data arrives; the dormancy tests (``TestHonestyContractDormancyLoud``)

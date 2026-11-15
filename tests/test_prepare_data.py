@@ -1,3 +1,11 @@
+import pytest
+
+pytest.importorskip(
+    "src.data.filter_dataset",
+    reason="prepare_dataset needs the private src.data pipeline, "
+    "stripped from this public mirror",
+)
+
 import json
 
 import pytest

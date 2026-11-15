@@ -353,6 +353,7 @@ def src_data_pipeline_present() -> bool:
     import) since commit 559d47b, so a directory-existence check reads True on
     the mirror and would invert the DATA-blocked framing this probe exists for."""
     repo_root = Path(__file__).resolve().parents[1]
+return (repo_root / "src" / "data" / "filter_dataset.py").is_file()
     return (repo_root / "src" / "data" / "filter_dataset.py").is_file()
 
 
