@@ -72,6 +72,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.agent_check_status import src_data_pipeline_present  # noqa: E402
 from scripts.replay_freeze_validloss_ci import load_samples, replay_samples  # noqa: E402
 from src.tg_lora.freeze_evidence_hash import evidence_hash  # noqa: E402
 from src.tg_lora.freeze_surrogate_gate import TIES  # noqa: E402
@@ -99,14 +100,6 @@ VERDICT_WORKER_MODULE = "scripts.run_freeze_validloss_ci_9b"
 # path, NOT on the §4 verdict run above. ``present`` ⇒ the recover re-run is
 # importable here; absent ⇒ every recover re-run dies on import, GPU or not.
 RECOVER_RERUN_ENTRYPOINT = "src/data/build_seed_dataset.py"
-
-# What "src.data is stripped" must be keyed on. Since 559d47b the
-# ``src/data`` directory and RECOVER_RERUN_ENTRYPOINT itself are PUBLIC (the
-# mirror intentionally ships build_seed_dataset + schema for train_tg_lora), so
-# keying presence on the entrypoint misreports the mirror as having the
-# pipeline. The private pipeline is exactly the module 559d47b deliberately
-# excluded — its absence (and only its absence) marks a stripped checkout.
-SRC_DATA_PRIVATE_MARKER = "src/data/filter_dataset.py"
 
 # seq1024 full-budget 9B QLoRA VRAM floor under the suffix-only config both legs
 # were fired with (RTX 3060, 12 GB). Informational only — a transient runtime
@@ -402,7 +395,8 @@ def assess_section4_decision(
     src_data_present:
         Override for the ``src.data`` strip invariant (the recover.py ``--rerun``
         / ``train_tg_lora`` block and the PIVOT absolute-loss dependency).
-        ``None`` (default) probes the live checkout.
+        ``None`` (default) probes repository identity through
+        :func:`scripts.agent_check_status.src_data_pipeline_present`.
     verdict_worker_status:
         Override for the §4 verdict worker's import probe
         (:func:`_probe_verdict_worker`). ``None`` (default) runs the probe; pass
@@ -472,7 +466,7 @@ def assess_section4_decision(
     # The recover.py --rerun / train_tg_lora corrective-re-run path IS src.data-
     # blocked here — a real block, but on a DIFFERENT path than the verdict run.
     if src_data_present is None:
-        src_data_present = (root / SRC_DATA_PRIVATE_MARKER).exists()
+        src_data_present = src_data_pipeline_present()
     src_data_status = "present" if src_data_present else "stripped_deliberate"
 
     # PIVOT (absolute-loss comparability vs the private-repo baseline via the

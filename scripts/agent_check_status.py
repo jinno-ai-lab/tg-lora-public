@@ -337,24 +337,29 @@ def query_gpu_compute_apps():
 
 
 def src_data_pipeline_present() -> bool:
-    """Whether the private ``src.data`` data pipeline ships in this checkout.
+    """Whether this checkout is the PRIVATE repo — i.e. the 9B data lever is
+    actionable from here (its real readiness gate is GPU availability).
 
-    The 9B target-scale run (GOAL §4) depends on ``src.data`` to produce/serve
-    its 9B samples. On the PUBLIC mirror that pipeline is deliberately stripped
-    (DATA/Cat-C — see PURPOSE.md), so the 9B lever is NOT actionable from this
-    checkout regardless of GPU state; on the PRIVATE checkout it ships and the
-    run's real readiness gate is GPU availability. Resolved from ``__file__``
-    (not CWD) so the answer is stable however ``make status`` is invoked, and a
-    module-level function so tests can inject both contexts without a GPU.
-
-    Detects the pipeline by a private-only module marker, not by the bare
-    ``src/data`` directory: the mirror legitimately ships a minimal public
-    subset (``build_seed_dataset`` + ``schema``, needed by ``train_tg_lora``'s
-    import) since commit 559d47b, so a directory-existence check reads True on
-    the mirror and would invert the DATA-blocked framing this probe exists for."""
+    The public mirror deliberately omits the private ``src.data`` pipeline and
+    9B corpus (DATA/Cat-C — see PURPOSE.md), so that work is not actionable
+    here regardless of GPU state. Use the origin repository identity instead
+    of probing individual files: the private pipeline's layout can change
+    independently of whether this is the private checkout. Resolve from
+    ``__file__`` (not CWD) so the answer is stable however ``make status`` is
+    invoked. Undeterminable origin (no git, tarball copy) conservatively reads
+    False — the honest-on-mirror default."""
     repo_root = Path(__file__).resolve().parents[1]
-return (repo_root / "src" / "data" / "filter_dataset.py").is_file()
-    return (repo_root / "src" / "data" / "filter_dataset.py").is_file()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    if proc.returncode != 0:
+        return False
+    url = proc.stdout.strip().rstrip("/").removesuffix(".git")
+    return url.rsplit("/", 1)[-1] != "tg-lora-public"
 
 
 def data_blocked_operator_decision() -> list[str]:

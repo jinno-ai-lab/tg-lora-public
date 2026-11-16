@@ -514,14 +514,15 @@ class TestUnblockStepAndArchitecturalInvariant:
         # (NOT the verdict run). Pinned (not fabricated): scripts/prepare_data.py
         # documents the strip and tests/test_filter_dataset.py + tests/test_dedup.py
         # hold the interface, skipping via importorskip while the private
-        # implementation is absent. Since 559d47b the ``src/data`` directory and
-        # build_seed_dataset.py are PUBLIC (train_tg_lora imports them), so the
-        # strip marker is the private-only module (filter_dataset) — not the
-        # directory, and not the entrypoint file. If this pin flips, the
-        # PIVOT-branch + recover-path logic above must be revisited together — do
-        # not just delete this test.
+        # implementation is absent. The block is keyed on checkout identity,
+        # not file presence, so adding or removing a public-safe module cannot
+        # silently change whether private data is available. If this pin flips,
+        # the PIVOT-branch + recover-path logic above must be revisited together —
+        # do not just delete this test.
+        snap = assess_section4_decision()
+        assert snap["src_data_status"] == "stripped_deliberate"
+        assert snap["recover_rerun_blocked_by_src_data"] is True
         assert not (REPO_ROOT / "src" / "data" / "filter_dataset.py").exists()
-        assert (REPO_ROOT / "src" / "data" / "build_seed_dataset.py").exists()
         # ...but the stripped interface is still documented in this mirror:
         assert (REPO_ROOT / "tests" / "test_filter_dataset.py").exists()
         assert (REPO_ROOT / "tests" / "test_dedup.py").exists()
