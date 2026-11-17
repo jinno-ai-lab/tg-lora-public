@@ -95,12 +95,42 @@ def test_parse_gpu_holders_skips_malformed_rows() -> None:
 
 
 def test_src_data_pipeline_present_false_on_public_mirror() -> None:
-    """On this public mirror ``src.data`` is deliberately stripped (DATA/Cat-C),
-    so the probe reads False — the contract that drives the DATA-blocked (not
-    GPU-blocked) framing of the 9B lever below. Pins that the framing is not
-    accidentally inverted by a future port."""
+    """On this public mirror the probe reads False — the contract that drives
+    the DATA-blocked (not GPU-blocked) framing of the 9B lever below. The
+    mirror tracks a ``src/data`` snapshot too (559d47b + the e4434a3 sweep),
+    so this pins the origin-based discrimination, not a bare directory check."""
     mod = _load_module()
     assert mod.src_data_pipeline_present() is False
+
+
+def test_src_data_pipeline_present_true_on_private_origin(monkeypatch) -> None:
+    """The same directory state must read True on the PRIVATE checkout — the
+    discriminator is the git origin, not the directory's existence."""
+    mod = _load_module()
+    monkeypatch.setattr(
+        mod, "_git_origin_url", lambda root: "https://github.com/jinno0/tg-lora.git"
+    )
+    assert mod.src_data_pipeline_present() is True
+
+
+def test_src_data_pipeline_present_false_without_git_metadata(monkeypatch) -> None:
+    """A checkout without git metadata (tarball download) is treated as the
+    mirror: DATA-blocked is the conservative direction — claiming 'actionable'
+    on unknown provenance is the dangerous error."""
+    mod = _load_module()
+    monkeypatch.setattr(mod, "_git_origin_url", lambda root: None)
+    assert mod.src_data_pipeline_present() is False
+
+
+def test_is_public_mirror_origin_matches_repo_name() -> None:
+    """The mirror marker is the ``tg-lora-public`` repo name in the origin URL;
+    the private origin (jinno0/tg-lora) must not match it."""
+    mod = _load_module()
+    assert mod._is_public_mirror_origin(
+        "https://github.com/jinno-ai-lab/tg-lora-public"
+    )
+    assert not mod._is_public_mirror_origin("git@github.com:jinno0/tg-lora.git")
+    assert mod._is_public_mirror_origin(None)
 
 
 def test_report_gpu_availability_mirror_held_gpu_is_data_blocked_not_gpu(monkeypatch) -> None:

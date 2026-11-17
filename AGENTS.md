@@ -44,8 +44,9 @@ tg-lora/
 │   │   ├── random_walk_controller.py  # ハイパーパラメータ適応探索
 │   │   ├── lora_state.py         # LoRA状態管理
 │   │   └── metrics.py            # 学習メトリクス
-│   ├── (data/)           # ← private pipeline は public mirror で意図的 strip 済み
-│   │                       #   （src/data は不在。依存 tests ~130件 = pre-existing 失敗・非回帰）
+│   ├── data/             # 公開スナップショット（559d47b で部分的に追跡開始・e4434a3 で拡大）
+│   │                       #   private 最新版とは内容が乖離。9B lever の判別は
+│   │                       #   scripts/agent_check_status.py が git origin で実施
 │   ├── training/         # 学習ループ
 │   │   ├── train_baseline_qlora.py
 │   │   ├── train_tg_lora.py

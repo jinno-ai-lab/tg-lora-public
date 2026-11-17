@@ -336,25 +336,52 @@ def query_gpu_compute_apps():
     return proc.stdout
 
 
+def _git_origin_url(repo_root: Path) -> "str | None":
+    """The checkout's git ``origin`` URL, or None when unavailable (no .git —
+    e.g. a tarball download — or no origin remote configured)."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    url = out.stdout.strip()
+    return url or None
+
+
+def _is_public_mirror_origin(origin: "str | None") -> bool:
+    """Classify a git origin URL as the public mirror. ``None`` (no git
+    metadata) counts as the mirror: DATA-blocked is the conservative direction
+    — claiming "actionable" on unknown provenance is the dangerous error."""
+    if not origin:
+        return True
+    return "tg-lora-public" in origin
+
+
 def src_data_pipeline_present() -> bool:
     """Whether the private ``src.data`` data pipeline ships in this checkout.
 
     The 9B target-scale run (GOAL §4) depends on ``src.data`` to produce/serve
-    its 9B samples. On the PUBLIC mirror that pipeline is deliberately stripped
-    (DATA/Cat-C — see PURPOSE.md), so the 9B lever is NOT actionable from this
-    checkout regardless of GPU state; on the PRIVATE checkout it ships and the
-    run's real readiness gate is GPU availability. Resolved from ``__file__``
-    (not CWD) so the answer is stable however ``make status`` is invoked, and a
-    module-level function so tests can inject both contexts without a GPU.
+def src_data_pipeline_present() -> bool:
+    """Whether the private ``src.data`` data pipeline ships in this checkout.
 
-    Detects the pipeline by a private-only module marker, not by the bare
-    ``src/data`` directory: the mirror legitimately ships a minimal public
-    subset (``build_seed_dataset`` + ``schema``, needed by ``train_tg_lora``'s
-    import) since commit 559d47b, so a directory-existence check reads True on
-    the mirror and would invert the DATA-blocked framing this probe exists for."""
+    The 9B target-scale run (GOAL §4) depends on ``src.data`` to produce/serve
+    its 9B samples. The public mirror ships a minimal ``src/data`` subset
+    (``build_seed_dataset`` + ``schema``, needed by ``train_tg_lora``'s import),
+    so directory existence alone cannot identify the actionable private
+    pipeline. The private-only ``filter_dataset.py`` module is the pipeline
+    marker; the git ``origin`` check also keeps the public-mirror DATA-blocked
+    framing conservative when that marker is present. Resolved from ``__file__``
+    (not CWD) so the answer is stable however ``make status`` is invoked."""
     repo_root = Path(__file__).resolve().parents[1]
-return (repo_root / "src" / "data" / "filter_dataset.py").is_file()
-    return (repo_root / "src" / "data" / "filter_dataset.py").is_file()
+    data_dir = repo_root / "src" / "data"
+    if not data_dir.is_dir() or not (data_dir / "filter_dataset.py").is_file():
+        return False
+    return not _is_public_mirror_origin(_git_origin_url(repo_root))
 
 
 def data_blocked_operator_decision() -> list[str]:
