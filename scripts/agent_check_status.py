@@ -366,20 +366,20 @@ def src_data_pipeline_present() -> bool:
     """Whether the private ``src.data`` data pipeline ships in this checkout.
 
     The 9B target-scale run (GOAL §4) depends on ``src.data`` to produce/serve
-    its 9B samples. On the PRIVATE checkout (jinno0/tg-lora) the pipeline ships
-    and the run's real readiness gate is GPU availability. This PUBLIC mirror
-    ALSO tracks a ``src/data`` snapshot (public-subset commit 559d47b
-    2026-06-13, later grown by the harness sweep e4434a3 2026-09-19), so a bare
-    directory check can no longer tell the two apart — but on the mirror those
-    modules are NOT the actionable private pipeline (DATA/Cat-C — see
-    PURPOSE.md): the 9B lever is NOT actionable here regardless of GPU state.
-    The two checkouts are therefore discriminated by the git ``origin`` URL,
-    keeping the DATA-blocked (not GPU-blocked) operator framing honest on the
-    mirror. Resolved from ``__file__`` (not CWD) so the answer is stable
-    however ``make status`` is invoked, and a module-level function so tests
-    can inject both contexts without a GPU."""
+def src_data_pipeline_present() -> bool:
+    """Whether the private ``src.data`` data pipeline ships in this checkout.
+
+    The 9B target-scale run (GOAL §4) depends on ``src.data`` to produce/serve
+    its 9B samples. The public mirror ships a minimal ``src/data`` subset
+    (``build_seed_dataset`` + ``schema``, needed by ``train_tg_lora``'s import),
+    so directory existence alone cannot identify the actionable private
+    pipeline. The private-only ``filter_dataset.py`` module is the pipeline
+    marker; the git ``origin`` check also keeps the public-mirror DATA-blocked
+    framing conservative when that marker is present. Resolved from ``__file__``
+    (not CWD) so the answer is stable however ``make status`` is invoked."""
     repo_root = Path(__file__).resolve().parents[1]
-    if not (repo_root / "src" / "data").is_dir():
+    data_dir = repo_root / "src" / "data"
+    if not data_dir.is_dir() or not (data_dir / "filter_dataset.py").is_file():
         return False
     return not _is_public_mirror_origin(_git_origin_url(repo_root))
 

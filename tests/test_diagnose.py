@@ -56,22 +56,32 @@ class TestCheckGPU:
     def test_gpu_with_low_memory(self):
         import types
 
-        mock_torch = types.ModuleType("torch")
-        mock_torch.cuda = types.ModuleType("torch.cuda")
-        mock_torch.cuda.is_available = lambda: True
-        mock_torch.cuda.device_count = lambda: 1
-        mock_torch.cuda.get_device_name = lambda i: "Test GPU 8GB"
-        mock_torch.cuda.get_device_properties = lambda i: types.SimpleNamespace(
-            total_memory=8 * 1024 * 1024 * 1024
-        )
-        mock_torch.cuda.memory_allocated = lambda i: 0
-        mock_torch.cuda.memory_reserved = lambda i: 0
-        mock_torch.version = types.SimpleNamespace(cuda="12.1")
+        import torch as real_torch
+        import src.utils.device as _dev_mod
 
-        with patch.dict("sys.modules", {"torch": mock_torch}):
-            results = check_gpu()
-            # Should warn about low memory
-            assert any("12GB" in r.message and r.status == "warn" for r in results)
+        _prev = _dev_mod._CACHED_DEVICE
+        _dev_mod._CACHED_DEVICE = None
+        try:
+            mock_torch = types.ModuleType("torch")
+            mock_torch.cuda = types.ModuleType("torch.cuda")
+            mock_torch.cuda.is_available = lambda: True
+            mock_torch.cuda.device_count = lambda: 1
+            mock_torch.cuda.get_device_name = lambda i: "Test GPU 8GB"
+            mock_torch.cuda.get_device_properties = lambda i: types.SimpleNamespace(
+                total_memory=8 * 1024 * 1024 * 1024
+            )
+            mock_torch.cuda.memory_allocated = lambda i: 0
+            mock_torch.cuda.memory_reserved = lambda i: 0
+            mock_torch.version = types.SimpleNamespace(cuda="12.1")
+            mock_torch.device = real_torch.device
+
+            with patch.dict("sys.modules", {"torch": mock_torch}), \
+                 patch.object(_dev_mod, "torch", mock_torch):
+                results = check_gpu()
+                # Should warn about low memory
+                assert any("12GB" in r.message and r.status == "warn" for r in results)
+        finally:
+            _dev_mod._CACHED_DEVICE = _prev
 
 
 # ---------------------------------------------------------------------------

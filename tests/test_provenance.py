@@ -1,6 +1,19 @@
 """Unit tests for src/data/provenance.py."""
 
+import pytest
+
+pytest.importorskip(
+    "src.data.provenance",
+    reason="private src.data pipeline stripped from this public mirror",
+)
+
 from datetime import datetime, timezone
+
+import pytest
+
+# Private-pipeline module (DATA/Cat-C) — skip cleanly on the public mirror
+# instead of erroring at collection (which aborts the entire run).
+pytest.importorskip("src.data.provenance")
 
 from src.data.provenance import create_provenance
 
